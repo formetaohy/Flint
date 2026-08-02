@@ -45,7 +45,7 @@ git clone https://github.com/formetaohy/Flint.git
 
 cd Flint
 
-hf download Qwen/Qwen3.5-0.8B --include "*.json" "*.safetensors" --local-dir models/Qwen3.5-0.8B
+hf download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
 
 cargo run --release -- --model models/Qwen3.5-0.8B --prompt "What is a tensor?"
 ```
