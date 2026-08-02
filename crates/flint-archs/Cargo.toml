@@ -1,0 +1,17 @@
+[package]
+name = "flint-archs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flint-backend.workspace = true
+flint-checkpoint.workspace = true
+flint-error.workspace = true
+flint-model.workspace = true
+flint-tensor.workspace = true
+flint-tokenizer.workspace = true
+serde_json.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+flint-generate.workspace = true

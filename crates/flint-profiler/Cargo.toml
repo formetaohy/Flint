@@ -1,0 +1,8 @@
+[package]
+name = "flint-profiler"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flint-error.workspace = true
+wgpu.workspace = true

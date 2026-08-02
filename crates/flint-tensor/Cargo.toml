@@ -1,0 +1,7 @@
+[package]
+name = "flint-tensor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wgpu.workspace = true

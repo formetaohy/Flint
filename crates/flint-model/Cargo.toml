@@ -1,0 +1,12 @@
+[package]
+name = "flint-model"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flint-backend.workspace = true
+flint-checkpoint.workspace = true
+flint-error.workspace = true
+flint-tensor.workspace = true
+serde_json.workspace = true
+wgpu.workspace = true

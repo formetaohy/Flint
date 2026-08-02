@@ -1,0 +1,46 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/formetaohy/Flint"
+
+[workspace.dependencies]
+flint-error = { path = "crates/flint-error" }
+flint-checkpoint = { path = "crates/flint-checkpoint" }
+flint-tensor = { path = "crates/flint-tensor" }
+flint-kernel = { path = "crates/flint-kernel" }
+flint-backend = { path = "crates/flint-backend" }
+flint-model = { path = "crates/flint-model" }
+flint-archs = { path = "crates/flint-archs" }
+flint-tokenizer = { path = "crates/flint-tokenizer" }
+flint-generate = { path = "crates/flint-generate" }
+flint-profiler = { path = "crates/flint-profiler" }
+
+ahash = "0.8.12"
+clap = { version = "4.6.5", features = ["derive"] }
+env_logger = "0.11.11"
+memmap2 = "0.9.11"
+pollster = "1.0.1"
+safetensors = "0.8.0"
+serde = "1.0.229"
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+tokenizers = "0.23.1"
+wgpu = "30.0.0"
+
+[package]
+name = "flint"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flint-archs.workspace = true
+flint-backend.workspace = true
+flint-error.workspace = true
+flint-generate.workspace = true
+clap.workspace = true
+env_logger.workspace = true
