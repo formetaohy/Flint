@@ -1,23 +1,22 @@
 //! Qwen3.5 text model: hybrid Gated DeltaNet + gated grouped attention, with
 //! an optional single-layer MTP draft head behind the `Speculator` trait.
 
-use flint_backend::{Backend, Binding};
+use flint_backend::{Backend, Binding, Pass};
 use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
 use flint_model::cache::{KvCache, RecurrentState};
 use flint_model::config::{check_gemm_dims, check_head_dim, f64_field, req, u32_field, u32_list};
-use flint_model::loader::{self, WeightSet};
-use flint_model::loader::{Plan, Role};
-use flint_model::ops::{self, NormMode, ROWS};
+use flint_model::loader::{self, Plan, Role, SwigluMlp, WeightSet, take_mlp};
+use flint_model::ops::{self, MlpTiles, NormMode, ROWS};
 use flint_model::{ChunkOut, LanguageModel, Speculator};
-use flint_tensor::{DType, Tensor, Weight};
+use flint_tensor::{Tensor, Weight};
 use serde_json::Value;
 
 /// HF safetensors names -> canonical keys (text tower prefix stripped).
 fn hf_key(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("model.language_model.") {
         Some(rest.to_string())
-    } else if name.starts_with("mtp.") {
+    } else if name.starts_with("mtp.") || name.starts_with("lm_head.") {
         Some(name.to_string())
     } else {
         None
@@ -56,21 +55,25 @@ pub struct Qwen35Config {
     pub head_dim: u32,
     pub vocab: u32,
     pub layer_types: Vec<LayerKind>,
-    pub lin_heads: u32,
+    /// Linear-attention key heads (query/key projection width).
+    pub lin_key_heads: u32,
+    /// Linear-attention value heads (recurrence heads; b/a/beta/g width).
+    pub lin_val_heads: u32,
     pub lin_key_dim: u32,
     pub lin_val_dim: u32,
     pub rope_theta: f64,
     pub partial_rotary: f64,
     pub eos: Vec<u32>,
+    /// Tied embeddings share the table as the logits head; untied models
+    /// load a separate `lm_head`.
+    pub tied: bool,
     pub has_mtp: bool,
 }
 
 impl Qwen35Config {
     pub fn parse(v: &Value) -> Result<Self> {
         let t = req(v, "text_config")?;
-        if !req(v, "tie_word_embeddings")?.as_bool().unwrap_or(false) {
-            return Err(Error::Config("untied embeddings unsupported".into()));
-        }
+        let tied = req(v, "tie_word_embeddings")?.as_bool().unwrap_or(false);
         let layer_types = req(t, "layer_types")?
             .as_array()
             .ok_or_else(|| Error::Config("layer_types is not an array".into()))?
@@ -100,12 +103,14 @@ impl Qwen35Config {
             head_dim: u32_field(t, "head_dim")?,
             vocab: u32_field(t, "vocab_size")?,
             layer_types,
-            lin_heads: u32_field(t, "linear_num_value_heads")?,
+            lin_key_heads: u32_field(t, "linear_num_key_heads")?,
+            lin_val_heads: u32_field(t, "linear_num_value_heads")?,
             lin_key_dim: u32_field(t, "linear_key_head_dim")?,
             lin_val_dim: u32_field(t, "linear_value_head_dim")?,
             rope_theta: f64_field(rope, "rope_theta")?,
             partial_rotary: f64_field(rope, "partial_rotary_factor")?,
             eos: u32_list(t, "eos_token_id")?,
+            tied,
             has_mtp: mtp == 1,
         };
         cfg.validate()?;
@@ -120,6 +125,13 @@ impl Qwen35Config {
         if !t.q_heads.is_multiple_of(t.kv_heads) {
             return Err(Error::Config("q heads not divisible by kv heads".into()));
         }
+        if t.q_heads / t.kv_heads > ops::MAX_GQA {
+            return Err(Error::Config(format!(
+                "GQA ratio {} exceeds the attention shader's {} head slots",
+                t.q_heads / t.kv_heads,
+                ops::MAX_GQA
+            )));
+        }
         check_head_dim(t.head_dim)?;
         if !t.rotary_dim().is_multiple_of(2) {
             return Err(Error::Config("rotary_dim must be even".into()));
@@ -127,14 +139,20 @@ impl Qwen35Config {
         if t.lin_key_dim > 128 || t.lin_val_dim > 128 {
             return Err(Error::Config("linear head dims must be <= 128".into()));
         }
-        if t.lin_heads > 256 {
+        if t.lin_key_heads > 256 || t.lin_val_heads > 256 {
             return Err(Error::Config("linear heads must be <= 256".into()));
+        }
+        if !t.lin_val_heads.is_multiple_of(t.lin_key_heads) {
+            return Err(Error::Config(format!(
+                "linear value heads {} not divisible by key heads {}",
+                t.lin_val_heads, t.lin_key_heads
+            )));
         }
         check_gemm_dims(&[
             (t.vocab, t.hidden),
             (t.conv_dim(), t.hidden),
             (t.value_dim(), t.hidden),
-            (t.lin_heads, t.hidden),
+            (t.lin_val_heads, t.hidden),
             (t.hidden, t.value_dim()),
             (t.q_heads * t.head_dim * 2, t.hidden),
             (t.kv_heads * t.head_dim, t.hidden),
@@ -145,14 +163,20 @@ impl Qwen35Config {
         ])
     }
 
+    /// Key-head width of the conv tile's q/k segments.
     pub fn key_dim(&self) -> u32 {
-        self.lin_heads * self.lin_key_dim
+        self.lin_key_heads * self.lin_key_dim
     }
+    /// Value-head width of the conv tile's v segment and the recurrence state.
     pub fn value_dim(&self) -> u32 {
-        self.lin_heads * self.lin_val_dim
+        self.lin_val_heads * self.lin_val_dim
     }
     pub fn conv_dim(&self) -> u32 {
         self.key_dim() * 2 + self.value_dim()
+    }
+    /// Expanded q/k width after repeat_interleave to the value heads.
+    pub fn qk_exp_dim(&self) -> u32 {
+        self.lin_val_heads * self.lin_key_dim * 2
     }
     pub fn rotary_dim(&self) -> u32 {
         (self.head_dim as f64 * self.partial_rotary) as u32
@@ -161,14 +185,7 @@ impl Qwen35Config {
 
 // ---------------------------------------------------------------- weights
 
-/// SwiGLU MLP weights plus the norm that feeds it.
-struct MlpW {
-    norm: Tensor,
-    gate: Weight,
-    up: Weight,
-    down: Weight,
-}
-
+/// SwiGLU MLP weights plus the norm that feeds it; see [`SwigluMlp`].
 /// Gated grouped full-attention layer (also used by the MTP head).
 struct FullLayerW {
     attn_norm: Tensor,
@@ -178,7 +195,7 @@ struct FullLayerW {
     o: Weight,
     q_norm: Tensor,
     k_norm: Tensor,
-    mlp: MlpW,
+    mlp: SwigluMlp,
 }
 
 /// Gated DeltaNet layer.
@@ -193,7 +210,7 @@ struct LinearLayerW {
     dt_bias: Tensor,
     norm: Tensor,
     out_proj: Weight,
-    mlp: MlpW,
+    mlp: SwigluMlp,
 }
 
 /// One hybrid layer: weights plus the cache kind the layer type requires.
@@ -218,16 +235,6 @@ struct Mtp {
     layer: Box<FullLayerW>,
     norm: Tensor,
     kv: KvCache,
-}
-
-fn take_mlp(w: &mut WeightSet, p: &str) -> Result<MlpW> {
-    let k = |n: &str| format!("{p}.{n}");
-    Ok(MlpW {
-        norm: w.take_tensor(&k("post_attention_layernorm.weight"))?,
-        gate: w.take(&k("mlp.gate_proj.weight"))?,
-        up: w.take(&k("mlp.up_proj.weight"))?,
-        down: w.take(&k("mlp.down_proj.weight"))?,
-    })
 }
 
 fn take_full_layer(w: &mut WeightSet, p: &str) -> Result<Box<FullLayerW>> {
@@ -273,6 +280,8 @@ struct Scratch {
     normed: Tensor,
     qkv_raw: Tensor,
     convd: Tensor,
+    /// Conv q/k segments expanded from key heads to value heads.
+    qk_exp: Tensor,
     z: Tensor,
     b: Tensor,
     a: Tensor,
@@ -280,6 +289,8 @@ struct Scratch {
     g: Tensor,
     attn_out: Tensor,
     attn_out2: Tensor,
+    /// Split-K attention partials: [m, kv_heads, ATTN_SEGS, 4, hd+2] f32.
+    attn_scratch: Tensor,
     qg: Tensor,
     q: Tensor,
     q2: Tensor,
@@ -287,10 +298,7 @@ struct Scratch {
     k1: Tensor,
     k2: Tensor,
     v1: Tensor,
-    up1: Tensor,
-    up2: Tensor,
-    m1: Tensor,
-    m2: Tensor,
+    mlp: MlpTiles,
     logits: Tensor,
     mtp_e: Tensor,
     mtp_h: Tensor,
@@ -302,24 +310,31 @@ fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
     let i = cfg.intermediate;
     let z = |shape: &[u32], label: &str| backend.zero_tensor(shape, label);
     Scratch {
-        ids: Tensor::new(
-            backend.storage(ROWS as u64 * 4, "ids"),
-            vec![ROWS],
-            DType::U32,
-        ),
-        args: Tensor::new(backend.storage(4, "args"), vec![1], DType::U32),
+        ids: ops::token_ids(backend),
+        args: ops::step_args(backend),
         hidden: z(&[ROWS, h], "hidden"),
         hidden2: z(&[ROWS, h], "hidden2"),
         normed: z(&[ROWS, h], "normed"),
         qkv_raw: z(&[ROWS, cfg.conv_dim()], "qkv_raw"),
         convd: z(&[ROWS, cfg.conv_dim()], "convd"),
+        qk_exp: z(&[ROWS, cfg.qk_exp_dim()], "qk_exp"),
         z: z(&[ROWS, cfg.value_dim()], "z"),
-        b: z(&[ROWS, cfg.lin_heads], "b"),
-        a: z(&[ROWS, cfg.lin_heads], "a"),
-        beta: z(&[cfg.lin_heads], "beta"),
-        g: z(&[cfg.lin_heads], "g"),
+        b: z(&[ROWS, cfg.lin_val_heads], "b"),
+        a: z(&[ROWS, cfg.lin_val_heads], "a"),
+        beta: z(&[cfg.lin_val_heads], "beta"),
+        g: z(&[cfg.lin_val_heads], "g"),
         attn_out: z(&[ROWS, cfg.value_dim()], "attn_out"),
         attn_out2: z(&[ROWS, cfg.value_dim()], "attn_out2"),
+        attn_scratch: z(
+            &[
+                ROWS,
+                cfg.kv_heads,
+                ops::ATTN_SEGS,
+                ops::MAX_GQA,
+                cfg.head_dim + 2,
+            ],
+            "attn_scratch",
+        ),
         qg: z(&[ROWS, cfg.q_heads * cfg.head_dim * 2], "qg"),
         q: z(&[ROWS, cfg.q_heads * cfg.head_dim], "q"),
         q2: z(&[ROWS, cfg.q_heads * cfg.head_dim], "q2"),
@@ -327,10 +342,12 @@ fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
         k1: z(&[ROWS, cfg.kv_heads * cfg.head_dim], "k1"),
         k2: z(&[ROWS, cfg.kv_heads * cfg.head_dim], "k2"),
         v1: z(&[ROWS, cfg.kv_heads * cfg.head_dim], "v1"),
-        up1: z(&[ROWS, i], "up1"),
-        up2: z(&[ROWS, i], "up2"),
-        m1: z(&[ROWS, i], "m1"),
-        m2: z(&[ROWS, h], "m2"),
+        mlp: MlpTiles {
+            gate_out: z(&[ROWS, i], "up1"),
+            up_out: z(&[ROWS, i], "up2"),
+            act: z(&[ROWS, i], "m1"),
+            y: z(&[ROWS, h], "m2"),
+        },
         logits: z(&[ROWS, cfg.vocab], "logits"),
         mtp_e: z(&[ROWS, h], "mtp_e"),
         mtp_h: z(&[ROWS, h], "mtp_h"),
@@ -345,6 +362,8 @@ pub struct Qwen35 {
     max_seq: u32,
     pos: u32,
     embed: Weight,
+    /// Untied logits head; tied models score with the embedding table.
+    lm_head: Option<Weight>,
     norm: Tensor,
     layers: Vec<Layer>,
     mtp: Option<Mtp>,
@@ -358,6 +377,11 @@ pub struct Qwen35 {
 }
 
 impl Qwen35 {
+    /// The weight the logits projection scores against.
+    fn logit_head(&self) -> &Weight {
+        self.lm_head.as_ref().unwrap_or(&self.embed)
+    }
+
     pub fn load(
         source: &dyn Checkpoint,
         v: &Value,
@@ -375,6 +399,11 @@ impl Qwen35 {
             ));
         }
         let embed = w.take("embed_tokens.weight")?;
+        let lm_head = if cfg.tied {
+            None
+        } else {
+            Some(w.take("lm_head.weight")?)
+        };
         let norm = w.take_tensor("norm.weight")?;
 
         let mut layers = Vec::with_capacity(cfg.layers as usize);
@@ -398,7 +427,7 @@ impl Qwen35 {
                         w: take_linear_layer(&mut w, &p)?,
                         state: RecurrentState::new(
                             backend,
-                            [cfg.lin_heads, cfg.lin_key_dim, cfg.lin_val_dim],
+                            [cfg.lin_val_heads, cfg.lin_key_dim, cfg.lin_val_dim],
                             cfg.conv_dim(),
                             &format!("l{i}"),
                         ),
@@ -425,7 +454,7 @@ impl Qwen35 {
                 .map(|i| {
                     RecurrentState::new(
                         backend,
-                        [cfg.lin_heads, cfg.lin_key_dim, cfg.lin_val_dim],
+                        [cfg.lin_val_heads, cfg.lin_key_dim, cfg.lin_val_dim],
                         cfg.conv_dim(),
                         &format!("snap{i}"),
                     )
@@ -442,6 +471,7 @@ impl Qwen35 {
             max_seq,
             pos: 0,
             embed,
+            lm_head,
             norm,
             layers,
             mtp,
@@ -481,16 +511,13 @@ impl LanguageModel for Qwen35 {
         let cfg = &self.cfg;
         let mut enc = backend.encoder();
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("forward"),
-                ..Default::default()
-            });
+            let mut pass = Pass::begin(&mut enc, "forward");
             let s = &self.s;
             ops::embed(
                 backend,
                 &mut pass,
                 &s.ids,
-                &self.embed.t,
+                self.embed.tensor(),
                 Binding::Full(&s.hidden),
                 cfg.hidden,
                 1.0,
@@ -523,33 +550,17 @@ impl LanguageModel for Qwen35 {
                 backend,
                 &mut pass,
                 Binding::Full(&s.normed),
-                &self.embed,
+                self.logit_head(),
                 Binding::Full(&s.logits),
                 m,
             )?;
         }
         backend.submit(enc);
 
-        let mut out = ChunkOut {
-            logits: Vec::new(),
-            hidden: Vec::new(),
+        let out = ChunkOut {
+            logits: ops::read_rows(backend, &self.s.logits, logit_rows, m, cfg.vocab)?,
+            hidden: ops::read_rows(backend, &self.s.hidden, hidden_rows, m, cfg.hidden)?,
         };
-        for &r in logit_rows {
-            assert!(r < m, "logit row {r} outside chunk");
-            out.logits.push(backend.read_f32(
-                &self.s.logits.buf,
-                r as u64 * cfg.vocab as u64 * 4,
-                cfg.vocab as usize,
-            )?);
-        }
-        for &r in hidden_rows {
-            assert!(r < m, "hidden row {r} outside chunk");
-            out.hidden.push(backend.read_f32(
-                &self.s.hidden.buf,
-                r as u64 * cfg.hidden as u64 * 4,
-                cfg.hidden as usize,
-            )?);
-        }
         self.pos += m;
         backend.flush_profile()?;
         Ok(out)
@@ -614,16 +625,13 @@ impl Speculator for Qwen35 {
         let cfg = &self.cfg;
         let mut enc = backend.encoder();
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("draft"),
-                ..Default::default()
-            });
+            let mut pass = Pass::begin(&mut enc, "draft");
             let s = &self.s;
             ops::embed(
                 backend,
                 &mut pass,
                 &s.ids,
-                &self.embed.t,
+                self.embed.tensor(),
                 Binding::Full(&s.hidden),
                 cfg.hidden,
                 1.0,
@@ -670,16 +678,7 @@ impl Speculator for Qwen35 {
             )?;
 
             full_layer(
-                backend,
-                &mut pass,
-                cfg,
-                s,
-                &self.cos,
-                &self.sin,
-                &mtp.layer,
-                &mtp.kv,
-                1,
-                &s.args,
+                backend, &mut pass, cfg, s, &self.cos, &self.sin, &mtp.layer, &mtp.kv, 1, &s.args,
             )?;
 
             ops::norm(
@@ -698,7 +697,7 @@ impl Speculator for Qwen35 {
                 backend,
                 &mut pass,
                 Binding::Full(&s.normed),
-                &self.embed,
+                self.logit_head(),
                 Binding::Full(&s.logits),
                 1,
             )?;
@@ -745,7 +744,7 @@ impl Speculator for Qwen35 {
 #[allow(clippy::too_many_arguments)]
 fn full_layer(
     backend: &mut Backend,
-    pass: &mut wgpu::ComputePass<'_>,
+    pass: &mut Pass<'_>,
     cfg: &Qwen35Config,
     s: &Scratch,
     cos: &Tensor,
@@ -772,7 +771,7 @@ fn full_layer(
         backend,
         pass,
         Binding::Full(&s.hidden),
-        Binding::Full(&s.m2),
+        Binding::Full(&s.mlp.y),
         Binding::Full(&s.hidden2),
         ROWS * cfg.hidden,
     )?;
@@ -793,7 +792,7 @@ fn full_layer(
         backend,
         pass,
         Binding::Full(&s.hidden2),
-        Binding::Full(&s.m2),
+        Binding::Full(&s.mlp.y),
         Binding::Full(&s.hidden),
         ROWS * cfg.hidden,
     )
@@ -803,7 +802,7 @@ fn full_layer(
 /// rows, residual, post norm, SwiGLU MLP, residual. hidden -> hidden.
 fn linear_layer(
     backend: &mut Backend,
-    pass: &mut wgpu::ComputePass<'_>,
+    pass: &mut Pass<'_>,
     cfg: &Qwen35Config,
     s: &Scratch,
     w: &LinearLayerW,
@@ -827,7 +826,7 @@ fn linear_layer(
         backend,
         pass,
         Binding::Full(&s.hidden),
-        Binding::Full(&s.m2),
+        Binding::Full(&s.mlp.y),
         Binding::Full(&s.hidden2),
         ROWS * cfg.hidden,
     )?;
@@ -848,7 +847,7 @@ fn linear_layer(
         backend,
         pass,
         Binding::Full(&s.hidden2),
-        Binding::Full(&s.m2),
+        Binding::Full(&s.mlp.y),
         Binding::Full(&s.hidden),
         ROWS * cfg.hidden,
     )
@@ -858,7 +857,7 @@ fn linear_layer(
 #[allow(clippy::too_many_arguments)]
 fn full_attn_block(
     backend: &mut Backend,
-    pass: &mut wgpu::ComputePass<'_>,
+    pass: &mut Pass<'_>,
     cfg: &Qwen35Config,
     s: &Scratch,
     cos: &Tensor,
@@ -981,6 +980,7 @@ fn full_attn_block(
         Binding::Full(&s.q2),
         &kv.k,
         &kv.v,
+        &s.attn_scratch,
         Binding::Full(&s.attn_out),
         nq,
         nkv,
@@ -1003,23 +1003,24 @@ fn full_attn_block(
         pass,
         Binding::Full(&s.attn_out2),
         &w.o,
-        Binding::Full(&s.m2),
+        Binding::Full(&s.mlp.y),
         m,
     )
 }
 
 /// Gated DeltaNet attention; the recurrence runs row by row over the chunk.
-/// Result lands in s.m2.
+/// Result lands in s.m2. The conv tile carries q/k segments at key-head
+/// width; `repeat_qk` expands them to value-head width for the recurrence.
 fn linear_attn_block(
     backend: &mut Backend,
-    pass: &mut wgpu::ComputePass<'_>,
+    pass: &mut Pass<'_>,
     cfg: &Qwen35Config,
     s: &Scratch,
     w: &LinearLayerW,
     state: &RecurrentState,
     m: u32,
 ) -> Result<()> {
-    let heads = cfg.lin_heads;
+    let heads = cfg.lin_val_heads;
     let (key_d, val_d, conv_d) = (cfg.key_dim(), cfg.value_dim(), cfg.conv_dim());
 
     ops::gemm(
@@ -1066,6 +1067,24 @@ fn linear_attn_block(
             Binding::Slice(&s.convd, row(t, conv_d), conv_d as u64 * 4),
             conv_d,
         )?;
+    }
+    ops::repeat_qk(
+        backend,
+        pass,
+        Binding::Full(&s.convd),
+        Binding::Full(&s.qk_exp),
+        m,
+        cfg.lin_key_heads,
+        heads,
+        cfg.lin_key_dim,
+        cfg.lin_val_dim,
+    )?;
+    let exp_d = cfg.qk_exp_dim();
+    // Byte span of the expanded q segment (half the row).
+    let qkb = exp_d as u64 * 2;
+    for t in 0..m {
+        // delta_gate overwrites the shared beta/g scratch, so gate and recur
+        // must run back-to-back per row.
         ops::delta_gate(
             backend,
             pass,
@@ -1078,14 +1097,14 @@ fn linear_attn_block(
             heads,
             t,
         )?;
-        let cd = row(t, conv_d);
+        let ed = row(t, exp_d);
         let (kb, vb) = (key_d as u64 * 4, val_d as u64 * 4);
         ops::delta_recur(
             backend,
             pass,
-            Binding::Slice(&s.convd, cd, kb),
-            Binding::Slice(&s.convd, cd + kb, kb),
-            Binding::Slice(&s.convd, cd + kb * 2, vb),
+            Binding::Slice(&s.qk_exp, ed, qkb),
+            Binding::Slice(&s.qk_exp, ed + qkb, qkb),
+            Binding::Slice(&s.convd, row(t, conv_d) + kb * 2, vb),
             Binding::Full(&s.beta),
             Binding::Full(&s.g),
             &state.recur,
@@ -1114,7 +1133,7 @@ fn linear_attn_block(
         pass,
         Binding::Full(&s.attn_out2),
         &w.out_proj,
-        Binding::Full(&s.m2),
+        Binding::Full(&s.mlp.y),
         m,
     )
 }
@@ -1122,42 +1141,19 @@ fn linear_attn_block(
 /// SwiGLU MLP; result lands in s.m2.
 fn mlp_block(
     backend: &mut Backend,
-    pass: &mut wgpu::ComputePass<'_>,
+    pass: &mut Pass<'_>,
     cfg: &Qwen35Config,
     s: &Scratch,
-    mlp: &MlpW,
+    mlp: &SwigluMlp,
     m: u32,
 ) -> Result<()> {
-    ops::gemm(
+    ops::swiglu_mlp(
         backend,
         pass,
         Binding::Full(&s.normed),
-        &mlp.gate,
-        Binding::Full(&s.up1),
+        mlp,
+        &s.mlp,
         m,
-    )?;
-    ops::gemm(
-        backend,
-        pass,
-        Binding::Full(&s.normed),
-        &mlp.up,
-        Binding::Full(&s.up2),
-        m,
-    )?;
-    ops::swiglu(
-        backend,
-        pass,
-        Binding::Full(&s.up1),
-        Binding::Full(&s.up2),
-        Binding::Full(&s.m1),
-        ROWS * cfg.intermediate,
-    )?;
-    ops::gemm(
-        backend,
-        pass,
-        Binding::Full(&s.m1),
-        &mlp.down,
-        Binding::Full(&s.m2),
-        m,
+        cfg.intermediate,
     )
 }

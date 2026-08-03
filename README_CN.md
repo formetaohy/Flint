@@ -1,7 +1,6 @@
-<p align="center">
-  <!-- TODO: 替换为正式 logo -->
+<!-- <p align="center">
   <img src="assets/logo.png" alt="Flint" width="96" />
-</p>
+</p> -->
 
 <h3 align="center">Flint</h3>
 
@@ -35,6 +34,27 @@ Flint 是用纯 Rust 编写、基于 [WGPU](https://github.com/gfx-rs/wgpu) 的�
 - Gemma 3
 
 我们正在努力添加对更多模型的支持。如果你有想要支持的模型，欢迎提 issue 或 PR。
+
+## 性能
+
+`flint-bench` 用合成权重（内存生成、无需下载）在真实模型维度上测量吞吐：
+
+```sh
+cargo run --release -p flint-bench
+```
+
+RTX 5070 上的参考数据（Llama-8B 尺寸：hidden 4096 / intermediate 14336 / 8 层）：
+
+| 阶段 | 优化前 | 优化后 | 提升 |
+| --- | --- | --- | --- |
+| prefill | 200 tok/s | 510 tok/s | 2.5× |
+| decode（2K 上下文） | 67 tok/s | 149 tok/s | 2.2× |
+
+核心优化（对应顶会方法）：
+
+- **流式 gemm / gemv**（[SplitK work decomposition, arXiv:2402.00025](https://arxiv.org/abs/2402.00025)）：解码路径按 K 分段并行，窄输出（q/k/v 投影）的带宽利用率从 45 GB/s 提升到 216+ GB/s；标量寄存器累加器避免局部内存溢出。
+- **Split-K GQA 注意力**（[FlashAttention 系列](https://arxiv.org/abs/2205.14135)、[FlashInfer, arXiv:2501.01005](https://arxiv.org/abs/2501.01005)、[PAT, arXiv:2511.22333](https://arxiv.org/abs/2511.22333)）：KV 缓存按段切分并行扫描（解码时从 8 个 workgroup 扩展到 256 个），同一 kv head 的 query head 共享 K/V tile，长上下文注意力提速 8×。
+- **bf16 KV 缓存**：运行时内存减半，注意力带宽翻倍。
 
 ## 快速开始
 

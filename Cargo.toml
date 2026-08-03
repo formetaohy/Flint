@@ -15,12 +15,13 @@ flint-tensor = { path = "crates/flint-tensor" }
 flint-kernel = { path = "crates/flint-kernel" }
 flint-backend = { path = "crates/flint-backend" }
 flint-model = { path = "crates/flint-model" }
-flint-archs = { path = "crates/flint-archs" }
+flint-architectures = { path = "crates/flint-architectures" }
 flint-tokenizer = { path = "crates/flint-tokenizer" }
 flint-generate = { path = "crates/flint-generate" }
 flint-profiler = { path = "crates/flint-profiler" }
 
 ahash = "0.8.12"
+bytemuck = "1.25.2"
 clap = { version = "4.6.5", features = ["derive"] }
 env_logger = "0.11.11"
 memmap2 = "0.9.11"
@@ -38,7 +39,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-flint-archs.workspace = true
+flint-architectures.workspace = true
 flint-backend.workspace = true
 flint-error.workspace = true
 flint-generate.workspace = true

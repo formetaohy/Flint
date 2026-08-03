@@ -251,6 +251,34 @@ pub fn conv1d(x: &[f32], w: &[f32], state: &mut [f32]) -> Vec<f32> {
     out
 }
 
+/// Expands the q/k segments of a conv tile from N_K key heads to N_V value
+/// heads (repeat_interleave), matching the layout delta_recur consumes.
+/// x is [rows, 2*N_K*kd + N_V*vd]; out is [rows, 2*N_V*kd].
+#[allow(clippy::too_many_arguments)]
+pub fn repeat_qk(
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    n_k: usize,
+    n_v: usize,
+    kd: usize,
+    vd: usize,
+) {
+    let ratio = n_v / n_k;
+    let conv_dim = 2 * n_k * kd + n_v * vd;
+    let out_dim = 2 * n_v * kd;
+    for r in 0..rows {
+        for seg in 0..2 {
+            for h in 0..n_v {
+                for d in 0..kd {
+                    out[r * out_dim + seg * n_v * kd + h * kd + d] =
+                        x[r * conv_dim + seg * n_k * kd + (h / ratio) * kd + d];
+                }
+            }
+        }
+    }
+}
+
 /// Computes per-head beta = sigmoid(b) and g = -exp(A_log) * ln(1 + exp(a + dt)).
 pub fn delta_gate(b: &[f32], a: &[f32], a_log: &[f32], dt_bias: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let heads = b.len();

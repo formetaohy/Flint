@@ -4,17 +4,16 @@
 //! per-shader totals across frames, so a handful of generated tokens yield a
 //! stable breakdown of where GPU time actually goes. The profiler is only ever
 //! constructed when profiling is requested; otherwise the dispatch fast path
-//! is untouched.
+//! is untouched. Timestamp readback is owned by the backend, which resolves,
+//! maps and hands the raw values back to [`GpuProfiler::accumulate`].
 
 use std::collections::HashMap;
-use std::sync::mpsc;
 
 use wgpu::{
-    Buffer, BufferUsages, CommandEncoder, ComputePass, Device, MapMode, PollType, QuerySet,
-    QueryType, Queue,
+    Buffer, BufferUsages, CommandEncoder, ComputePass, Device, QuerySet, QueryType, Queue,
 };
 
-use flint_error::{Error, Result};
+use flint_error::Result;
 
 /// One aggregated row: total GPU time spent in a shader across all frames.
 pub struct ProfileRow {
@@ -113,16 +112,32 @@ impl GpuProfiler {
         );
     }
 
-    /// Reads the resolved timestamps back and folds this frame's spans into the
-    /// running totals, then resets the frame state.
-    pub fn accumulate(&mut self, device: &Device) -> Result<()> {
+    /// Resolved-timestamp readback target; the backend maps this after
+    /// submitting the resolve encoder.
+    pub fn read_buf(&self) -> &Buffer {
+        &self.read_buf
+    }
+
+    /// Number of query slots this frame used (0 when nothing was timed).
+    pub fn pending(&self) -> u32 {
+        self.next
+    }
+
+    /// Folds the resolved timestamps of this frame's spans into the running
+    /// totals, then resets the frame state.
+    pub fn accumulate(&mut self, timestamps: &[u64]) -> Result<()> {
         let count = self.next as usize;
         if self.spans.is_empty() || count == 0 {
             self.next = 0;
             self.spans.clear();
             return Ok(());
         }
-        let timestamps = read_u64(device, &self.read_buf, count)?;
+        if timestamps.len() < count {
+            return Err(flint_error::Error::Gpu(format!(
+                "profile readback returned {} timestamps, need {count}",
+                timestamps.len()
+            )));
+        }
         for span in &self.spans {
             let start = timestamps[span.start as usize];
             let end = timestamps[span.end as usize];
@@ -152,40 +167,3 @@ impl GpuProfiler {
     }
 }
 
-/// Maps a buffer of `count` u64 and collects them (blocks until ready).
-fn read_u64(device: &Device, buf: &Buffer, count: usize) -> Result<Vec<u64>> {
-    let (tx, rx) = mpsc::channel();
-    buf.slice(..(count as u64 * 8)).map_async(MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    loop {
-        match rx.try_recv() {
-            Ok(result) => {
-                result.map_err(|e| Error::Gpu(format!("profile map failed: {e}")))?;
-                break;
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                device
-                    .poll(PollType::Wait {
-                        submission_index: None,
-                        timeout: None,
-                    })
-                    .map_err(|e| Error::Gpu(format!("profile poll failed: {e}")))?;
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(Error::Gpu("profile map channel closed".into()));
-            }
-        }
-    }
-    let view = buf
-        .slice(..(count as u64 * 8))
-        .get_mapped_range()
-        .map_err(|e| Error::Gpu(format!("profile map range failed: {e}")))?;
-    let out: Vec<u64> = view
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-        .collect();
-    drop(view);
-    buf.unmap();
-    Ok(out)
-}

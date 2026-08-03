@@ -2,6 +2,6 @@
 //! factories, readback, and the dispatch facade over the compute kernels.
 //! Kernel semantics live in `flint-kernel`.
 
-mod device;
+mod backend;
 
-pub use device::{Backend, Binding};
+pub use backend::{Backend, Binding, Pass};

@@ -5,11 +5,10 @@
 use flint_backend::Backend;
 use flint_checkpoint::Checkpoint;
 use flint_error::Result;
-use flint_model::loader::{Plan, Role};
+use flint_model::loader::Plan;
 use serde_json::Value;
 
-use crate::dense::{DenseConfig, DenseModel};
-use crate::gguf_config::gguf_key;
+use crate::dense::{DenseConfig, DenseModel, dense_plan};
 
 /// HF safetensors names -> canonical keys ("model." stripped, lm_head kept).
 fn hf_key(name: &str) -> Option<String> {
@@ -22,21 +21,8 @@ fn hf_key(name: &str) -> Option<String> {
     }
 }
 
-fn role(key: &str) -> Role {
-    if key.contains("norm") || key.ends_with(".bias") {
-        Role::F32
-    } else if key == "embed_tokens.weight" {
-        Role::Bf16
-    } else {
-        Role::I8
-    }
-}
-
 fn plan(gguf: bool) -> Plan {
-    Plan {
-        key: if gguf { gguf_key } else { hf_key },
-        role,
-    }
+    dense_plan(gguf, hf_key)
 }
 
 /// Parses and validates a LLaMA-family config.

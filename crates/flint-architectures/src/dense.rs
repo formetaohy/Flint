@@ -3,17 +3,18 @@
 //! window, embedding scale and always-on QK-norm — expressed as configuration
 //! over one forward graph, not as separate implementations.
 
-use flint_backend::{Backend, Binding};
+use flint_backend::{Backend, Binding, Pass};
 use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
 use flint_model::cache::KvCache;
 use flint_model::config::{check_gemm_dims, check_head_dim, f64_field, u32_field, u32_list};
-use flint_model::loader::Plan;
-use flint_model::loader::{self, WeightSet};
-use flint_model::ops::{self, NormMode, ROWS};
+use flint_model::loader::{self, Plan, Role, SwigluMlp, WeightSet, take_mlp};
+use flint_model::ops::{self, MlpTiles, NormMode, ROWS};
 use flint_model::{ChunkOut, LanguageModel};
-use flint_tensor::{DType, Tensor, Weight};
+use flint_tensor::{Tensor, Weight};
 use serde_json::Value;
+
+use crate::gguf_config::gguf_key;
 
 /// Gemma-style alternating windows: layers whose (l+1) is a multiple of
 /// `pattern` attend globally, the rest see only the trailing `size` tokens.
@@ -21,6 +22,27 @@ use serde_json::Value;
 pub struct SlidingWindow {
     pub size: u32,
     pub pattern: u32,
+}
+
+/// GPU storage role for every dense-family weight: norms and biases are f32,
+/// the embedding is packed bf16, projections are group-quantized i8.
+pub fn dense_role(key: &str) -> Role {
+    if key.contains("norm") || key.ends_with(".bias") {
+        Role::F32
+    } else if key == "embed_tokens.weight" {
+        Role::Bf16
+    } else {
+        Role::I8
+    }
+}
+
+/// Loading policy for a dense-family checkpoint: native names map through
+/// `key` (HF or GGUF), every weight takes the shared [`dense_role`].
+pub fn dense_plan(gguf: bool, key: fn(&str) -> Option<String>) -> Plan {
+    Plan {
+        key: if gguf { gguf_key } else { key },
+        role: dense_role,
+    }
 }
 
 /// Validated dense GQA config covering every supported family.
@@ -92,6 +114,13 @@ impl DenseConfig {
         if !t.q_heads.is_multiple_of(t.kv_heads) {
             return Err(Error::Config("q heads not divisible by kv heads".into()));
         }
+        if t.q_heads / t.kv_heads > flint_model::ops::MAX_GQA {
+            return Err(Error::Config(format!(
+                "GQA ratio {} exceeds the attention shader's {} head slots",
+                t.q_heads / t.kv_heads,
+                flint_model::ops::MAX_GQA
+            )));
+        }
         check_head_dim(t.head_dim)?;
         if let Some(w) = t.window
             && w.pattern == 0
@@ -120,14 +149,8 @@ impl DenseConfig {
     }
 }
 
-/// SwiGLU MLP weights plus the norm that feeds it.
-struct MlpW {
-    norm: Tensor,
-    gate: Weight,
-    up: Weight,
-    down: Weight,
-}
-
+/// The weights of one transformer layer: attention + norms + the shared
+/// SwiGLU MLP (see [`SwigluMlp`]).
 struct LayerW {
     attn_norm: Tensor,
     q: Weight,
@@ -141,19 +164,9 @@ struct LayerW {
     k_norm: Option<Tensor>,
     /// Sandwich norm on the attention output (Gemma 3).
     post_attn_norm: Option<Tensor>,
-    mlp: MlpW,
+    mlp: SwigluMlp,
     /// Sandwich norm on the MLP output (Gemma 3).
     post_ffn_norm: Option<Tensor>,
-}
-
-fn take_mlp(w: &mut WeightSet, p: &str) -> Result<MlpW> {
-    let k = |n: &str| format!("{p}.{n}");
-    Ok(MlpW {
-        norm: w.take_tensor(&k("post_attention_layernorm.weight"))?,
-        gate: w.take(&k("mlp.gate_proj.weight"))?,
-        up: w.take(&k("mlp.up_proj.weight"))?,
-        down: w.take(&k("mlp.down_proj.weight"))?,
-    })
 }
 
 fn take_optional(w: &mut WeightSet, on: bool, key: &str) -> Result<Option<Tensor>> {
@@ -199,22 +212,17 @@ struct Scratch {
     q2: Tensor,
     k2: Tensor,
     attn_out: Tensor,
-    up1: Tensor,
-    up2: Tensor,
-    m1: Tensor,
-    m2: Tensor,
+    /// Split-K attention partials: [m, kv_heads, ATTN_SEGS, 4, hd+2] f32.
+    attn_scratch: Tensor,
+    mlp: MlpTiles,
     logits: Tensor,
 }
 
 fn alloc_scratch(cfg: &DenseConfig, backend: &Backend) -> Scratch {
     let z = |shape: &[u32], label: &str| backend.zero_tensor(shape, label);
     Scratch {
-        ids: Tensor::new(
-            backend.storage(ROWS as u64 * 4, "ids"),
-            vec![ROWS],
-            DType::U32,
-        ),
-        args: Tensor::new(backend.storage(4, "args"), vec![1], DType::U32),
+        ids: ops::token_ids(backend),
+        args: ops::step_args(backend),
         hidden: z(&[ROWS, cfg.hidden], "hidden"),
         hidden2: z(&[ROWS, cfg.hidden], "hidden2"),
         normed: z(&[ROWS, cfg.hidden], "normed"),
@@ -224,10 +232,22 @@ fn alloc_scratch(cfg: &DenseConfig, backend: &Backend) -> Scratch {
         q2: z(&[ROWS, cfg.q_heads * cfg.head_dim], "q2"),
         k2: z(&[ROWS, cfg.kv_heads * cfg.head_dim], "k2"),
         attn_out: z(&[ROWS, cfg.q_heads * cfg.head_dim], "attn_out"),
-        up1: z(&[ROWS, cfg.intermediate], "up1"),
-        up2: z(&[ROWS, cfg.intermediate], "up2"),
-        m1: z(&[ROWS, cfg.intermediate], "m1"),
-        m2: z(&[ROWS, cfg.hidden], "m2"),
+        attn_scratch: z(
+            &[
+                ROWS,
+                cfg.kv_heads,
+                ops::ATTN_SEGS,
+                ops::MAX_GQA,
+                cfg.head_dim + 2,
+            ],
+            "attn_scratch",
+        ),
+        mlp: MlpTiles {
+            gate_out: z(&[ROWS, cfg.intermediate], "up1"),
+            up_out: z(&[ROWS, cfg.intermediate], "up2"),
+            act: z(&[ROWS, cfg.intermediate], "m1"),
+            y: z(&[ROWS, cfg.hidden], "m2"),
+        },
         logits: z(&[ROWS, cfg.vocab], "logits"),
     }
 }
@@ -327,16 +347,13 @@ impl LanguageModel for DenseModel {
         let cfg = &self.cfg;
         let mut enc = backend.encoder();
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("forward"),
-                ..Default::default()
-            });
+            let mut pass = Pass::begin(&mut enc, "forward");
             let s = &self.s;
             ops::embed(
                 backend,
                 &mut pass,
                 &s.ids,
-                &self.embed.t,
+                self.embed.tensor(),
                 Binding::Full(&s.hidden),
                 cfg.hidden,
                 cfg.embed_scale,
@@ -472,6 +489,7 @@ impl LanguageModel for DenseModel {
                     Binding::Full(q_src),
                     &kv.k,
                     &kv.v,
+                    &s.attn_scratch,
                     Binding::Full(&s.attn_out),
                     nq,
                     nkv,
@@ -486,7 +504,7 @@ impl LanguageModel for DenseModel {
                     &mut pass,
                     Binding::Full(&s.attn_out),
                     &lw.o,
-                    Binding::Full(&s.m2),
+                    Binding::Full(&s.mlp.y),
                     m,
                 )?;
 
@@ -498,9 +516,9 @@ impl LanguageModel for DenseModel {
                             backend,
                             &mut pass,
                             NormMode::Direct,
-                            Binding::Full(&s.m2),
+                            Binding::Full(&s.mlp.y),
                             pn,
-                            Binding::Full(&s.m2),
+                            Binding::Full(&s.mlp.y),
                             Binding::Full(&s.normed),
                             ROWS,
                             cfg.hidden,
@@ -520,7 +538,7 @@ impl LanguageModel for DenseModel {
                             backend,
                             &mut pass,
                             Binding::Full(&s.hidden),
-                            Binding::Full(&s.m2),
+                            Binding::Full(&s.mlp.y),
                             Binding::Full(&s.hidden2),
                             ROWS * cfg.hidden,
                         )?;
@@ -539,37 +557,14 @@ impl LanguageModel for DenseModel {
                     cfg.hidden,
                     cfg.hidden,
                 )?;
-                ops::gemm(
+                ops::swiglu_mlp(
                     backend,
                     &mut pass,
                     Binding::Full(&s.normed),
-                    &lw.mlp.gate,
-                    Binding::Full(&s.up1),
+                    &lw.mlp,
+                    &s.mlp,
                     m,
-                )?;
-                ops::gemm(
-                    backend,
-                    &mut pass,
-                    Binding::Full(&s.normed),
-                    &lw.mlp.up,
-                    Binding::Full(&s.up2),
-                    m,
-                )?;
-                ops::swiglu(
-                    backend,
-                    &mut pass,
-                    Binding::Full(&s.up1),
-                    Binding::Full(&s.up2),
-                    Binding::Full(&s.m1),
-                    ROWS * cfg.intermediate,
-                )?;
-                ops::gemm(
-                    backend,
-                    &mut pass,
-                    Binding::Full(&s.m1),
-                    &lw.mlp.down,
-                    Binding::Full(&s.m2),
-                    m,
+                    cfg.intermediate,
                 )?;
 
                 match &lw.post_ffn_norm {
@@ -578,9 +573,9 @@ impl LanguageModel for DenseModel {
                             backend,
                             &mut pass,
                             NormMode::Direct,
-                            Binding::Full(&s.m2),
+                            Binding::Full(&s.mlp.y),
                             pn,
-                            Binding::Full(&s.m2),
+                            Binding::Full(&s.mlp.y),
                             Binding::Full(&s.normed),
                             ROWS,
                             cfg.hidden,
@@ -600,7 +595,7 @@ impl LanguageModel for DenseModel {
                             backend,
                             &mut pass,
                             Binding::Full(&s.hidden2),
-                            Binding::Full(&s.m2),
+                            Binding::Full(&s.mlp.y),
                             Binding::Full(&s.hidden),
                             ROWS * cfg.hidden,
                         )?;
@@ -631,26 +626,10 @@ impl LanguageModel for DenseModel {
         }
         backend.submit(enc);
 
-        let mut out = ChunkOut {
-            logits: Vec::new(),
-            hidden: Vec::new(),
+        let out = ChunkOut {
+            logits: ops::read_rows(backend, &self.s.logits, logit_rows, m, cfg.vocab)?,
+            hidden: ops::read_rows(backend, &self.s.hidden, hidden_rows, m, cfg.hidden)?,
         };
-        for &r in logit_rows {
-            assert!(r < m, "logit row {r} outside chunk");
-            out.logits.push(backend.read_f32(
-                &self.s.logits.buf,
-                r as u64 * cfg.vocab as u64 * 4,
-                cfg.vocab as usize,
-            )?);
-        }
-        for &r in hidden_rows {
-            assert!(r < m, "hidden row {r} outside chunk");
-            out.hidden.push(backend.read_f32(
-                &self.s.hidden.buf,
-                r as u64 * cfg.hidden as u64 * 4,
-                cfg.hidden as usize,
-            )?);
-        }
         self.pos += m;
         backend.flush_profile()?;
         Ok(out)

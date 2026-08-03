@@ -179,6 +179,21 @@ fn repeat_penalty_respects_last_n_and_disable() {
     let mut disabled = [2.0f32, -2.0];
     apply_repeat_penalty(&mut disabled, &[0, 1], 1.0, 8);
     assert_eq!(disabled, [2.0, -2.0], "penalty 1.0 is a no-op");
+
+    let mut zero_window = [2.0f32, 1.0];
+    apply_repeat_penalty(&mut zero_window, &[0, 1], 2.0, 0);
+    assert_eq!(zero_window, [2.0, 1.0], "last_n=0 sees no context");
+}
+
+#[test]
+fn default_params_match_common_chat_inference() {
+    let d = SamplingParams::default();
+    assert_eq!(d.temperature, 0.7);
+    assert_eq!(d.top_k, 20);
+    assert_eq!(d.top_p, 0.8);
+    assert_eq!(d.min_p, 0.0);
+    assert_eq!(d.repeat_penalty, 1.0);
+    assert_eq!(d.repeat_last_n, 64);
 }
 
 // ---------------------------------------------------------------- softmax

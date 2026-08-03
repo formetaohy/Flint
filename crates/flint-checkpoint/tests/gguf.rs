@@ -2,7 +2,6 @@
 //! custom alignment, tensor info + dequantization, dim reversal and the
 //! format-detection dispatch.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use flint_checkpoint::{Checkpoint, Gguf, MetaVal};
@@ -202,14 +201,173 @@ fn open_dispatches_on_directory_contents() {
     assert!(flint_checkpoint::open(Path::new("./no-such-dir-flint")).is_err());
 }
 
+// ---------------------------------------------------------------- writer round-trip
+
+// ---------------------------------------------------------------- value types
+
+/// Hand-writes every metadata value type the reader accepts: u8/i8/u16/i16/
+/// i32/u64/i64/f64 plus a f32 array.
+fn synth_full_types() -> Vec<u8> {
+    let mut h = Vec::new();
+    w_u32(&mut h, 0x4655_4747);
+    w_u32(&mut h, 3);
+    w_u64(&mut h, 0); // tensors
+    w_u64(&mut h, 9); // kv pairs
+
+    let kv = |out: &mut Vec<u8>, key: &str, ty: u32, body: &[u8]| {
+        w_str(out, key);
+        w_u32(out, ty);
+        out.extend_from_slice(body);
+    };
+    kv(&mut h, "t_u8", 0, &[200]);
+    kv(&mut h, "t_i8", 1, &[(-7i8) as u8]);
+    kv(&mut h, "t_u16", 2, &500u16.to_le_bytes());
+    kv(&mut h, "t_i16", 3, &(-500i16).to_le_bytes());
+    kv(&mut h, "t_i32", 5, &(-1_000_000i32).to_le_bytes());
+    kv(&mut h, "t_u64", 10, &(1u64 << 40).to_le_bytes());
+    kv(&mut h, "t_i64", 11, &(-(1i64 << 40)).to_le_bytes());
+    kv(&mut h, "t_f64", 12, &std::f64::consts::PI.to_le_bytes());
+    // f32 array (element tag 6).
+    let mut arr = Vec::new();
+    w_u32(&mut arr, 6);
+    w_u64(&mut arr, 2);
+    arr.extend_from_slice(&1.5f32.to_le_bytes());
+    arr.extend_from_slice(&(-2.0f32).to_le_bytes());
+    kv(&mut h, "t_arr_f32", 9, &arr);
+    h
+}
+
 #[test]
-fn metadata_constructs_from_kv() {
-    let meta = flint_checkpoint::Metadata::new(HashMap::from([
-        ("s".to_string(), MetaVal::Str("v".into())),
-        ("n".to_string(), MetaVal::UInt(9)),
-    ]));
-    assert_eq!(meta.str("s"), Some("v"));
-    assert_eq!(meta.u32("n"), Some(9));
-    assert!(!meta.is_empty());
-    assert!(flint_checkpoint::Metadata::default().is_empty());
+fn reads_every_metadata_value_type() {
+    let dir = tmp_dir("types");
+    let path = dir.join("m.gguf");
+    std::fs::write(&path, synth_full_types()).unwrap();
+    let gguf = Gguf::open(&path).unwrap();
+    let meta = gguf.metadata();
+
+    assert_eq!(meta.u64("t_u8"), Some(200));
+    assert_eq!(meta.u64("t_i8"), None, "negative i8 is not a u64");
+    assert_eq!(meta.u64("t_u16"), Some(500));
+    assert_eq!(meta.u64("t_i16"), None, "negative i16 is not a u64");
+    assert_eq!(meta.u64("t_u64"), Some(1u64 << 40));
+    assert_eq!(meta.u64("t_i64"), None);
+    assert_eq!(meta.u64("t_i32"), None);
+    assert_eq!(meta.f64("t_f64"), Some(std::f64::consts::PI));
+    assert_eq!(meta.f64("t_i32"), Some(-1_000_000.0), "ints coerce to f64");
+    assert_eq!(meta.f64("t_u8"), Some(200.0));
+    assert_eq!(meta.f64_array("t_arr_f32").unwrap(), vec![1.5, -2.0]);
+
+    // Type-mismatched accessors return None rather than panicking.
+    assert_eq!(meta.str("t_u8"), None);
+    assert_eq!(meta.u32("t_f64"), None);
+    assert_eq!(meta.u32_array("t_arr_f32"), None, "float array is not a u32 array");
+    assert_eq!(meta.str_array("t_u64"), None);
+    assert_eq!(meta.f64_array("t_i8"), None);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn rejects_unknown_value_types_and_versions() {
+    let dir = tmp_dir("bad-ty");
+
+    // Unknown metadata value tag 13: patch the first record's tag byte.
+    let mut bad = synth_full_types();
+    let tag_off = 8 + 8 + 8 + 8 + 4; // magic+version, counts, key len, key "t_u8"
+    bad[tag_off] = 13;
+    let p = dir.join("bad.gguf");
+    std::fs::write(&p, &bad).unwrap();
+    assert!(
+        err_str(Gguf::open(&p)).contains("unknown GGUF metadata value type"),
+        "unknown tag must fail"
+    );
+
+    // Version 4 is out of the supported 2..=3 range.
+    let mut v4 = synth_gguf();
+    v4[4..8].copy_from_slice(&4u32.to_le_bytes());
+    let p = dir.join("v4.gguf");
+    std::fs::write(&p, &v4).unwrap();
+    assert!(err_str(Gguf::open(&p)).contains("unsupported GGUF version"));
+
+    // Version 2 reads like version 3 (identical header layout).
+    let mut v2 = synth_gguf();
+    v2[4..8].copy_from_slice(&2u32.to_le_bytes());
+    let p = dir.join("v2.gguf");
+    std::fs::write(&p, &v2).unwrap();
+    assert_eq!(
+        Gguf::open(&p).unwrap().metadata().u32("llama.block_count"),
+        Some(24)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn writer_roundtrips_through_reader() {
+    let dir = tmp_dir("writer");
+    let mut w = flint_checkpoint::GgufWriter::new(32);
+    w.kv_str("general.architecture", "llama");
+    w.kv_u32("llama.block_count", 2);
+    w.kv_f32("llama.rope.freq_base", 10000.0);
+    w.kv_bool("llama.bool", true);
+    w.kv_str_array("tokenizer.ggml.tokens", &["a", "b", "<|endoftext|>"]);
+    w.kv_u32_array("tokenizer.ggml.token_type", &[0, 0, 3]);
+    w.kv_f64_array("tokenizer.ggml.scores", &[1.5, 0.5, -1.0]);
+
+    // One tensor per storage flavor: F32, bf16, Q8_0.
+    let f32_data: Vec<f32> = (0..32).map(|i| i as f32 - 16.0).collect();
+    let bf16_data: Vec<f32> = (0..64).map(|i| i as f32 * 0.5).collect();
+    let q8_data: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 3.0).collect();
+    w.tensor_f32("t_f32", &[2, 16], &f32_data);
+    w.tensor_bf16("t_bf16", &[2, 32], &bf16_data);
+    w.tensor_q8_0("t_q8", &[2, 32], &q8_data);
+    std::fs::write(dir.join("m.gguf"), w.finish()).unwrap();
+
+    let g = Gguf::open(&dir.join("m.gguf")).unwrap();
+    assert_eq!(g.kind(), "gguf");
+    assert_eq!(g.metadata().str("general.architecture"), Some("llama"));
+    assert_eq!(g.metadata().u32("llama.block_count"), Some(2));
+    assert_eq!(g.metadata().f64("llama.rope.freq_base"), Some(10000.0));
+    assert_eq!(g.metadata().get("llama.bool"), Some(&MetaVal::Bool(true)));
+    assert_eq!(
+        g.metadata().str_array("tokenizer.ggml.tokens"),
+        Some(vec!["a", "b", "<|endoftext|>"])
+    );
+    assert_eq!(
+        g.metadata().u32_array("tokenizer.ggml.token_type"),
+        Some(vec![0, 0, 3])
+    );
+    assert_eq!(
+        g.metadata().f64_array("tokenizer.ggml.scores"),
+        Some(vec![1.5, 0.5, -1.0])
+    );
+
+    let names = g.names();
+    assert_eq!(names.len(), 3);
+
+    let f32 = g.read("t_f32").unwrap();
+    assert_eq!(f32.shape, vec![2, 16]);
+    assert_eq!(f32.data.into_f32(), f32_data);
+
+    let bf16 = g.read("t_bf16").unwrap();
+    assert_eq!(bf16.shape, vec![2, 32]);
+    let got: Vec<f32> = bf16
+        .data
+        .into_f32()
+        .iter()
+        .zip(&bf16_data)
+        .map(|(a, b)| (a - b).abs())
+        .collect();
+    assert!(
+        got.iter().all(|d| *d <= 2f32.powi(-9) * 32.0),
+        "bf16 drift {:?}",
+        got
+    );
+
+    let q8 = g.read("t_q8").unwrap();
+    assert_eq!(q8.shape, vec![2, 32]);
+    let got = q8.data.into_f32();
+    for (a, b) in got.iter().zip(&q8_data) {
+        // Q8_0 error is bounded by d/2 (one 127th of the block max).
+        assert!((a - b).abs() < 0.5, "{a} vs {b}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
 }

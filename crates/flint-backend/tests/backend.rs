@@ -1,7 +1,7 @@
 //! Backend resource layer: buffer factories, readback, copies, tensor
 //! geometry, weight invariants and fail-fast error paths.
 
-use flint_backend::{Backend, Binding};
+use flint_backend::{Backend, Binding, Pass};
 use flint_tensor::{DType, Weight};
 
 #[test]
@@ -83,9 +83,9 @@ fn unknown_shader_is_an_error_not_a_panic() {
     let mut backend = Backend::new().unwrap();
     let t = backend.zero_tensor(&[1], "t");
     let mut enc = backend.encoder();
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+    let mut pass = Pass::begin(&mut enc, "k");
     let err = backend
-        .run(&mut pass, "nope", &[], &[Binding::Full(&t)], [1, 1, 1])
+        .dispatch(&mut pass, "nope", &[], &[Binding::Full(&t)], [1, 1, 1])
         .unwrap_err();
     assert!(err.to_string().contains("unknown shader"), "{err}");
 }
@@ -98,14 +98,29 @@ fn weight_invariants() {
     let i = backend.tensor_i8(&[0u8; 4], vec![2, 2], "i");
     let s = backend.tensor_f32(&[1.0; 2], vec![2, 1], "s");
 
-    assert!(Weight::plain(f).scale.is_none());
-    let q = Weight::quant(i, s, 128);
-    assert!(q.scale.is_some() && q.group == 128);
-    let _ = b;
+    assert!(matches!(Weight::plain(f), Weight::Plain(_)));
+    assert!(matches!(Weight::plain(b), Weight::Plain(_)));
+    match Weight::quant(i, s, 128) {
+        Weight::Quantized { group, .. } => assert_eq!(group, 128),
+        Weight::Plain(_) => unreachable!(),
+    }
+
+    // Accessors across variants: plain weights carry no scale and default
+    // the group to the preferred 128; quantized weights report their own.
+    let f = backend.tensor_f32(&[0.0; 4], vec![2, 2], "f");
+    let w = Weight::plain(f);
+    assert!(w.scale().is_none());
+    assert_eq!(w.group(), 128);
+    assert_eq!(w.tensor().shape, vec![2, 2]);
+    let i = backend.tensor_i8(&[0u8; 4], vec![2, 2], "i");
+    let s = backend.tensor_f32(&[1.0; 1], vec![1, 1], "s");
+    let q = Weight::quant(i, s, 32);
+    assert_eq!(q.group(), 32);
+    assert!(q.scale().is_some());
 }
 
 #[test]
-#[should_panic(expected = "requires scales")]
+#[should_panic(expected = "must be f32 or bf16")]
 fn plain_weight_rejects_i8() {
     let backend = Backend::new().unwrap();
     let i = backend.tensor_i8(&[0u8; 4], vec![2, 2], "i");

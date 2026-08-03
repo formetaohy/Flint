@@ -1,7 +1,7 @@
 //! Architecture config validation: each parser accepts a well-formed config
 //! and rejects every class of invalid input fail-fast.
 
-use flint_archs::{Qwen35Config, gemma, llama};
+use flint_architectures::{Qwen35Config, gemma, llama};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------- Llama
@@ -141,6 +141,7 @@ fn qwen35_json() -> Value {
             "head_dim": 64,
             "vocab_size": 256,
             "layer_types": ["linear_attention", "full_attention"],
+            "linear_num_key_heads": 16,
             "linear_num_value_heads": 16,
             "linear_key_head_dim": 32,
             "linear_value_head_dim": 32,
@@ -158,18 +159,30 @@ fn qwen35_parses_hybrid_layout() {
     assert_eq!(cfg.key_dim(), 512);
     assert_eq!(cfg.value_dim(), 512);
     assert_eq!(cfg.conv_dim(), 1536, "2*key + value");
+    assert!(cfg.tied, "tied embeddings default");
     assert!(!cfg.has_mtp, "no mtp field means no draft head");
 }
 
 #[test]
-fn qwen35_rejects_invalid_configs() {
+fn qwen35_parses_split_key_value_heads() {
+    let mut v = qwen35_json();
+    v["text_config"]["linear_num_key_heads"] = json!(8);
+    let cfg = Qwen35Config::parse(&v).unwrap();
+    assert_eq!(cfg.key_dim(), 256, "key_dim follows key heads");
+    assert_eq!(cfg.value_dim(), 512, "value_dim follows value heads");
+    assert_eq!(cfg.conv_dim(), 1024, "2*key + value");
+}
+
+#[test]
+fn qwen35_parses_untied_embeddings() {
     let mut v = qwen35_json();
     v["tie_word_embeddings"] = json!(false);
-    assert!(
-        Qwen35Config::parse(&v).is_err(),
-        "untied embeddings unsupported"
-    );
+    let cfg = Qwen35Config::parse(&v).unwrap();
+    assert!(!cfg.tied, "untied embeddings accepted");
+}
 
+#[test]
+fn qwen35_rejects_invalid_configs() {
     let mut v = qwen35_json();
     v["text_config"]["layer_types"] = json!(["linear_attention"]);
     assert!(
@@ -186,6 +199,13 @@ fn qwen35_rejects_invalid_configs() {
     assert!(
         Qwen35Config::parse(&v).is_err(),
         "linear head dim above 128"
+    );
+
+    let mut v = qwen35_json();
+    v["text_config"]["linear_num_value_heads"] = json!(24);
+    assert!(
+        Qwen35Config::parse(&v).is_err(),
+        "value heads not divisible by key heads"
     );
 
     let mut v = qwen35_json();

@@ -33,6 +33,11 @@ const SHADERS: &[ShaderSpec] = &[
         read_only: &[true, true, true, false],
     },
     ShaderSpec {
+        name: "merge_gemv",
+        source: include_str!("wgsl/merge_gemv.wgsl"),
+        read_only: &[true, false],
+    },
+    ShaderSpec {
         name: "embed",
         source: include_str!("wgsl/embed.wgsl"),
         read_only: &[true, true, false],
@@ -83,6 +88,11 @@ const SHADERS: &[ShaderSpec] = &[
         read_only: &[true, true, true, true, true, false, false],
     },
     ShaderSpec {
+        name: "repeat_qk",
+        source: include_str!("wgsl/repeat_qk.wgsl"),
+        read_only: &[true, false],
+    },
+    ShaderSpec {
         name: "rope",
         source: include_str!("wgsl/rope.wgsl"),
         read_only: &[true, true, false, true],
@@ -91,6 +101,11 @@ const SHADERS: &[ShaderSpec] = &[
         name: "attn",
         source: include_str!("wgsl/attn.wgsl"),
         read_only: &[true, true, true, false, true],
+    },
+    ShaderSpec {
+        name: "merge_attn",
+        source: include_str!("wgsl/merge_attn.wgsl"),
+        read_only: &[true, false],
     },
     ShaderSpec {
         name: "kv_store",

@@ -5,22 +5,23 @@
 
 use flint_error::{Error, Result};
 
-/// The ggml_type enum values used in GGUF tensor info records.
+/// The ggml_type enum values used in GGUF tensor info records. Explicit
+/// discriminants match the GGUF spec so `ty as u32` serializes correctly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GgmlType {
-    F32,
-    F16,
-    Bf16,
-    Q4_0,
-    Q4_1,
-    Q5_0,
-    Q5_1,
-    Q8_0,
-    Q2K,
-    Q3K,
-    Q4K,
-    Q5K,
-    Q6K,
+    F32 = 0,
+    F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q2K = 10,
+    Q3K = 11,
+    Q4K = 12,
+    Q5K = 13,
+    Q6K = 14,
+    Bf16 = 30,
 }
 
 impl GgmlType {
@@ -75,6 +76,47 @@ impl GgmlType {
             GgmlType::Q6K => 210,
         }
     }
+}
+
+/// f32 -> IEEE-754 binary16, round-to-nearest-even.
+pub fn f32_to_f16(f: f32) -> u16 {
+    let b = f.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let mant = b & 0x7f_ffff;
+
+    if exp == 0xff {
+        // inf / nan: keep the top mantissa bits.
+        return sign | 0x7c00 | ((mant >> 13) as u16);
+    }
+    let half_exp = exp - 127 + 15;
+    if half_exp >= 0x1f {
+        return sign | 0x7c00; // overflow -> inf
+    }
+    if half_exp <= 0 {
+        // Zero or subnormal; round-to-nearest-even on the shifted mantissa.
+        if half_exp < -10 {
+            return sign;
+        }
+        let m = mant | 0x80_0000;
+        let shift = 14 - half_exp;
+        let mut v = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        if rem > half || (rem == half && v & 1 == 1) {
+            v += 1;
+        }
+        return sign | v as u16;
+    }
+    let mut m16 = (mant >> 13) as u16;
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && m16 & 1 == 1) {
+        m16 += 1;
+        if m16 == 0x400 {
+            return sign | ((half_exp + 1) as u16) << 10;
+        }
+    }
+    sign | ((half_exp as u16) << 10) | m16
 }
 
 /// IEEE-754 binary16 -> f32.

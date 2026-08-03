@@ -1,11 +1,18 @@
 [package]
-name = "flint-model"
+name = "flint-bench"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "flint_bench"
+path = "src/lib.rs"
+
 [dependencies]
+flint-architectures.workspace = true
 flint-backend.workspace = true
 flint-checkpoint.workspace = true
 flint-error.workspace = true
-flint-tensor.workspace = true
+flint-model.workspace = true
+clap.workspace = true
 serde_json.workspace = true
+

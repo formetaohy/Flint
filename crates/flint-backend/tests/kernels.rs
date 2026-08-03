@@ -3,7 +3,7 @@
 //! tests at the bottom pin the CPU reference itself to hand-computed math, so
 //! the two backends cannot silently agree on wrong results.
 
-use flint_backend::{Backend, Binding};
+use flint_backend::{Backend, Binding, Pass};
 use flint_kernel::cpu;
 use flint_tensor::{DType, Tensor};
 
@@ -73,9 +73,9 @@ impl Ctx {
     ) {
         let mut enc = self.backend.encoder();
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let mut pass = Pass::begin(&mut enc, "k");
             self.backend
-                .run(&mut pass, name, consts, bufs, groups)
+                .dispatch(&mut pass, name, consts, bufs, groups)
                 .unwrap();
         }
         self.backend.submit(enc);
@@ -159,6 +159,8 @@ fn dequant(bytes: &[u8], scales: &[f32], cols: usize, group: usize) -> Vec<f32> 
 }
 
 // ================================================================ gemm
+// The streaming two-row matmul is the production prefill path; it must agree
+// with the CPU reference on every weight layout.
 
 enum WType {
     Bf16,
@@ -181,8 +183,6 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
         }
         WType::I8(group) => {
             let (wq, scales) = quant(&w, n, k, group);
-            // Reference against the dequantized weights isolates kernel math
-            // from quantization error.
             let cpu_w = dequant(&wq, &scales, k, group);
             let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32], "wq");
             let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
@@ -204,7 +204,7 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
             Binding::Full(&sb),
             Binding::Full(&y),
         ],
-        [(n / 16) as u32, (m / 16) as u32, 1],
+        [(n / 16) as u32, (m / 2) as u32, 1],
     );
     agree(&ctx.read(&y), &cpu::gemm(&x, &cpu_w, m, n, k), rel, abs);
 }
@@ -236,14 +236,18 @@ fn gemm_i8_group32() {
 }
 
 // ================================================================ gemv
+// The split-K decode gemv plus its merge pass. SEGS=1 exercises the direct
+// write; SEGS>1 the partial + merge path; every case must match the CPU
+// reference.
 
-fn gemv_case(wt: WType, n: usize, k: usize, seed: u64) {
+fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
     let mut ctx = Ctx::new();
     let mut rng = Rng(seed);
     let x = rng.fill(k);
     let w = rng.fill(n * k);
     let xb = ctx.f32(&x, &[k as u32]);
     let y = ctx.zero(&[n as u32]);
+    let partial = ctx.zero(&[8, 65536]);
 
     let (wb, sb, wdtype, group, cpu_w, rel, abs) = match wt {
         WType::Bf16 => {
@@ -260,6 +264,11 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64) {
         }
     };
 
+    let out = if segs == 1 {
+        Binding::Full(&y)
+    } else {
+        Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64)
+    };
     ctx.dispatch(
         "gemv",
         &[
@@ -267,32 +276,49 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64) {
             ("K", k as f64),
             ("WDTYPE", wdtype),
             ("GROUP", group),
+            ("SEGS", segs as f64),
         ],
-        &[
-            Binding::Full(&xb),
-            Binding::Full(&wb),
-            Binding::Full(&sb),
-            Binding::Full(&y),
-        ],
-        [(n / 16) as u32, 1, 1],
+        &[Binding::Full(&xb), Binding::Full(&wb), Binding::Full(&sb), out],
+        [(n / 16) as u32, segs, 1],
     );
+    if segs > 1 {
+        ctx.dispatch(
+            "merge_gemv",
+            &[("N", n as f64), ("SEGS", segs as f64)],
+            &[
+                Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64),
+                Binding::Full(&y),
+            ],
+            [(n / 16) as u32, 1, 1],
+        );
+    }
     agree(&ctx.read(&y), &cpu::gemv(&x, &cpu_w, n, k), rel, abs);
 }
 
 #[test]
 fn gemv_bf16() {
-    gemv_case(WType::Bf16, 32, 128, 31);
+    gemv_case(WType::Bf16, 32, 128, 31, 1);
 }
 
 #[test]
 fn gemv_i8_group128() {
-    gemv_case(WType::I8(128), 64, 256, 37);
+    gemv_case(WType::I8(128), 64, 256, 37, 1);
 }
 
 #[test]
 fn gemv_i8_partial_chunk() {
     // K not a multiple of BK=128 exercises the final partial-chunk guard.
-    gemv_case(WType::I8(32), 32, 192, 41);
+    gemv_case(WType::I8(32), 32, 192, 41, 1);
+}
+
+#[test]
+fn gemv_i8_split4() {
+    gemv_case(WType::I8(128), 64, 512, 43, 4);
+}
+
+#[test]
+fn gemv_bf16_split8() {
+    gemv_case(WType::Bf16, 32, 1024, 47, 8);
 }
 
 // ================================================================ embed
@@ -587,6 +613,148 @@ fn conv1d_rolls_state_across_steps() {
     agree(&ctx.read(&st), &state, 0.0, 1e-6);
 }
 
+// ================================================================ repeat_qk
+
+/// Simulates the production sequence: conv1d writes a conv tile (per-row
+/// slices) and repeat_qk then reads the whole tile in the same pass.
+#[test]
+fn repeat_qk_sees_convd_writes_in_same_pass() {
+    let mut ctx = Ctx::new();
+    // DIMS: conv_dim=192 (row stride 768 B) and exp row stride 256 B are
+    // both multiples of wgpu's 256 B min_storage_buffer_offset_alignment.
+    let (n_k, n_v, kd, vd) = (2usize, 2usize, 16usize, 64usize);
+    let conv_dim = 2 * n_k * kd + n_v * vd;
+    let rows = 3usize;
+    let mut rng = Rng(101);
+    let w = rng.fill(conv_dim * 4);
+    let mut state = rng.fill(conv_dim * 3);
+    let x: Vec<Vec<f32>> = (0..rows).map(|_| rng.fill(conv_dim)).collect();
+
+    let wb = ctx.f32(&w, &[conv_dim as u32, 4]);
+    let st = ctx.f32(&state, &[conv_dim as u32, 3]);
+    let xb = ctx.zero(&[rows as u32, conv_dim as u32]);
+    let convd = ctx.zero(&[rows as u32, conv_dim as u32]);
+    let y = ctx.zero(&[rows as u32, (2 * n_v * kd) as u32]);
+
+    // Stage the full input tile before the pass, like the gemm that feeds
+    // conv1d in production.
+    let flat: Vec<f32> = x.iter().flatten().copied().collect();
+    ctx.backend.write_f32(&xb.buf, &flat);
+
+    // Same pass: per-row conv1d writes, then a full-tile repeat_qk read.
+    let mut enc = ctx.backend.encoder();
+    {
+        let mut pass = Pass::begin(&mut enc, "k");
+        let row = |t: usize| (t * conv_dim * 4) as u64;
+        for t in 0..rows {
+            ctx.backend
+                .dispatch(
+                    &mut pass,
+                    "conv1d",
+                    &[("DIM", conv_dim as f64)],
+                    &[
+                        Binding::Slice(&xb, row(t), conv_dim as u64 * 4),
+                        Binding::Full(&wb),
+                        Binding::Full(&st),
+                        Binding::Slice(&convd, row(t), conv_dim as u64 * 4),
+                    ],
+                    [1, 1, 1],
+                )
+                .unwrap();
+        }
+        // Reference: conv each row sequentially, then repeat_qk the tile.
+        let mut conv_cpu = Vec::with_capacity(rows * conv_dim);
+        let mut st2 = state.clone();
+        for xrow in &x {
+            conv_cpu.extend(cpu::conv1d(xrow, &w, &mut st2));
+        }
+        ctx.backend
+            .dispatch(
+                &mut pass,
+                "repeat_qk",
+                &[
+                    ("ROWS", rows as f64),
+                    ("N_K", n_k as f64),
+                    ("N_V", n_v as f64),
+                    ("K_DIM", kd as f64),
+                    ("RATIO", (n_v / n_k) as f64),
+                    ("CONV_DIM", conv_dim as f64),
+                ],
+                &[
+                    Binding::Slice(&convd, 0, (rows * conv_dim * 4) as u64),
+                    Binding::Full(&y),
+                ],
+                [rows as u32, 1, 1],
+            )
+            .unwrap();
+    }
+    ctx.backend.submit(enc);
+
+    // Reference: conv each row sequentially, then repeat_qk the tile.
+    let mut conv_cpu = Vec::with_capacity(rows * conv_dim);
+    for xrow in &x {
+        conv_cpu.extend(cpu::conv1d(xrow, &w, &mut state));
+    }
+    let mut cpu_y = vec![0f32; rows * 2 * n_v * kd];
+    cpu::repeat_qk(&conv_cpu, &mut cpu_y, rows, n_k, n_v, kd, vd);
+    agree(&ctx.read(&y), &cpu_y, 1e-5, 1e-6);
+}
+
+fn repeat_qk_case(rows: usize, n_k: usize, n_v: usize, kd: usize, vd: usize, seed: u64) {
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(seed);
+    let conv_dim = 2 * n_k * kd + n_v * vd;
+    let x = rng.fill(rows * conv_dim);
+    let xb = ctx.f32(&x, &[rows as u32, conv_dim as u32]);
+    let out_dim = 2 * n_v * kd;
+    let y = ctx.zero(&[rows as u32, out_dim as u32]);
+
+    ctx.dispatch(
+        "repeat_qk",
+        &[
+            ("ROWS", rows as f64),
+            ("N_K", n_k as f64),
+            ("N_V", n_v as f64),
+            ("K_DIM", kd as f64),
+            ("RATIO", (n_v / n_k) as f64),
+            ("CONV_DIM", conv_dim as f64),
+        ],
+        &[Binding::Full(&xb), Binding::Full(&y)],
+        [rows as u32, 1, 1],
+    );
+
+    let mut cpu_y = vec![0f32; rows * out_dim];
+    cpu::repeat_qk(&x, &mut cpu_y, rows, n_k, n_v, kd, vd);
+    agree(&ctx.read(&y), &cpu_y, 0.0, 1e-6);
+}
+
+/// Exact production dims of the toy Qwen35 model (conv 384, exp 256).
+#[test]
+fn repeat_qk_production_dims() {
+    repeat_qk_case(2, 16, 16, 8, 8, 211);
+}
+
+#[test]
+fn repeat_qk_identity_ratio_one() {
+    repeat_qk_case(3, 4, 4, 8, 16, 91);
+}
+
+#[test]
+fn repeat_qk_expands_key_heads() {
+    repeat_qk_case(2, 2, 4, 8, 16, 93);
+    repeat_qk_case(3, 1, 3, 16, 8, 97);
+}
+
+#[test]
+fn anchor_repeat_qk() {
+    // One row, q=[1,2] k=[3,4] v=[5,6,7] at key-head width; value heads
+    // double the q/k segments (repeat_interleave) and leave v untouched.
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+    let mut y = vec![0f32; 8];
+    cpu::repeat_qk(&x, &mut y, 1, 1, 2, 2, 3);
+    assert_eq!(y, [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+}
+
 // ================================================================ delta_gate
 
 #[test]
@@ -684,6 +852,9 @@ fn delta_recur_asymmetric_dims() {
 }
 
 // ================================================================ attn
+// The split-K GQA attention (per-segment kernel + merge) is the production
+// path; it must match the CPU reference on GQA, sliding windows, empty
+// segments (short prefixes) and 8:1 GQA ratios.
 
 fn attn_case(
     m: usize,
@@ -708,6 +879,7 @@ fn attn_case(
     let kb = ctx.bf16(&kc, &[nkv as u32, max_seq as u32, hd as u32]);
     let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
     let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
+    let scratch = ctx.zero(&[m as u32, nkv as u32, 32, 8, hd as u32 + 2]);
     let args = ctx.arg(pos);
 
     ctx.dispatch(
@@ -719,15 +891,26 @@ fn attn_case(
             ("MAX_SEQ", max_seq as f64),
             ("SCALE", 1.0 / (hd as f64).sqrt()),
             ("WINDOW", window as f64),
+            ("NQ_PER_KV", (nq / nkv) as f64),
         ],
         &[
             Binding::Full(&qb),
             Binding::Full(&kb),
             Binding::Full(&vb),
-            Binding::Full(&y),
+            Binding::Full(&scratch),
             Binding::Full(&args),
         ],
-        [m as u32, nq as u32, 1],
+        [m as u32, nkv as u32, 32],
+    );
+    ctx.dispatch(
+        "merge_attn",
+        &[
+            ("N_HEADS", nq as f64),
+            ("KV_HEADS", nkv as f64),
+            ("HEAD_DIM", hd as f64),
+        ],
+        &[Binding::Full(&scratch), Binding::Full(&y)],
+        [m as u32, nkv as u32, 1],
     );
     agree(
         &ctx.read(&y),
@@ -751,6 +934,32 @@ fn attn_sliding_window() {
 #[test]
 fn attn_single_query_per_head() {
     attn_case(1, 2, 2, 4, 0, 0, 95);
+}
+
+#[test]
+fn attn_gqa_4x_multi_chunk() {
+    attn_case(16, 4, 1, 64, 16, 0, 97);
+}
+
+#[test]
+fn attn_split_short_prefix() {
+    // pos=2 with 32 segments: most segments are empty.
+    attn_case(1, 2, 1, 16, 2, 0, 101);
+}
+
+#[test]
+fn attn_split_long_prefix() {
+    attn_case(16, 4, 1, 1024, 512, 0, 103);
+}
+
+#[test]
+fn attn_split_sliding_window() {
+    attn_case(3, 2, 1, 1024, 700, 128, 105);
+}
+
+#[test]
+fn attn_gqa_8x() {
+    attn_case(2, 8, 1, 64, 10, 0, 107);
 }
 
 // ================================================================ layout

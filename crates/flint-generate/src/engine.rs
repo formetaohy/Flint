@@ -86,10 +86,6 @@ impl Engine {
         }
     }
 
-    pub fn backend_name(&self) -> &str {
-        self.backend.adapter_name()
-    }
-
     /// Formatted per-kernel GPU time breakdown, or None when profiling is off.
     pub fn profile_report(&self) -> Option<String> {
         if !self.backend.profiling() {

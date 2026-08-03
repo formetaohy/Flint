@@ -1,0 +1,44 @@
+# CI on GitHub-hosted runners, which have no GPU: wgpu runs on lavapipe, the
+# Mesa CPU-only Vulkan ICD (the same setup llama.cpp / sherpa-onnx / rerun
+# use for their Vulkan CI legs). Every test builds its own toy checkpoint in
+# memory, so no weights are ever downloaded.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    env:
+      # Vulkan only: never let wgpu fall back to GL, and fail fast with a
+      # clear "no suitable adapter" if lavapipe is missing.
+      WGPU_BACKEND: vulkan
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install software Vulkan (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers vulkan-tools
+          # Mesa renamed its lavapipe ICD manifest across releases
+          # (lvp_icd.json on 24.04 updates, lvp_icd.x86_64.json before), so
+          # hardcoding a name leaves the loader with zero ICDs and wgpu
+          # fails with "vulkan drivers/libraries could not be loaded".
+          # Pin whichever manifest this runner actually ships; a future
+          # rename fails loudly right here instead of in the tests.
+          ICD="$(find /usr/share/vulkan/icd.d/ -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD" || { echo "::error::lavapipe ICD manifest not found"; exit 1; }
+          echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
+      - name: Verify Vulkan setup (diagnostics, non-fatal)
+        run: vulkaninfo --summary || true
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace

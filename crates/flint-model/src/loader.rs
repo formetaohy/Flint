@@ -11,7 +11,6 @@ use flint_backend::Backend;
 use flint_checkpoint::{Checkpoint, RawTensor, TensorData};
 use flint_error::{Error, Result};
 use flint_tensor::{Tensor, Weight};
-
 /// Where a weight's bytes live and how kernels consume them.
 pub enum Role {
     /// Decoded to f32 on the CPU (norms, biases, conv taps).
@@ -87,18 +86,37 @@ impl WeightSet {
 
     /// Takes an unquantized weight as a bare tensor.
     pub fn take_tensor(&mut self, key: &str) -> Result<Tensor> {
-        let w = self.take(key)?;
-        if w.scale.is_some() {
-            return Err(Error::Model(format!(
+        match self.take(key)? {
+            Weight::Plain(t) => Ok(t),
+            Weight::Quantized { .. } => Err(Error::Model(format!(
                 "{key:?} is quantized; expected a plain tensor"
-            )));
+            ))),
         }
-        Ok(w.t)
     }
 
     pub fn has(&self, key: &str) -> bool {
         self.weights.contains_key(key)
     }
+}
+
+/// SwiGLU MLP weights plus the norm that feeds it; the shared weight shape
+/// used by every architecture's MLP block.
+pub struct SwigluMlp {
+    pub norm: Tensor,
+    pub gate: Weight,
+    pub up: Weight,
+    pub down: Weight,
+}
+
+/// Takes an MLP's weights under `prefix` (e.g. `layers.0`).
+pub fn take_mlp(w: &mut WeightSet, prefix: &str) -> Result<SwigluMlp> {
+    let k = |n: &str| format!("{prefix}.{n}");
+    Ok(SwigluMlp {
+        norm: w.take_tensor(&k("post_attention_layernorm.weight"))?,
+        gate: w.take(&k("mlp.gate_proj.weight"))?,
+        up: w.take(&k("mlp.up_proj.weight"))?,
+        down: w.take(&k("mlp.down_proj.weight"))?,
+    })
 }
 
 /// Loads every checkpoint tensor the plan claims, onto the GPU by role.

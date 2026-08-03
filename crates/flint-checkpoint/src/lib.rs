@@ -4,7 +4,7 @@
 //! model directory.
 //!
 //! The checkpoint layer owns only container mechanics. Architecture-specific
-//! tensor naming and config synthesis live in `flint-archs`.
+//! tensor naming and config synthesis live in `flint-architectures`.
 
 pub mod dequant;
 pub mod gguf;
@@ -14,8 +14,8 @@ use std::path::Path;
 
 use flint_error::{Error, Result};
 
-pub use gguf::{Gguf, MetaVal, Metadata};
-pub use safetensors::Safetensors;
+pub use gguf::{Gguf, GgufWriter, MetaVal, Metadata};
+pub use safetensors::{Safetensors, write_tensors};
 
 /// CPU-decoded tensor bytes, ready for the role-based GPU upload.
 pub enum TensorData {

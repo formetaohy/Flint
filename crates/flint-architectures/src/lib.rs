@@ -7,7 +7,7 @@ pub mod dense;
 pub mod gemma;
 pub mod gguf_config;
 pub mod llama;
-pub mod qwen3_5;
+pub mod qwen35;
 
 use std::path::Path;
 
@@ -21,7 +21,7 @@ use serde_json::Value;
 pub use chat::{ChatFormat, ChatMl, ChatMlThink, GemmaChat};
 pub use dense::{DenseConfig, DenseModel, SlidingWindow};
 pub use gguf_config::{gguf_key, synthesize_config};
-pub use qwen3_5::{Qwen35, Qwen35Config};
+pub use qwen35::{Qwen35, Qwen35Config};
 
 /// A fully assembled, chat-ready model: tensor engine, tokenizer, prompt format
 /// and reply terminators.
@@ -34,19 +34,19 @@ pub struct ChatModel {
 
 /// Architecture families Flint can instantiate.
 #[derive(Clone, Copy)]
-pub enum ArchKind {
+pub enum Family {
     Qwen35,
     Llama,
     Gemma,
 }
 
-impl ArchKind {
+impl Family {
     /// Dispatches on a safetensors config's `model_type`.
     fn from_model_type(t: Option<&str>) -> Result<Self> {
         match t {
-            Some("qwen3_5") => Ok(ArchKind::Qwen35),
-            Some("llama" | "qwen2" | "qwen3" | "mistral") => Ok(ArchKind::Llama),
-            Some("gemma" | "gemma2" | "gemma3" | "gemma3_text") => Ok(ArchKind::Gemma),
+            Some("qwen3_5") => Ok(Family::Qwen35),
+            Some("llama" | "qwen2" | "qwen3" | "mistral") => Ok(Family::Llama),
+            Some("gemma" | "gemma2" | "gemma3" | "gemma3_text") => Ok(Family::Gemma),
             other => Err(Error::Config(format!("unsupported model_type {other:?}"))),
         }
     }
@@ -54,8 +54,8 @@ impl ArchKind {
     /// Dispatches on a GGUF `general.architecture`.
     fn from_gguf_arch(a: &str) -> Result<Self> {
         match a {
-            "llama" | "qwen2" | "qwen3" | "mistral" => Ok(ArchKind::Llama),
-            "gemma" | "gemma2" | "gemma3" => Ok(ArchKind::Gemma),
+            "llama" | "qwen2" | "qwen3" | "mistral" => Ok(Family::Llama),
+            "gemma" | "gemma2" | "gemma3" => Ok(Family::Gemma),
             other => Err(Error::Config(format!(
                 "unsupported GGUF architecture {other:?}"
             ))),
@@ -65,9 +65,9 @@ impl ArchKind {
     /// The family's chat prompt format.
     fn chat_format(self) -> Box<dyn ChatFormat> {
         match self {
-            ArchKind::Qwen35 => Box::new(ChatMlThink),
-            ArchKind::Llama => Box::new(ChatMl),
-            ArchKind::Gemma => Box::new(GemmaChat),
+            Family::Qwen35 => Box::new(ChatMlThink),
+            Family::Llama => Box::new(ChatMl),
+            Family::Gemma => Box::new(GemmaChat),
         }
     }
 }
@@ -78,15 +78,15 @@ impl ArchKind {
 /// work.
 pub fn load(model_dir: &Path, max_seq: u32, backend: &Backend) -> Result<ChatModel> {
     let source = open(model_dir)?;
-    let kind = arch_kind(source.as_ref())?;
-    let config = config_for(source.as_ref(), kind)?;
-    let model: Box<dyn LanguageModel> = match kind {
-        ArchKind::Qwen35 => Box::new(Qwen35::load(source.as_ref(), &config, max_seq, backend)?),
-        ArchKind::Llama => Box::new(llama::load(source.as_ref(), &config, max_seq, backend)?),
-        ArchKind::Gemma => Box::new(gemma::load(source.as_ref(), &config, max_seq, backend)?),
+    let family = family_of(source.as_ref())?;
+    let config = config_for(source.as_ref(), family)?;
+    let model: Box<dyn LanguageModel> = match family {
+        Family::Qwen35 => Box::new(Qwen35::load(source.as_ref(), &config, max_seq, backend)?),
+        Family::Llama => Box::new(llama::load(source.as_ref(), &config, max_seq, backend)?),
+        Family::Gemma => Box::new(gemma::load(source.as_ref(), &config, max_seq, backend)?),
     };
     let tokenizer = Tokenizer::load(model_dir, source.as_ref())?;
-    let chat = kind.chat_format();
+    let chat = family.chat_format();
     let stop = stop_tokens(model.eos(), &tokenizer, chat.stop_literals());
     Ok(ChatModel {
         model,
@@ -110,20 +110,20 @@ fn stop_tokens(eos: &[u32], tokenizer: &Tokenizer, literals: &[&str]) -> Vec<u32
     stop
 }
 
-fn arch_kind(source: &dyn Checkpoint) -> Result<ArchKind> {
+fn family_of(source: &dyn Checkpoint) -> Result<Family> {
     match source.kind() {
         "safetensors" => {
             let v = source
                 .config_json()?
                 .ok_or_else(|| Error::Config("safetensors checkpoint has no config.json".into()))?;
-            ArchKind::from_model_type(v["model_type"].as_str())
+            Family::from_model_type(v["model_type"].as_str())
         }
         "gguf" => {
             let arch = source
                 .metadata()
                 .str("general.architecture")
                 .ok_or_else(|| Error::Config("GGUF missing general.architecture".into()))?;
-            ArchKind::from_gguf_arch(arch)
+            Family::from_gguf_arch(arch)
         }
         other => Err(Error::Config(format!(
             "unknown checkpoint format {other:?}"
@@ -131,12 +131,12 @@ fn arch_kind(source: &dyn Checkpoint) -> Result<ArchKind> {
     }
 }
 
-fn config_for(source: &dyn Checkpoint, kind: ArchKind) -> Result<Value> {
+fn config_for(source: &dyn Checkpoint, family: Family) -> Result<Value> {
     match source.kind() {
         "safetensors" => source
             .config_json()?
             .ok_or_else(|| Error::Config("safetensors checkpoint has no config.json".into())),
-        "gguf" => gguf_config::synthesize_config(source, kind),
+        "gguf" => gguf_config::synthesize_config(source, family),
         other => Err(Error::Config(format!(
             "unknown checkpoint format {other:?}"
         ))),

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use flint_archs::ChatFormat;
+use flint_architectures::ChatFormat;
 use flint_backend::Backend;
 use flint_error::Result;
 use flint_generate::{Engine, Sampler, SamplingParams};
@@ -13,7 +13,7 @@ use flint_generate::{Engine, Sampler, SamplingParams};
 #[command(name = "flint", version, about)]
 struct Args {
     /// Directory containing config.json / tokenizer.json / safetensors shards.
-    #[arg(long, default_value = "models/Qwen3.5-0.8B")]
+    #[arg(long)]
     model: PathBuf,
 
     /// One-shot prompt; omit for an interactive session.
@@ -66,7 +66,7 @@ fn main() -> Result<()> {
 
     eprintln!("[flint] loading weights from {}...", args.model.display());
     let load_t = std::time::Instant::now();
-    let chat_model = flint_archs::load(&args.model, args.max_seq, &backend)?;
+    let chat_model = flint_architectures::load(&args.model, args.max_seq, &backend)?;
     eprintln!(
         "[flint] weights loaded in {:.1}s",
         load_t.elapsed().as_secs_f64()
@@ -103,43 +103,45 @@ fn main() -> Result<()> {
                 &prompt,
                 args.max_tokens,
             )?;
-            if let Some(report) = engine.profile_report() {
-                eprint!("{report}");
-            }
-            Ok(())
         }
-        None => {
-            eprintln!("[flint] interactive mode. type 'exit' to quit.");
-            let mut history: Vec<(String, String)> = Vec::new();
-            let stdin = std::io::stdin();
-            loop {
-                print!("> ");
-                std::io::stdout().flush().ok();
-                let mut line = String::new();
-                match stdin.lock().read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                let user = line.trim().to_string();
-                if user.is_empty() {
-                    continue;
-                }
-                if user == "exit" {
-                    break;
-                }
-                let reply = run_turn(
-                    &mut engine,
-                    chat.as_ref(),
-                    &args.system,
-                    &history,
-                    &user,
-                    args.max_tokens,
-                )?;
-                history.push((user, reply));
-            }
-            Ok(())
-        }
+        None => interactive(&mut engine, chat.as_ref(), &args.system, args.max_tokens)?,
     }
+    if let Some(report) = engine.profile_report() {
+        eprint!("{report}");
+    }
+    Ok(())
+}
+
+/// Interactive REPL: reads user turns, keeps them as history, and streams each
+/// assistant reply back to stdout.
+fn interactive(
+    engine: &mut Engine,
+    chat: &dyn ChatFormat,
+    system: &str,
+    max_tokens: usize,
+) -> Result<()> {
+    eprintln!("[flint] interactive mode. type 'exit' to quit.");
+    let mut history: Vec<(String, String)> = Vec::new();
+    let stdin = std::io::stdin();
+    loop {
+        print!("> ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let user = line.trim().to_string();
+        if user.is_empty() {
+            continue;
+        }
+        if user == "exit" {
+            break;
+        }
+        let reply = run_turn(engine, chat, system, &history, &user, max_tokens)?;
+        history.push((user, reply));
+    }
+    Ok(())
 }
 
 /// Generates one assistant turn, streaming pieces to stdout. Returns the

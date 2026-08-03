@@ -46,6 +46,19 @@ impl<'a> Binding<'a> {
     }
 }
 
+/// Owns one GPU compute pass; the only way architectures and kernel
+/// dispatchers interact with wgpu's pass API.
+pub struct Pass<'a>(wgpu::ComputePass<'a>);
+
+impl<'a> Pass<'a> {
+    pub fn begin(encoder: &'a mut CommandEncoder, label: &str) -> Self {
+        Self(encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(label),
+            ..Default::default()
+        }))
+    }
+}
+
 /// Most bindings any shader takes (delta_recur: 7).
 const MAX_BINDINGS: usize = 8;
 
@@ -111,6 +124,8 @@ pub struct Backend {
     adapter_name: String,
     /// One-element f32 buffer bound as the gemm scale input of bf16 weights.
     dummy_scale: Tensor,
+    /// Split-K gemv partials [8, 65536] f32; every gemv output width fits.
+    gemv_partial: Tensor,
     /// Bind groups keyed by their buffer signature; the forward graph rebinds
     /// the same buffers every step, so each is created once and reused.
     bg_cache: HashMap<BgKey, BindGroup>,
@@ -138,7 +153,33 @@ impl Backend {
         let limits = Limits {
             max_storage_buffer_binding_size: (1u64 << 31) - 4,
             max_buffer_size: 1u64 << 30,
+            // The attention kernel runs 512 threads (8 head slots x 64 keys)
+            // and its staged KV tiles exceed the 16 KiB default workgroup
+            // storage.
+            max_compute_workgroup_size_x: 1024,
+            max_compute_invocations_per_workgroup: 1024,
+            max_compute_workgroup_storage_size: 48 * 1024,
             ..Limits::default()
+        };
+        // request_device rejects any requested limit above the adapter's
+        // capability (lavapipe on CI caps workgroup storage at 32 KiB), so
+        // downlevel each raised field to what this adapter actually supports.
+        let supported = adapter.limits();
+        let limits = Limits {
+            max_storage_buffer_binding_size: limits
+                .max_storage_buffer_binding_size
+                .min(supported.max_storage_buffer_binding_size),
+            max_buffer_size: limits.max_buffer_size.min(supported.max_buffer_size),
+            max_compute_workgroup_size_x: limits
+                .max_compute_workgroup_size_x
+                .min(supported.max_compute_workgroup_size_x),
+            max_compute_invocations_per_workgroup: limits
+                .max_compute_invocations_per_workgroup
+                .min(supported.max_compute_invocations_per_workgroup),
+            max_compute_workgroup_storage_size: limits
+                .max_compute_workgroup_storage_size
+                .min(supported.max_compute_workgroup_storage_size),
+            ..limits
         };
         // Profiling is opt-in: request the timestamp features only when asked,
         // and only those the adapter actually exposes.
@@ -166,7 +207,7 @@ impl Backend {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("dummy_scale"),
                 contents: &[0u8; 4],
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             }),
             vec![1],
             DType::F32,
@@ -183,12 +224,22 @@ impl Backend {
             }
             None
         };
+        let gemv_partial = Tensor::new(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gemv_partial"),
+                contents: &vec![0u8; 8 * 65536 * 4],
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            }),
+            vec![8, 65536],
+            DType::F32,
+        );
         Ok(Self {
             device,
             queue,
             kernels,
             adapter_name,
             dummy_scale,
+            gemv_partial,
             bg_cache: HashMap::new(),
             profiler,
         })
@@ -247,7 +298,7 @@ impl Backend {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
-                contents: bytemuck_cast(data),
+                contents: bytemuck::cast_slice(data),
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
@@ -277,7 +328,7 @@ impl Backend {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
-                contents: bytemuck_cast(&padded),
+                contents: bytemuck::cast_slice(&padded),
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             });
         Ok(Tensor::new(buf, shape, DType::Bf16Packed))
@@ -306,7 +357,7 @@ impl Backend {
     }
 
     pub fn write_f32(&self, buf: &Buffer, data: &[f32]) {
-        self.queue.write_buffer(buf, 0, bytemuck_cast(data));
+        self.queue.write_buffer(buf, 0, bytemuck::cast_slice(data));
     }
 
     pub fn encoder(&self) -> CommandEncoder {
@@ -316,11 +367,11 @@ impl Backend {
             })
     }
 
-    /// Encode one kernel dispatch, reusing a cached bind group for the buffer
+    /// Encodes one kernel dispatch, reusing a cached bind group for the buffer
     /// set and a cached pipeline for the constants.
-    pub fn run(
+    pub fn dispatch(
         &mut self,
-        pass: &mut wgpu::ComputePass<'_>,
+        pass: &mut Pass<'_>,
         name: &'static str,
         consts: &[(&'static str, f64)],
         bufs: &[Binding<'_>],
@@ -331,11 +382,29 @@ impl Backend {
         let layout = self.kernels.bind_group_layout(name)?.clone();
         let bind_group = cached_bind_group(&mut self.bg_cache, &self.device, &layout, key, bufs);
         let pipeline = self.kernels.pipeline(&self.device, name, consts)?;
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
+        pass.0.set_pipeline(pipeline);
+        pass.0.set_bind_group(0, bind_group, &[]);
+        pass.0.dispatch_workgroups(groups[0], groups[1], groups[2]);
         self.prof_end(pass, name, span);
         Ok(())
+    }
+
+    /// The gemm/gemv weight constants and scale binding for a weight.
+    fn weight_io(w: &Weight) -> (u32, u32, Binding<'_>, f64) {
+        assert_eq!(
+            w.tensor().shape.len(),
+            2,
+            "gemm weight must be a [N, K] matrix"
+        );
+        let (n, k) = (w.tensor().shape[0], w.tensor().shape[1]);
+        let wdtype = match w.tensor().dtype {
+            DType::Bf16Packed => 0.0,
+            DType::I8 => 1.0,
+            DType::F32 | DType::U32 => {
+                unreachable!("gemm operands are weights, never index tensors")
+            }
+        };
+        (n, k, Binding::Full(w.tensor()), wdtype)
     }
 
     /// y = x @ dequant(w)^T over `rows` activation rows (multiple of 16).
@@ -343,30 +412,21 @@ impl Backend {
     /// slot, i8 weights bind their scales.
     pub fn gemm(
         &mut self,
-        pass: &mut wgpu::ComputePass<'_>,
+        pass: &mut Pass<'_>,
         x: Binding<'_>,
         w: &Weight,
         y: Binding<'_>,
         rows: u32,
     ) -> Result<()> {
-        assert_eq!(w.t.shape.len(), 2, "gemm weight must be a [N, K] matrix");
-        let (n, k) = (w.t.shape[0], w.t.shape[1]);
-        let wdtype = match w.t.dtype {
-            DType::Bf16Packed => 0.0,
-            DType::I8 => 1.0,
-            DType::F32 | DType::U32 => {
-                unreachable!("gemm operands are weights, never index tensors")
-            }
-        };
+        let (n, k, wb, wdtype) = Self::weight_io(w);
         let consts = [
             ("N", n as f64),
             ("K", k as f64),
             ("WDTYPE", wdtype),
-            ("GROUP", w.group as f64),
+            ("GROUP", w.group() as f64),
         ];
         let span = self.prof_begin(pass);
-        let wb = Binding::Full(&w.t);
-        let scale = match &w.scale {
+        let scale = match w.scale() {
             Some(s) => Binding::Full(s),
             None => Binding::Full(&self.dummy_scale),
         };
@@ -375,51 +435,80 @@ impl Backend {
         let layout = self.kernels.bind_group_layout("gemm")?.clone();
         let bind_group = cached_bind_group(&mut self.bg_cache, &self.device, &layout, key, &bufs);
         let pipeline = self.kernels.pipeline(&self.device, "gemm", &consts)?;
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.dispatch_workgroups(n / 16, rows / 16, 1);
+        pass.0.set_pipeline(pipeline);
+        pass.0.set_bind_group(0, bind_group, &[]);
+        // The streaming gemm covers 2 rows per workgroup (rows a multiple of 16).
+        pass.0.dispatch_workgroups(n / 16, rows / 2, 1);
         self.prof_end(pass, "gemm", span);
         Ok(())
     }
 
     /// y[n] = x[k] @ dequant(w)^T: the single-row (decode) fast path. Streams
     /// the weight matrix at near-peak bandwidth instead of the tiled matmul.
+    /// Narrow outputs (small N) split K across more workgroups and merge the
+    /// segment partials, so every output width saturates the GPU.
     pub fn gemv(
         &mut self,
-        pass: &mut wgpu::ComputePass<'_>,
+        pass: &mut Pass<'_>,
         x: Binding<'_>,
         w: &Weight,
         y: Binding<'_>,
     ) -> Result<()> {
-        assert_eq!(w.t.shape.len(), 2, "gemv weight must be a [N, K] matrix");
-        let (n, k) = (w.t.shape[0], w.t.shape[1]);
-        let wdtype = match w.t.dtype {
-            DType::Bf16Packed => 0.0,
-            DType::I8 => 1.0,
-            DType::F32 | DType::U32 => {
-                unreachable!("gemv operands are weights, never index tensors")
-            }
+        let (n, k, wb, wdtype) = Self::weight_io(w);
+        // K splits: measured bandwidth peaks at SEGS=4 for wide outputs and
+        // narrow short-K projections, and SEGS=2 for mid outputs (4096);
+        // every width gains workgroups, none loses more than the merge cost.
+        let segs: u32 = if n >= 8192 {
+            4
+        } else if n >= 4096 {
+            2
+        } else {
+            4
+        };
+        let span = self.prof_begin(pass);
+        let scale = match w.scale() {
+            Some(s) => Binding::Full(s),
+            None => Binding::Full(&self.dummy_scale),
         };
         let consts = [
             ("N", n as f64),
             ("K", k as f64),
             ("WDTYPE", wdtype),
-            ("GROUP", w.group as f64),
+            ("GROUP", w.group() as f64),
+            ("SEGS", segs as f64),
         ];
-        let span = self.prof_begin(pass);
-        let wb = Binding::Full(&w.t);
-        let scale = match &w.scale {
-            Some(s) => Binding::Full(s),
-            None => Binding::Full(&self.dummy_scale),
+        let out = if segs == 1 {
+            y
+        } else {
+            // gemv writes one row per segment: [SEGS, N] f32.
+            Binding::Slice(&self.gemv_partial, 0, n as u64 * 4 * segs as u64)
         };
-        let bufs = [x, wb, scale, y];
+        let bufs = [x, wb, scale, out];
         let key = BgKey::new("gemv", &bufs);
         let layout = self.kernels.bind_group_layout("gemv")?.clone();
         let bind_group = cached_bind_group(&mut self.bg_cache, &self.device, &layout, key, &bufs);
         let pipeline = self.kernels.pipeline(&self.device, "gemv", &consts)?;
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.dispatch_workgroups(n / 16, 1, 1);
+        pass.0.set_pipeline(pipeline);
+        pass.0.set_bind_group(0, bind_group, &[]);
+        pass.0.dispatch_workgroups(n / 16, segs, 1);
+        if segs > 1 {
+            let bufs = [
+                Binding::Slice(&self.gemv_partial, 0, n as u64 * 4 * segs as u64),
+                y,
+            ];
+            let key = BgKey::new("merge_gemv", &bufs);
+            let layout = self.kernels.bind_group_layout("merge_gemv")?.clone();
+            let bind_group =
+                cached_bind_group(&mut self.bg_cache, &self.device, &layout, key, &bufs);
+            let pipeline = self.kernels.pipeline(
+                &self.device,
+                "merge_gemv",
+                &[("N", n as f64), ("SEGS", segs as f64)],
+            )?;
+            pass.0.set_pipeline(pipeline);
+            pass.0.set_bind_group(0, bind_group, &[]);
+            pass.0.dispatch_workgroups(n / 16, 1, 1);
+        }
         self.prof_end(pass, "gemv", span);
         Ok(())
     }
@@ -429,32 +518,39 @@ impl Backend {
     }
 
     /// Writes a start timestamp around a dispatch when profiling is active.
-    fn prof_begin(&mut self, pass: &mut wgpu::ComputePass<'_>) -> Option<u32> {
-        self.profiler.as_mut().and_then(|p| p.begin(pass))
+    fn prof_begin(&mut self, pass: &mut Pass<'_>) -> Option<u32> {
+        self.profiler.as_mut().and_then(|p| p.begin(&mut pass.0))
     }
 
     /// Writes the matching end timestamp when profiling is active.
-    fn prof_end(
-        &mut self,
-        pass: &mut wgpu::ComputePass<'_>,
-        label: &'static str,
-        span: Option<u32>,
-    ) {
+    fn prof_end(&mut self, pass: &mut Pass<'_>, label: &'static str, span: Option<u32>) {
         if let Some(p) = self.profiler.as_mut() {
-            p.end(pass, label, span);
+            p.end(&mut pass.0, label, span);
         }
     }
 
     /// Resolves this frame's timestamps and folds them into the running totals.
     /// A no-op when profiling is disabled.
     pub fn flush_profile(&mut self) -> Result<()> {
-        if self.profiler.is_none() {
+        let Some(prof) = self.profiler.as_mut() else {
             return Ok(());
-        }
-        let mut enc = self.encoder();
-        self.profiler.as_mut().unwrap().resolve(&mut enc);
-        self.submit(enc);
-        self.profiler.as_mut().unwrap().accumulate(&self.device)
+        };
+        let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("step"),
+        });
+        prof.resolve(&mut enc);
+        self.queue.submit(Some(enc.finish()));
+        let pending = prof.pending();
+        let timestamps = if pending > 0 {
+            let bytes = map_read(&self.device, prof.read_buf())?;
+            bytes
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        prof.accumulate(&timestamps)
     }
 
     /// Whether GPU profiling is active.
@@ -469,46 +565,7 @@ impl Backend {
 
     /// Copy `count` f32 values from `offset` bytes of `src` into a fresh vec (blocks).
     pub fn read_f32(&self, src: &Buffer, offset: BufferAddress, count: usize) -> Result<Vec<f32>> {
-        let size = (count * 4) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut enc = self.encoder();
-        enc.copy_buffer_to_buffer(src, offset, &staging, 0, size);
-        self.submit(enc);
-
-        let (tx, rx) = mpsc::channel();
-        staging.slice(..).map_async(MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        loop {
-            match rx.try_recv() {
-                Ok(result) => {
-                    result.map_err(|e| Error::Gpu(format!("readback mapping failed: {e}")))?;
-                    break;
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.device
-                        .poll(PollType::Wait {
-                            submission_index: None,
-                            timeout: None,
-                        })
-                        .map_err(|e| Error::Gpu(format!("device poll failed: {e}")))?;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err(Error::Gpu("readback channel closed".into()));
-                }
-            }
-        }
-        let bytes = staging
-            .slice(..)
-            .get_mapped_range()
-            .map_err(|e| Error::Gpu(format!("readback map failed: {e}")))?
-            .to_vec();
-        staging.unmap();
+        let bytes = read_back(&self.device, &self.queue, src, offset, count * 4)?;
         Ok(bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -516,15 +573,60 @@ impl Backend {
     }
 }
 
-fn bytemuck_cast(data: &[impl NoUninit]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
+/// Maps `len` bytes of `src` at `offset` via a staging buffer and blocks
+/// until they are ready (the wgpu map path is inherently asynchronous).
+fn read_back(
+    device: &Device,
+    queue: &Queue,
+    src: &Buffer,
+    offset: BufferAddress,
+    len: usize,
+) -> Result<Vec<u8>> {
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: len as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("readback"),
+    });
+    enc.copy_buffer_to_buffer(src, offset, &staging, 0, len as u64);
+    queue.submit(Some(enc.finish()));
+    map_read(device, &staging)
 }
 
-/// Marker allowing bytemuck_cast for f32/u32 without an extra dependency.
-///
-/// # Safety
-/// Implementors must be plain-data types whose any bit pattern is valid and
-/// whose layout has no padding, so byte reinterpretation is sound.
-pub unsafe trait NoUninit {}
-unsafe impl NoUninit for f32 {}
-unsafe impl NoUninit for u32 {}
+/// Maps a MAP_READ buffer directly and blocks for the result. The profiler's
+/// readback buffer is already mapable, so it skips the staging copy.
+fn map_read(device: &Device, buf: &Buffer) -> Result<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    buf.slice(..).map_async(MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    loop {
+        match rx.try_recv() {
+            Ok(result) => {
+                result.map_err(|e| Error::Gpu(format!("readback mapping failed: {e}")))?;
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                device
+                    .poll(PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    })
+                    .map_err(|e| Error::Gpu(format!("device poll failed: {e}")))?;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(Error::Gpu("readback channel closed".into()));
+            }
+        }
+    }
+    let bytes = buf
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|e| Error::Gpu(format!("readback map failed: {e}")))?
+        .to_vec();
+    buf.unmap();
+    Ok(bytes)
+}

@@ -1,6 +1,6 @@
 //! GGUF container reader: header, metadata KV, tensor-info table and on-demand
 //! tensor dequantization. Format mechanics only — architecture-specific name
-//! mapping and config synthesis live in `flint-archs`.
+//! mapping and config synthesis live in `flint-architectures`.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -110,10 +110,6 @@ impl Metadata {
                 .collect(),
             _ => None,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.kv.is_empty()
     }
 }
 
@@ -330,4 +326,236 @@ impl Reader<'_> {
 
 fn align_up(v: usize, a: usize) -> usize {
     v + (a - v % a) % a
+}
+
+// ================================================================ writing
+
+/// GGUF serializer: metadata KV table plus tensor payload, the exact inverse
+/// of [`Gguf::open`]. Tensors are written f32, packed bf16 or Q8_0; offsets
+/// and alignment follow the reader's expectations exactly, so a written file
+/// round-trips through [`Gguf::open`] unchanged.
+pub struct GgufWriter {
+    kvs: Vec<(String, MetaVal)>,
+    tensors: Vec<TensorSpec>,
+    alignment: usize,
+}
+
+struct TensorSpec {
+    name: String,
+    ty: GgmlType,
+    /// Fastest-first dims, as ggml stores them.
+    shape: Vec<u32>,
+    data: Vec<u8>,
+}
+
+impl GgufWriter {
+    pub fn new(alignment: u32) -> Self {
+        Self {
+            kvs: Vec::new(),
+            tensors: Vec::new(),
+            alignment: alignment as usize,
+        }
+    }
+
+    pub fn kv_str(&mut self, key: &str, value: &str) {
+        self.kvs
+            .push((key.to_string(), MetaVal::Str(value.to_string())));
+    }
+
+    pub fn kv_u32(&mut self, key: &str, value: u32) {
+        self.kvs
+            .push((key.to_string(), MetaVal::UInt(value as u64)));
+    }
+
+    pub fn kv_f32(&mut self, key: &str, value: f32) {
+        self.kvs
+            .push((key.to_string(), MetaVal::Float(value as f64)));
+    }
+
+    pub fn kv_bool(&mut self, key: &str, value: bool) {
+        self.kvs.push((key.to_string(), MetaVal::Bool(value)));
+    }
+
+    pub fn kv_str_array(&mut self, key: &str, value: &[impl AsRef<str>]) {
+        self.kvs.push((
+            key.to_string(),
+            MetaVal::Arr(
+                value
+                    .iter()
+                    .map(|s| MetaVal::Str(s.as_ref().to_string()))
+                    .collect(),
+            ),
+        ));
+    }
+
+    pub fn kv_u32_array(&mut self, key: &str, value: &[u32]) {
+        self.kvs.push((
+            key.to_string(),
+            MetaVal::Arr(value.iter().map(|v| MetaVal::UInt(*v as u64)).collect()),
+        ));
+    }
+
+    pub fn kv_f64_array(&mut self, key: &str, value: &[f64]) {
+        self.kvs.push((
+            key.to_string(),
+            MetaVal::Arr(value.iter().map(|v| MetaVal::Float(*v)).collect()),
+        ));
+    }
+
+    pub fn tensor_f32(&mut self, name: &str, shape: &[u32], data: &[f32]) {
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for v in data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        self.tensors.push(TensorSpec {
+            name: name.to_string(),
+            ty: GgmlType::F32,
+            shape: shape.to_vec(),
+            data: bytes,
+        });
+    }
+
+    /// Stores f32 values as packed bf16, two bytes per element.
+    pub fn tensor_bf16(&mut self, name: &str, shape: &[u32], data: &[f32]) {
+        let mut bytes = Vec::with_capacity(data.len() * 2);
+        for v in data {
+            bytes.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        self.tensors.push(TensorSpec {
+            name: name.to_string(),
+            ty: GgmlType::Bf16,
+            shape: shape.to_vec(),
+            data: bytes,
+        });
+    }
+
+    /// Quantizes f32 values to ggml Q8_0 blocks (half d + 32 i8). The element
+    /// count must be a multiple of 32.
+    pub fn tensor_q8_0(&mut self, name: &str, shape: &[u32], data: &[f32]) {
+        assert!(
+            data.len().is_multiple_of(32),
+            "Q8_0 requires a multiple of 32 elements, got {}",
+            data.len()
+        );
+        let mut bytes = Vec::with_capacity(data.len() / 32 * 34);
+        for block in data.chunks_exact(32) {
+            let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let d = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+            bytes.extend_from_slice(&dequant::f32_to_f16(d).to_le_bytes());
+            for v in block {
+                bytes.push(((v / d).round().clamp(-127.0, 127.0) as i8) as u8);
+            }
+        }
+        self.tensors.push(TensorSpec {
+            name: name.to_string(),
+            ty: GgmlType::Q8_0,
+            shape: shape.to_vec(),
+            data: bytes,
+        });
+    }
+
+    /// Serializes header, metadata, tensor table and aligned payload.
+    pub fn finish(self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC.to_le_bytes());
+        out.extend_from_slice(&3u32.to_le_bytes()); // version
+        out.extend_from_slice(&(self.tensors.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(self.kvs.len() as u64).to_le_bytes());
+
+        for (key, val) in &self.kvs {
+            write_str(&mut out, key);
+            write_value(&mut out, val);
+        }
+
+        // Tensor info records; each ends with an offset slot written as zero
+        // now and patched once the payload layout is known.
+        let header_end = out.len();
+        let rec_len = |t: &TensorSpec| 8 + t.name.len() + 4 + t.shape.len() * 8 + 4 + 8;
+        for t in &self.tensors {
+            write_str(&mut out, &t.name);
+            out.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());
+            // ggml stores dims fastest-first; the reader reverses them back
+            // to Flint's [N, K] convention, so write the reverse here.
+            for d in t.shape.iter().rev() {
+                out.extend_from_slice(&(*d as u64).to_le_bytes());
+            }
+            out.extend_from_slice(&(t.ty as u32).to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes());
+        }
+
+        // Align the payload start, then lay out each tensor at its own
+        // alignment boundary, patching offsets as we go.
+        let mut pos = align_up(out.len(), self.alignment);
+        let mut cursor = 0usize;
+        let mut rec_off = 0usize;
+        for t in &self.tensors {
+            cursor = align_up(cursor, self.alignment);
+            let rel = cursor;
+            cursor += t.data.len();
+            let slot = header_end + rec_off + rec_len(t) - 8;
+            out[slot..slot + 8].copy_from_slice(&(rel as u64).to_le_bytes());
+            out.extend(std::iter::repeat_n(0u8, pos - out.len()));
+            out.extend_from_slice(&t.data);
+            pos = align_up(out.len(), self.alignment);
+            rec_off += rec_len(t);
+        }
+        out
+    }
+}
+
+fn write_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Writes a metadata value including its type tag.
+fn write_value(out: &mut Vec<u8>, v: &MetaVal) {
+    match v {
+        MetaVal::UInt(n) => {
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&(*n as u32).to_le_bytes());
+        }
+        MetaVal::Int(i) => {
+            out.extend_from_slice(&5u32.to_le_bytes());
+            out.extend_from_slice(&(*i as i32).to_le_bytes());
+        }
+        MetaVal::Float(f) => {
+            out.extend_from_slice(&6u32.to_le_bytes());
+            out.extend_from_slice(&(*f as f32).to_le_bytes());
+        }
+        MetaVal::Bool(b) => {
+            out.extend_from_slice(&7u32.to_le_bytes());
+            out.push(*b as u8);
+        }
+        MetaVal::Str(s) => {
+            out.extend_from_slice(&8u32.to_le_bytes());
+            write_str(out, s);
+        }
+        MetaVal::Arr(items) => {
+            out.extend_from_slice(&9u32.to_le_bytes());
+            let et = match items.first() {
+                Some(MetaVal::UInt(_)) => 4u32,
+                Some(MetaVal::Int(_)) => 5,
+                Some(MetaVal::Float(_)) => 6,
+                Some(MetaVal::Str(_)) => 8,
+                other => panic!("cannot infer array element type from {other:?}"),
+            };
+            out.extend_from_slice(&et.to_le_bytes());
+            out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            for it in items {
+                write_value_typed(out, it);
+            }
+        }
+    }
+}
+
+/// Writes an array element whose type tag was already emitted.
+fn write_value_typed(out: &mut Vec<u8>, v: &MetaVal) {
+    match v {
+        MetaVal::UInt(n) => out.extend_from_slice(&(*n as u32).to_le_bytes()),
+        MetaVal::Int(i) => out.extend_from_slice(&(*i as i32).to_le_bytes()),
+        MetaVal::Float(f) => out.extend_from_slice(&(*f as f32).to_le_bytes()),
+        MetaVal::Str(s) => write_str(out, s),
+        other => panic!("unsupported array element {other:?}"),
+    }
 }

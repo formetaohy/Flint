@@ -6,7 +6,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
-use safetensors::tensor::{Dtype, SafeTensors};
+use safetensors::serialize;
+use safetensors::tensor::{Dtype, SafeTensors, TensorView};
 
 use flint_error::{Error, Result};
 
@@ -17,6 +18,7 @@ use super::{Checkpoint, RawTensor, TensorData};
 pub struct Safetensors {
     dir: PathBuf,
     weight_map: HashMap<String, String>,
+    meta: Metadata,
 }
 
 impl Safetensors {
@@ -46,6 +48,7 @@ impl Safetensors {
         Ok(Self {
             dir: dir.to_path_buf(),
             weight_map: index.weight_map,
+            meta: Metadata::default(),
         })
     }
 }
@@ -85,8 +88,7 @@ impl Checkpoint for Safetensors {
     }
 
     fn metadata(&self) -> &Metadata {
-        static EMPTY: std::sync::OnceLock<Metadata> = std::sync::OnceLock::new();
-        EMPTY.get_or_init(Metadata::default)
+        &self.meta
     }
 
     fn config_json(&self) -> Result<Option<serde_json::Value>> {
@@ -114,6 +116,25 @@ fn shard_tensor_names(path: &Path) -> Result<Vec<String>> {
     let tables =
         SafeTensors::deserialize(&mmap).map_err(|e| Error::Model(format!("parse: {e}")))?;
     Ok(tables.tensors().into_iter().map(|(n, _)| n).collect())
+}
+
+/// Writes tensors as a single-shard `model.safetensors` file. Each entry is
+/// `(native name, shape, little-endian bytes)`; `bf16` selects the BF16 dtype
+/// (two bytes per element), anything else is F32.
+pub fn write_tensors(path: &Path, tensors: &[(String, Vec<u32>, Vec<u8>, bool)]) -> Result<()> {
+    let mut views = Vec::with_capacity(tensors.len());
+    for (name, shape, data, bf16) in tensors {
+        let dtype = if *bf16 { Dtype::BF16 } else { Dtype::F32 };
+        let shape: Vec<usize> = shape.iter().map(|d| *d as usize).collect();
+        let view = TensorView::new(dtype, shape, data)
+            .map_err(|e| Error::Model(format!("{name}: {e}")))?;
+        views.push((name.clone(), view));
+    }
+    let bytes =
+        serialize(views, None).map_err(|e| Error::Model(format!("serialize safetensors: {e}")))?;
+    std::fs::write(path, bytes)
+        .map_err(|e| Error::Model(format!("write {}: {e}", path.display())))?;
+    Ok(())
 }
 
 fn f32_bytes(data: &[u8]) -> &[f32] {

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use flint_archs::gguf_key;
+use flint_architectures::gguf_key;
 use flint_checkpoint::{Checkpoint, MetaVal, Metadata, RawTensor};
 use serde_json::json;
 
@@ -138,7 +138,7 @@ fn llama_synthesis_reads_metadata_and_tensor_names() {
             "blk.0.attn_q_norm.weight",
         ],
     );
-    let cfg = flint_archs::synthesize_config(&src, flint_archs::ArchKind::Llama).unwrap();
+    let cfg = flint_architectures::synthesize_config(&src, flint_architectures::Family::Llama).unwrap();
     assert_eq!(
         cfg,
         json!({
@@ -178,7 +178,7 @@ fn gemma_synthesis_adds_end_of_turn_to_eos() {
         ],
         &["token_embd.weight"], // no output.weight -> tied
     );
-    let cfg = flint_archs::synthesize_config(&src, flint_archs::ArchKind::Gemma).unwrap();
+    let cfg = flint_architectures::synthesize_config(&src, flint_architectures::Family::Gemma).unwrap();
     assert_eq!(cfg["model_type"], json!("gemma3"));
     assert_eq!(cfg["hidden_size"], json!(1152));
     assert_eq!(cfg["head_dim"], json!(288), "derived as hidden / heads");
@@ -200,11 +200,11 @@ fn gemma_synthesis_adds_end_of_turn_to_eos() {
 fn synthesis_fails_fast() {
     let src = FakeSource::new("llama", vec![], &[]);
     assert!(
-        flint_archs::synthesize_config(&src, flint_archs::ArchKind::Llama).is_err(),
+        flint_architectures::synthesize_config(&src, flint_architectures::Family::Llama).is_err(),
         "missing embedding_length"
     );
     assert!(
-        flint_archs::synthesize_config(&src, flint_archs::ArchKind::Qwen35).is_err(),
+        flint_architectures::synthesize_config(&src, flint_architectures::Family::Qwen35).is_err(),
         "Qwen3.5 has no GGUF form"
     );
 }

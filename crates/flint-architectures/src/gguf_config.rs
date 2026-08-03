@@ -7,7 +7,7 @@ use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
 use serde_json::{Value, json};
 
-use crate::ArchKind;
+use crate::Family;
 
 /// Maps a GGUF tensor name to its canonical registry key, or None to skip.
 pub fn gguf_key(name: &str) -> Option<String> {
@@ -45,17 +45,20 @@ pub fn gguf_key(name: &str) -> Option<String> {
 }
 
 /// Builds the config the target architecture's parser expects.
-pub fn synthesize_config(source: &dyn Checkpoint, kind: ArchKind) -> Result<Value> {
-    match kind {
-        ArchKind::Llama => llama_config(source),
-        ArchKind::Gemma => gemma_config(source),
-        ArchKind::Qwen35 => Err(Error::Config(
+pub fn synthesize_config(source: &dyn Checkpoint, family: Family) -> Result<Value> {
+    match family {
+        Family::Llama => dense_config(source, false),
+        Family::Gemma => dense_config(source, true),
+        Family::Qwen35 => Err(Error::Config(
             "Qwen3.5 ships no GGUF (hybrid Gated DeltaNet is not a ggml architecture)".into(),
         )),
     }
 }
 
-fn llama_config(source: &dyn Checkpoint) -> Result<Value> {
+/// Synthesizes the config for a dense-GQA family (Llama or Gemma). Gemma adds
+/// the sliding-window fields and terminates on <end_of_turn>; Llama detects
+/// QKV biases and QK-norm from the layer-0 tensor names.
+fn dense_config(source: &dyn Checkpoint, gemma: bool) -> Result<Value> {
     let m = source.metadata();
     let arch = m
         .str("general.architecture")
@@ -89,16 +92,9 @@ fn llama_config(source: &dyn Checkpoint) -> Result<Value> {
     // Tied embeddings: checkpoints without a separate output projection reuse
     // the token embedding table as the logits head.
     let tied = !source.names().iter().any(|n| n == "output.weight");
-    // Q/K/V biases: present in Qwen2 small models and Phi.
-    let bias = source.names().iter().any(|n| n == "blk.0.attn_q.bias");
-    // QK-norm: present in Qwen3 (per-head RMSNorm weights on Q and K).
-    let qk_norm = source
-        .names()
-        .iter()
-        .any(|n| n == "blk.0.attn_q_norm.weight");
 
-    Ok(json!({
-        "model_type": "llama",
+    let mut cfg = json!({
+        "model_type": if gemma { "gemma3" } else { "llama" },
         "hidden_size": hidden,
         "num_attention_heads": heads,
         "num_key_value_heads": kv,
@@ -109,70 +105,33 @@ fn llama_config(source: &dyn Checkpoint) -> Result<Value> {
         "rope_theta": rope_theta,
         "eos_token_id": eos,
         "tie_word_embeddings": tied,
-        "attention_bias": bias,
-        "qk_norm": qk_norm,
-    }))
-}
+    });
 
-/// Synthesizes a Gemma 3 text config. Gemma layers apply sandwich norms
-/// (post_attention_norm / post_ffw_norm) and alternate local sliding-window
-/// attention with global attention every `sliding_window_pattern` layers.
-fn gemma_config(source: &dyn Checkpoint) -> Result<Value> {
-    let m = source.metadata();
-    let arch = m
-        .str("general.architecture")
-        .ok_or_else(|| Error::Config("GGUF missing general.architecture".into()))?;
-    let key = |k: &str| format!("{arch}.{k}");
-    let req = |k: &str| -> Result<u32> {
-        m.u32(&key(k))
-            .ok_or_else(|| Error::Config(format!("GGUF metadata missing {}", key(k))))
-    };
-
-    let hidden = req("embedding_length")?;
-    let heads = req("attention.head_count")?;
-    let kv = m.u32(&key("attention.head_count_kv")).unwrap_or(heads);
-    let head_dim = m
-        .u32(&key("attention.key_length"))
-        .unwrap_or(hidden / heads);
-    let intermediate = req("feed_forward_length")?;
-    let layers = req("block_count")?;
-    let rope_theta = m.f64(&key("rope.freq_base")).unwrap_or(10000.0);
-    let sliding_window = m.u32(&key("attention.sliding_window")).unwrap_or(0);
-    let sliding_window_pattern = m.u32(&key("attention.sliding_window_pattern")).unwrap_or(6);
-
-    let vocab = m
-        .u32(&key("vocab_size"))
-        .or_else(|| m.str_array("tokenizer.ggml.tokens").map(|t| t.len() as u32))
-        .ok_or_else(|| Error::Config("GGUF has no vocab size".into()))?;
-
-    let mut eos = Vec::new();
-    if let Some(id) = m.u32("tokenizer.ggml.eos_token_id") {
-        eos.push(id);
+    if gemma {
+        let sliding_window = m.u32(&key("attention.sliding_window")).unwrap_or(0);
+        let sliding_window_pattern = m.u32(&key("attention.sliding_window_pattern")).unwrap_or(6);
+        cfg["sliding_window"] = json!(sliding_window);
+        cfg["sliding_window_pattern"] = json!(sliding_window_pattern);
+        // Gemma also terminates on the <end_of_turn> marker when chatting.
+        if let Some(id) = m.str_array("tokenizer.ggml.tokens").and_then(|t| {
+            t.iter()
+                .position(|s| *s == "<end_of_turn>")
+                .map(|i| i as u32)
+        }) && !eos.contains(&id)
+        {
+            cfg["eos_token_id"] = json!([eos.as_slice(), &[id]].concat());
+        }
+    } else {
+        // Q/K/V biases: present in Qwen2 small models and Phi.
+        let bias = source.names().iter().any(|n| n == "blk.0.attn_q.bias");
+        // QK-norm: present in Qwen3 (per-head RMSNorm weights on Q and K).
+        let qk_norm = source
+            .names()
+            .iter()
+            .any(|n| n == "blk.0.attn_q_norm.weight");
+        cfg["attention_bias"] = json!(bias);
+        cfg["qk_norm"] = json!(qk_norm);
     }
-    // Gemma also terminates on the <end_of_turn> marker when chatting.
-    if let Some(id) = m.str_array("tokenizer.ggml.tokens").and_then(|t| {
-        t.iter()
-            .position(|s| *s == "<end_of_turn>")
-            .map(|i| i as u32)
-    }) && !eos.contains(&id)
-    {
-        eos.push(id);
-    }
-    let tied = !source.names().iter().any(|n| n == "output.weight");
 
-    Ok(json!({
-        "model_type": "gemma3",
-        "hidden_size": hidden,
-        "num_attention_heads": heads,
-        "num_key_value_heads": kv,
-        "head_dim": head_dim,
-        "intermediate_size": intermediate,
-        "num_hidden_layers": layers,
-        "vocab_size": vocab,
-        "rope_theta": rope_theta,
-        "sliding_window": sliding_window,
-        "sliding_window_pattern": sliding_window_pattern,
-        "eos_token_id": eos,
-        "tie_word_embeddings": tied,
-    }))
+    Ok(cfg)
 }
