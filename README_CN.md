@@ -5,10 +5,11 @@
 <h3 align="center">Flint</h3>
 
 <p align="center">
-  <strong>跨平台、高性能的本地大模型推理引擎。<br>纯 Rust 编写，全平台运行，无需 CUDA。</strong>
+  <strong>高性能、跨平台的 LLM 推理引擎</strong>
 </p>
 
 <p align="center">
+  <a href="https://github.com/formetaohy/Flint/actions/workflows/ci.yml"><img src="https://github.com/formetaohy/Flint/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://github.com/formetaohy/Flint/stargazers"><img src="https://img.shields.io/github/stars/formetaohy/Flint?style=flat-square&color=yellow" alt="Stars" /></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/language-Rust-dea584?style=flat-square&logo=rust" alt="Rust" /></a>
   <a href="https://github.com/formetaohy/Flint/blob/main/LICENSE"><img src="https://img.shields.io/github/license/formetaohy/Flint?style=flat-square&color=blue" alt="License" /></a>
@@ -26,7 +27,7 @@ Flint 是用纯 Rust 编写、基于 [WGPU](https://github.com/gfx-rs/wgpu) 的�
 
 - **跨平台** —— 基于 WGPU 开发，可运行于所有支持的平台。
 - **高性能** —— 高度优化的、基于 WGSL 的推理核心。
-- **广泛兼容** —— 支持 `safetensors` 与量化 `GGUF` 格式。
+- **多格式支持** —— 支持加载 `safetensors` 与量化 `GGUF` 模型。
 
 ## 支持的架构
 

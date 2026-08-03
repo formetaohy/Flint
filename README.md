@@ -5,10 +5,11 @@
 <h3 align="center"><strong>Flint</strong></h3>
 
 <p align="center">
-  <strong>A general, fast LLM inference engine.<br>Built in Rust. Runs everywhere, no CUDA required.</strong>
+  <strong>Fast, cross-platform LLM inference engine.</strong>
 </p>
 
 <p align="center">
+  <a href="https://github.com/formetaohy/Flint/actions/workflows/ci.yml"><img src="https://github.com/formetaohy/Flint/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://github.com/formetaohy/Flint/stargazers"><img src="https://img.shields.io/github/stars/formetaohy/Flint?style=flat-square&color=yellow" alt="Stars" /></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/language-Rust-dea584?style=flat-square&logo=rust" alt="Rust" /></a>
   <a href="https://github.com/formetaohy/Flint/blob/main/LICENSE"><img src="https://img.shields.io/github/license/formetaohy/Flint?style=flat-square&color=blue" alt="License" /></a>
@@ -26,7 +27,7 @@ Flint is a local LLM inference engine written in pure Rust on [WGPU](https://git
 
 - **Cross-platform** — Built on WGPU; runs on every platform. 
 - **Fast** — Highly optimized WGSL-based inference core.
-- **Broadly compatible** — Supports `safetensors` and quantized `GGUF` formats.
+- **Multi-format** — Loads `safetensors` and quantized `GGUF` models.
 
 ## Supported Architectures
 
