@@ -1,10 +1,9 @@
 //! Pluggable checkpoint formats. A [`Checkpoint`] exposes native tensor
 //! names, CPU-decoded tensor bytes and (for self-describing formats)
-//! metadata. New formats implement [`Checkpoint`]; [`open`] picks one from a
-//! model directory.
+//! metadata; [`open`] picks one from a model directory.
 //!
-//! The checkpoint layer owns only container mechanics. Architecture-specific
-//! tensor naming and config synthesis live in `flint-architectures`.
+//! The checkpoint layer owns only container mechanics; tensor naming and
+//! config synthesis live in `flint-architectures`.
 
 pub mod dequant;
 pub mod gguf;
@@ -75,7 +74,7 @@ fn find_gguf(model_dir: &Path) -> Result<Option<std::path::PathBuf>> {
         .collect();
     match found.len() {
         0 => Ok(None),
-        1 => Ok(Some(found.pop().unwrap())),
+        1 => Ok(Some(found.remove(0))),
         _ => Err(Error::Model(format!(
             "multiple .gguf shards in {} — merge into one file",
             model_dir.display()

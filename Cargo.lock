@@ -547,6 +547,8 @@ dependencies = [
  "flint-backend",
  "flint-error",
  "flint-generate",
+ "flint-model",
+ "flint-tensor",
 ]
 
 [[package]]

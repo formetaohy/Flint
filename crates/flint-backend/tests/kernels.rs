@@ -1,7 +1,7 @@
 //! Kernel conformance. Every kernel runs on the WGPU backend and must match
 //! the CPU reference (`flint_kernel::cpu`) on identical inputs; the anchor
-//! tests at the bottom pin the CPU reference itself to hand-computed math, so
-//! the two backends cannot silently agree on wrong results.
+//! tests at the bottom pin the CPU reference to hand-computed math, so the
+//! two backends cannot silently agree on wrong results.
 
 use flint_backend::{Backend, Binding, Pass};
 use flint_kernel::cpu;
@@ -42,10 +42,13 @@ impl Ctx {
         self.backend.zero_bf16_tensor(shape, "z")
     }
 
-    /// One-u32 step-args buffer holding a position, for rope/kv_store/attn.
-    fn arg(&self, pos: usize) -> Tensor {
-        let t = Tensor::new(self.backend.storage(4, "args"), vec![1], DType::U32);
-        self.backend.write_u32(&t.buf, &[pos as u32]);
+    /// Step-args buffer: [position, effective attention segments]; rope,
+    /// kv_store and attn read it so the position stays out of the pipeline
+    /// constants.
+    fn arg(&self, pos: usize, kv_len: usize) -> Tensor {
+        let segs = kv_len.div_ceil(32).clamp(1, 32);
+        let t = Tensor::new(self.backend.storage(8, "args"), vec![2], DType::U32);
+        self.backend.write_u32(&t.buf, &[pos as u32, segs as u32]);
         t
     }
 
@@ -127,10 +130,12 @@ fn agree(gpu: &[f32], cpu: &[f32], rel: f32, abs: f32) {
     }
 }
 
-/// Group absmax quantization, written independently of `flint_model::loader`
-/// (which cannot be depended on here) so it also cross-checks the loader math.
+/// Group absmax quantization in the production block-major layout
+/// [cols/16, rows, 16]: every 16-byte vec4 of a column's k range is
+/// contiguous. Written independently of `flint_model::loader` (which cannot
+/// be depended on here) so it also cross-checks the loader math.
 fn quant(data: &[f32], rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f32>) {
-    let mut bytes = Vec::new();
+    let mut row_major = Vec::new();
     let mut scales = Vec::new();
     for r in 0..rows {
         for g in 0..cols / group {
@@ -139,23 +144,33 @@ fn quant(data: &[f32], rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<
             let scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
             scales.push(scale);
             for v in block {
-                bytes.push((v / scale).round().clamp(-127.0, 127.0) as i8 as u8);
+                row_major.push((v / scale).round().clamp(-127.0, 127.0) as i8 as u8);
+            }
+        }
+    }
+    let mut bytes = vec![0u8; rows * cols];
+    for kb in 0..cols / 16 {
+        for r in 0..rows {
+            for i in 0..16 {
+                bytes[(kb * rows + r) * 16 + i] = row_major[r * cols + kb * 16 + i];
             }
         }
     }
     (bytes, scales)
 }
 
-fn dequant(bytes: &[u8], scales: &[f32], cols: usize, group: usize) -> Vec<f32> {
-    bytes
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| {
-            let row = i / cols;
-            let g = (i % cols) / group;
-            (b as i8) as f32 * scales[row * (cols / group) + g]
-        })
-        .collect()
+fn dequant(bytes: &[u8], scales: &[f32], rows: usize, cols: usize, group: usize) -> Vec<f32> {
+    let mut out = vec![0f32; rows * cols];
+    for kb in 0..cols / 16 {
+        for r in 0..rows {
+            for i in 0..16 {
+                let byte = bytes[(kb * rows + r) * 16 + i];
+                let g = (kb * 16) / group;
+                out[r * cols + kb * 16 + i] = (byte as i8) as f32 * scales[r * (cols / group) + g];
+            }
+        }
+    }
+    out
 }
 
 // ================================================================ gemm
@@ -183,7 +198,7 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
         }
         WType::I8(group) => {
             let (wq, scales) = quant(&w, n, k, group);
-            let cpu_w = dequant(&wq, &scales, k, group);
+            let cpu_w = dequant(&wq, &scales, n, k, group);
             let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32], "wq");
             let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
             (wb, sb, 1.0, group as f64, cpu_w, 1e-4, 1e-3)
@@ -197,6 +212,10 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
             ("K", k as f64),
             ("WDTYPE", wdtype),
             ("GROUP", group),
+            ("ROWS_G", 16.0),
+            ("ACC", 0.0),
+            ("Y_STRIDE", n as f64),
+            ("Y_OFF", 0.0),
         ],
         &[
             Binding::Full(&xb),
@@ -204,7 +223,7 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
             Binding::Full(&sb),
             Binding::Full(&y),
         ],
-        [(n / 16) as u32, (m / 2) as u32, 1],
+        [(n / 16) as u32, m.div_ceil(16) as u32, 1],
     );
     agree(&ctx.read(&y), &cpu::gemm(&x, &cpu_w, m, n, k), rel, abs);
 }
@@ -257,7 +276,7 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
         }
         WType::I8(group) => {
             let (wq, scales) = quant(&w, n, k, group);
-            let cpu_w = dequant(&wq, &scales, k, group);
+            let cpu_w = dequant(&wq, &scales, n, k, group);
             let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32], "wq");
             let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
             (wb, sb, 1.0, group as f64, cpu_w, 1e-4, 1e-3)
@@ -277,14 +296,20 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
             ("WDTYPE", wdtype),
             ("GROUP", group),
             ("SEGS", segs as f64),
+            ("ACC", 0.0),
         ],
-        &[Binding::Full(&xb), Binding::Full(&wb), Binding::Full(&sb), out],
+        &[
+            Binding::Full(&xb),
+            Binding::Full(&wb),
+            Binding::Full(&sb),
+            out,
+        ],
         [(n / 16) as u32, segs, 1],
     );
     if segs > 1 {
         ctx.dispatch(
             "merge_gemv",
-            &[("N", n as f64), ("SEGS", segs as f64)],
+            &[("N", n as f64), ("SEGS", segs as f64), ("ACC", 0.0)],
             &[
                 Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64),
                 Binding::Full(&y),
@@ -339,14 +364,14 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
         DType::F32,
     );
     ctx.backend.write_u32(&ib.buf, &ids);
-    let y = ctx.zero(&[16 as u32, dim as u32]);
+    let y = ctx.zero(&[16u32, dim as u32]);
     let fallback = ctx.f32(&[1.0], &[1]);
     let w = Weight::plain(tb);
 
     ctx.dispatch(
         "embed",
         &[
-            ("ROWS", 16.0),
+            ("M", rows as f64),
             ("DIM", dim as f64),
             ("SCALE", scale as f64),
             ("WDTYPE", 0.0),
@@ -358,7 +383,7 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
             Binding::Full(&fallback),
             Binding::Full(&y),
         ],
-        [1, 1, 1],
+        [(rows * dim).div_ceil(256) as u32, 1, 1],
     );
     let got = ctx.read(&y);
     agree(
@@ -399,12 +424,24 @@ fn norm_case(mode: u32, rows: usize, dim: usize, w_dim: usize, seed: u64) {
             ("DIM", dim as f64),
             ("W_DIM", w_dim as f64),
             ("EPS", 1e-6),
+            ("HEADS", 1.0),
+            ("ROT", 2.0),
+            ("COS_STRIDE", 1.0),
         ],
+        // Scalar and vec4 views of the same buffers; the unused RoPE slots
+        // (8-10) bind the gate.
         &[
             Binding::Full(&xb),
             Binding::Full(&wb),
             Binding::Full(&zb),
             Binding::Full(&y),
+            Binding::Full(&xb),
+            Binding::Full(&wb),
+            Binding::Full(&zb),
+            Binding::Full(&y),
+            Binding::Full(&zb),
+            Binding::Full(&zb),
+            Binding::Full(&zb),
         ],
         [rows as u32, 1, 1],
     );
@@ -547,7 +584,7 @@ fn mul_broadcast() {
     let a = rng.fill(n);
     let b = rng.fill(4);
     let ab = ctx.f32(&a, &[n as u32]);
-    let bb = ctx.f32(&b, &[4 as u32]);
+    let bb = ctx.f32(&b, &[4u32]);
     let y = ctx.zero(&[n as u32]);
 
     ctx.dispatch(
@@ -568,16 +605,16 @@ fn expert_gather_scatter() {
     let x = rng.fill(4 * hidden);
     let rows: Vec<u32> = vec![1, 3, 0, 2];
     let weights = [0.5f32, 1.5, 2.5, 3.5];
-    let xb = ctx.f32(&x, &[4 as u32, hidden as u32]);
-    let rb = Tensor::new(ctx.backend.storage(16, "rb"), vec![4], DType::U32);
+    let xb = ctx.f32(&x, &[4u32, hidden as u32]);
+    let rb = Tensor::new(ctx.backend.storage(16, "rb"), vec![4u32], DType::U32);
     ctx.backend.write_u32(&rb.buf, &rows);
-    let wb = ctx.f32(&weights, &[4 as u32]);
-    let packed = ctx.zero(&[16 as u32, hidden as u32]);
-    let acc = ctx.zero(&[4 as u32, hidden as u32]);
+    let wb = ctx.f32(&weights, &[4u32]);
+    let packed = ctx.zero(&[16u32, hidden as u32]);
+    let acc = ctx.zero(&[4u32, hidden as u32]);
 
     ctx.dispatch(
         "expert_gather",
-        &[("ROWS", 16.0), ("HIDDEN", hidden as f64), ("COUNT", 4.0)],
+        &[("HIDDEN", hidden as f64), ("COUNT", 4.0)],
         &[
             Binding::Full(&xb),
             Binding::Slice(&rb, 0, 16),
@@ -587,11 +624,7 @@ fn expert_gather_scatter() {
     );
     ctx.dispatch(
         "expert_scatter",
-        &[
-            ("ROWS", 16.0),
-            ("HIDDEN", hidden as f64),
-            ("COUNT", 4.0),
-        ],
+        &[("HIDDEN", hidden as f64), ("COUNT", 4.0)],
         &[
             Binding::Full(&acc),
             Binding::Full(&packed),
@@ -610,7 +643,7 @@ fn expert_gather_scatter() {
 fn zero_rows() {
     let mut ctx = Ctx::new();
     let x = vec![1.0f32, 2.0, 3.0, 4.0];
-    let xb = ctx.f32(&x, &[4 as u32]);
+    let xb = ctx.f32(&x, &[4u32]);
     ctx.dispatch(
         "zero_rows",
         &[("N_ELEM", 3.0)],
@@ -684,7 +717,7 @@ fn rope_case(m: usize, heads: usize, hd: usize, rot: usize, pos: usize, seed: u6
     let xb = ctx.f32(&x, &[m as u32, heads as u32, hd as u32]);
     let cb = ctx.f32(&cos, &[max_seq as u32, half as u32]);
     let sb = ctx.f32(&sin, &[max_seq as u32, half as u32]);
-    let args = ctx.arg(pos);
+    let args = ctx.arg(pos, pos + m);
 
     ctx.dispatch(
         "rope",
@@ -1019,7 +1052,7 @@ fn attn_case(
     let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
     let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
     let scratch = ctx.zero(&[m as u32, nkv as u32, 32, 8, hd as u32 + 2]);
-    let args = ctx.arg(pos);
+    let args = ctx.arg(pos, pos + m);
 
     ctx.dispatch(
         "attn",
@@ -1050,7 +1083,11 @@ fn attn_case(
             ("HEAD_DIM", hd as f64),
             ("STRIDE", (hd as u32 + 2) as f64),
         ],
-        &[Binding::Full(&scratch), Binding::Full(&y)],
+        &[
+            Binding::Full(&scratch),
+            Binding::Full(&y),
+            Binding::Full(&args),
+        ],
         [m as u32, nkv as u32, 1],
     );
     agree(
@@ -1131,14 +1168,17 @@ fn split_qg() {
 }
 
 #[test]
-fn kv_store_multi_row() {
+fn kv_store_writes_both_caches() {
     let mut ctx = Ctx::new();
     let (m, nkv, hd, max_seq, pos) = (3usize, 2usize, 4usize, 8usize, 3usize);
     let mut rng = Rng(111);
-    let src = rng.fill(m * nkv * hd);
-    let sb = ctx.f32(&src, &[m as u32, nkv as u32, hd as u32]);
-    let cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
-    let args = ctx.arg(pos);
+    let k_src = rng.fill(m * nkv * hd);
+    let v_src = rng.fill(m * nkv * hd);
+    let kb = ctx.f32(&k_src, &[m as u32, nkv as u32, hd as u32]);
+    let vb = ctx.f32(&v_src, &[m as u32, nkv as u32, hd as u32]);
+    let k_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
+    let v_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
+    let args = ctx.arg(pos, pos + m);
 
     ctx.dispatch(
         "kv_store",
@@ -1148,15 +1188,20 @@ fn kv_store_multi_row() {
             ("MAX_SEQ", max_seq as f64),
         ],
         &[
-            Binding::Full(&sb),
-            Binding::Full(&cache),
+            Binding::Full(&kb),
+            Binding::Full(&vb),
+            Binding::Full(&k_cache),
+            Binding::Full(&v_cache),
             Binding::Full(&args),
         ],
         [1, m as u32, 1],
     );
-    let mut cpu_cache = vec![0f32; nkv * max_seq * hd];
-    cpu::kv_store(&src, &mut cpu_cache, m, nkv, hd, max_seq, pos);
-    agree(&ctx.read_bf16(&cache), &cpu_cache, 0.0, 1e-7);
+    let mut cpu_k = vec![0f32; nkv * max_seq * hd];
+    let mut cpu_v = vec![0f32; nkv * max_seq * hd];
+    cpu::kv_store(&k_src, &mut cpu_k, m, nkv, hd, max_seq, pos);
+    cpu::kv_store(&v_src, &mut cpu_v, m, nkv, hd, max_seq, pos);
+    agree(&ctx.read_bf16(&k_cache), &cpu_k, 0.0, 1e-7);
+    agree(&ctx.read_bf16(&v_cache), &cpu_v, 0.0, 1e-7);
 }
 
 // ================================================================ anchors
@@ -1338,6 +1383,3 @@ fn anchor_delta_recur_two_steps() {
     assert!((out[0] - 1.0 / r2).abs() < 1e-5);
     assert!((out[1] - 1.0 / r2).abs() < 1e-5);
 }
-
-
-

@@ -1,16 +1,14 @@
 // Split-K fused GQA attention: one workgroup per (query row m, kv head g,
-// segment s). The KV range of each (m, g) is split into SEGS segments so
-// decode (m == 1) fans out over the whole GPU instead of idling 40 SMs on
-// 8 workgroups. Each workgroup computes the exact partial softmax statistics
-// (max, sum) and the unnormalized output of its segment and writes them to
-// the scratch buffer; `merge_attn` combines the SEGS partials.
+// segment s). The KV range of each (m, g) splits into SEGS segments so
+// decode (m == 1) fans out over the whole GPU. Each workgroup computes the
+// exact partial softmax statistics (max, sum) and unnormalized output of
+// its segment; `merge_attn` combines the SEGS partials.
 //
-// Within a segment, the K and V tiles are staged in workgroup memory and
-// shared by the NQ_PER_KV query heads of this kv head (GQA batching).
-// HEAD_DIM in [64, 512]; NQ_PER_KV in [1, 8]. 512 threads = 8 head slots
-// x 64 key slots; heads beyond NQ_PER_KV idle (their barriers still sync).
-// Tiles are staged in 128-dim halves so the workgroup storage stays at
-// 32 KiB regardless of HEAD_DIM.
+// K/V tiles are staged in workgroup memory and shared by the NQ_PER_KV
+// query heads of this kv head (GQA batching). HEAD_DIM in [64, 512];
+// NQ_PER_KV in [1, 8]. 512 threads = 8 head slots x 64 key slots; heads
+// beyond NQ_PER_KV idle (their barriers still sync). Tiles are staged in
+// 128-dim halves so workgroup storage stays at 32 KiB regardless of HEAD_DIM.
 
 override N_HEADS: u32 = 1u;
 override KV_HEADS: u32 = 1u;
@@ -83,9 +81,15 @@ fn stage_v(e: u32, key: u32, d2: u32, limit: u32, c0: u32, plane: u32, half: u32
 @compute @workgroup_size(512)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let pos = args[0];
+    // Effective split: short prefixes use fewer segments so workgroups own
+    // a useful key range instead of 1-2 keys; the merge reads args[1] too.
+    let segs = min(SEGS, max(1u, args[1]));
     let m = wg.x;
     let kvh = wg.y;
     let seg = wg.z;
+    if (seg >= segs) {
+        return;
+    }
     let qpos = pos + m;
     let kv_len = qpos + 1u;
     var win_start = 0u;
@@ -93,7 +97,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         win_start = kv_len - WINDOW;
     }
     // This workgroup's key range: [seg * seg_len, min((seg+1) * seg_len, kv_len)).
-    let seg_len = (kv_len + SEGS - 1u) / SEGS;
+    let seg_len = (kv_len + segs - 1u) / segs;
     let seg_lo = seg * seg_len;
     let seg_hi = min(seg_lo + seg_len, kv_len);
     let q0 = (m * N_HEADS + kvh * NQ_PER_KV) * HEAD_DIM;

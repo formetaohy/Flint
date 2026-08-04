@@ -5,8 +5,8 @@
 
 use std::path::PathBuf;
 
-use safetensors::tensor::{Dtype, TensorView};
 use safetensors::serialize;
+use safetensors::tensor::{Dtype, TensorView};
 
 use flint_checkpoint::{Checkpoint, Safetensors, write_tensors};
 
@@ -157,7 +157,10 @@ fn fail_fast_paths() {
     )
     .unwrap();
     let st = Safetensors::open(&dir).unwrap();
-    assert!(err_str(st.read("a")).contains("missing shard"), "missing shard");
+    assert!(
+        err_str(st.read("a")).contains("missing shard"),
+        "missing shard"
+    );
 
     // Unsupported dtype (F64 is never produced by Flint writers).
     let view = TensorView::new(Dtype::F64, vec![2], &[0u8; 16]).unwrap();

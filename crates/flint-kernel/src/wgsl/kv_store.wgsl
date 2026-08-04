@@ -1,14 +1,15 @@
-// cache[h, POS + m, d] = bf16(src[(m * N_KV + h) * HEAD_DIM + d])
-// The cache stores packed bf16 (two values per u32); each thread writes one
-// u32 (a consecutive d pair) so no two threads touch the same word.
+// K/V cache store: writes both projections into their caches in one
+// dispatch (packed bf16, two values per u32).
 
 override N_KV: u32 = 1u;
 override HEAD_DIM: u32 = 1u;
 override MAX_SEQ: u32 = 1u;
 
-@group(0) @binding(0) var<storage, read> src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> cache: array<u32>;
-@group(0) @binding(2) var<storage, read> args: array<u32>;
+@group(0) @binding(0) var<storage, read> k_src: array<f32>;
+@group(0) @binding(1) var<storage, read> v_src: array<f32>;
+@group(0) @binding(2) var<storage, read_write> k_cache: array<u32>;
+@group(0) @binding(3) var<storage, read_write> v_cache: array<u32>;
+@group(0) @binding(4) var<storage, read> args: array<u32>;
 
 fn bf16bits(v: f32) -> u32 {
     return bitcast<u32>(v) >> 16;
@@ -26,8 +27,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(global_invocation_id) g: 
     let h = i / half_dim;
     let d2 = i % half_dim;
     let s_base = (m * N_KV + h) * HEAD_DIM + d2 * 2u;
-    let lo = bf16bits(src[s_base]);
-    let hi = bf16bits(src[s_base + 1u]);
     let c_base = (h * MAX_SEQ + pos + m) * half_dim + d2;
-    cache[c_base] = lo | (hi << 16);
+
+    let k_lo = bf16bits(k_src[s_base]);
+    let k_hi = bf16bits(k_src[s_base + 1u]);
+    k_cache[c_base] = k_lo | (k_hi << 16);
+    let v_lo = bf16bits(v_src[s_base]);
+    let v_hi = bf16bits(v_src[s_base + 1u]);
+    v_cache[c_base] = v_lo | (v_hi << 16);
 }

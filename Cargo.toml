@@ -45,3 +45,7 @@ flint-error.workspace = true
 flint-generate.workspace = true
 clap.workspace = true
 env_logger.workspace = true
+
+[dev-dependencies]
+flint-model.workspace = true
+flint-tensor.workspace = true

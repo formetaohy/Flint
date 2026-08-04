@@ -11,12 +11,12 @@ use flint_backend::Backend;
 use flint_checkpoint::{MetaVal, Metadata};
 use flint_error::Result;
 use flint_generate::{Engine, GenStats, Sampler};
-use flint_model::{ChunkOut, LanguageModel, ROWS};
+use flint_model::{ChunkOut, LanguageModel, M_MAX};
 use flint_tokenizer::Tokenizer;
 
 const VOCAB: u32 = 32;
 const EOS: u32 = 31; // last id, outside the plain-token cycle
-const MAX_SEQ: u32 = 128;
+const MAX_SEQ: u32 = 512;
 
 /// The adapter is a single shared, memory-limited resource: serialize GPU work.
 static GPU: Mutex<()> = Mutex::new(());
@@ -62,10 +62,13 @@ impl LanguageModel for FakeModel {
         hidden_rows: &[u32],
     ) -> Result<ChunkOut> {
         let m = tokens.len() as u32;
-        assert!(m > 0 && m <= ROWS, "chunk size {m} outside [1, {ROWS}]");
+        assert!(m > 0 && m <= M_MAX, "chunk size {m} outside [1, {M_MAX}]");
         assert!(self.pos + m <= MAX_SEQ, "context overflow");
         let base = self.pos;
-        let logits = logit_rows.iter().map(|&r| self.logits_for(base + r)).collect();
+        let logits = logit_rows
+            .iter()
+            .map(|&r| self.logits_for(base + r))
+            .collect();
         let hidden = hidden_rows
             .iter()
             .map(|&r| vec![(base + r) as f32; 4])
@@ -97,10 +100,7 @@ fn tokenizer() -> Tokenizer {
     let tokens: Vec<String> = (0..VOCAB).map(|i| format!("t{i}")).collect();
     let scores: Vec<f64> = (0..VOCAB).map(|i| -(i as f64) - 1.0).collect();
     let mut kv = HashMap::new();
-    kv.insert(
-        "tokenizer.ggml.model".into(),
-        MetaVal::Str("llama".into()),
-    );
+    kv.insert("tokenizer.ggml.model".into(), MetaVal::Str("llama".into()));
     kv.insert(
         "tokenizer.ggml.tokens".into(),
         MetaVal::Arr(tokens.iter().map(|t| MetaVal::Str(t.clone())).collect()),
@@ -117,11 +117,7 @@ fn tokenizer() -> Tokenizer {
 /// eos prediction k decoded positions past the prefill (0 = the very first
 /// pending token is eos). The prompt's true encoded length is measured, not
 /// assumed, because the unigram tokenizer folds spaces/unknowns into ids.
-fn run(
-    prompt: &str,
-    max_tokens: usize,
-    eos_after: Option<u32>,
-) -> (Vec<u32>, GenStats, u32) {
+fn run(prompt: &str, max_tokens: usize, eos_after: Option<u32>) -> (Vec<u32>, GenStats, u32) {
     let _g = gpu();
     let backend = Backend::new().unwrap();
     let tok = tokenizer();
@@ -175,7 +171,11 @@ fn token_budget_terminates_without_eos() {
     let (tokens, stats, n) = run("t0", 5, None);
     assert_eq!(tokens.len(), 5, "budget caps the stream");
     assert_eq!(stats.decode_tokens, 5);
-    assert_eq!(tokens[0], ((n - 1) * 7 + 3) % (VOCAB - 1), "deterministic script");
+    assert_eq!(
+        tokens[0],
+        ((n - 1) * 7 + 3) % (VOCAB - 1),
+        "deterministic script"
+    );
 }
 
 #[test]
@@ -205,11 +205,14 @@ fn multi_turn_reset_reproduces_output() {
 
 #[test]
 fn stats_account_prefill_and_decode() {
-    // 40 space-separated words encode to well over ROWS tokens, forcing
+    // 200 space-separated words encode to well over M_MAX tokens, forcing
     // chunked prefill; the count is measured from the same tokenizer.
-    let prompt = (0..40).map(|i| format!("t{}", i % 31)).collect::<Vec<_>>().join(" ");
+    let prompt = (0..200)
+        .map(|i| format!("t{}", i % 31))
+        .collect::<Vec<_>>()
+        .join(" ");
     let n = tokenizer().encode(&prompt).unwrap().len();
-    assert!(n > ROWS as usize, "prompt must span prefill chunks");
+    assert!(n > M_MAX as usize, "prompt must span prefill chunks");
     let (tokens, stats, _) = run(&prompt, 8, None);
     assert_eq!(stats.prefill_tokens, n, "all prompt tokens counted");
     assert_eq!(stats.decode_tokens, 8);

@@ -4,7 +4,7 @@
 //           [vocab, DIM/GROUP] (large embedding tables halve their footprint).
 // SCALE is 1.0 for most models; Gemma scales its input embeddings by sqrt(dim).
 
-override ROWS: u32 = 1u;
+override M: u32 = 1u;
 override DIM: u32 = 1u;
 override SCALE: f32 = 1.0;
 override WDTYPE: u32 = 0u;
@@ -22,7 +22,7 @@ fn bf16f(bits: u32) -> f32 {
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     let i = g.x;
-    if (i >= ROWS * DIM) {
+    if (i >= M * DIM) {
         return;
     }
     let row = ids[i / DIM];

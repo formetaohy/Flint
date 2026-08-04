@@ -15,12 +15,33 @@ override EPS: f32 = 1e-6;
 @group(0) @binding(2) var<storage, read> gate: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 
+// The same buffers viewed as vec4 lanes (16B-aligned; every normalized dim
+// is a multiple of 4).
+@group(0) @binding(4) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> w4v: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> g4: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> y4: array<vec4<f32>>;
+// RoPE tables and step args (MODE 4 only).
+@group(0) @binding(8) var<storage, read> cos_tbl: array<f32>;
+@group(0) @binding(9) var<storage, read> sin_tbl: array<f32>;
+@group(0) @binding(10) var<storage, read> args: array<u32>;
+
+override HEADS: u32 = 1u;
+override ROT: u32 = 1u;
+override COS_STRIDE: u32 = 1u;
+
 var<workgroup> red: array<f32, 256>;
 // Mean accumulator, used by layer mode only.
 var<workgroup> mean: array<f32, 256>;
+// Norm+rope staging (MODE 4): the normalized row before rotation.
+var<workgroup> tile: array<f32, 520>;
 
 fn silu(v: f32) -> f32 {
     return v / (1.0 + exp(-v));
+}
+
+fn silu4(v: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(silu(v.x), silu(v.y), silu(v.z), silu(v.w));
 }
 
 @compute @workgroup_size(256)
@@ -28,20 +49,31 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let row = wg.x;
     let base = row * DIM;
     let t = lid.x;
+    let vbase = base / 4u;
+    let vdim = DIM / 4u;
 
     var s = 0.0;
     var m = 0.0;
     var i = t;
     loop {
-        if (i >= DIM) {
+        if (i >= vdim) {
             break;
         }
-        let v = x[base + i];
+        let xv = x4[vbase + i];
+        s += dot(xv, xv);
+        if (MODE == 3u) {
+            m += xv.x + xv.y + xv.z + xv.w;
+        }
+        i += 256u;
+    }
+    let tail = DIM % 4u;
+    if (t < tail) {
+        let e = base + vdim * 4u + t;
+        let v = x[e];
         s += v * v;
         if (MODE == 3u) {
             m += v;
         }
-        i += 256u;
     }
     red[t] = s;
     if (MODE == 3u) {
@@ -73,28 +105,88 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     } else {
         inv = inverseSqrt(red[0] / f32(DIM) + EPS);
     }
+    if (MODE == 4u) {
+        // Norm+rope: write the normalized row to shared memory, then apply
+        // the partial rotation (the rotation crosses element pairs).
+        i = t;
+        loop {
+            if (i >= vdim) {
+                break;
+            }
+            let xv = x4[vbase + i];
+            let v = (xv - vec4(center)) * inv * w4v[i];
+            tile[i * 4u] = v.x;
+            tile[i * 4u + 1u] = v.y;
+            tile[i * 4u + 2u] = v.z;
+            tile[i * 4u + 3u] = v.w;
+            i += 256u;
+        }
+        if (t < tail) {
+            let e = base + vdim * 4u + t;
+            tile[vdim * 4u + t] = (x[e] - center) * inv * w[e];
+        }
+        workgroupBarrier();
+        let pos_m = args[0] + row / HEADS;
+        let half = ROT >> 1;
+        if (t < DIM) {
+            let cc = cos_tbl[pos_m * COS_STRIDE + t % half];
+            let ss = sin_tbl[pos_m * COS_STRIDE + t % half];
+            var rv: f32;
+            if (t < ROT) {
+                if (t < half) {
+                    rv = tile[t] * cc - tile[t + half] * ss;
+                } else {
+                    rv = tile[t] * cc + tile[t - half] * ss;
+                }
+            } else {
+                rv = tile[t];
+            }
+            y[base + t] = rv;
+        }
+        return;
+    }
     i = t;
     loop {
-        if (i >= DIM) {
+        if (i >= vdim) {
             break;
         }
-        var v = (x[base + i] - center) * inv;
+        let xv = x4[vbase + i];
+        var v = (xv - vec4(center)) * inv;
         switch MODE {
             case 0u: {
-                v *= 1.0 + w[i];
+                v *= vec4(1.0) + w4v[i];
             }
             case 1u: {
-                v *= w[i % W_DIM] * silu(gate[base + i]);
+                let wdim4 = max(W_DIM / 4u, 1u);
+                v *= w4v[i % wdim4] * silu4(g4[vbase + i]);
             }
             case 3u: {
-                // Layer-norm bias: a [DIM] vector broadcast across rows.
-                v = v * w[i] + gate[i];
+                v = v * w4v[i] + g4[i];
             }
             default: {
-                v *= w[i];
+                v *= w4v[i];
             }
         }
-        y[base + i] = v;
+        y4[vbase + i] = v;
         i += 256u;
+    }
+    if (t < tail) {
+        let e = base + vdim * 4u + t;
+        var v = (x[e] - center) * inv;
+        switch MODE {
+            case 0u: {
+                v *= 1.0 + w[e];
+            }
+            case 1u: {
+                v *= w[e % W_DIM] * silu(gate[e]);
+            }
+            case 3u: {
+                v = v * w[e] + gate[e];
+            }
+            default: {
+                v *= w[e];
+            }
+        }
+        y[e] = v;
     }
 }

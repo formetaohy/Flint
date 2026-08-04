@@ -1,17 +1,13 @@
 //! GPU timestamp profiling for Flint's compute kernels.
 //!
-//! Brackets every dispatch with two GPU timestamp queries and accumulates
-//! per-shader totals across frames, so a handful of generated tokens yield a
-//! stable breakdown of where GPU time actually goes. The profiler is only ever
-//! constructed when profiling is requested; otherwise the dispatch fast path
-//! is untouched. Timestamp readback is owned by the backend, which resolves,
-//! maps and hands the raw values back to [`GpuProfiler::accumulate`].
+//! Brackets every dispatch with two timestamp queries and accumulates
+//! per-shader totals across frames. Constructed only when profiling is
+//! requested; readback is owned by the backend, which hands raw values to
+//! [`GpuProfiler::accumulate`].
 
 use std::collections::HashMap;
 
-use wgpu::{
-    Buffer, BufferUsages, CommandEncoder, ComputePass, Device, QuerySet, QueryType, Queue,
-};
+use wgpu::{Buffer, BufferUsages, CommandEncoder, ComputePass, Device, QuerySet, QueryType, Queue};
 
 use flint_error::Result;
 
@@ -30,8 +26,7 @@ struct Span {
 }
 
 /// Times dispatches on the GPU via timestamp queries and accumulates
-/// per-shader totals. Frame state (query cursor + spans) resets on each
-/// `accumulate`; totals persist for the session.
+/// per-shader totals. Frame state resets on each `accumulate`; totals persist.
 pub struct GpuProfiler {
     set: QuerySet,
     resolve_buf: Buffer,
@@ -75,8 +70,8 @@ impl GpuProfiler {
         }
     }
 
-    /// Writes a start timestamp and returns its query slot, or `None` once the
-    /// frame's query budget is exhausted (the dispatch still runs, untimed).
+    /// Writes a start timestamp and returns its query slot, or `None` once
+    /// the frame's query budget is exhausted (the dispatch still runs).
     pub fn begin(&mut self, pass: &mut ComputePass) -> Option<u32> {
         if self.next + 2 > self.capacity {
             return None;
@@ -166,4 +161,3 @@ impl GpuProfiler {
         rows
     }
 }
-

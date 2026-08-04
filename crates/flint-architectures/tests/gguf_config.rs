@@ -138,7 +138,8 @@ fn llama_synthesis_reads_metadata_and_tensor_names() {
             "blk.0.attn_q_norm.weight",
         ],
     );
-    let cfg = flint_architectures::synthesize_config(&src, flint_architectures::Family::Llama).unwrap();
+    let cfg =
+        flint_architectures::synthesize_config(&src, flint_architectures::Family::Llama).unwrap();
     assert_eq!(
         cfg,
         json!({
@@ -178,7 +179,8 @@ fn gemma_synthesis_adds_end_of_turn_to_eos() {
         ],
         &["token_embd.weight"], // no output.weight -> tied
     );
-    let cfg = flint_architectures::synthesize_config(&src, flint_architectures::Family::Gemma).unwrap();
+    let cfg =
+        flint_architectures::synthesize_config(&src, flint_architectures::Family::Gemma).unwrap();
     assert_eq!(cfg["model_type"], json!("gemma3"));
     assert_eq!(cfg["hidden_size"], json!(1152));
     assert_eq!(cfg["head_dim"], json!(288), "derived as hidden / heads");

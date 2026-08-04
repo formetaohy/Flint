@@ -7,34 +7,10 @@
 use flint_backend::Backend;
 use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
-use flint_model::loader::Plan;
 use flint_model::ops::Act;
 use serde_json::Value;
 
 use crate::dense::{DenseConfig, DenseModel, PerLayerConfig, RopeSpec, dense_plan};
-
-/// HF safetensors names -> canonical keys. The model-level Per-Layer
-/// Embedding tensors get explicit names; `model.layers.{i}.{tail}` passes the
-/// tail through (the canonical suffixes match the HF names for this family).
-fn hf_key(name: &str) -> Option<String> {
-    let rest = name.strip_prefix("model.")?;
-    match rest {
-        "embed_tokens_per_layer.weight" | "per_layer_model_projection.weight"
-        | "per_layer_projection_norm.weight" => return Some(rest.to_string()),
-        "embed_tokens.weight" | "norm.weight" => return Some(rest.to_string()),
-        _ => {}
-    }
-    if name.starts_with("lm_head.") {
-        return Some(name.to_string());
-    }
-    let rest = rest.strip_prefix("layers.")?;
-    let (idx, tail) = rest.split_once('.')?;
-    Some(format!("layers.{idx}.{tail}"))
-}
-
-fn plan(gguf: bool) -> Plan {
-    dense_plan(gguf, hf_key)
-}
 
 /// Parses and validates a Gemma 4 text config (the `text_config` object of the
 /// multimodal wrapper, or a bare `gemma4_text` config).
@@ -65,10 +41,7 @@ pub fn parse_config(v: &Value) -> Result<DenseConfig> {
         .and_then(Value::as_u64)
         .unwrap_or(512) as u32;
     let sliding_hd = cfg.head_dims[0];
-    let window = t
-        .get("sliding_window")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+    let window = t.get("sliding_window").and_then(Value::as_u64).unwrap_or(0) as u32;
     let mut head_dims = Vec::with_capacity(cfg.layers as usize);
     let mut windows = Vec::with_capacity(cfg.layers as usize);
     let mut layer_rope = Vec::with_capacity(cfg.layers as usize);
@@ -85,9 +58,7 @@ pub fn parse_config(v: &Value) -> Result<DenseConfig> {
                 layer_rope.push(1);
             }
             other => {
-                return Err(Error::Config(format!(
-                    "unknown layer type {other:?}"
-                )));
+                return Err(Error::Config(format!("unknown layer type {other:?}")));
             }
         }
     }
@@ -132,21 +103,27 @@ pub fn parse_config(v: &Value) -> Result<DenseConfig> {
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
     // Double-wide MLPs on the KV-shared layers.
-    if t.get("use_double_wide_mlp").and_then(Value::as_bool).unwrap_or(false) {
-        cfg.double_wide = (0..cfg.layers)
-            .map(|l| l >= cfg.first_shared())
-            .collect();
+    if t.get("use_double_wide_mlp")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        cfg.double_wide = (0..cfg.layers).map(|l| l >= cfg.first_shared()).collect();
     }
     cfg.softcap = t
         .get("final_logit_softcapping")
         .and_then(Value::as_f64)
         .map(|c| c as f32);
-    if let Some(d) = t.get("hidden_size_per_layer_input").and_then(Value::as_u64) {
-        if d > 0 {
-            cfg.per_layer = Some(PerLayerConfig { dim: d as u32 });
-        }
+    if let Some(d) = t
+        .get("hidden_size_per_layer_input")
+        .and_then(Value::as_u64)
+        .filter(|&d| d > 0)
+    {
+        cfg.per_layer = Some(PerLayerConfig { dim: d as u32 });
     }
-    if t.get("enable_moe_block").and_then(Value::as_bool).unwrap_or(false) {
+    if t.get("enable_moe_block")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return Err(Error::Config(
             "Gemma 4 enable_moe_block (26B-A4B) is not supported".into(),
         ));
@@ -166,7 +143,7 @@ pub fn load(
     DenseModel::load(
         source,
         cfg,
-        &plan(source.kind() == "gguf"),
+        &dense_plan(source.kind() == "gguf"),
         max_seq,
         backend,
     )

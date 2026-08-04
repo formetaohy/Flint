@@ -1,8 +1,6 @@
 //! Format-agnostic tokenizer: text to token ids and back. Loads an HF
 //! `tokenizer.json` when present, otherwise rebuilds the tokenizer embedded in
-//! a GGUF checkpoint's metadata (supplied by the caller, so a checkpoint is
-//! only ever opened once). Knows nothing about model architectures or chat
-//! formats.
+//! a GGUF checkpoint's metadata. Knows nothing about architectures or chat.
 
 use std::path::Path;
 
@@ -40,8 +38,8 @@ pub struct Decoder {
 
 impl Tokenizer {
     /// Loads the tokenizer for a model directory plus its already-opened
-    /// checkpoint: `tokenizer.json` when present, otherwise the tokenizer
-    /// embedded in the GGUF checkpoint's metadata.
+    /// checkpoint: `tokenizer.json` when present, otherwise the embedded GGUF
+    /// tokenizer.
     pub fn load(model_dir: &Path, source: &dyn Checkpoint) -> Result<Self> {
         let path = model_dir.join("tokenizer.json");
         if path.exists() {
@@ -68,9 +66,9 @@ impl Tokenizer {
         Self::from_gguf(source.metadata())
     }
 
-    /// Rebuilds a tokenizer from GGUF metadata, dispatching on the SentencePiece
-    /// model kind: `llama` is a Unigram model, anything else a BPE model. Special
-    /// tokens keep their original ids in both paths.
+    /// Rebuilds a tokenizer from GGUF metadata, dispatching on the
+    /// SentencePiece model kind: `llama` is Unigram, anything else BPE.
+    /// Special tokens keep their original ids in both paths.
     pub fn from_gguf(meta: &Metadata) -> Result<Self> {
         match meta.str("tokenizer.ggml.model") {
             Some("llama") => Self::from_gguf_unigram(meta),
@@ -94,10 +92,12 @@ impl Tokenizer {
         let is_unused = |i: usize| matches!(types.get(i), Some(5));
 
         // Base vocab keeps each non-special, non-unused token at its original
-        // id. Unused tokens are dropped so the added special tokens land at the
-        // top of the vocab with their true ids. The unknown token stays: the
-        // BPE builder rejects an unk that is not in the vocab.
-        let unk_id = meta.u32("tokenizer.ggml.unknown_token_id").map(|i| i as usize);
+        // id; unused tokens are dropped so the added special tokens land at
+        // the top with their true ids. The unknown token stays: the BPE
+        // builder rejects an unk not in the vocab.
+        let unk_id = meta
+            .u32("tokenizer.ggml.unknown_token_id")
+            .map(|i| i as usize);
         let mut vocab = AHashMap::with_capacity(tokens.len());
         for (i, t) in tokens.iter().enumerate() {
             if (!is_added(i) && !is_unused(i)) || Some(i) == unk_id {

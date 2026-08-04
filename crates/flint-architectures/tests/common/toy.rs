@@ -6,8 +6,7 @@
 //!
 //! Structural invariants (chunked vs sequential prefill, speculative vs plain
 //! decoding, snapshot/restore, tokenizer round-trips) are weight-independent:
-//! they compare execution paths over identical inputs, not the quality of the
-//! output. Toy checkpoints exist precisely to exercise those paths on CI.
+//! they compare execution paths over identical inputs, not output quality.
 
 use std::path::Path;
 
@@ -207,7 +206,8 @@ fn gguf_name(key: &str) -> String {
             "per_layer_input_gate" => "inp_gate",
             "per_layer_projection" => "proj",
             "post_per_layer_input_norm" => "post_norm",
-            "layer_scalar" => "layer_output_scale",            "input_layernorm" => "attn_norm",
+            "layer_scalar" => "layer_output_scale",
+            "input_layernorm" => "attn_norm",
             "self_attn.q_proj" => "attn_q",
             "self_attn.k_proj" => "attn_k",
             "self_attn.v_proj" => "attn_v",
@@ -316,12 +316,7 @@ fn write_dense(spec: ToySpec, dir: &Path) -> Result<()> {
 
 /// Materializes a Qwen3.5 toy with the given linear-attention key/value head
 /// counts and embedding tying; the MTP draft head is always present.
-fn write_qwen35(
-    dir: &Path,
-    lin_key_heads: u32,
-    lin_val_heads: u32,
-    tied: bool,
-) -> Result<()> {
+fn write_qwen35(dir: &Path, lin_key_heads: u32, lin_val_heads: u32, tied: bool) -> Result<()> {
     let (lin_key, lin_val) = (8u32, 8u32);
     let key_dim = lin_key_heads * lin_key;
     let val_dim = lin_val_heads * lin_val;
@@ -442,8 +437,11 @@ fn write_qwen35(
     std::fs::create_dir_all(dir)
         .map_err(|e| Error::Model(format!("create {}: {e}", dir.display())))?;
     write_tensors(&dir.join("model.safetensors"), &files)?;
-    std::fs::write(dir.join("config.json"), qwen35_config(lin_key_heads, lin_val_heads, tied).to_string())
-        .map_err(|e| Error::Model(format!("write config.json: {e}")))?;
+    std::fs::write(
+        dir.join("config.json"),
+        qwen35_config(lin_key_heads, lin_val_heads, tied).to_string(),
+    )
+    .map_err(|e| Error::Model(format!("write config.json: {e}")))?;
     std::fs::write(dir.join("tokenizer.json"), tokenizer::tokenizer_json()?)
         .map_err(|e| Error::Model(format!("write tokenizer.json: {e}")))?;
     Ok(())
@@ -715,7 +713,11 @@ fn write_gemma4(dir: &Path) -> Result<()> {
     ];
     for l in 0..4u32 {
         let hd = if l % 2 == 0 { HEAD_DIM } else { FULL_HD };
-        let ffl = if l >= 2 { 2 * INTERMEDIATE } else { INTERMEDIATE };
+        let ffl = if l >= 2 {
+            2 * INTERMEDIATE
+        } else {
+            INTERMEDIATE
+        };
         let has_kv = l < 2;
         let p = format!("layers.{l}");
         all.push(f32w(format!("{p}.input_layernorm.weight"), &[HIDDEN]));
@@ -724,8 +726,14 @@ fn write_gemma4(dir: &Path) -> Result<()> {
             &[Q_HEADS * hd, HIDDEN],
         ));
         if has_kv {
-            all.push(proj(format!("{p}.self_attn.k_proj.weight"), &[KV_HEADS * hd, HIDDEN]));
-            all.push(proj(format!("{p}.self_attn.v_proj.weight"), &[KV_HEADS * hd, HIDDEN]));
+            all.push(proj(
+                format!("{p}.self_attn.k_proj.weight"),
+                &[KV_HEADS * hd, HIDDEN],
+            ));
+            all.push(proj(
+                format!("{p}.self_attn.v_proj.weight"),
+                &[KV_HEADS * hd, HIDDEN],
+            ));
         }
         all.push(proj(
             format!("{p}.self_attn.o_proj.weight"),
@@ -735,13 +743,25 @@ fn write_gemma4(dir: &Path) -> Result<()> {
         if has_kv {
             all.push(f32w(format!("{p}.self_attn.k_norm.weight"), &[hd]));
         }
-        all.push(f32w(format!("{p}.post_attention_layernorm.weight"), &[HIDDEN]));
+        all.push(f32w(
+            format!("{p}.post_attention_layernorm.weight"),
+            &[HIDDEN],
+        ));
         all.push(proj(format!("{p}.mlp.gate_proj.weight"), &[ffl, HIDDEN]));
         all.push(proj(format!("{p}.mlp.up_proj.weight"), &[ffl, HIDDEN]));
         all.push(proj(format!("{p}.mlp.down_proj.weight"), &[HIDDEN, ffl]));
-        all.push(proj(format!("{p}.per_layer_input_gate.weight"), &[PLE, HIDDEN]));
-        all.push(proj(format!("{p}.per_layer_projection.weight"), &[HIDDEN, PLE]));
-        all.push(f32w(format!("{p}.post_per_layer_input_norm.weight"), &[HIDDEN]));
+        all.push(proj(
+            format!("{p}.per_layer_input_gate.weight"),
+            &[PLE, HIDDEN],
+        ));
+        all.push(proj(
+            format!("{p}.per_layer_projection.weight"),
+            &[HIDDEN, PLE],
+        ));
+        all.push(f32w(
+            format!("{p}.post_per_layer_input_norm.weight"),
+            &[HIDDEN],
+        ));
         all.push(f32w(format!("{p}.layer_scalar"), &[1]));
     }
     write_gguf_tensors(&mut w, &mut rng, &all, dir)
@@ -760,12 +780,7 @@ fn write_gguf_tokenizer(w: &mut GgufWriter) {
 
 /// Writes GGUF tensors (proj roles quantized Q8_0; 3D expert tensors
 /// flattened per the writer's fastest-first dims) plus the tokenizer.
-fn write_gguf_tensors(
-    w: &mut GgufWriter,
-    rng: &mut Rng,
-    all: &[Canon],
-    dir: &Path,
-) -> Result<()> {
+fn write_gguf_tensors(w: &mut GgufWriter, rng: &mut Rng, all: &[Canon], dir: &Path) -> Result<()> {
     for c in all {
         let data = rng.fill(c.shape.iter().map(|d| *d as usize).product());
         match c.role {

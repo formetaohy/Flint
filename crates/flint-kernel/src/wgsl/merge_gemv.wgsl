@@ -4,6 +4,8 @@
 
 override N: u32 = 1u;
 override SEGS: u32 = 8u;
+// Accumulate into y instead of overwriting: y = y + result.
+override ACC: u32 = 0u;
 
 const BN: u32 = 16u;
 const SR: u32 = 33u;
@@ -35,6 +37,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         stride >>= 1u;
     }
     if (lane < BN) {
-        y[n0 + lane] = red[lane * SR];
+        y[n0 + lane] = red[lane * SR] + f32(ACC) * y[n0 + lane];
     }
 }

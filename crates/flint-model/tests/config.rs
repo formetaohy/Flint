@@ -42,15 +42,24 @@ fn u32_list_accepts_absent_single_and_array() {
 #[test]
 fn gemm_dims_must_tile_to_16() {
     assert!(check_gemm_dims(&[(16, 64), (256, 128), (49152, 960)]).is_ok());
-    assert!(check_gemm_dims(&[(15, 64)]).is_err(), "N must be a multiple of 16");
-    assert!(check_gemm_dims(&[(16, 32)]).is_err(), "K must be a multiple of 64");
+    assert!(
+        check_gemm_dims(&[(15, 64)]).is_err(),
+        "N must be a multiple of 16"
+    );
+    assert!(
+        check_gemm_dims(&[(16, 32)]).is_err(),
+        "K must be a multiple of 64"
+    );
 }
 
 #[test]
 fn head_dim_bounds() {
     assert!(check_head_dim(64).is_ok());
     assert!(check_head_dim(256).is_ok());
-    assert!(check_head_dim(512).is_ok(), "Gemma 4 global heads widen to 512");
+    assert!(
+        check_head_dim(512).is_ok(),
+        "Gemma 4 global heads widen to 512"
+    );
     assert!(check_head_dim(63).is_err());
     assert!(check_head_dim(513).is_err());
 }

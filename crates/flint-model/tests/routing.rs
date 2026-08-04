@@ -23,7 +23,14 @@ fn sparsemixer_masks_distant_experts() {
     let logits: Vec<f32> = vec![
         10.0, 9.9, 5.0, -5.0, 9.95, 9.98, 0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0, 9.0, 9.99,
     ];
-    let r = Routing::new(&logits, 1, 16, 2, RouteKind::SparseMixer { jitter: 0.01 }, 0.0);
+    let r = Routing::new(
+        &logits,
+        1,
+        16,
+        2,
+        RouteKind::SparseMixer { jitter: 0.01 },
+        0.0,
+    );
     let mut hits = Vec::new();
     for e in 0..16 {
         if r.count(e) > 0 {
@@ -31,7 +38,10 @@ fn sparsemixer_masks_distant_experts() {
         }
     }
     assert!(hits.contains(&0), "top-1 expert 0 selected");
-    assert!(hits.len() == 2, "exactly two experts selected, got {hits:?}");
+    assert!(
+        hits.len() == 2,
+        "exactly two experts selected, got {hits:?}"
+    );
     // Weights come from softmax over the near-max set: the runner-up's weight
     // is large (the masked-away experts do not dilute it).
     let max_w = r.weights.iter().cloned().fold(0.0f32, f32::max);

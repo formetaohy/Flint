@@ -7,21 +7,12 @@ use flint_error::{Error, Result};
 use flint_model::cache::{KvCache, RecurrentState};
 use flint_model::config::{check_gemm_dims, check_head_dim, f64_field, req, u32_field, u32_list};
 use flint_model::loader::{self, Plan, Role, SwigluMlp, WeightSet, take_mlp};
-use flint_model::ops::{self, Act, MlpTiles, NormMode, ROWS};
+use flint_model::ops::{self, Act, M_MAX, MlpTiles, NormMode};
 use flint_model::{ChunkOut, LanguageModel, Speculator};
 use flint_tensor::{Tensor, Weight};
 use serde_json::Value;
 
-/// HF safetensors names -> canonical keys (text tower prefix stripped).
-fn hf_key(name: &str) -> Option<String> {
-    if let Some(rest) = name.strip_prefix("model.language_model.") {
-        Some(rest.to_string())
-    } else if name.starts_with("mtp.") || name.starts_with("lm_head.") {
-        Some(name.to_string())
-    } else {
-        None
-    }
-}
+use crate::names::hf_key;
 
 const PLAN: Plan = Plan { key: hf_key, role };
 
@@ -185,7 +176,6 @@ impl Qwen35Config {
 
 // ---------------------------------------------------------------- weights
 
-/// SwiGLU MLP weights plus the norm that feeds it; see [`SwigluMlp`].
 /// Gated grouped full-attention layer (also used by the MTP head).
 struct FullLayerW {
     attn_norm: Tensor,
@@ -214,8 +204,7 @@ struct LinearLayerW {
 }
 
 /// One hybrid layer: weights plus the cache kind the layer type requires.
-/// Weight structs are boxed so the enum stays small and uniform; the box is
-/// allocated once at load and never touched by value afterwards.
+/// Weight structs are boxed so the enum stays small and uniform.
 enum Layer {
     Full {
         w: Box<FullLayerW>,
@@ -270,12 +259,10 @@ fn take_linear_layer(w: &mut WeightSet, p: &str) -> Result<Box<LinearLayerW>> {
 
 // ---------------------------------------------------------------- model
 
-/// Per-forward scratch tiles, all [ROWS, dim].
+/// Per-forward scratch tiles, all [M_MAX, dim].
 struct Scratch {
-    /// One-element f32 dummy for the embed op's unused scale binding.
-    ones: Tensor,
     ids: Tensor,
-    /// One-u32 step args holding the current position for rope/kv_store/attn.
+    /// Step args [pos, attn segments]; rope/kv_store/attn read it.
     args: Tensor,
     hidden: Tensor,
     hidden2: Tensor,
@@ -312,25 +299,24 @@ fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
     let i = cfg.intermediate;
     let z = |shape: &[u32], label: &str| backend.zero_tensor(shape, label);
     Scratch {
-        ones: backend.tensor_f32(&[1.0], vec![1], "ones"),
         ids: ops::token_ids(backend),
         args: ops::step_args(backend),
-        hidden: z(&[ROWS, h], "hidden"),
-        hidden2: z(&[ROWS, h], "hidden2"),
-        normed: z(&[ROWS, h], "normed"),
-        qkv_raw: z(&[ROWS, cfg.conv_dim()], "qkv_raw"),
-        convd: z(&[ROWS, cfg.conv_dim()], "convd"),
-        qk_exp: z(&[ROWS, cfg.qk_exp_dim()], "qk_exp"),
-        z: z(&[ROWS, cfg.value_dim()], "z"),
-        b: z(&[ROWS, cfg.lin_val_heads], "b"),
-        a: z(&[ROWS, cfg.lin_val_heads], "a"),
+        hidden: z(&[M_MAX, h], "hidden"),
+        hidden2: z(&[M_MAX, h], "hidden2"),
+        normed: z(&[M_MAX, h], "normed"),
+        qkv_raw: z(&[M_MAX, cfg.conv_dim()], "qkv_raw"),
+        convd: z(&[M_MAX, cfg.conv_dim()], "convd"),
+        qk_exp: z(&[M_MAX, cfg.qk_exp_dim()], "qk_exp"),
+        z: z(&[M_MAX, cfg.value_dim()], "z"),
+        b: z(&[M_MAX, cfg.lin_val_heads], "b"),
+        a: z(&[M_MAX, cfg.lin_val_heads], "a"),
         beta: z(&[cfg.lin_val_heads], "beta"),
         g: z(&[cfg.lin_val_heads], "g"),
-        attn_out: z(&[ROWS, cfg.value_dim()], "attn_out"),
-        attn_out2: z(&[ROWS, cfg.value_dim()], "attn_out2"),
+        attn_out: z(&[M_MAX, cfg.value_dim()], "attn_out"),
+        attn_out2: z(&[M_MAX, cfg.value_dim()], "attn_out2"),
         attn_scratch: z(
             &[
-                ROWS,
+                M_MAX,
                 cfg.kv_heads,
                 ops::ATTN_SEGS,
                 ops::MAX_GQA,
@@ -338,23 +324,23 @@ fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
             ],
             "attn_scratch",
         ),
-        qg: z(&[ROWS, cfg.q_heads * cfg.head_dim * 2], "qg"),
-        q: z(&[ROWS, cfg.q_heads * cfg.head_dim], "q"),
-        q2: z(&[ROWS, cfg.q_heads * cfg.head_dim], "q2"),
-        gate: z(&[ROWS, cfg.q_heads * cfg.head_dim], "gate"),
-        k1: z(&[ROWS, cfg.kv_heads * cfg.head_dim], "k1"),
-        k2: z(&[ROWS, cfg.kv_heads * cfg.head_dim], "k2"),
-        v1: z(&[ROWS, cfg.kv_heads * cfg.head_dim], "v1"),
+        qg: z(&[M_MAX, cfg.q_heads * cfg.head_dim * 2], "qg"),
+        q: z(&[M_MAX, cfg.q_heads * cfg.head_dim], "q"),
+        q2: z(&[M_MAX, cfg.q_heads * cfg.head_dim], "q2"),
+        gate: z(&[M_MAX, cfg.q_heads * cfg.head_dim], "gate"),
+        k1: z(&[M_MAX, cfg.kv_heads * cfg.head_dim], "k1"),
+        k2: z(&[M_MAX, cfg.kv_heads * cfg.head_dim], "k2"),
+        v1: z(&[M_MAX, cfg.kv_heads * cfg.head_dim], "v1"),
         mlp: MlpTiles {
-            gate_out: z(&[ROWS, i], "up1"),
-            up_out: z(&[ROWS, i], "up2"),
-            act: z(&[ROWS, i], "m1"),
-            y: z(&[ROWS, h], "m2"),
+            gate_out: z(&[M_MAX, i], "mlp_gate"),
+            up_out: z(&[M_MAX, i], "mlp_up"),
+            act: z(&[M_MAX, i], "mlp_act"),
+            down_out: z(&[M_MAX, h], "mlp_down"),
         },
-        logits: z(&[ROWS, cfg.vocab], "logits"),
-        mtp_e: z(&[ROWS, h], "mtp_e"),
-        mtp_h: z(&[ROWS, h], "mtp_h"),
-        mtp_cat: z(&[ROWS, 2 * h], "mtp_cat"),
+        logits: z(&[M_MAX, cfg.vocab], "logits"),
+        mtp_e: z(&[M_MAX, h], "mtp_e"),
+        mtp_h: z(&[M_MAX, h], "mtp_h"),
+        mtp_cat: z(&[M_MAX, 2 * h], "mtp_cat"),
     }
 }
 
@@ -468,7 +454,14 @@ impl Qwen35 {
         };
 
         let s = alloc_scratch(&cfg, backend);
-        let (cos, sin) = ops::rope_tables(backend, max_seq, cfg.rotary_dim(), cfg.rotary_dim(), cfg.rope_theta, None);
+        let (cos, sin) = ops::rope_tables(
+            backend,
+            max_seq,
+            cfg.rotary_dim(),
+            cfg.rotary_dim(),
+            cfg.rope_theta,
+            None,
+        );
         Ok(Self {
             cfg,
             max_seq,
@@ -497,8 +490,8 @@ impl LanguageModel for Qwen35 {
         hidden_rows: &[u32],
     ) -> Result<ChunkOut> {
         let m = tokens.len() as u32;
-        if m == 0 || m > ROWS {
-            return Err(Error::Model(format!("chunk size {m} outside [1, {ROWS}]")));
+        if m == 0 || m > M_MAX {
+            return Err(Error::Model(format!("chunk size {m} outside [1, {M_MAX}]")));
         }
         if self.pos + m > self.max_seq {
             return Err(Error::Model(format!(
@@ -506,10 +499,14 @@ impl LanguageModel for Qwen35 {
                 self.max_seq
             )));
         }
-        let mut ids = vec![0u32; ROWS as usize];
+        let mut ids = vec![0u32; M_MAX as usize];
         ids[..tokens.len()].copy_from_slice(tokens);
         backend.write_u32(&self.s.ids.buf, &ids);
-        backend.write_u32(&self.s.args.buf, &[self.pos]);
+        // args: [pos, effective attention segments]; short prefixes use fewer
+        // split-K segments (see the dense model's forward).
+        let kv_len = self.pos + m;
+        let attn_segs = kv_len.div_ceil(ops::ATTN_SEGS).clamp(1, ops::ATTN_SEGS);
+        backend.write_u32(&self.s.args.buf, &[self.pos, attn_segs]);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder();
@@ -521,8 +518,8 @@ impl LanguageModel for Qwen35 {
                 &mut pass,
                 &s.ids,
                 &self.embed,
-                &s.ones,
                 Binding::Full(&s.hidden),
+                m,
                 cfg.hidden,
                 1.0,
             )?;
@@ -546,7 +543,7 @@ impl LanguageModel for Qwen35 {
                 &self.norm,
                 Binding::Full(&s.hidden),
                 Binding::Full(&s.normed),
-                ROWS,
+                m,
                 cfg.hidden,
                 cfg.hidden,
                 1e-6,
@@ -621,10 +618,12 @@ impl Speculator for Qwen35 {
             )));
         }
 
-        let mut ids = vec![0u32; ROWS as usize];
+        let mut ids = vec![0u32; M_MAX as usize];
         ids[0] = token;
         backend.write_u32(&self.s.ids.buf, &ids);
-        backend.write_u32(&self.s.args.buf, &[self.mtp_pos]);
+        let kv_len = self.mtp_pos + 1;
+        let attn_segs = kv_len.div_ceil(ops::ATTN_SEGS).clamp(1, ops::ATTN_SEGS);
+        backend.write_u32(&self.s.args.buf, &[self.mtp_pos, attn_segs]);
         backend.write_f32(&self.s.mtp_h.buf, hidden);
 
         let cfg = &self.cfg;
@@ -637,8 +636,8 @@ impl Speculator for Qwen35 {
                 &mut pass,
                 &s.ids,
                 &self.embed,
-                &s.ones,
                 Binding::Full(&s.hidden),
+                1,
                 cfg.hidden,
                 1.0,
             )?;
@@ -650,7 +649,7 @@ impl Speculator for Qwen35 {
                 &mtp.pre_fc_norm_embedding,
                 Binding::Full(&s.hidden),
                 Binding::Full(&s.mtp_e),
-                ROWS,
+                1,
                 cfg.hidden,
                 cfg.hidden,
                 1e-6,
@@ -663,7 +662,7 @@ impl Speculator for Qwen35 {
                 &mtp.pre_fc_norm_hidden,
                 Binding::Full(&s.mtp_h),
                 Binding::Full(&s.normed),
-                ROWS,
+                1,
                 cfg.hidden,
                 cfg.hidden,
                 1e-6,
@@ -674,6 +673,7 @@ impl Speculator for Qwen35 {
                 Binding::Full(&s.mtp_e),
                 Binding::Full(&s.normed),
                 Binding::Full(&s.mtp_cat),
+                1,
                 cfg.hidden,
             )?;
             ops::gemm(
@@ -697,7 +697,7 @@ impl Speculator for Qwen35 {
                 &mtp.norm,
                 Binding::Full(&s.hidden),
                 Binding::Full(&s.normed),
-                ROWS,
+                1,
                 cfg.hidden,
                 cfg.hidden,
                 1e-6,
@@ -771,42 +771,21 @@ fn full_layer(
         &w.attn_norm,
         Binding::Full(&s.hidden),
         Binding::Full(&s.normed),
-        ROWS,
+        m,
         cfg.hidden,
         cfg.hidden,
-                1e-6,
+        1e-6,
     )?;
     full_attn_block(backend, pass, cfg, s, cos, sin, w, kv, m, args)?;
     ops::add(
         backend,
         pass,
         Binding::Full(&s.hidden),
-        Binding::Full(&s.mlp.y),
+        Binding::Full(&s.mlp.down_out),
         Binding::Full(&s.hidden2),
-        ROWS * cfg.hidden,
+        m * cfg.hidden,
     )?;
-    ops::norm(
-        backend,
-        pass,
-        NormMode::Offset,
-        Binding::Full(&s.hidden2),
-        &w.mlp.norm,
-        Binding::Full(&s.hidden2),
-        Binding::Full(&s.normed),
-        ROWS,
-        cfg.hidden,
-        cfg.hidden,
-                1e-6,
-    )?;
-    mlp_block(backend, pass, cfg, s, &w.mlp, m)?;
-    ops::add(
-        backend,
-        pass,
-        Binding::Full(&s.hidden2),
-        Binding::Full(&s.mlp.y),
-        Binding::Full(&s.hidden),
-        ROWS * cfg.hidden,
-    )
+    post_mlp(backend, pass, cfg, s, &w.mlp, m)
 }
 
 /// Gated DeltaNet layer: input norm, sequential recurrence over the chunk's
@@ -828,45 +807,24 @@ fn linear_layer(
         &w.attn_norm,
         Binding::Full(&s.hidden),
         Binding::Full(&s.normed),
-        ROWS,
+        m,
         cfg.hidden,
         cfg.hidden,
-                1e-6,
+        1e-6,
     )?;
     linear_attn_block(backend, pass, cfg, s, w, state, m)?;
     ops::add(
         backend,
         pass,
         Binding::Full(&s.hidden),
-        Binding::Full(&s.mlp.y),
+        Binding::Full(&s.mlp.down_out),
         Binding::Full(&s.hidden2),
-        ROWS * cfg.hidden,
+        m * cfg.hidden,
     )?;
-    ops::norm(
-        backend,
-        pass,
-        NormMode::Offset,
-        Binding::Full(&s.hidden2),
-        &w.mlp.norm,
-        Binding::Full(&s.hidden2),
-        Binding::Full(&s.normed),
-        ROWS,
-        cfg.hidden,
-        cfg.hidden,
-                1e-6,
-    )?;
-    mlp_block(backend, pass, cfg, s, &w.mlp, m)?;
-    ops::add(
-        backend,
-        pass,
-        Binding::Full(&s.hidden2),
-        Binding::Full(&s.mlp.y),
-        Binding::Full(&s.hidden),
-        ROWS * cfg.hidden,
-    )
+    post_mlp(backend, pass, cfg, s, &w.mlp, m)
 }
 
-/// Gated grouped full attention; result lands in s.m2.
+/// Gated grouped full attention; result lands in s.mlp.down_out.
 #[allow(clippy::too_many_arguments)]
 fn full_attn_block(
     backend: &mut Backend,
@@ -896,6 +854,7 @@ fn full_attn_block(
         Binding::Full(&s.qg),
         Binding::Full(&s.q),
         Binding::Full(&s.gate),
+        m,
         nq,
         hd,
     )?;
@@ -907,10 +866,10 @@ fn full_attn_block(
         &w.q_norm,
         Binding::Full(&s.q),
         Binding::Full(&s.q2),
-        ROWS * nq,
+        m * nq,
         hd,
         hd,
-                1e-6,
+        1e-6,
     )?;
     ops::gemm(
         backend,
@@ -928,10 +887,10 @@ fn full_attn_block(
         &w.k_norm,
         Binding::Full(&s.k1),
         Binding::Full(&s.k2),
-        ROWS * nkv,
+        m * nkv,
         hd,
         hd,
-                1e-6,
+        1e-6,
     )?;
     ops::gemm(
         backend,
@@ -970,17 +929,8 @@ fn full_attn_block(
         backend,
         pass,
         Binding::Full(&s.k2),
-        &kv.k,
-        nkv,
-        hd,
-        kv.max_seq,
-        args,
-        m,
-    )?;
-    ops::kv_store(
-        backend,
-        pass,
         Binding::Full(&s.v1),
+        &kv.k,
         &kv.v,
         nkv,
         hd,
@@ -1012,21 +962,22 @@ fn full_attn_block(
         Binding::Full(&s.attn_out),
         Binding::Full(&s.gate),
         Binding::Full(&s.attn_out2),
-        ROWS * nq * hd,
+        m * nq * hd,
     )?;
     ops::gemm(
         backend,
         pass,
         Binding::Full(&s.attn_out2),
         &w.o,
-        Binding::Full(&s.mlp.y),
+        Binding::Full(&s.mlp.down_out),
         m,
     )
 }
 
 /// Gated DeltaNet attention; the recurrence runs row by row over the chunk.
-/// Result lands in s.m2. The conv tile carries q/k segments at key-head
-/// width; `repeat_qk` expands them to value-head width for the recurrence.
+/// Result lands in s.mlp.down_out. The conv tile carries q/k segments at
+/// key-head width; `repeat_qk` expands them to value-head width for the
+/// recurrence.
 fn linear_attn_block(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
@@ -1143,19 +1094,52 @@ fn linear_attn_block(
         m * heads,
         cfg.lin_val_dim,
         cfg.lin_val_dim,
-                1e-6,
+        1e-6,
     )?;
     ops::gemm(
         backend,
         pass,
         Binding::Full(&s.attn_out2),
         &w.out_proj,
-        Binding::Full(&s.mlp.y),
+        Binding::Full(&s.mlp.down_out),
         m,
     )
 }
 
-/// SwiGLU MLP; result lands in s.m2.
+/// Post-norm + SwiGLU MLP + residual; result lands back in s.hidden.
+fn post_mlp(
+    backend: &mut Backend,
+    pass: &mut Pass<'_>,
+    cfg: &Qwen35Config,
+    s: &Scratch,
+    mlp: &SwigluMlp,
+    m: u32,
+) -> Result<()> {
+    ops::norm(
+        backend,
+        pass,
+        NormMode::Offset,
+        Binding::Full(&s.hidden2),
+        &mlp.norm,
+        Binding::Full(&s.hidden2),
+        Binding::Full(&s.normed),
+        m,
+        cfg.hidden,
+        cfg.hidden,
+        1e-6,
+    )?;
+    mlp_block(backend, pass, cfg, s, mlp, m)?;
+    ops::add(
+        backend,
+        pass,
+        Binding::Full(&s.hidden2),
+        Binding::Full(&s.mlp.down_out),
+        Binding::Full(&s.hidden),
+        m * cfg.hidden,
+    )
+}
+
+/// SwiGLU MLP; result lands in s.mlp.down_out.
 fn mlp_block(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
@@ -1173,5 +1157,7 @@ fn mlp_block(
         m,
         cfg.intermediate,
         Act::Silu,
+        Binding::Full(&s.mlp.down_out),
+        false,
     )
 }

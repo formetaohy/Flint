@@ -1,5 +1,5 @@
 //! CPU-side decoders for every ggml quantization block layout Flint reads.
-//! GGUF tensors are dequantized to f32 (or kept as bf16) on the host, then the
+//! GGUF tensors dequantize to f32 (or stay bf16) on the host, then the
 //! role-based upload re-packs them for the GPU. Block byte orders follow the
 //! ggml struct definitions exactly.
 

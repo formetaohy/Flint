@@ -38,6 +38,28 @@ const SHADERS: &[ShaderSpec] = &[
         read_only: &[true, false],
     },
     ShaderSpec {
+        name: "gemv_qkv",
+        source: include_str!("wgsl/gemv_qkv.wgsl"),
+        read_only: &[
+            true, true, true, false, true, true, false, true, true, false, false,
+        ],
+    },
+    ShaderSpec {
+        name: "merge_qkv",
+        source: include_str!("wgsl/merge_qkv.wgsl"),
+        read_only: &[true, false, false, false],
+    },
+    ShaderSpec {
+        name: "gemv_gateup",
+        source: include_str!("wgsl/gemv_gateup.wgsl"),
+        read_only: &[true, true, true, false, true, true, false, false],
+    },
+    ShaderSpec {
+        name: "merge_gateup",
+        source: include_str!("wgsl/merge_gateup.wgsl"),
+        read_only: &[true, false, false],
+    },
+    ShaderSpec {
         name: "embed",
         source: include_str!("wgsl/embed.wgsl"),
         read_only: &[true, true, true, false],
@@ -45,7 +67,9 @@ const SHADERS: &[ShaderSpec] = &[
     ShaderSpec {
         name: "norm",
         source: include_str!("wgsl/norm.wgsl"),
-        read_only: &[true, true, true, false],
+        read_only: &[
+            true, true, true, false, true, true, true, false, true, true, true,
+        ],
     },
     ShaderSpec {
         name: "add",
@@ -130,12 +154,12 @@ const SHADERS: &[ShaderSpec] = &[
     ShaderSpec {
         name: "merge_attn",
         source: include_str!("wgsl/merge_attn.wgsl"),
-        read_only: &[true, false],
+        read_only: &[true, false, true],
     },
     ShaderSpec {
         name: "kv_store",
         source: include_str!("wgsl/kv_store.wgsl"),
-        read_only: &[true, false, true],
+        read_only: &[true, true, false, false, true],
     },
     ShaderSpec {
         name: "split_qg",
@@ -150,7 +174,7 @@ struct CompiledShader {
     bind_group_layout: BindGroupLayout,
 }
 
-/// Most constants any shader takes (attn: 7).
+/// Most constants any shader takes (attn: 8).
 const MAX_CONSTS: usize = 8;
 
 /// Allocation-free pipeline cache key: the shader plus its override constants

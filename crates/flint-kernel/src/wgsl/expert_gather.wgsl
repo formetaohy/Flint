@@ -3,7 +3,6 @@
 // COUNT..ROWS are left untouched (the following gemm may compute them; the
 // scatter only consumes 0..COUNT).
 
-override ROWS: u32 = 16u;
 override HIDDEN: u32 = 1u;
 override COUNT: u32 = 1u;
 

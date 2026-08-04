@@ -1,26 +1,23 @@
 //! Phi family: Phi-4-mini (dense, partial rotary, LongRoPE) and Phi-MoE
-//! (layer-normed MoE with the sparsemixer router). Both are configurations of
-//! the shared dense model; Phi-4-mini differs from LLaMA in its rotary range
-//! and LongRoPE factors, Phi-MoE in its LayerNorm, uniform sliding window and
-//! MoE feed-forward.
+//! (layer-normed MoE with the sparsemixer router), both as configurations of
+//! the shared dense model.
 
 use flint_backend::Backend;
 use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
-use flint_model::loader::{MoEPart, MoEPlan, Plan, Role, load_moe as load_moe_weights};
+use flint_model::loader::{MoEPart, MoEPlan, Plan, Role, load_moe_experts, upload};
 use flint_model::ops::{Act, RopeScaling};
 use flint_model::routing::RouteKind;
 use flint_tensor::Weight;
 use serde_json::Value;
 
 use crate::dense::{DenseConfig, DenseModel, MoeConfig, RopeSpec, dense_role};
-use crate::gguf_config::gguf_key;
-use crate::llama::hf_key;
+use crate::names::{gguf_key, gguf_moe_key, hf_key};
 
 /// HF safetensors names for Phi-MoE's expert set. Two layouts exist:
-/// `model.layers.{l}.mlp.{router,gate_up_proj,down_proj}` (fused 3D) and the
-/// Mixtral-style `model.layers.{l}.block_sparse_moe.{gate,experts.E.w1/w2/w3}`
-/// (per-expert 2D, w1 = gate, w2 = down, w3 = up).
+/// `model.layers.{l}.mlp.{router,gate_up_proj,down_proj}` (fused 3D) and
+/// Mixtral-style `block_sparse_moe.{gate,experts.E.w1/w2/w3}` (w1 = gate,
+/// w2 = down, w3 = up).
 fn moe_key(name: &str) -> Option<(String, MoEPart)> {
     let rest = name.strip_prefix("model.layers.")?;
     let (idx, tail) = rest.split_once('.')?;
@@ -133,10 +130,7 @@ pub fn parse_moe(v: &Value) -> Result<DenseConfig> {
         .get("rms_norm_eps")
         .and_then(Value::as_f64)
         .unwrap_or(1e-5) as f32;
-    let window = v
-        .get("sliding_window")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+    let window = v.get("sliding_window").and_then(Value::as_u64).unwrap_or(0) as u32;
     cfg.windows = vec![window; cfg.layers as usize];
     cfg.moe = Some(MoeConfig {
         experts: flint_model::config::u32_field(v, "num_local_experts")?,
@@ -184,7 +178,7 @@ pub fn load(
     DenseModel::load_extra(source, cfg, &plan(gguf), extra, max_seq, backend)
 }
 
-/// Dense-plan key for Phi-MoE: the expert-set tensors are excluded so the
+/// Dense-plan key for Phi-MoE: expert-set tensors are excluded so the
 /// split loader owns them.
 fn hf_key_moe_dense(name: &str) -> Option<String> {
     if moe_key(name).is_some() {
@@ -215,11 +209,11 @@ pub fn load_moe(
         }
     };
     let moe_plan = MoEPlan {
-        key: if gguf { crate::gguf_config::gguf_moe_key } else { moe_key },
+        key: if gguf { gguf_moe_key } else { moe_key },
         experts,
         shared: false,
     };
-    let extra = load_moe_weights(backend, source, &moe_plan, dense_role)?;
+    let extra = load_moe_experts(backend, source, &moe_plan, dense_role)?;
     DenseModel::load_extra(source, cfg, &plan, extra, max_seq, backend)
 }
 
@@ -253,7 +247,7 @@ pub fn gguf_split_qkv(
     let names = source.names();
     for l in 0..cfg.layers {
         let name = format!("blk.{l}.attn_qkv.weight");
-        if !names.iter().any(|n| *n == name) {
+        if !names.contains(&name) {
             continue;
         }
         let raw = source.read(&name)?;
@@ -265,14 +259,14 @@ pub fn gguf_split_qkv(
         }
         split_rows(
             backend,
-            &raw,
+            raw,
             &mut out,
             role,
             |part| format!("layers.{l}.self_attn.{part}.weight"),
             &[
-                ("q_proj", (0, qw)),
-                ("k_proj", (qw, qw + kvw)),
-                ("v_proj", (qw + kvw, qw + 2 * kvw)),
+                ("q_proj", 0, qw),
+                ("k_proj", qw, qw + kvw),
+                ("v_proj", qw + kvw, qw + 2 * kvw),
             ],
         )?;
     }
@@ -280,7 +274,7 @@ pub fn gguf_split_qkv(
     // with a plain up projection carry the single width and skip the split.
     for l in 0..cfg.layers {
         let name = format!("blk.{l}.ffn_up.weight");
-        if !names.iter().any(|n| *n == name) {
+        if !names.contains(&name) {
             continue;
         }
         let raw = source.read(&name)?;
@@ -290,11 +284,11 @@ pub fn gguf_split_qkv(
         let half = raw.shape[0] / 2;
         split_rows(
             backend,
-            &raw,
+            raw,
             &mut out,
             role,
             |part| format!("layers.{l}.mlp.{part}.weight"),
-            &[("gate_proj", (0, half)), ("up_proj", (half, 2 * half))],
+            &[("gate_proj", 0, half), ("up_proj", half, 2 * half)],
         )?;
     }
     Ok(out)
@@ -302,50 +296,31 @@ pub fn gguf_split_qkv(
 
 /// Splits a raw [N, K] tensor's leading axis into ranges and uploads each as
 /// a canonical key (the fused QKV / gate+up paths).
-#[allow(clippy::type_complexity)]
 fn split_rows(
     backend: &Backend,
-    raw: &flint_checkpoint::RawTensor,
+    raw: flint_checkpoint::RawTensor,
     out: &mut Vec<(String, Weight)>,
     role: fn(&str) -> Role,
     key_for: impl Fn(&str) -> String,
-    parts: &[(&str, (u32, u32))],
+    parts: &[(&str, u32, u32)],
 ) -> Result<()> {
-    use flint_checkpoint::{RawTensor, TensorData};
-    use flint_model::loader::upload_key;
     let k = raw.shape[1];
-    let _ = k;
-    let mut data: Option<Vec<f32>> = None;
-    for (part, (lo, hi)) in parts {
+    let data = raw.data.into_f32();
+    for &(part, lo, hi) in parts {
         let key = key_for(part);
-        let data = match &data {
-            Some(d) => d,
-            None => {
-                let d = match &raw.data {
-                    TensorData::F32(v) => v.clone(),
-                    TensorData::Bf16(b) => b
-                        .chunks_exact(2)
-                        .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                        .collect(),
-                };
-                data = Some(d);
-                data.as_ref().unwrap()
-            }
-        };
-        let slice: Vec<f32> = data[(*lo as usize * k as usize)..(*hi as usize * k as usize)].to_vec();
+        let slice: Vec<f32> = data[(lo as usize * k as usize)..(hi as usize * k as usize)].to_vec();
         out.push((
             key.clone(),
-            upload_key(
+            upload(
                 backend,
                 &key,
-                RawTensor {
+                flint_checkpoint::RawTensor {
                     shape: vec![hi - lo, k],
-                    data: TensorData::F32(slice),
+                    data: flint_checkpoint::TensorData::F32(slice),
                 },
                 role(&key),
             )?,
         ));
     }
-    let _ = k;
     Ok(())
 }

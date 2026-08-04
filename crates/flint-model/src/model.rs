@@ -9,7 +9,7 @@ pub struct ChunkOut {
     pub hidden: Vec<Vec<f32>>,
 }
 
-/// A runnable text model. Forward consumes 1..=ROWS tokens per call and
+/// A runnable text model. Forward consumes 1..=M_MAX tokens per call and
 /// advances the internal position; decode is a one-token chunk.
 pub trait LanguageModel {
     fn forward(
@@ -34,8 +34,7 @@ pub trait LanguageModel {
 
 /// A draft head shadowing the target model one token ahead, plus the
 /// rollback machinery speculative verification needs. Every method is
-/// mandatory: an architecture that offers a speculator implements the full
-/// protocol — there are no no-op defaults to silently corrupt state.
+/// mandatory — there are no no-op defaults to silently corrupt state.
 pub trait Speculator {
     /// Consumes the most recently committed token plus the target hidden
     /// state at its position, advances internal position and caches, and

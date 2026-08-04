@@ -9,27 +9,9 @@
 use flint_backend::Backend;
 use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
-use flint_model::loader::Plan;
 use serde_json::Value;
 
 use crate::dense::{DenseConfig, DenseModel, dense_plan};
-
-/// HF safetensors names -> canonical keys (model / language_model prefixes stripped).
-fn hf_key(name: &str) -> Option<String> {
-    if let Some(rest) = name.strip_prefix("model.language_model.") {
-        Some(rest.to_string())
-    } else if let Some(rest) = name.strip_prefix("model.") {
-        Some(rest.to_string())
-    } else if name.starts_with("lm_head.") {
-        Some(name.to_string())
-    } else {
-        None
-    }
-}
-
-fn plan(gguf: bool) -> Plan {
-    dense_plan(gguf, hf_key)
-}
 
 /// Parses and validates a Gemma 3 text config.
 pub fn parse_config(v: &Value) -> Result<DenseConfig> {
@@ -73,7 +55,7 @@ pub fn load(
     DenseModel::load(
         source,
         cfg,
-        &plan(source.kind() == "gguf"),
+        &dense_plan(source.kind() == "gguf"),
         max_seq,
         backend,
     )

@@ -1,18 +1,12 @@
 //! Sampling pipeline: temperature, top-k, nucleus (top-p), min-p and a
 //! repetition penalty, plus speculative-draft verification.
 //!
-//! One invariant carries the whole design: `transform` is the single place
-//! raw logits become a sampling distribution, and every consumer — plain
-//! decoding, draft sampling, speculative verification — draws and compares
-//! only transformed distributions. Speculative decoding is then exact
-//! (Leviathan et al., arXiv:2211.17192): the rejection test's proposal
-//! distribution is by construction the very distribution draft tokens were
-//! drawn from, so committed tokens follow the target distribution exactly.
-//! vLLM and HF transformers enforce the same rule by running identical
-//! logits processors over draft and target logits before verification.
+//! `transform` is the single place raw logits become a sampling distribution,
+//! and every consumer draws and compares only transformed distributions.
+//! Speculative decoding is then exact (Leviathan et al., arXiv:2211.17192).
 
-/// A processed sampling distribution — the only thing tokens are ever drawn
-/// from, and the only thing verification compares.
+/// A processed sampling distribution — the only thing tokens are drawn from
+/// and verification compares.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Dist {
     /// temperature <= 0: deterministic argmax of the penalized logits.
@@ -77,8 +71,8 @@ impl Sampler {
     }
 
     /// Applies the full sampling configuration to raw logits, yielding the
-    /// distribution tokens are drawn from. Pure: identical inputs (logits and
-    /// context) always yield the identical distribution.
+    /// distribution tokens are drawn from. Pure: identical inputs yield
+    /// identical distributions.
     pub fn transform(&self, logits: &[f32], context: &[u32]) -> Dist {
         let p = self.params;
         let mut scores = logits.to_vec();
@@ -129,14 +123,10 @@ impl Sampler {
         }
     }
 
-    /// Speculative verification. Both distributions must carry the identical
-    /// sampling configuration — transform target and draft logits with the
-    /// same context, then pass the results here.
-    ///
-    /// Accepts the draft token with probability min(1, pt/pd); on rejection
-    /// resamples from norm(max(0, pt - pd)). Under that rule the committed
-    /// token follows pt exactly, whatever pd is. Greedy runs stay
-    /// deterministic: accept iff the draft matches the target argmax.
+    /// Speculative verification: accepts the draft token with probability
+    /// min(1, pt/pd); on rejection resamples from norm(max(0, pt - pd)).
+    /// Under that rule the committed token follows pt exactly. Greedy runs
+    /// accept iff the draft matches the target argmax.
     pub fn verify(&mut self, target: &Dist, draft: &Dist, draft_token: u32) -> (bool, u32) {
         match (target, draft) {
             (Dist::Greedy(t), Dist::Greedy(_)) => (*t == draft_token, *t),
@@ -173,7 +163,7 @@ impl Sampler {
 }
 
 /// Multiplicative repetition penalty over the last_n context tokens: positive
-/// logits are divided, negative ones multiplied, so repeats are discouraged
+/// logits divided, negative multiplied, so repeats are discouraged
 /// symmetrically around zero.
 pub fn apply_repeat_penalty(scores: &mut [f32], context: &[u32], penalty: f32, last_n: usize) {
     if penalty == 1.0 || context.is_empty() {

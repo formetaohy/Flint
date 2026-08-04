@@ -1,6 +1,6 @@
 //! GGUF container reader: header, metadata KV, tensor-info table and on-demand
-//! tensor dequantization. Format mechanics only — architecture-specific name
-//! mapping and config synthesis live in `flint-architectures`.
+//! tensor dequantization. Format mechanics only — name mapping and config
+//! synthesis live in `flint-architectures`.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -338,9 +338,8 @@ fn align_up(v: usize, a: usize) -> usize {
 // ================================================================ writing
 
 /// GGUF serializer: metadata KV table plus tensor payload, the exact inverse
-/// of [`Gguf::open`]. Tensors are written f32, packed bf16 or Q8_0; offsets
-/// and alignment follow the reader's expectations exactly, so a written file
-/// round-trips through [`Gguf::open`] unchanged.
+/// of [`Gguf::open`]. Tensors are written f32, packed bf16 or Q8_0; a written
+/// file round-trips through [`Gguf::open`] unchanged.
 pub struct GgufWriter {
     kvs: Vec<(String, MetaVal)>,
     tensors: Vec<TensorSpec>,

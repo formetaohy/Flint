@@ -260,7 +260,11 @@ fn reads_every_metadata_value_type() {
     // Type-mismatched accessors return None rather than panicking.
     assert_eq!(meta.str("t_u8"), None);
     assert_eq!(meta.u32("t_f64"), None);
-    assert_eq!(meta.u32_array("t_arr_f32"), None, "float array is not a u32 array");
+    assert_eq!(
+        meta.u32_array("t_arr_f32"),
+        None,
+        "float array is not a u32 array"
+    );
     assert_eq!(meta.str_array("t_u64"), None);
     assert_eq!(meta.f64_array("t_i8"), None);
     std::fs::remove_dir_all(&dir).ok();

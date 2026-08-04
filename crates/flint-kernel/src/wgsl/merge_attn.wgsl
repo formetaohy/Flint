@@ -1,10 +1,8 @@
-// Combines the SEGS per-segment attention partials written by `attn`:
-// for each (row m, kv head g, query head hl) the exact softmax over the
-// whole prefix is reassembled from per-segment (max, sum, unnormalized o)
-// via the standard two-pass rescale: out = sum_s exp(m_s - M) * o_s /
-// sum_s exp(m_s - M) * sum_s, with M the global max. One workgroup per
-// (m, g); 512 threads = 8 head slots x 64 dims (HEAD_DIM <= 512, four
-// 64-wide column pairs per thread).
+// Combines the SEGS per-segment attention partials written by `attn`: for
+// each (row m, kv head g, query head hl) the exact softmax over the whole
+// prefix is reassembled via the standard two-pass rescale: out = sum_s
+// exp(m_s - M) * o_s / sum_s exp(m_s - M) * sum_s, with M the global max.
+// One workgroup per (m, g); 512 threads = 8 head slots x 64 dims.
 
 override N_HEADS: u32 = 1u;
 override KV_HEADS: u32 = 1u;
@@ -18,6 +16,7 @@ const NEG_INF: f32 = -3.4e38;
 
 @group(0) @binding(0) var<storage, read> scratch: array<f32>;
 @group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<storage, read> args: array<u32>;
 
 @compute @workgroup_size(512)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -26,10 +25,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let t = lid.x;
     let hl = t / CHUNK;
     let slot = t % CHUNK;
+    // Only the segments attn actually wrote carry data; the rest hold stale
+    // partials and must not be folded in.
+    let segs = min(SEGS, max(1u, args[1]));
 
     // Global max over the segments (per head).
     var mx = NEG_INF;
-    for (var s = 0u; s < SEGS; s += 1u) {
+    for (var s = 0u; s < segs; s += 1u) {
         let base = ((m * KV_HEADS + kvh) * SEGS + s) * (8u * STRIDE) + hl * STRIDE;
         mx = max(mx, scratch[base + HEAD_DIM]);
     }
@@ -43,7 +45,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     var o5 = 0.0;
     var o6 = 0.0;
     var o7 = 0.0;
-    for (var s = 0u; s < SEGS; s += 1u) {
+    for (var s = 0u; s < segs; s += 1u) {
         let base = ((m * KV_HEADS + kvh) * SEGS + s) * (8u * STRIDE) + hl * STRIDE;
         // Segments with no keys carry max = NEG_INF; exp(NEG_INF - M) = 0.
         let w = exp(scratch[base + HEAD_DIM] - mx);

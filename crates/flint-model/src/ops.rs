@@ -1,15 +1,15 @@
-//! Kernel dispatchers shared by every architecture. All activations are
-//! [ROWS, dim] tiles; gemm always operates on the full tile.
+//! Kernel dispatchers shared by every architecture. Activations are [M_MAX, dim]
+//! tiles; gemm always operates on the full tile.
 
 use flint_backend::{Backend, Binding, Pass};
 use flint_error::Result;
 use flint_tensor::{DType, Tensor, Weight};
 
-use crate::loader::{ExpertW, MoeMlp, SwigluMlp};
+use crate::loader::{ExpertWeights, MoeMlp, SwigluMlp};
 use crate::routing::Routing;
 
-/// Activation tile row capacity (also the chunk size for prefill).
-pub const ROWS: u32 = 16;
+/// Activation tile row capacity: the max chunk size for prefill.
+pub const M_MAX: u32 = 128;
 
 /// Gated MLP activation functions.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -19,7 +19,7 @@ pub enum Act {
 }
 
 /// RMSNorm / LayerNorm variants shared across architectures; the discriminant
-/// is the MODE override constant of the norm shader.
+/// is the MODE constant of the norm shader.
 #[derive(Clone, Copy)]
 pub enum NormMode {
     /// Weight is an offset applied as (1 + w).
@@ -32,23 +32,19 @@ pub enum NormMode {
     Layer = 3,
 }
 
-fn div_ceil(a: u32, b: u32) -> u32 {
-    a.div_ceil(b)
-}
-
-/// [ROWS]-wide u32 id scratch fed to `embed`.
+/// [M_MAX]-wide u32 id scratch fed to `embed`.
 pub fn token_ids(backend: &Backend) -> Tensor {
     Tensor::new(
-        backend.storage(ROWS as u64 * 4, "ids"),
-        vec![ROWS],
+        backend.storage(M_MAX as u64 * 4, "ids"),
+        vec![M_MAX],
         DType::U32,
     )
 }
 
-/// One-u32 step-args tensor holding the current position; rope, kv_store and
-/// attn read it so the position stays out of the pipeline constants.
+/// Step-args tensor: [position, effective attention segments]; rope, kv_store
+/// and attn read it. Short prefixes use fewer split-K segments.
 pub fn step_args(backend: &Backend) -> Tensor {
-    Tensor::new(backend.storage(4, "args"), vec![1], DType::U32)
+    Tensor::new(backend.storage(8, "args"), vec![2], DType::U32)
 }
 
 /// Reads `count`-wide rows out of a result tensor: one Vec per requested row.
@@ -68,8 +64,7 @@ pub fn read_rows(
 }
 
 /// Projects the activation tile through a weight. Decode (`rows == 1`) takes
-/// the bandwidth-optimal gemv fast path; multi-row prefill takes the tiled
-/// matmul over the full ROWS tile.
+/// the gemv fast path; multi-row prefill takes the tiled matmul.
 pub fn gemm(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
@@ -78,24 +73,70 @@ pub fn gemm(
     y: Binding<'_>,
     rows: u32,
 ) -> Result<()> {
+    gemm_acc(backend, pass, x, w, y, rows, false)
+}
+
+/// Fused q/k/v projection: decode takes one dispatch over the three weights;
+/// multi-row prefill falls back to three separate gemms.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_qkv(
+    backend: &mut Backend,
+    pass: &mut Pass<'_>,
+    x: Binding<'_>,
+    wq: &Weight,
+    wk: &Weight,
+    wv: &Weight,
+    yq: Binding<'_>,
+    yk: Binding<'_>,
+    yv: Binding<'_>,
+    rows: u32,
+    nq: u32,
+    nk: u32,
+    nv: u32,
+) -> Result<()> {
     if rows == 1 {
-        backend.gemv(pass, x, w, y)
+        let k = wq.tensor().shape[1];
+        backend.gemv_qkv(pass, x, wq, wk, wv, yq, yk, yv, nq, nk, nv, k)
     } else {
-        backend.gemm(pass, x, w, y, ROWS)
+        gemm(backend, pass, x, wq, yq, rows)?;
+        if nk > 0 {
+            gemm(backend, pass, x, wk, yk, rows)?;
+            gemm(backend, pass, x, wv, yv, rows)?;
+        }
+        Ok(())
+    }
+}
+
+/// [`gemm`] with residual accumulation into `y` (the residual-stream fusion:
+/// output projections accumulate directly onto the layer input).
+pub fn gemm_acc(
+    backend: &mut Backend,
+    pass: &mut Pass<'_>,
+    x: Binding<'_>,
+    w: &Weight,
+    y: Binding<'_>,
+    rows: u32,
+    acc: bool,
+) -> Result<()> {
+    if rows == 1 {
+        backend.gemv_acc(pass, x, w, y, acc)
+    } else {
+        backend.gemm_acc(pass, x, w, y, rows, acc)
     }
 }
 
 /// Scratch tiles for one SwiGLU MLP: gate/up projections, SiLU activation
-/// and the down-projection target. Owned by the architecture's per-forward
-/// scratch set; `y` doubles as the residual addend after the call.
+/// and the down-projection target. `down_out` doubles as the residual addend.
 pub struct MlpTiles {
     pub gate_out: Tensor,
     pub up_out: Tensor,
     pub act: Tensor,
-    pub y: Tensor,
+    pub down_out: Tensor,
 }
 
 /// SwiGLU MLP: y = down(act(gate(x)) * up(x)) over one activation tile.
+/// With `acc_y` the down projection accumulates onto the residual stream.
+#[allow(clippy::too_many_arguments)]
 pub fn swiglu_mlp(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
@@ -105,32 +146,48 @@ pub fn swiglu_mlp(
     rows: u32,
     intermediate: u32,
     act: Act,
+    y_out: Binding<'_>,
+    acc_y: bool,
 ) -> Result<()> {
-    gemm(
-        backend,
-        pass,
-        x,
-        &mlp.gate,
-        Binding::Full(&t.gate_out),
-        rows,
-    )?;
-    gemm(backend, pass, x, &mlp.up, Binding::Full(&t.up_out), rows)?;
+    if rows == 1 {
+        backend.gemv_gateup(
+            pass,
+            x,
+            &mlp.gate,
+            &mlp.up,
+            Binding::Full(&t.gate_out),
+            Binding::Full(&t.up_out),
+            intermediate,
+            mlp.gate.tensor().shape[1],
+        )?;
+    } else {
+        gemm(
+            backend,
+            pass,
+            x,
+            &mlp.gate,
+            Binding::Full(&t.gate_out),
+            rows,
+        )?;
+        gemm(backend, pass, x, &mlp.up, Binding::Full(&t.up_out), rows)?;
+    }
     swiglu(
         backend,
         pass,
         Binding::Full(&t.gate_out),
         Binding::Full(&t.up_out),
         Binding::Full(&t.act),
-        ROWS * intermediate,
+        rows * intermediate,
         act,
     )?;
-    gemm(
+    gemm_acc(
         backend,
         pass,
         Binding::Full(&t.act),
         &mlp.down,
-        Binding::Full(&t.y),
+        y_out,
         rows,
+        acc_y,
     )
 }
 
@@ -156,24 +213,92 @@ pub fn norm(
             ("DIM", dim as f64),
             ("W_DIM", w_dim as f64),
             ("EPS", eps as f64),
+            ("HEADS", 1.0),
+            ("ROT", 2.0),
+            ("COS_STRIDE", 1.0),
         ],
-        &[x, Binding::Full(weight), gate, y],
+        // Scalar and vec4 views of the same buffers (vec4 lanes need
+        // 16B-aligned offsets, so every norm binding is a full tensor).
+        // The RoPE slots (8-10) are unused below MODE 4 and bind the gate.
+        &[
+            x,
+            Binding::Full(weight),
+            gate,
+            y,
+            x,
+            Binding::Full(weight),
+            gate,
+            y,
+            gate,
+            gate,
+            gate,
+        ],
         [rows, 1, 1],
     )
 }
 
+/// Fused QK-norm + RoPE: normalizes per-head rows (Direct mode) and rotates
+/// the first `rot` dims in place — one dispatch instead of norm + rope.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_rope(
+    backend: &mut Backend,
+    pass: &mut Pass<'_>,
+    x: Binding<'_>,
+    weight: &Tensor,
+    y: Binding<'_>,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+    heads: u32,
+    rot: u32,
+    cos: &Tensor,
+    sin: &Tensor,
+    args: &Tensor,
+) -> Result<()> {
+    backend.dispatch(
+        pass,
+        "norm",
+        &[
+            ("MODE", 4.0),
+            ("DIM", dim as f64),
+            ("W_DIM", dim as f64),
+            ("EPS", eps as f64),
+            ("HEADS", heads as f64),
+            ("ROT", rot as f64),
+            ("COS_STRIDE", (rot / 2) as f64),
+        ],
+        &[
+            x,
+            Binding::Full(weight),
+            x,
+            y,
+            x,
+            Binding::Full(weight),
+            x,
+            y,
+            Binding::Full(cos),
+            Binding::Full(sin),
+            Binding::Full(args),
+        ],
+        [rows, 1, 1],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn embed(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
     ids: &Tensor,
     table: &Weight,
-    fallback_scales: &Tensor,
     y: Binding<'_>,
+    rows: u32,
     dim: u32,
     scale: f32,
 ) -> Result<()> {
+    // The scales slot is unused below WDTYPE 1, so plain tables bind the
+    // table itself as a stable read-only stand-in.
     let (wdt, wd, group, scales) = match table {
-        Weight::Plain(t) => (0.0, Binding::Full(t), 128.0, Binding::Full(fallback_scales)),
+        Weight::Plain(t) => (0.0, Binding::Full(t), 128.0, Binding::Full(t)),
         Weight::Quantized {
             tensor: t,
             scale: s,
@@ -184,14 +309,14 @@ pub fn embed(
         pass,
         "embed",
         &[
-            ("ROWS", ROWS as f64),
+            ("M", rows as f64),
             ("DIM", dim as f64),
             ("SCALE", scale as f64),
             ("WDTYPE", wdt),
             ("GROUP", group),
         ],
         &[Binding::Full(ids), wd, scales, y],
-        [div_ceil(ROWS * dim, 256), 1, 1],
+        [(rows * dim).div_ceil(256), 1, 1],
     )
 }
 
@@ -227,12 +352,15 @@ pub fn rope(
     )
 }
 
+/// K/V cache store: writes both projections into their caches in one dispatch.
 #[allow(clippy::too_many_arguments)]
 pub fn kv_store(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
-    src: Binding<'_>,
-    cache: &Tensor,
+    k_src: Binding<'_>,
+    v_src: Binding<'_>,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
     kv_heads: u32,
     head_dim: u32,
     max_seq: u32,
@@ -247,14 +375,19 @@ pub fn kv_store(
             ("HEAD_DIM", head_dim as f64),
             ("MAX_SEQ", max_seq as f64),
         ],
-        &[src, Binding::Full(cache), Binding::Full(args)],
-        [div_ceil(kv_heads * (head_dim / 2), 256), m, 1],
+        &[
+            k_src,
+            v_src,
+            Binding::Full(k_cache),
+            Binding::Full(v_cache),
+            Binding::Full(args),
+        ],
+        [(kv_heads * (head_dim / 2)).div_ceil(256), m, 1],
     )
 }
 
 /// Split-K attention partials: [m, kv_heads, ATTN_SEGS, MAX_GQA, hd+2] f32.
-/// `stride` is the scratch slot width (largest layer head dim + 2 when layers
-/// have varying head dims).
+/// `stride` is the scratch slot width (largest layer head dim + 2).
 pub const ATTN_SEGS: u32 = 32;
 
 /// Max query heads sharing one kv head (the attention shader's head slots).
@@ -283,9 +416,8 @@ pub fn attn(
         "GQA ratio {} exceeds the attention shader's {MAX_GQA} head slots",
         q_heads / kv_heads
     );
-    // The KV range of each (row, kv head) is split into ATTN_SEGS parallel
-    // segments, and every query head of a kv head shares its staged K/V
-    // tiles; merge_attn reassembles the segments afterwards.
+    // The KV range of each (row, kv head) splits into ATTN_SEGS parallel
+    // segments; merge_attn reassembles them.
     backend.dispatch(
         pass,
         "attn",
@@ -317,17 +449,19 @@ pub fn attn(
             ("HEAD_DIM", head_dim as f64),
             ("STRIDE", stride as f64),
         ],
-        &[Binding::Full(scratch), y],
+        &[Binding::Full(scratch), y, Binding::Full(args)],
         [m, kv_heads, 1],
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn split_qg(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
     x: Binding<'_>,
     q: Binding<'_>,
     gate: Binding<'_>,
+    rows: u32,
     heads: u32,
     head_dim: u32,
 ) -> Result<()> {
@@ -335,12 +469,12 @@ pub fn split_qg(
         pass,
         "split_qg",
         &[
-            ("ROWS", ROWS as f64),
+            ("ROWS", rows as f64),
             ("HEADS", heads as f64),
             ("HD", head_dim as f64),
         ],
         &[x, q, gate],
-        [div_ceil(ROWS * heads * head_dim, 256), 1, 1],
+        [(rows * heads * head_dim).div_ceil(256), 1, 1],
     )
 }
 
@@ -357,25 +491,26 @@ pub fn add(
         "add",
         &[("N_ELEM", n_elem as f64)],
         &[a, b, y],
-        [div_ceil(n_elem, 256), 1, 1],
+        [n_elem.div_ceil(256), 1, 1],
     )
 }
 
-/// In-place row-broadcast bias over a [ROWS, dim] tile: x += bias per row.
+/// In-place row-broadcast bias over a [rows, dim] tile: x += bias per row.
 pub fn bias(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
     x: Binding<'_>,
     bias: &Tensor,
+    rows: u32,
     dim: u32,
 ) -> Result<()> {
-    let n_elem = ROWS * dim;
+    let n_elem = rows * dim;
     backend.dispatch(
         pass,
         "bias",
         &[("N_ELEM", n_elem as f64), ("DIM", dim as f64)],
         &[x, Binding::Full(bias)],
-        [div_ceil(n_elem, 256), 1, 1],
+        [n_elem.div_ceil(256), 1, 1],
     )
 }
 
@@ -393,7 +528,7 @@ pub fn swiglu(
         "swiglu",
         &[("N_ELEM", n_elem as f64), ("MODE", act as u32 as f64)],
         &[gate, up, y],
-        [div_ceil(n_elem, 256), 1, 1],
+        [n_elem.div_ceil(256), 1, 1],
     )
 }
 
@@ -410,7 +545,7 @@ pub fn softcap(
         "softcap",
         &[("N_ELEM", n_elem as f64), ("CAP", cap as f64)],
         &[x],
-        [div_ceil(n_elem, 256), 1, 1],
+        [n_elem.div_ceil(256), 1, 1],
     )
 }
 
@@ -429,7 +564,7 @@ pub fn mul(
         "mul",
         &[("N", n as f64), ("M", m as f64)],
         &[a, b, y],
-        [div_ceil(n, 256), 1, 1],
+        [n.div_ceil(256), 1, 1],
     )
 }
 
@@ -446,7 +581,7 @@ pub fn sigmoid_mul(
         "sigmoid_mul",
         &[("N_ELEM", n_elem as f64)],
         &[a, b, y],
-        [div_ceil(n_elem, 256), 1, 1],
+        [n_elem.div_ceil(256), 1, 1],
     )
 }
 
@@ -456,14 +591,15 @@ pub fn concat(
     a: Binding<'_>,
     b: Binding<'_>,
     y: Binding<'_>,
+    rows: u32,
     dim: u32,
 ) -> Result<()> {
     backend.dispatch(
         pass,
         "concat",
-        &[("ROWS", ROWS as f64), ("D", dim as f64)],
+        &[("ROWS", rows as f64), ("D", dim as f64)],
         &[a, b, y],
-        [div_ceil(ROWS * 2 * dim, 256), 1, 1],
+        [(rows * 2 * dim).div_ceil(256), 1, 1],
     )
 }
 
@@ -483,7 +619,7 @@ pub fn conv1d(
         "conv1d",
         &[("DIM", dim as f64)],
         &[x, Binding::Full(weight), Binding::Full(state), y],
-        [div_ceil(dim, 256), 1, 1],
+        [dim.div_ceil(256), 1, 1],
     )
 }
 
@@ -622,13 +758,13 @@ pub struct RopeScaling {
 /// row tiles and the shared gate/up/act/down tiles.
 pub struct MoeTiles {
     pub logits: Tensor,
-    /// Packed rows per expert (+ the shared expert slot): [ROWS, hidden].
+    /// Packed rows per expert (+ the shared expert slot): [M_MAX, hidden].
     pub packed: Vec<Tensor>,
     pub gate: Tensor,
     pub up: Tensor,
     pub act: Tensor,
     pub down: Tensor,
-    /// Weighted accumulator [ROWS, hidden]; the MoE block's output.
+    /// Weighted accumulator [M_MAX, hidden]; the MoE block's output.
     pub acc: Tensor,
     /// Pair row ids and weights, ordered by expert (see [`Routing`]).
     pub rows: Tensor,
@@ -638,19 +774,19 @@ pub struct MoeTiles {
 impl MoeTiles {
     pub fn new(cfg: &MoeTilesCfg, backend: &Backend) -> Self {
         let z = |shape: &[u32], label: &str| backend.zero_tensor(shape, label);
-        // Worst-case pair slots: every expert's range pads to a 64-element
+        // Worst-case pair slots: every expert's range pads to 64-element
         // alignment, plus the shared expert's rows.
         let pairs = (cfg.experts + 2) * 64 + cfg.rows * cfg.top_k + cfg.rows;
         MoeTiles {
-            logits: z(&[ROWS, cfg.experts], "moe_logits"),
+            logits: z(&[M_MAX, cfg.experts], "moe_logits"),
             packed: (0..=cfg.experts)
-                .map(|e| z(&[ROWS, cfg.hidden], &format!("moe_packed{e}")))
+                .map(|e| z(&[M_MAX, cfg.hidden], &format!("moe_packed{e}")))
                 .collect(),
-            gate: z(&[ROWS, cfg.intermediate], "moe_gate"),
-            up: z(&[ROWS, cfg.intermediate], "moe_up"),
-            act: z(&[ROWS, cfg.intermediate], "moe_act"),
-            down: z(&[ROWS, cfg.hidden], "moe_down"),
-            acc: z(&[ROWS, cfg.hidden], "moe_acc"),
+            gate: z(&[M_MAX, cfg.intermediate], "moe_gate"),
+            up: z(&[M_MAX, cfg.intermediate], "moe_up"),
+            act: z(&[M_MAX, cfg.intermediate], "moe_act"),
+            down: z(&[M_MAX, cfg.hidden], "moe_down"),
+            acc: z(&[M_MAX, cfg.hidden], "moe_acc"),
             rows: Tensor::new(
                 backend.storage(pairs as u64 * 4, "moe_rows"),
                 vec![pairs],
@@ -670,14 +806,11 @@ pub struct MoeTilesCfg {
     pub intermediate: u32,
 }
 
-/// Copies the logits of a packed row into the MoE output tile, then runs the
-/// gate/up/act/down projections of every expert with pairs and scatters the
-/// weighted results into the accumulator. The shared expert (virtual expert
-/// `experts`) processes the activation tile directly.
-///
-/// The router logits must have been written by the caller (`gemm` against the
-/// router weight) and routed with [`crate::routing::Routing::new`]; the pair
-/// buffers are written before this call.
+/// Copies the logits of a packed row into the MoE output tile, runs every
+/// expert's gate/up/act/down projections with pairs, and scatters the weighted
+/// results into the accumulator. The shared expert (virtual expert `experts`)
+/// processes the activation tile directly. Router logits and pair buffers
+/// must have been written by the caller first.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_apply(
     backend: &mut Backend,
@@ -738,13 +871,13 @@ fn expert_mlp(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
     x: Binding<'_>,
-    ew: &ExpertW,
+    ew: &ExpertWeights,
     t: &MoeTiles,
     intermediate: u32,
     act: Act,
     count: u32,
 ) -> Result<()> {
-    let rows = if count == 1 { 1 } else { ROWS };
+    let rows = count;
     let y_gate = if count == 1 {
         Binding::Slice(&t.gate, 0, intermediate as u64 * 4)
     } else {
@@ -763,7 +896,7 @@ fn expert_mlp(
         Binding::Full(&t.gate),
         Binding::Full(&t.up),
         Binding::Full(&t.act),
-        ROWS * intermediate,
+        count * intermediate,
         act,
     )?;
     gemm(
@@ -789,13 +922,9 @@ pub fn expert_gather(
     backend.dispatch(
         pass,
         "expert_gather",
-        &[
-            ("ROWS", ROWS as f64),
-            ("HIDDEN", hidden as f64),
-            ("COUNT", count as f64),
-        ],
+        &[("HIDDEN", hidden as f64), ("COUNT", count as f64)],
         &[x, ids, out],
-        [div_ceil(count * hidden, 256), 1, 1],
+        [(count * hidden).div_ceil(256), 1, 1],
     )
 }
 
@@ -814,28 +943,19 @@ pub fn expert_scatter(
     backend.dispatch(
         pass,
         "expert_scatter",
-        &[
-            ("ROWS", ROWS as f64),
-            ("HIDDEN", hidden as f64),
-            ("COUNT", count as f64),
-        ],
+        &[("HIDDEN", hidden as f64), ("COUNT", count as f64)],
         &[acc, src, ids, weights],
-        [div_ceil(count * hidden, 256), 1, 1],
+        [(count * hidden).div_ceil(256), 1, 1],
     )
 }
 
 /// Zeroes the first `n` elements (the MoE accumulator before a block).
-pub fn zero_rows(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    x: Binding<'_>,
-    n: u32,
-) -> Result<()> {
+pub fn zero_rows(backend: &mut Backend, pass: &mut Pass<'_>, x: Binding<'_>, n: u32) -> Result<()> {
     backend.dispatch(
         pass,
         "zero_rows",
         &[("N_ELEM", n as f64)],
         &[x],
-        [div_ceil(n, 256), 1, 1],
+        [n.div_ceil(256), 1, 1],
     )
 }

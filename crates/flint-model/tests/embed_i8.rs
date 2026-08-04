@@ -10,13 +10,16 @@ fn embed_i8_matches_cpu_dequant() {
     let rows = 4u32;
     let dim = 64u32;
     let group = 32u32;
-    let table: Vec<f32> = (0..rows * dim).map(|i| (i % 17) as f32 * 0.1 - 0.8).collect();
+    let table: Vec<f32> = (0..rows * dim)
+        .map(|i| (i % 17) as f32 * 0.1 - 0.8)
+        .collect();
     let groups = dim / group;
     let mut bytes = Vec::with_capacity((rows * dim) as usize);
     let mut scales = Vec::with_capacity((rows * groups) as usize);
     for r in 0..rows {
         for g in 0..groups {
-            let block = &table[(r * dim + g * group) as usize..(r * dim + (g + 1) * group) as usize];
+            let block =
+                &table[(r * dim + g * group) as usize..(r * dim + (g + 1) * group) as usize];
             let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
             let scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
             scales.push(scale);
@@ -33,20 +36,28 @@ fn embed_i8_matches_cpu_dequant() {
     let ids_t = Tensor::new(backend.storage(16, "ids"), vec![4], DType::U32);
     backend.write_u32(&ids_t.buf, &[3, 1, 0, 2]);
     let y = backend.zero_tensor(&[16, dim], "y");
-    let fallback = backend.tensor_f32(&[1.0], vec![1], "fb");
     {
         let mut enc = backend.encoder();
         {
             let mut pass = Pass::begin(&mut enc, "k");
-            ops::embed(&mut backend, &mut pass, &ids_t, &w, &fallback, Binding::Full(&y), dim, 1.0)
-                .unwrap();
+            ops::embed(
+                &mut backend,
+                &mut pass,
+                &ids_t,
+                &w,
+                Binding::Full(&y),
+                4,
+                dim,
+                1.0,
+            )
+            .unwrap();
         }
         backend.submit(enc);
     }
     let got = backend.read_f32(&y.buf, 0, (4 * dim) as usize).unwrap();
     let ids = [3u32, 1, 0, 2];
     for r in 0..rows {
-        let src = ids[r as usize] as u32;
+        let src = ids[r as usize];
         let row = &table[(src * dim) as usize..((src + 1) * dim) as usize];
         let mut expect = vec![0f32; dim as usize];
         for g in 0..groups {

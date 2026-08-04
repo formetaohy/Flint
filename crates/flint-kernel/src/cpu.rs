@@ -1,7 +1,6 @@
-//! CPU reference implementations of every compute kernel, in plain Rust. These
-//! define the intended semantics; the WGPU kernels are tested against them so
-//! the two backends are exercised by one shared suite. All activations are
-//! row-major `[rows, dim]` tiles, matching the GPU layout.
+//! CPU reference implementations of every compute kernel, in plain Rust.
+//! They define the intended semantics; the WGPU kernels are tested against
+//! them. Activations are row-major `[rows, dim]` tiles, matching the GPU.
 
 fn silu(v: f32) -> f32 {
     v / (1.0 + (-v).exp())
@@ -56,6 +55,7 @@ pub fn embed(ids: &[u32], table: &[f32], dim: usize, scale: f32) -> Vec<f32> {
 /// (weight * silu(gate)), 2 = direct weight (w), 3 = layer norm
 /// ((x - mean) * inv_std * w + bias, `gate` holds the bias). `w_dim` is the
 /// weight length (may repeat across dim).
+#[allow(clippy::too_many_arguments)]
 pub fn norm(
     mode: u32,
     x: &[f32],
@@ -111,7 +111,7 @@ pub fn bias(x: &mut [f32], bias: &[f32], dim: usize) {
 /// mode 0 = silu, 1 = gelu (pytorch tanh approximation).
 pub fn swiglu(gate: &[f32], up: &[f32], mode: u32) -> Vec<f32> {
     let act = |v: f32| match mode {
-        1 => 0.5 * v * (1.0 + (0.7978845608028654 * (v + 0.044715 * v * v * v)).tanh()),
+        1 => 0.5 * v * (1.0 + (0.7978846 * (v + 0.044715 * v * v * v)).tanh()),
         _ => silu(v),
     };
     gate.iter().zip(up).map(|(g, u)| act(*g) * u).collect()
@@ -129,23 +129,18 @@ pub fn mul(a: &[f32], b: &[f32], n: usize, m: usize) -> Vec<f32> {
     (0..n).map(|i| a[i] * b[i % m]).collect()
 }
 
-/// Copies COUNT rows of x [ROWS, HIDDEN] selected by ids into out rows 0..COUNT.
+/// Copies COUNT rows of x [M_MAX, HIDDEN] selected by ids into out rows 0..COUNT.
 pub fn expert_gather(x: &[f32], ids: &[u32], rows: usize, hidden: usize) -> Vec<f32> {
     let mut out = vec![0f32; rows * hidden];
     for (r, &id) in ids.iter().enumerate() {
-        out[r * hidden..(r + 1) * hidden].copy_from_slice(&x[id as usize * hidden..(id as usize + 1) * hidden]);
+        out[r * hidden..(r + 1) * hidden]
+            .copy_from_slice(&x[id as usize * hidden..(id as usize + 1) * hidden]);
     }
     out
 }
 
 /// MoE weighted accumulation: acc[ids[i]] += weights[i] * src[i] over packed rows.
-pub fn expert_scatter(
-    acc: &mut [f32],
-    src: &[f32],
-    ids: &[u32],
-    weights: &[f32],
-    hidden: usize,
-) {
+pub fn expert_scatter(acc: &mut [f32], src: &[f32], ids: &[u32], weights: &[f32], hidden: usize) {
     for (i, &id) in ids.iter().enumerate() {
         let w = weights[i];
         for c in 0..hidden {
@@ -317,7 +312,6 @@ pub fn conv1d(x: &[f32], w: &[f32], state: &mut [f32]) -> Vec<f32> {
 
 /// Expands the q/k segments of a conv tile from N_K key heads to N_V value
 /// heads (repeat_interleave), matching the layout delta_recur consumes.
-/// x is [rows, 2*N_K*kd + N_V*vd]; out is [rows, 2*N_V*kd].
 #[allow(clippy::too_many_arguments)]
 pub fn repeat_qk(
     x: &[f32],

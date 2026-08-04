@@ -44,16 +44,28 @@ fn tensors(s: &BenchSpec) -> Vec<(String, Vec<u32>)> {
     for l in 0..s.layers {
         let p = format!("model.layers.{l}");
         v.push((format!("{p}.input_layernorm.weight"), vec![s.hidden]));
-        v.push((format!("{p}.post_attention_layernorm.weight"), vec![s.hidden]));
+        v.push((
+            format!("{p}.post_attention_layernorm.weight"),
+            vec![s.hidden],
+        ));
         let qk = s.q_heads * s.head_dim;
         let vk = s.kv_heads * s.head_dim;
         v.push((format!("{p}.self_attn.q_proj.weight"), vec![qk, s.hidden]));
         v.push((format!("{p}.self_attn.k_proj.weight"), vec![vk, s.hidden]));
         v.push((format!("{p}.self_attn.v_proj.weight"), vec![vk, s.hidden]));
         v.push((format!("{p}.self_attn.o_proj.weight"), vec![s.hidden, qk]));
-        v.push((format!("{p}.mlp.gate_proj.weight"), vec![s.intermediate, s.hidden]));
-        v.push((format!("{p}.mlp.up_proj.weight"), vec![s.intermediate, s.hidden]));
-        v.push((format!("{p}.mlp.down_proj.weight"), vec![s.hidden, s.intermediate]));
+        v.push((
+            format!("{p}.mlp.gate_proj.weight"),
+            vec![s.intermediate, s.hidden],
+        ));
+        v.push((
+            format!("{p}.mlp.up_proj.weight"),
+            vec![s.intermediate, s.hidden],
+        ));
+        v.push((
+            format!("{p}.mlp.down_proj.weight"),
+            vec![s.hidden, s.intermediate],
+        ));
     }
     v
 }

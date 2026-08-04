@@ -1,7 +1,7 @@
 //! flint-bench: synthetic-weight throughput benchmark for the Flint inference
 //! engine. Builds a real-size dense model from deterministic random weights
-//! (no disk, no downloads) and measures prefill and decode throughput on the
-//! WGPU backend, plus an optional per-kernel GPU profile (FLINT_PROFILE=1).
+//! (no disk, no downloads) and measures prefill/decode throughput, plus an
+//! optional per-kernel GPU profile (FLINT_PROFILE=1).
 
 use std::time::Instant;
 
@@ -95,19 +95,19 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let source = SynthCheckpoint::new(spec);
     let cfg = config(&spec);
-    let plan = flint_architectures::dense::dense_plan(false, |n: &str| {
-        n.strip_prefix("model.")
-            .map(str::to_string)
-            .or_else(|| n.starts_with("lm_head.").then(|| n.to_string()))
-    });
+    let plan = flint_architectures::dense::dense_plan(false);
     let mut backend = backend;
     let mut model = DenseModel::load(&source, cfg, &plan, args.max_seq, &backend)?;
-    eprintln!("[bench] weights loaded in {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[bench] weights loaded in {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
 
-    // ---- prefill: ROWS-wide chunks ----
-    let mut tokens: Vec<u32> = (0..args.prefill_tokens).map(|i| i % (args.vocab - 1) + 1).collect();
-    let _ = &mut tokens;
-    let (chunks, rem) = (args.prefill_tokens / 16, args.prefill_tokens % 16);
+    // ---- prefill: M_MAX-wide chunks ----
+    let (chunks, rem) = (
+        args.prefill_tokens / flint_model::M_MAX,
+        args.prefill_tokens % flint_model::M_MAX,
+    );
     let mut t = 0u32;
     // Warmup chunk: pipeline compilation happens once here, and a readback
     // forces the GPU to catch up so the timed run measures steady state.
@@ -116,9 +116,11 @@ fn main() -> Result<()> {
     let _ = backend.read_f32(&backend.dummy_scale().buf, 0, 1)?;
     let t0 = Instant::now();
     for _ in 0..chunks {
-        let ids: Vec<u32> = (t..t + 16).map(|i| i % (args.vocab - 1) + 1).collect();
+        let ids: Vec<u32> = (t..t + flint_model::M_MAX)
+            .map(|i| i % (args.vocab - 1) + 1)
+            .collect();
         model.forward(&mut backend, &ids, &[], &[])?;
-        t += 16;
+        t += flint_model::M_MAX;
     }
     if rem > 0 {
         let ids: Vec<u32> = (t..t + rem).map(|i| i % (args.vocab - 1) + 1).collect();
@@ -160,14 +162,21 @@ fn main() -> Result<()> {
         "[bench] decode bandwidth: {:.1} GB/s (weights only)",
         spec.weight_bytes() as f64 / decode_secs / 1e9
     );
-    eprintln!("[bench] last logit[0..4]: {:?}", &logits[..4.min(logits.len())]);
+    eprintln!(
+        "[bench] last logit[0..4]: {:?}",
+        &logits[..4.min(logits.len())]
+    );
 
     if backend.profiling() {
         let rows = backend.profile_report();
         let total: u64 = rows.iter().map(|r| r.total_ns).sum();
         eprintln!("[bench] GPU kernel time breakdown (cumulative over prefill+decode):");
         for r in rows {
-            let pct = if total > 0 { r.total_ns as f64 / total as f64 * 100.0 } else { 0.0 };
+            let pct = if total > 0 {
+                r.total_ns as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
             eprintln!(
                 "  {:<12} {:9.2} ms  {:8} calls  {:5.1}%",
                 r.label,

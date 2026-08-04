@@ -1,8 +1,6 @@
 //! CPU-side expert routing: softmax over router logits, top-k selection and
-//! the per-expert pair lists the GPU kernels consume. The logits tile is tiny
-//! (ROWS x experts), so routing happens on the CPU between GPU dispatches and
-//! never touches the GPU. The pair lists are sorted by expert so each expert's
-//! rows are contiguous, giving the gather/scatter kernels fixed ranges.
+//! per-expert pair lists the GPU kernels consume. Pairs are sorted by expert
+//! so each expert's rows are contiguous, giving fixed gather/scatter ranges.
 
 /// How router logits become routing weights.
 #[derive(Clone, Copy, Debug)]
@@ -11,14 +9,14 @@ pub enum RouteKind {
     Softmax,
     /// Phi-MoE's sparsemixer: softmax over the experts within 2 * jitter of
     /// the max score, top-1 selected, then a re-softmax over the remainder
-    /// for top-2 (see transformers' `sparsemixer`, eval path).
+    /// for top-2 (transformers' `sparsemixer`, eval path).
     SparseMixer { jitter: f32 },
 }
 
 /// One forward's routing result: pair lists sorted by expert id, with the
 /// shared expert (when present) as a final virtual expert covering every row.
-/// Each expert's range starts at a 256-byte boundary (64 elements) so the
-/// range binds directly as a storage-buffer slice.
+/// Each expert's range starts at a 64-element boundary so the range binds
+/// directly as a storage-buffer slice.
 #[derive(Debug)]
 pub struct Routing {
     /// Aligned start index of each expert's pairs (length experts + 2; the
@@ -34,8 +32,7 @@ pub struct Routing {
 
 impl Routing {
     /// Builds the routing for `m` rows over `experts` experts, appending the
-    /// shared expert as a virtual expert `experts` covering every row with a
-    /// constant weight.
+    /// shared expert as a virtual expert covering every row.
     pub fn new(
         logits: &[f32],
         m: u32,
@@ -121,11 +118,6 @@ impl Routing {
     pub fn offset(&self, e: usize) -> u64 {
         self.starts[e] as u64 * 4
     }
-
-    /// Total padded pair slots (buffer sizing).
-    pub fn len(&self) -> usize {
-        self.starts[self.starts.len() - 1] as usize
-    }
 }
 
 /// Rounds up to the next 64-element (256-byte) boundary.
@@ -142,7 +134,7 @@ fn softmax_topk(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
         .enumerate()
         .map(|(i, v)| (i, (v - mx).exp() / sum))
         .collect();
-    probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    probs.sort_by(|a, b| b.1.total_cmp(&a.1));
     probs.truncate(top_k);
     probs
 }

@@ -8,6 +8,7 @@ pub mod gemma;
 pub mod gemma4;
 pub mod gguf_config;
 pub mod llama;
+pub mod names;
 pub mod phi;
 pub mod qwen35;
 
@@ -22,7 +23,8 @@ use serde_json::Value;
 
 pub use chat::{ChatFormat, ChatMl, ChatMlThink, Gemma4Chat, GemmaChat, Phi4Chat, PhiChat};
 pub use dense::{DenseConfig, DenseModel, MoeConfig};
-pub use gguf_config::{gguf_key, synthesize_config};
+pub use gguf_config::synthesize_config;
+pub use names::gguf_key;
 pub use qwen35::{Qwen35, Qwen35Config};
 
 /// A fully assembled, chat-ready model: tensor engine, tokenizer, prompt format

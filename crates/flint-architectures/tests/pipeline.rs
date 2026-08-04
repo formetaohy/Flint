@@ -1,15 +1,12 @@
 //! Full-pipeline tests over toy checkpoints. Every supported architecture
-//! materializes a minimal deterministic-weight model via `common::toy` — GGUF
-//! for the dense families, safetensors for Qwen3.5 — and the complete
-//! load -> prefill -> generate path is exercised with zero external weight
-//! files.
+//! materializes a minimal deterministic-weight model via `common::toy`, and
+//! the complete load -> prefill -> generate path runs with zero external
+//! weight files.
 //!
-//! The assertions are structural, not qualitative: chunked vs sequential
-//! prefill must agree, speculative decoding must reproduce plain decoding
+//! Assertions are structural, not qualitative: chunked vs sequential prefill
+//! must agree, speculative decoding must reproduce plain decoding
 //! token-for-token, snapshot/restore must be lossless, tokenizers must
-//! round-trip. Random toy weights exercise every kernel and every loading
-//! path; only "the model says something sensible" would need real weights,
-//! which this suite deliberately never downloads.
+//! round-trip.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -70,7 +67,7 @@ fn sequential_logits(
     logits
 }
 
-/// Prefills in ROWS-wide chunks; returns the last chunk's final-row logits.
+/// Prefills in M_MAX-wide chunks; returns the last chunk's final-row logits.
 fn chunked_logits(
     model: &mut Box<dyn LanguageModel>,
     backend: &mut Backend,
@@ -79,7 +76,7 @@ fn chunked_logits(
     let mut logits = Vec::new();
     let mut done = 0usize;
     while done < prompt.len() {
-        let end = (done + flint_model::ROWS as usize).min(prompt.len());
+        let end = (done + 16).min(prompt.len());
         let chunk = &prompt[done..end];
         let last = end == prompt.len();
         let row = [chunk.len() as u32 - 1];
@@ -277,17 +274,10 @@ fn unsupported_formats_fail_fast() {
         &[("a".to_string(), vec![1], vec![0u8; 4], false)],
     )
     .unwrap();
-    std::fs::write(
-        dir.join("config.json"),
-        r#"{"model_type": "bert"}"#,
-    )
-    .unwrap();
+    std::fs::write(dir.join("config.json"), r#"{"model_type": "bert"}"#).unwrap();
     let backend = Backend::new().unwrap();
     let err = flint_architectures::load(&dir, 64, &backend).err().unwrap();
-    assert!(
-        err.to_string().contains("unsupported model_type"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("unsupported model_type"), "{err}");
 
     // GGUF without general.architecture.
     let gguf_dir = std::env::temp_dir().join(format!("flint-badarch-{}", std::process::id()));
@@ -296,7 +286,9 @@ fn unsupported_formats_fail_fast() {
     let mut w = flint_checkpoint::GgufWriter::new(32);
     w.kv_u32("llama.block_count", 1);
     std::fs::write(gguf_dir.join("model.gguf"), w.finish()).unwrap();
-    let err = flint_architectures::load(&gguf_dir, 64, &backend).err().unwrap();
+    let err = flint_architectures::load(&gguf_dir, 64, &backend)
+        .err()
+        .unwrap();
     assert!(
         err.to_string().contains("missing general.architecture"),
         "{err}"
@@ -328,7 +320,7 @@ fn verify_chunk_row0_matches_single_forward() {
     let prompt: Vec<u32> = (10..40).collect();
     let mut done = 0usize;
     while done < prompt.len() {
-        let end = (done + flint_model::ROWS as usize).min(prompt.len());
+        let end = (done + flint_model::M_MAX as usize).min(prompt.len());
         cm.model
             .forward(&mut backend, &prompt[done..end], &[], &[])
             .unwrap();
@@ -401,9 +393,9 @@ fn engine_and_model_fail_fast() {
     );
     assert!(
         cm.model
-            .forward(&mut backend, &[1u32; 17], &[0], &[])
+            .forward(&mut backend, &[1u32; 129], &[0], &[])
             .is_err(),
-        "chunk above ROWS"
+        "chunk above M_MAX"
     );
     for _ in 0..4 {
         cm.model
@@ -429,7 +421,3 @@ fn engine_and_model_fail_fast() {
         "prompt exceeds context"
     );
 }
-
-
-
-

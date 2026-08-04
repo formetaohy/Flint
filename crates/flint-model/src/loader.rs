@@ -1,9 +1,7 @@
 //! Role-based weight loading shared by every format and architecture. The
-//! checkpoint [`Checkpoint`] supplies decoded bytes; the [`Plan`] maps native
-//! names to canonical keys and picks each key's GPU storage role; the upload
-//! path re-packs each role (f32, packed bf16, group-quantized i8).
-//! Architectures then resolve the uploaded set into typed weight structs — a
-//! key missing from the checkpoint fails the load, never the forward.
+//! checkpoint supplies decoded bytes; the plan maps native names to canonical
+//! keys and picks each key's GPU storage role. A key missing from the
+//! checkpoint fails the load, never the forward.
 
 use std::collections::HashMap;
 
@@ -21,9 +19,8 @@ pub enum Role {
     I8,
 }
 
-/// Architecture + format loading policy: how a checkpoint's native tensor names
-/// map onto the canonical registry keys the forward graph reads, and how each
-/// canonical key is stored on the GPU.
+/// Architecture + format loading policy: name mapping onto canonical keys and
+/// the GPU storage role of each canonical key.
 pub struct Plan {
     /// Maps a source-native tensor name to its canonical key, or None to skip.
     pub key: fn(&str) -> Option<String>,
@@ -32,11 +29,11 @@ pub struct Plan {
 }
 
 /// Largest preferred quantization group that divides `k`. Group size trades
-/// accuracy for scale storage; 128 is preferred, falling back for dimensions
+/// accuracy for scale storage; 128 preferred, falling back for dimensions
 /// (e.g. SmolLM's 960-wide hidden) that are not multiples of 128.
-pub fn choose_group(k: u32) -> Result<usize> {
-    for g in [128usize, 64, 32] {
-        if (k as usize).is_multiple_of(g) {
+pub fn choose_group(k: u32) -> Result<u32> {
+    for g in [128u32, 64, 32] {
+        if k.is_multiple_of(g) {
             return Ok(g);
         }
     }
@@ -46,11 +43,18 @@ pub fn choose_group(k: u32) -> Result<usize> {
 }
 
 /// Row-wise group absmax quantization of f32 rows [rows, cols] with `group`
-/// elements per scale.
+/// elements per scale. The i8 bytes are stored block-major: [cols/16, rows,
+/// 16] so a gemm/gemv lane reads one contiguous 16-byte vec4 per (k-block,
+/// column) tile, and every k-block of every column is independently
+/// addressable (no lane idling on short K).
 pub fn quantize(data: &[f32], rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f32>) {
     assert!(
         cols.is_multiple_of(group),
         "quantized K must be a multiple of the group size"
+    );
+    assert!(
+        cols.is_multiple_of(16),
+        "quantized K must be a multiple of 16 (vec4 blocks)"
     );
     let groups = cols / group;
     let mut bytes = Vec::with_capacity(rows * cols);
@@ -68,7 +72,18 @@ pub fn quantize(data: &[f32], rows: usize, cols: usize, group: usize) -> (Vec<u8
             }
         }
     }
-    (bytes, scales)
+    // Block-major layout [cols/16, rows, 16]: re-pack the row-major bytes
+    // produced above. Blocks never straddle a group boundary (group sizes
+    // are multiples of 16), so the scale order is unchanged.
+    let mut out = vec![0u8; rows * cols];
+    for kb in 0..cols / 16 {
+        for r in 0..rows {
+            for i in 0..16 {
+                out[(kb * rows + r) * 16 + i] = bytes[r * cols + kb * 16 + i];
+            }
+        }
+    }
+    (out, scales)
 }
 
 /// Uploaded weights keyed by canonical name, consumed by typed take.
@@ -104,7 +119,7 @@ impl WeightSet {
     }
 }
 
-/// SwiGLU MLP weights plus the norm that feeds it; the shared weight shape
+/// SwiGLU MLP weights plus the norm feeding it; the shared weight shape
 /// used by every architecture's MLP block.
 pub struct SwigluMlp {
     pub norm: Tensor,
@@ -126,8 +141,8 @@ pub fn take_mlp(w: &mut WeightSet, prefix: &str) -> Result<SwigluMlp> {
 
 /// A layer's feed-forward block: a dense gated MLP or a MoE block.
 pub enum MlpBlock {
-    Dense(SwigluMlp),
-    Moe(MoeMlp),
+    Dense(Box<SwigluMlp>),
+    Moe(Box<MoeMlp>),
 }
 
 impl MlpBlock {
@@ -182,7 +197,7 @@ pub struct MoEPlan {
 /// per-expert matrices split from their 3D tensors into individually
 /// quantized weights, and the optional dense shared expert. Returns canonical
 /// (key, weight) pairs for the caller's WeightSet.
-pub fn load_moe(
+pub fn load_moe_experts(
     backend: &Backend,
     source: &dyn Checkpoint,
     plan: &MoEPlan,
@@ -199,10 +214,18 @@ pub fn load_moe(
         match part {
             MoEPart::Router => {
                 let key = format!("{prefix}.router.weight");
-                out.push((key.clone(), upload(&key, raw, backend, role(&key))?));
+                out.push((key.clone(), upload(backend, &key, raw, role(&key))?));
             }
             MoEPart::GateUp => {
-                out.extend(upload_experts(backend, &prefix, &["gate_proj", "up_proj"], raw, plan.experts, true, role)?);
+                out.extend(upload_experts(
+                    backend,
+                    &prefix,
+                    &["gate_proj", "up_proj"],
+                    raw,
+                    plan.experts,
+                    true,
+                    role,
+                )?);
             }
             MoEPart::Gate | MoEPart::Up | MoEPart::Down => {
                 let part = match part {
@@ -214,9 +237,17 @@ pub fn load_moe(
                     // Per-expert 2D tensors (Mixtral-style `block_sparse_moe`
                     // checkpoints): the prefix already carries the expert id.
                     let key = format!("{prefix}.{part}.weight");
-                    out.push((key.clone(), upload(&key, raw, backend, role(&key))?));
+                    out.push((key.clone(), upload(backend, &key, raw, role(&key))?));
                 } else {
-                    out.extend(upload_experts(backend, &prefix, &[part], raw, plan.experts, false, role)?);
+                    out.extend(upload_experts(
+                        backend,
+                        &prefix,
+                        &[part],
+                        raw,
+                        plan.experts,
+                        false,
+                        role,
+                    )?);
                 }
             }
             MoEPart::SharedGate | MoEPart::SharedUp | MoEPart::SharedDown => {
@@ -226,7 +257,7 @@ pub fn load_moe(
                     _ => "shared_expert.down_proj",
                 };
                 let key = format!("{prefix}.{part}.weight");
-                out.push((key.clone(), upload(&key, raw, backend, role(&key))?));
+                out.push((key.clone(), upload(backend, &key, raw, role(&key))?));
             }
         }
     }
@@ -279,14 +310,14 @@ fn upload_experts(
                 shape: vec![rows, k],
                 data: TensorData::F32(slice),
             };
-            out.push((key.clone(), upload(&key, raw, backend, role(&key))?));
+            out.push((key.clone(), upload(backend, &key, raw, role(&key))?));
         }
     }
     Ok(out)
 }
 
 /// One expert's gated MLP weights, per canonical key.
-pub struct ExpertW {
+pub struct ExpertWeights {
     pub gate: Weight,
     pub up: Weight,
     pub down: Weight,
@@ -294,21 +325,19 @@ pub struct ExpertW {
 
 /// A MoE block's weights: the input norm, router and per-expert MLPs plus the
 /// optional dense shared expert. Experts are individually quantized [N, K]
-/// weights; the router stays a dense weight for routing precision.
+/// weights; the router stays dense for routing precision.
 pub struct MoeMlp {
     pub norm: Tensor,
     pub norm_bias: Option<Tensor>,
     pub router: Weight,
-    pub experts: Vec<ExpertW>,
-    pub shared: Option<ExpertW>,
+    pub experts: Vec<ExpertWeights>,
+    pub shared: Option<ExpertWeights>,
     pub top_k: u32,
     pub scale: f32,
     pub shared_scale: f32,
 }
 
-/// Takes a MoE block's weights under `prefix` (e.g. `layers.0`): the input
-/// norm (+ bias for layer-norm families), router, per-expert gate/up/down
-/// and the optional shared expert.
+/// Takes a MoE block's weights under `prefix` (e.g. `layers.0`).
 pub fn take_moe(
     w: &mut WeightSet,
     prefix: &str,
@@ -322,7 +351,7 @@ pub fn take_moe(
     let mut exp = Vec::with_capacity(experts as usize);
     for e in 0..experts {
         let ek = |n: &str| format!("{prefix}.mlp.experts.{e}.{n}");
-        exp.push(ExpertW {
+        exp.push(ExpertWeights {
             gate: w.take(&ek("gate_proj.weight"))?,
             up: w.take(&ek("up_proj.weight"))?,
             down: w.take(&ek("down_proj.weight"))?,
@@ -330,7 +359,7 @@ pub fn take_moe(
     }
     let shared = if w.has(&k("mlp.shared_expert.gate_proj.weight")) {
         let sk = |n: &str| format!("{prefix}.mlp.shared_expert.{n}");
-        Some(ExpertW {
+        Some(ExpertWeights {
             gate: w.take(&sk("gate_proj.weight"))?,
             up: w.take(&sk("up_proj.weight"))?,
             down: w.take(&sk("down_proj.weight"))?,
@@ -365,23 +394,13 @@ pub fn load_weights(backend: &Backend, source: &dyn Checkpoint, plan: &Plan) -> 
         };
         let raw = source.read(&name)?;
         let role = (plan.role)(&key);
-        weights.insert(key.clone(), upload(&key, raw, backend, role)?);
+        weights.insert(key.clone(), upload(backend, &key, raw, role)?);
     }
     Ok(WeightSet { weights })
 }
 
-/// Uploads a raw tensor under a canonical key with the plan's role (the
-/// fused-QKV split path).
-pub fn upload_key(
-    backend: &Backend,
-    key: &str,
-    raw: RawTensor,
-    role: Role,
-) -> Result<Weight> {
-    upload(key, raw, backend, role)
-}
-
-fn upload(key: &str, raw: RawTensor, backend: &Backend, role: Role) -> Result<Weight> {
+/// Uploads a raw tensor under a canonical key with the plan's role.
+pub fn upload(backend: &Backend, key: &str, raw: RawTensor, role: Role) -> Result<Weight> {
     let label = format!("w:{key}");
     let shape = raw.shape;
     match role {
@@ -407,12 +426,12 @@ fn upload(key: &str, raw: RawTensor, backend: &Backend, role: Role) -> Result<We
             }
             let group = choose_group(shape[1])?;
             let data = raw.data.into_f32();
-            let (bytes, scales) = quantize(&data, shape[0] as usize, shape[1] as usize, group);
-            let (n, groups) = (shape[0], shape[1] / group as u32);
+            let (bytes, scales) = quantize(&data, shape[0] as usize, shape[1] as usize, group as usize);
+            let (n, groups) = (shape[0], shape[1] / group);
             Ok(Weight::quant(
                 backend.tensor_i8(&bytes, shape, &label),
                 backend.tensor_f32(&scales, vec![n, groups], &format!("{label}.scale")),
-                group as u32,
+                group,
             ))
         }
     }

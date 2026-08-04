@@ -1,7 +1,6 @@
 // MoE weighted accumulation: acc[ids[i]] += weights[i] * src[i] over the
 // packed rows 0..COUNT. The accumulator is zeroed before the block's scatters.
 
-override ROWS: u32 = 16u;
 override HIDDEN: u32 = 1u;
 override COUNT: u32 = 1u;
 

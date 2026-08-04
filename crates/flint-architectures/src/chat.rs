@@ -1,7 +1,5 @@
-//! Per-family chat prompt formats. Each model family owns how its turns are
-//! rendered into a prompt and which extra literals terminate a reply. Marker
-//! tokens (im_start/im_end, think tags, Gemma turn tags) are plain
-//! angle-bracket sequences registered as added/special tokens.
+//! Per-family chat prompt formats. Each family owns how turns render into a
+//! prompt and which extra literals terminate a reply.
 
 /// A chat prompt format plus the literals that end a reply.
 pub trait ChatFormat {
@@ -135,8 +133,8 @@ fn push_gemma4_turn(out: &mut String, role: &str, content: &str) {
     out.push_str(&format!("<|turn>{role}\n{content}<turn|>\n"));
 }
 
-/// ChatML rendering. With `think`, opens an empty think block in the assistant
-/// prefix (Qwen3.5 non-thinking mode).
+/// ChatML rendering. With `think`, opens an empty think block in the
+/// assistant prefix (Qwen3.5 non-thinking mode).
 fn render_chatml(think: bool, system: &str, history: &[(String, String)], user: &str) -> String {
     let mut out = String::new();
     push_turn(&mut out, "system", system);
@@ -160,8 +158,8 @@ fn render_chatml(think: bool, system: &str, history: &[(String, String)], user: 
     out
 }
 
-/// Gemma turn format: `<bos><start_of_turn>role\ncontent<end_of_turn>\n`. Gemma
-/// has no system role, so the system prompt is folded into the first user turn.
+/// Gemma turn format: `<bos><start_of_turn>role\ncontent<end_of_turn>\n`.
+/// Gemma has no system role, so the system prompt folds into the first turn.
 fn render_gemma(system: &str, history: &[(String, String)], user: &str) -> String {
     let mut out = String::new();
     out.push_str("<bos>");

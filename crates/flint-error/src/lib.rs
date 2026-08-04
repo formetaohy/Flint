@@ -6,8 +6,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("gpu: {0}")]
     Gpu(String),
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
     #[error("model: {0}")]
     Model(String),
     #[error("config: {0}")]

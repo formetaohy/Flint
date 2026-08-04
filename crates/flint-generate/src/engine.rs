@@ -1,19 +1,16 @@
 //! Prefill/decode engine with optional speculative decoding.
 //!
 //! Speculation is exact by construction: the sampler's `transform` is the
-//! single source of sampling distributions, so the draft distribution stored
-//! in the spec phase and the target distribution computed at verification
-//! carry the identical configuration over the identical context — the
-//! rejection test compares the distribution the draft token was drawn from
-//! against the target distribution, and committed tokens follow the target
-//! distribution exactly (arXiv:2211.17192).
+//! single source of sampling distributions, so the draft and target
+//! distributions carry identical configuration over identical context, and
+//! committed tokens follow the target distribution exactly (arXiv:2211.17192).
 
 use std::collections::VecDeque;
 use std::time::Instant;
 
 use flint_backend::Backend;
 use flint_error::{Error, Result};
-use flint_model::{LanguageModel, ROWS};
+use flint_model::{LanguageModel, M_MAX};
 use flint_tokenizer::{Decoder, Tokenizer};
 
 use crate::sampler::{Dist, Sampler};
@@ -132,7 +129,7 @@ impl Engine {
         let speculate = self.speculate && self.model.speculator().is_some();
         Ok(Stream {
             backend: &mut self.backend,
-            model: &mut self.model,
+            model: &mut *self.model,
             tokenizer: &self.tokenizer,
             sampler: &mut self.sampler,
             stop: self.stop.clone(),
@@ -176,7 +173,7 @@ enum Phase {
 /// Iterator over committed pieces; `stats()` is final once the stream ends.
 pub struct Stream<'a> {
     backend: &'a mut Backend,
-    model: &'a mut Box<dyn LanguageModel>,
+    model: &'a mut dyn LanguageModel,
     tokenizer: &'a Tokenizer,
     sampler: &'a mut Sampler,
     stop: Vec<u32>,
@@ -258,7 +255,7 @@ impl Stream<'_> {
 
     fn step_prefill(&mut self, done: usize) -> Result<()> {
         let total = self.prompt_ids.len();
-        let end = (done + ROWS as usize).min(total);
+        let end = (done + M_MAX as usize).min(total);
         let chunk = &self.prompt_ids[done..end];
         let m = chunk.len() as u32;
         let last = end == total;
@@ -277,14 +274,12 @@ impl Stream<'_> {
         let first = self.dist(&out.logits[0]);
         let pending = self.sampler.draw(&first);
         if self.speculate {
-            let draft_logits = {
-                let spec = self
-                    .model
-                    .speculator()
-                    .expect("speculate implies a speculator");
-                spec.prime();
-                spec.draft(self.backend, pending, &out.hidden[0])?
-            };
+            let spec = self
+                .model
+                .speculator()
+                .expect("speculate implies a speculator");
+            spec.prime();
+            let draft_logits = spec.draft(self.backend, pending, &out.hidden[0])?;
             let draft_dist = self.dist_after(&draft_logits, pending);
             let draft_token = self.sampler.draw(&draft_dist);
             self.phase = Phase::Spec {
@@ -343,14 +338,12 @@ impl Stream<'_> {
             // supplied the bonus).
             let bonus_dist = self.dist(&out.logits[1]);
             let bonus = self.sampler.draw(&bonus_dist);
-            let draft_logits = {
-                let spec = self
-                    .model
-                    .speculator()
-                    .expect("spec phase implies a speculator");
-                spec.draft(self.backend, draft_token, &out.hidden[0])?;
-                spec.draft(self.backend, bonus, &out.hidden[1])?
-            };
+            let spec = self
+                .model
+                .speculator()
+                .expect("spec phase implies a speculator");
+            spec.draft(self.backend, draft_token, &out.hidden[0])?;
+            let draft_logits = spec.draft(self.backend, bonus, &out.hidden[1])?;
             let draft_dist = self.dist_after(&draft_logits, bonus);
             let next_draft = self.sampler.draw(&draft_dist);
             self.phase = Phase::Spec {
@@ -373,11 +366,11 @@ impl Stream<'_> {
             return Ok(());
         }
         self.model.forward(self.backend, &[pending], &[], &[])?;
-        let draft_logits = self
+        let spec = self
             .model
             .speculator()
-            .expect("spec phase implies a speculator")
-            .draft(self.backend, chosen, &out.hidden[0])?;
+            .expect("spec phase implies a speculator");
+        let draft_logits = spec.draft(self.backend, chosen, &out.hidden[0])?;
         let draft_dist = self.dist_after(&draft_logits, chosen);
         let next_draft = self.sampler.draw(&draft_dist);
         self.phase = Phase::Spec {

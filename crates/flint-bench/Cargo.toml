@@ -3,10 +3,6 @@ name = "flint-bench"
 version.workspace = true
 edition.workspace = true
 
-[lib]
-name = "flint_bench"
-path = "src/lib.rs"
-
 [dependencies]
 flint-architectures.workspace = true
 flint-backend.workspace = true
