@@ -8,11 +8,11 @@
 
 use flint_backend::Backend;
 use flint_checkpoint::Checkpoint;
-use flint_error::Result;
+use flint_error::{Error, Result};
 use flint_model::loader::Plan;
 use serde_json::Value;
 
-use crate::dense::{DenseConfig, DenseModel, SlidingWindow, dense_plan};
+use crate::dense::{DenseConfig, DenseModel, dense_plan};
 
 /// HF safetensors names -> canonical keys (model / language_model prefixes stripped).
 fn hf_key(name: &str) -> Option<String> {
@@ -43,7 +43,20 @@ pub fn parse_config(v: &Value) -> Result<DenseConfig> {
             .get("sliding_window_pattern")
             .and_then(Value::as_u64)
             .unwrap_or(6) as u32;
-        cfg.window = Some(SlidingWindow { size, pattern });
+        if pattern == 0 {
+            return Err(Error::Config(
+                "sliding_window_pattern must be non-zero".into(),
+            ));
+        }
+        cfg.windows = (0..cfg.layers)
+            .map(|l| {
+                if (l + 1).is_multiple_of(pattern) {
+                    0
+                } else {
+                    size
+                }
+            })
+            .collect();
     }
     cfg.validate()?;
     Ok(cfg)

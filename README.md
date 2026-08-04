@@ -25,16 +25,23 @@ Flint is a local LLM inference engine written in pure Rust on [WGPU](https://git
 
 ## Features
 
-- **Cross-platform** — Built on WGPU; runs on every platform. 
+- **Cross-platform** — Built on WGPU; runs on every platform.
 - **Fast** — Highly optimized WGSL-based inference core.
-- **Multi-format** — Loads `safetensors` and quantized `GGUF` models.
+- **Multi-format** — Supports `safetensors` and quantized `GGUF` formats
 
 ## Supported Architectures
 
-- Qwen3.5, Qwen3, Qwen2
-- Gemma 3
+| Family | Models
+| --- | ---
+| Qwen | Qwen3.5 / Qwen3 / Qwen2 / Qwen1.5
+| LLaMA | LLaMA 2/3.x, Mistral, Phi-3/3.5
+| Gemma | Gemma 2 / 3
+| Phi | Phi-4-mini / Phi-3.x
+| Phi-MoE | Phi-tiny/mini-MoE
+| Gemma 4 | Gemma 4 E2B/E4B
 
 We're actively adding support for more models. If there's a model you'd like supported, feel free to open an issue or PR.
+
 
 ## Quick Start
 

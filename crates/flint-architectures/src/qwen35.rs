@@ -7,7 +7,7 @@ use flint_error::{Error, Result};
 use flint_model::cache::{KvCache, RecurrentState};
 use flint_model::config::{check_gemm_dims, check_head_dim, f64_field, req, u32_field, u32_list};
 use flint_model::loader::{self, Plan, Role, SwigluMlp, WeightSet, take_mlp};
-use flint_model::ops::{self, MlpTiles, NormMode, ROWS};
+use flint_model::ops::{self, Act, MlpTiles, NormMode, ROWS};
 use flint_model::{ChunkOut, LanguageModel, Speculator};
 use flint_tensor::{Tensor, Weight};
 use serde_json::Value;
@@ -272,6 +272,8 @@ fn take_linear_layer(w: &mut WeightSet, p: &str) -> Result<Box<LinearLayerW>> {
 
 /// Per-forward scratch tiles, all [ROWS, dim].
 struct Scratch {
+    /// One-element f32 dummy for the embed op's unused scale binding.
+    ones: Tensor,
     ids: Tensor,
     /// One-u32 step args holding the current position for rope/kv_store/attn.
     args: Tensor,
@@ -310,6 +312,7 @@ fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
     let i = cfg.intermediate;
     let z = |shape: &[u32], label: &str| backend.zero_tensor(shape, label);
     Scratch {
+        ones: backend.tensor_f32(&[1.0], vec![1], "ones"),
         ids: ops::token_ids(backend),
         args: ops::step_args(backend),
         hidden: z(&[ROWS, h], "hidden"),
@@ -465,7 +468,7 @@ impl Qwen35 {
         };
 
         let s = alloc_scratch(&cfg, backend);
-        let (cos, sin) = ops::rope_tables(backend, max_seq, cfg.rotary_dim(), cfg.rope_theta);
+        let (cos, sin) = ops::rope_tables(backend, max_seq, cfg.rotary_dim(), cfg.rotary_dim(), cfg.rope_theta, None);
         Ok(Self {
             cfg,
             max_seq,
@@ -517,7 +520,8 @@ impl LanguageModel for Qwen35 {
                 backend,
                 &mut pass,
                 &s.ids,
-                self.embed.tensor(),
+                &self.embed,
+                &s.ones,
                 Binding::Full(&s.hidden),
                 cfg.hidden,
                 1.0,
@@ -545,6 +549,7 @@ impl LanguageModel for Qwen35 {
                 ROWS,
                 cfg.hidden,
                 cfg.hidden,
+                1e-6,
             )?;
             ops::gemm(
                 backend,
@@ -631,7 +636,8 @@ impl Speculator for Qwen35 {
                 backend,
                 &mut pass,
                 &s.ids,
-                self.embed.tensor(),
+                &self.embed,
+                &s.ones,
                 Binding::Full(&s.hidden),
                 cfg.hidden,
                 1.0,
@@ -647,6 +653,7 @@ impl Speculator for Qwen35 {
                 ROWS,
                 cfg.hidden,
                 cfg.hidden,
+                1e-6,
             )?;
             ops::norm(
                 backend,
@@ -659,6 +666,7 @@ impl Speculator for Qwen35 {
                 ROWS,
                 cfg.hidden,
                 cfg.hidden,
+                1e-6,
             )?;
             ops::concat(
                 backend,
@@ -692,6 +700,7 @@ impl Speculator for Qwen35 {
                 ROWS,
                 cfg.hidden,
                 cfg.hidden,
+                1e-6,
             )?;
             ops::gemm(
                 backend,
@@ -765,6 +774,7 @@ fn full_layer(
         ROWS,
         cfg.hidden,
         cfg.hidden,
+                1e-6,
     )?;
     full_attn_block(backend, pass, cfg, s, cos, sin, w, kv, m, args)?;
     ops::add(
@@ -786,6 +796,7 @@ fn full_layer(
         ROWS,
         cfg.hidden,
         cfg.hidden,
+                1e-6,
     )?;
     mlp_block(backend, pass, cfg, s, &w.mlp, m)?;
     ops::add(
@@ -820,6 +831,7 @@ fn linear_layer(
         ROWS,
         cfg.hidden,
         cfg.hidden,
+                1e-6,
     )?;
     linear_attn_block(backend, pass, cfg, s, w, state, m)?;
     ops::add(
@@ -841,6 +853,7 @@ fn linear_layer(
         ROWS,
         cfg.hidden,
         cfg.hidden,
+                1e-6,
     )?;
     mlp_block(backend, pass, cfg, s, &w.mlp, m)?;
     ops::add(
@@ -897,6 +910,7 @@ fn full_attn_block(
         ROWS * nq,
         hd,
         hd,
+                1e-6,
     )?;
     ops::gemm(
         backend,
@@ -917,6 +931,7 @@ fn full_attn_block(
         ROWS * nkv,
         hd,
         hd,
+                1e-6,
     )?;
     ops::gemm(
         backend,
@@ -989,6 +1004,7 @@ fn full_attn_block(
         args,
         m,
         0,
+        hd + 2,
     )?;
     ops::sigmoid_mul(
         backend,
@@ -1127,6 +1143,7 @@ fn linear_attn_block(
         m * heads,
         cfg.lin_val_dim,
         cfg.lin_val_dim,
+                1e-6,
     )?;
     ops::gemm(
         backend,
@@ -1155,5 +1172,6 @@ fn mlp_block(
         &s.mlp,
         m,
         cfg.intermediate,
+        Act::Silu,
     )
 }

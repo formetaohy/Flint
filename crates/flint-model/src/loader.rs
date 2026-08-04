@@ -97,6 +97,11 @@ impl WeightSet {
     pub fn has(&self, key: &str) -> bool {
         self.weights.contains_key(key)
     }
+
+    /// Inserts a weight (MoE loading path).
+    pub fn insert(&mut self, key: String, w: Weight) {
+        self.weights.insert(key, w);
+    }
 }
 
 /// SwiGLU MLP weights plus the norm that feeds it; the shared weight shape
@@ -119,6 +124,236 @@ pub fn take_mlp(w: &mut WeightSet, prefix: &str) -> Result<SwigluMlp> {
     })
 }
 
+/// A layer's feed-forward block: a dense gated MLP or a MoE block.
+pub enum MlpBlock {
+    Dense(SwigluMlp),
+    Moe(MoeMlp),
+}
+
+impl MlpBlock {
+    /// The norm feeding the block.
+    pub fn norm(&self) -> &Tensor {
+        match self {
+            MlpBlock::Dense(m) => &m.norm,
+            MlpBlock::Moe(m) => &m.norm,
+        }
+    }
+
+    /// Layer-norm bias of the feeding norm, when the family uses one.
+    pub fn norm_bias(&self) -> Option<&Tensor> {
+        match self {
+            MlpBlock::Dense(_) => None,
+            MlpBlock::Moe(m) => m.norm_bias.as_ref(),
+        }
+    }
+}
+
+// ================================================================ MoE
+
+/// One MoE weight's role in the expert set, mapped from a native tensor name
+/// onto canonical keys under the block prefix (`layers.{l}.mlp`).
+pub enum MoEPart {
+    /// Router projection [E, hidden], uploaded as a dense weight.
+    Router,
+    /// Fused per-expert gate+up [E, 2N, K], split into gate/up halves.
+    GateUp,
+    /// Per-expert gate [E, N, K].
+    Gate,
+    /// Per-expert up [E, N, K].
+    Up,
+    /// Per-expert down [E, hidden, inter].
+    Down,
+    /// Dense shared expert (2D matrices, no expert axis).
+    SharedGate,
+    SharedUp,
+    SharedDown,
+}
+
+/// MoE tensor classifier: maps each native name to its canonical block prefix
+/// plus part, or None to skip. The expert count and shared-expert presence
+/// come from the model config.
+pub struct MoEPlan {
+    pub key: fn(&str) -> Option<(String, MoEPart)>,
+    pub experts: u32,
+    pub shared: bool,
+}
+
+/// Loads every MoE weight the plan claims: the router as a dense weight, the
+/// per-expert matrices split from their 3D tensors into individually
+/// quantized weights, and the optional dense shared expert. Returns canonical
+/// (key, weight) pairs for the caller's WeightSet.
+pub fn load_moe(
+    backend: &Backend,
+    source: &dyn Checkpoint,
+    plan: &MoEPlan,
+    role: fn(&str) -> Role,
+) -> Result<Vec<(String, Weight)>> {
+    let mut names = source.names();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let Some((prefix, part)) = (plan.key)(&name) else {
+            continue;
+        };
+        let raw = source.read(&name)?;
+        match part {
+            MoEPart::Router => {
+                let key = format!("{prefix}.router.weight");
+                out.push((key.clone(), upload(&key, raw, backend, role(&key))?));
+            }
+            MoEPart::GateUp => {
+                out.extend(upload_experts(backend, &prefix, &["gate_proj", "up_proj"], raw, plan.experts, true, role)?);
+            }
+            MoEPart::Gate | MoEPart::Up | MoEPart::Down => {
+                let part = match part {
+                    MoEPart::Gate => "gate_proj",
+                    MoEPart::Up => "up_proj",
+                    _ => "down_proj",
+                };
+                if raw.shape.len() == 2 {
+                    // Per-expert 2D tensors (Mixtral-style `block_sparse_moe`
+                    // checkpoints): the prefix already carries the expert id.
+                    let key = format!("{prefix}.{part}.weight");
+                    out.push((key.clone(), upload(&key, raw, backend, role(&key))?));
+                } else {
+                    out.extend(upload_experts(backend, &prefix, &[part], raw, plan.experts, false, role)?);
+                }
+            }
+            MoEPart::SharedGate | MoEPart::SharedUp | MoEPart::SharedDown => {
+                let part = match part {
+                    MoEPart::SharedGate => "shared_expert.gate_proj",
+                    MoEPart::SharedUp => "shared_expert.up_proj",
+                    _ => "shared_expert.down_proj",
+                };
+                let key = format!("{prefix}.{part}.weight");
+                out.push((key.clone(), upload(&key, raw, backend, role(&key))?));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Splits a 3D expert tensor along its leading axis and uploads each slice
+/// as a quantized [rows, k] weight under `{prefix}.experts.{e}.{part}.weight`.
+/// With `fused`, the middle axis is a concatenated gate+up [E, 2N, K] and
+/// `parts` receives both halves per expert.
+fn upload_experts(
+    backend: &Backend,
+    prefix: &str,
+    parts: &[&str],
+    raw: RawTensor,
+    experts: u32,
+    fused: bool,
+    role: fn(&str) -> Role,
+) -> Result<Vec<(String, Weight)>> {
+    if raw.shape.len() != 3 || raw.shape[0] != experts {
+        return Err(Error::Model(format!(
+            "{prefix}.experts: expected a [{experts}, N, K] tensor, got {:?}",
+            raw.shape
+        )));
+    }
+    let (e_count, n, k) = (raw.shape[0], raw.shape[1], raw.shape[2]);
+    if fused && !n.is_multiple_of(2) {
+        return Err(Error::Model(format!(
+            "{prefix}.experts: fused gate+up width {n} is odd"
+        )));
+    }
+    let data = raw.data.into_f32();
+    let mut out = Vec::with_capacity(e_count as usize * parts.len());
+    for e in 0..e_count {
+        for (i, part) in parts.iter().enumerate() {
+            let (lo, hi) = if fused {
+                (i as u32 * n / 2, (i as u32 + 1) * n / 2)
+            } else {
+                (0, n)
+            };
+            let rows = hi - lo;
+            let key = format!("{prefix}.experts.{e}.{part}.weight");
+            let slice: Vec<f32> = (lo..hi)
+                .flat_map(|r| {
+                    let base = ((e * n + r) * k) as usize;
+                    data[base..base + k as usize].to_vec()
+                })
+                .collect();
+            let raw = RawTensor {
+                shape: vec![rows, k],
+                data: TensorData::F32(slice),
+            };
+            out.push((key.clone(), upload(&key, raw, backend, role(&key))?));
+        }
+    }
+    Ok(out)
+}
+
+/// One expert's gated MLP weights, per canonical key.
+pub struct ExpertW {
+    pub gate: Weight,
+    pub up: Weight,
+    pub down: Weight,
+}
+
+/// A MoE block's weights: the input norm, router and per-expert MLPs plus the
+/// optional dense shared expert. Experts are individually quantized [N, K]
+/// weights; the router stays a dense weight for routing precision.
+pub struct MoeMlp {
+    pub norm: Tensor,
+    pub norm_bias: Option<Tensor>,
+    pub router: Weight,
+    pub experts: Vec<ExpertW>,
+    pub shared: Option<ExpertW>,
+    pub top_k: u32,
+    pub scale: f32,
+    pub shared_scale: f32,
+}
+
+/// Takes a MoE block's weights under `prefix` (e.g. `layers.0`): the input
+/// norm (+ bias for layer-norm families), router, per-expert gate/up/down
+/// and the optional shared expert.
+pub fn take_moe(
+    w: &mut WeightSet,
+    prefix: &str,
+    experts: u32,
+    top_k: u32,
+    scale: f32,
+    shared_scale: f32,
+    layernorm: bool,
+) -> Result<MoeMlp> {
+    let k = |n: &str| format!("{prefix}.{n}");
+    let mut exp = Vec::with_capacity(experts as usize);
+    for e in 0..experts {
+        let ek = |n: &str| format!("{prefix}.mlp.experts.{e}.{n}");
+        exp.push(ExpertW {
+            gate: w.take(&ek("gate_proj.weight"))?,
+            up: w.take(&ek("up_proj.weight"))?,
+            down: w.take(&ek("down_proj.weight"))?,
+        });
+    }
+    let shared = if w.has(&k("mlp.shared_expert.gate_proj.weight")) {
+        let sk = |n: &str| format!("{prefix}.mlp.shared_expert.{n}");
+        Some(ExpertW {
+            gate: w.take(&sk("gate_proj.weight"))?,
+            up: w.take(&sk("up_proj.weight"))?,
+            down: w.take(&sk("down_proj.weight"))?,
+        })
+    } else {
+        None
+    };
+    Ok(MoeMlp {
+        norm: w.take_tensor(&k("post_attention_layernorm.weight"))?,
+        norm_bias: if layernorm {
+            Some(w.take_tensor(&k("post_attention_layernorm.bias"))?)
+        } else {
+            None
+        },
+        router: w.take(&k("mlp.router.weight"))?,
+        experts: exp,
+        shared,
+        top_k,
+        scale,
+        shared_scale,
+    })
+}
+
 /// Loads every checkpoint tensor the plan claims, onto the GPU by role.
 pub fn load_weights(backend: &Backend, source: &dyn Checkpoint, plan: &Plan) -> Result<WeightSet> {
     let mut names = source.names();
@@ -133,6 +368,17 @@ pub fn load_weights(backend: &Backend, source: &dyn Checkpoint, plan: &Plan) -> 
         weights.insert(key.clone(), upload(&key, raw, backend, role)?);
     }
     Ok(WeightSet { weights })
+}
+
+/// Uploads a raw tensor under a canonical key with the plan's role (the
+/// fused-QKV split path).
+pub fn upload_key(
+    backend: &Backend,
+    key: &str,
+    raw: RawTensor,
+    role: Role,
+) -> Result<Weight> {
+    upload(key, raw, backend, role)
 }
 
 fn upload(key: &str, raw: RawTensor, backend: &Backend, role: Role) -> Result<Weight> {

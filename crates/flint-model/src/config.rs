@@ -55,11 +55,12 @@ pub fn check_gemm_dims(pairs: &[(u32, u32)]) -> Result<()> {
     Ok(())
 }
 
-/// The attention kernel owns one output column per thread (max 256).
+/// The attention kernel owns one output column per thread (max 512: eight
+/// 64-wide column pairs).
 pub fn check_head_dim(head_dim: u32) -> Result<()> {
-    if !(64..=256).contains(&head_dim) {
+    if !(64..=512).contains(&head_dim) {
         return Err(Error::Config(format!(
-            "head_dim {head_dim} outside [64, 256]"
+            "head_dim {head_dim} outside [64, 512]"
         )));
     }
     Ok(())

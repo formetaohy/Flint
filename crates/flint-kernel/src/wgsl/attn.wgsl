@@ -7,8 +7,10 @@
 //
 // Within a segment, the K and V tiles are staged in workgroup memory and
 // shared by the NQ_PER_KV query heads of this kv head (GQA batching).
-// HEAD_DIM in [64, 256]; NQ_PER_KV in [1, 8]. 512 threads = 8 head slots
+// HEAD_DIM in [64, 512]; NQ_PER_KV in [1, 8]. 512 threads = 8 head slots
 // x 64 key slots; heads beyond NQ_PER_KV idle (their barriers still sync).
+// Tiles are staged in 128-dim halves so the workgroup storage stays at
+// 32 KiB regardless of HEAD_DIM.
 
 override N_HEADS: u32 = 1u;
 override KV_HEADS: u32 = 1u;
@@ -17,9 +19,15 @@ override MAX_SEQ: u32 = 8192u;
 override SCALE: f32 = 0.0625;
 override WINDOW: u32 = 0u;
 override NQ_PER_KV: u32 = 1u;
+// Scratch slot stride (HEAD_DIM + 2, or the largest layer head dim when
+// layers vary; keeps one shared scratch valid for every layer).
+override STRIDE: u32 = 258u;
 
 const CHUNK: u32 = 64u;
 const SEGS: u32 = 32u;
+// Dims staged per step; a half-tile is 64 keys x 128 dims packed bf16.
+const HALF: u32 = 128u;
+const STAGE: u32 = CHUNK * HALF / 2u;
 const NEG_INF: f32 = -3.4e38;
 
 @group(0) @binding(0) var<storage, read> q: array<f32>;
@@ -28,8 +36,8 @@ const NEG_INF: f32 = -3.4e38;
 @group(0) @binding(3) var<storage, read_write> scratch: array<f32>;
 @group(0) @binding(4) var<storage, read> args: array<u32>;
 
-var<workgroup> kt: array<u32, CHUNK * HEAD_DIM / 2u>;
-var<workgroup> vt: array<u32, CHUNK * HEAD_DIM / 2u>;
+var<workgroup> kt: array<u32, STAGE>;
+var<workgroup> vt: array<u32, STAGE>;
 var<workgroup> scs: array<f32, 8u * CHUNK>;
 var<workgroup> red: array<f32, 8u * CHUNK>;
 // Segment softmax stats per head (max, sum); kept out of `red` because the
@@ -48,6 +56,28 @@ fn load_k(e: u32) -> f32 {
 fn load_v(e: u32) -> f32 {
     let word = vt[e >> 1];
     return bf16f(select(word >> 16, word & 0xFFFFu, (e & 1u) == 0u));
+}
+
+// Stages one 128-dim half of the K tile: half h covers dims [h*128, h*128+128)
+// of the chunk's keys. `d2` is the dim-PAIR index (e % 64): the staged word e
+// holds the cache word for dims (d2*2, d2*2+1). Out-of-range keys and dims
+// beyond HEAD_DIM stage zeros.
+fn stage_k(e: u32, key: u32, d2: u32, limit: u32, c0: u32, plane: u32, half: u32) {
+    if (key < limit && half * HALF + d2 * 2u < HEAD_DIM) {
+        let ckey = plane + (c0 + key) * HEAD_DIM + half * HALF + d2 * 2u;
+        kt[e] = k_cache[ckey >> 1];
+    } else {
+        kt[e] = 0u;
+    }
+}
+
+fn stage_v(e: u32, key: u32, d2: u32, limit: u32, c0: u32, plane: u32, half: u32) {
+    if (key < limit && half * HALF + d2 * 2u < HEAD_DIM) {
+        let ckey = plane + (c0 + key) * HEAD_DIM + half * HALF + d2 * 2u;
+        vt[e] = v_cache[ckey >> 1];
+    } else {
+        vt[e] = 0u;
+    }
 }
 
 @compute @workgroup_size(512)
@@ -72,15 +102,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
     let hl = t / CHUNK;
     let slot = t % CHUNK;
-    let d0 = slot;
-    let d1 = slot + CHUNK;
-    let d2 = slot + 2u * CHUNK;
-    let d3 = slot + 3u * CHUNK;
 
     var o0 = 0.0;
     var o1 = 0.0;
     var o2 = 0.0;
     var o3 = 0.0;
+    var o4 = 0.0;
+    var o5 = 0.0;
+    var o6 = 0.0;
+    var o7 = 0.0;
 
     // Segment stats (max, sum) per head; empty segments stay NEG_INF/0 so
     // the merge absorbs them.
@@ -93,29 +123,25 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     for (var c0: u32 = seg_lo; c0 < seg_hi; c0 += CHUNK) {
         let limit = min(CHUNK, seg_hi - c0);
 
-        // ---- Stage the K and V tiles. ----
-        for (var j: u32 = 0u; j < CHUNK * HEAD_DIM / 2u / 256u; j += 1u) {
-            let e = t + j * 256u;
-            let key = e / (HEAD_DIM / 2u);
-            let d = (e % (HEAD_DIM / 2u)) * 2u;
-            if (key < limit) {
-                kt[e] = k_cache[(cache_plane + (c0 + key) * HEAD_DIM + d) >> 1];
-                vt[e] = v_cache[(cache_plane + (c0 + key) * HEAD_DIM + d) >> 1];
-            } else {
-                kt[e] = 0u;
-                vt[e] = 0u;
+        // ---- Phase 1: scores, staged in 128-dim halves. ----
+        var dot = 0.0;
+        for (var half = 0u; half < (HEAD_DIM + HALF - 1u) / HALF; half += 1u) {
+            // 512 threads cover STAGE words in STAGE/512 steps of 512.
+            for (var j: u32 = 0u; j < STAGE / 512u; j += 1u) {
+                let e = t + j * 512u;
+                stage_k(e, e / (HALF / 2u), e % (HALF / 2u), limit, c0, cache_plane, half);
             }
+            workgroupBarrier();
+            if (hl < NQ_PER_KV && c0 + slot >= win_start && c0 + slot < seg_hi) {
+                let qb = q0 + hl * HEAD_DIM + half * HALF;
+                for (var dd = 0u; dd < HALF && half * HALF + dd < HEAD_DIM; dd += 1u) {
+                    dot += q[qb + dd] * load_k(slot * HALF + dd);
+                }
+            }
+            workgroupBarrier();
         }
-        workgroupBarrier();
-
-        // ---- Phase 1: scores (masked by window and segment tail). ----
         var sc = NEG_INF;
         if (hl < NQ_PER_KV && c0 + slot >= win_start && c0 + slot < seg_hi) {
-            let qb = q0 + hl * HEAD_DIM;
-            var dot = 0.0;
-            for (var dd = 0u; dd < HEAD_DIM; dd += 1u) {
-                dot += q[qb + dd] * load_k(slot * HEAD_DIM + dd);
-            }
             sc = dot * SCALE;
         }
         scs[hl * CHUNK + slot] = sc;
@@ -167,22 +193,36 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         let c_sum = red[hl * CHUNK];
 
         // ---- Phase 3: fold this chunk into the segment partials. ----
-        if (hl < NQ_PER_KV) {
-            for (var kk = 0u; kk < limit; kk += 1u) {
-                let w = scs[hl * CHUNK + kk];
-                if (d0 < HEAD_DIM) {
-                    o0 += w * load_v(kk * HEAD_DIM + d0);
-                }
-                if (d1 < HEAD_DIM) {
-                    o1 += w * load_v(kk * HEAD_DIM + d1);
-                }
-                if (d2 < HEAD_DIM) {
-                    o2 += w * load_v(kk * HEAD_DIM + d2);
-                }
-                if (d3 < HEAD_DIM) {
-                    o3 += w * load_v(kk * HEAD_DIM + d3);
+        // Each half contributes two of the eight per-thread columns:
+        // half h feeds accumulators 2h and 2h+1 (dims h*128+slot, +64).
+        for (var half = 0u; half < (HEAD_DIM + HALF - 1u) / HALF; half += 1u) {
+            for (var j: u32 = 0u; j < STAGE / 512u; j += 1u) {
+                let e = t + j * 512u;
+                stage_v(e, e / (HALF / 2u), e % (HALF / 2u), limit, c0, cache_plane, half);
+            }
+            workgroupBarrier();
+            if (hl < NQ_PER_KV) {
+                for (var kk = 0u; kk < limit; kk += 1u) {
+                    let w = scs[hl * CHUNK + kk];
+                    if (half == 0u) {
+                        o0 += w * load_v(kk * HALF + slot);
+                        o1 += w * load_v(kk * HALF + slot + CHUNK);
+                    }
+                    if (half == 1u) {
+                        o2 += w * load_v(kk * HALF + slot);
+                        o3 += w * load_v(kk * HALF + slot + CHUNK);
+                    }
+                    if (half == 2u) {
+                        o4 += w * load_v(kk * HALF + slot);
+                        o5 += w * load_v(kk * HALF + slot + CHUNK);
+                    }
+                    if (half == 3u) {
+                        o6 += w * load_v(kk * HALF + slot);
+                        o7 += w * load_v(kk * HALF + slot + CHUNK);
+                    }
                 }
             }
+            workgroupBarrier();
         }
         // Fold the chunk stats into the running segment stats (exact max;
         // the sum rescales by the max delta).
@@ -203,25 +243,37 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         workgroupBarrier();
     }
 
-    // ---- Write the segment partials: [SEGS, m, kvh, 4 heads, hd] ----
+    // ---- Write the segment partials: [SEGS, m, kvh, 8 heads, hd] ----
     // plus per-head max/sum at the tail of each head's row.
     if (hl < NQ_PER_KV) {
-        let sbase = ((m * KV_HEADS + kvh) * SEGS + seg) * (8u * (HEAD_DIM + 2u));
-        if (d0 < HEAD_DIM) {
-            scratch[sbase + hl * (HEAD_DIM + 2u) + d0] = o0;
+        let sbase = ((m * KV_HEADS + kvh) * SEGS + seg) * (8u * STRIDE);
+        if (slot < HEAD_DIM) {
+            scratch[sbase + hl * STRIDE + slot] = o0;
         }
-        if (d1 < HEAD_DIM) {
-            scratch[sbase + hl * (HEAD_DIM + 2u) + d1] = o1;
+        if (slot + CHUNK < HEAD_DIM) {
+            scratch[sbase + hl * STRIDE + slot + CHUNK] = o1;
         }
-        if (d2 < HEAD_DIM) {
-            scratch[sbase + hl * (HEAD_DIM + 2u) + d2] = o2;
+        if (slot + 2u * CHUNK < HEAD_DIM) {
+            scratch[sbase + hl * STRIDE + slot + 2u * CHUNK] = o2;
         }
-        if (d3 < HEAD_DIM) {
-            scratch[sbase + hl * (HEAD_DIM + 2u) + d3] = o3;
+        if (slot + 3u * CHUNK < HEAD_DIM) {
+            scratch[sbase + hl * STRIDE + slot + 3u * CHUNK] = o3;
+        }
+        if (slot + 4u * CHUNK < HEAD_DIM) {
+            scratch[sbase + hl * STRIDE + slot + 4u * CHUNK] = o4;
+        }
+        if (slot + 5u * CHUNK < HEAD_DIM) {
+            scratch[sbase + hl * STRIDE + slot + 5u * CHUNK] = o5;
+        }
+        if (slot + 6u * CHUNK < HEAD_DIM) {
+            scratch[sbase + hl * STRIDE + slot + 6u * CHUNK] = o6;
+        }
+        if (slot + 7u * CHUNK < HEAD_DIM) {
+            scratch[sbase + hl * STRIDE + slot + 7u * CHUNK] = o7;
         }
         if (slot == 0u) {
-            scratch[sbase + hl * (HEAD_DIM + 2u) + HEAD_DIM] = segstat[hl * 2u];
-            scratch[sbase + hl * (HEAD_DIM + 2u) + HEAD_DIM + 1u] = segstat[hl * 2u + 1u];
+            scratch[sbase + hl * STRIDE + HEAD_DIM] = segstat[hl * 2u];
+            scratch[sbase + hl * STRIDE + HEAD_DIM + 1u] = segstat[hl * 2u + 1u];
         }
     }
 }

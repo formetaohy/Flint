@@ -124,7 +124,9 @@ pub struct Backend {
     adapter_name: String,
     /// One-element f32 buffer bound as the gemm scale input of bf16 weights.
     dummy_scale: Tensor,
-    /// Split-K gemv partials [8, 65536] f32; every gemv output width fits.
+    /// Split-K gemv partials [SEGS, N] f32, grown on demand: the slice an
+    /// active gemv binds must always fit (wide vocab projections exceed any
+    /// fixed size).
     gemv_partial: Tensor,
     /// Bind groups keyed by their buffer signature; the forward graph rebinds
     /// the same buffers every step, so each is created once and reused.
@@ -152,7 +154,8 @@ impl Backend {
 
         let limits = Limits {
             max_storage_buffer_binding_size: (1u64 << 31) - 4,
-            max_buffer_size: 1u64 << 30,
+            // 2 GiB: Phi-4-mini's bf16 embedding table alone is 1.23 GiB.
+            max_buffer_size: 1u64 << 31,
             // The attention kernel runs 512 threads (8 head slots x 64 keys)
             // and its staged KV tiles exceed the 16 KiB default workgroup
             // storage.
@@ -224,15 +227,7 @@ impl Backend {
             }
             None
         };
-        let gemv_partial = Tensor::new(
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gemv_partial"),
-                contents: &vec![0u8; 8 * 65536 * 4],
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            }),
-            vec![8, 65536],
-            DType::F32,
-        );
+        let gemv_partial = Self::gemv_partial_buf(&device, 8 * 65536);
         Ok(Self {
             device,
             queue,
@@ -247,6 +242,20 @@ impl Backend {
 
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
+    }
+
+    /// Allocates a zeroed gemv-partial buffer of `words` f32 elements (the
+    /// shape is a raw [words] view; bindings always slice it).
+    fn gemv_partial_buf(device: &Device, words: usize) -> Tensor {
+        Tensor::new(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gemv_partial"),
+                contents: &vec![0u8; words * 4],
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            }),
+            vec![words as u32],
+            DType::F32,
+        )
     }
 
     /// Scale-slot binding for non-quantized gemm weights.
@@ -477,6 +486,9 @@ impl Backend {
             ("GROUP", w.group() as f64),
             ("SEGS", segs as f64),
         ];
+        if segs > 1 && (n * segs) as usize > self.gemv_partial.numel() as usize {
+            self.gemv_partial = Self::gemv_partial_buf(&self.device, (n * segs) as usize);
+        }
         let out = if segs == 1 {
             y
         } else {

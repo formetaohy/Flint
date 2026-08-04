@@ -27,14 +27,21 @@ Flint 是用纯 Rust 编写、基于 [WGPU](https://github.com/gfx-rs/wgpu) 的�
 
 - **跨平台** —— 基于 WGPU 开发，可运行于所有支持的平台。
 - **高性能** —— 高度优化的、基于 WGSL 的推理核心。
-- **多格式支持** —— 支持加载 `safetensors` 与量化 `GGUF` 模型。
+- **多格式** —— 支持 `safetensors` 与量化 `GGUF` 格式。
 
 ## 支持的架构
 
-- Qwen3.5、Qwen3、Qwen2.5
-- Gemma 3
+| 家族 | 模型
+| --- | ---
+| Qwen | Qwen3.5 / Qwen3 / Qwen2 / Qwen1.5
+| LLaMA | LLaMA 2/3.x、Mistral、Phi-3/3.5
+| Gemma | Gemma 2 / 3
+| Phi | Phi-4-mini / Phi-3.x
+| Phi-MoE | Phi-tiny/mini-MoE
+| Gemma 4 | Gemma 4 E2B/E4B
 
 我们正在努力添加对更多模型的支持。如果你有想要支持的模型，欢迎提 issue 或 PR。
+
 
 ## 快速开始
 

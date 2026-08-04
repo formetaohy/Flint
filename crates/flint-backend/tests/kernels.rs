@@ -5,7 +5,7 @@
 
 use flint_backend::{Backend, Binding, Pass};
 use flint_kernel::cpu;
-use flint_tensor::{DType, Tensor};
+use flint_tensor::{DType, Tensor, Weight};
 
 // ================================================================ harness
 
@@ -339,20 +339,30 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
         DType::F32,
     );
     ctx.backend.write_u32(&ib.buf, &ids);
-    let y = ctx.zero(&[rows as u32, dim as u32]);
+    let y = ctx.zero(&[16 as u32, dim as u32]);
+    let fallback = ctx.f32(&[1.0], &[1]);
+    let w = Weight::plain(tb);
 
     ctx.dispatch(
         "embed",
         &[
-            ("ROWS", rows as f64),
+            ("ROWS", 16.0),
             ("DIM", dim as f64),
             ("SCALE", scale as f64),
+            ("WDTYPE", 0.0),
+            ("GROUP", 128.0),
         ],
-        &[Binding::Full(&ib), Binding::Full(&tb), Binding::Full(&y)],
+        &[
+            Binding::Full(&ib),
+            Binding::Full(w.tensor()),
+            Binding::Full(&fallback),
+            Binding::Full(&y),
+        ],
         [1, 1, 1],
     );
+    let got = ctx.read(&y);
     agree(
-        &ctx.read(&y),
+        &got[..rows * dim],
         &cpu::embed(&ids, &bf16_round(&table), dim, scale),
         0.0,
         1e-6,
@@ -388,6 +398,7 @@ fn norm_case(mode: u32, rows: usize, dim: usize, w_dim: usize, seed: u64) {
             ("MODE", mode as f64),
             ("DIM", dim as f64),
             ("W_DIM", w_dim as f64),
+            ("EPS", 1e-6),
         ],
         &[
             Binding::Full(&xb),
@@ -399,10 +410,15 @@ fn norm_case(mode: u32, rows: usize, dim: usize, w_dim: usize, seed: u64) {
     );
     agree(
         &ctx.read(&y),
-        &cpu::norm(mode, &x, &w, &z, rows, dim, w_dim),
+        &cpu::norm(mode, &x, &w, &z, rows, dim, w_dim, 1e-6),
         1e-4,
         1e-5,
     );
+}
+
+#[test]
+fn norm_layer() {
+    norm_case(3, 4, 64, 64, 29);
 }
 
 #[test]
@@ -476,11 +492,134 @@ fn swiglu() {
 
     ctx.dispatch(
         "swiglu",
-        &[("N_ELEM", n as f64)],
+        &[("N_ELEM", n as f64), ("MODE", 0.0)],
         &[Binding::Full(&gb), Binding::Full(&ub), Binding::Full(&y)],
         [1, 1, 1],
     );
-    agree(&ctx.read(&y), &cpu::swiglu(&g, &u), 1e-5, 1e-6);
+    agree(&ctx.read(&y), &cpu::swiglu(&g, &u, 0), 1e-5, 1e-6);
+}
+
+#[test]
+fn swiglu_gelu_tanh() {
+    let mut ctx = Ctx::new();
+    let n = 100usize;
+    let mut rng = Rng(47);
+    let g = rng.fill(n);
+    let u = rng.fill(n);
+    let gb = ctx.f32(&g, &[n as u32]);
+    let ub = ctx.f32(&u, &[n as u32]);
+    let y = ctx.zero(&[n as u32]);
+
+    ctx.dispatch(
+        "swiglu",
+        &[("N_ELEM", n as f64), ("MODE", 1.0)],
+        &[Binding::Full(&gb), Binding::Full(&ub), Binding::Full(&y)],
+        [1, 1, 1],
+    );
+    agree(&ctx.read(&y), &cpu::swiglu(&g, &u, 1), 1e-5, 1e-6);
+}
+
+#[test]
+fn softcap() {
+    let mut ctx = Ctx::new();
+    let n = 100usize;
+    let mut rng = Rng(53);
+    let mut x = rng.fill(n);
+    for v in x.iter_mut() {
+        *v *= 40.0; // push past the cap
+    }
+    let xb = ctx.f32(&x, &[n as u32]);
+    ctx.dispatch(
+        "softcap",
+        &[("N_ELEM", n as f64), ("CAP", 30.0)],
+        &[Binding::Full(&xb)],
+        [1, 1, 1],
+    );
+    cpu::softcap(&mut x, 30.0);
+    agree(&ctx.read(&xb), &x, 1e-5, 1e-6);
+}
+
+#[test]
+fn mul_broadcast() {
+    let mut ctx = Ctx::new();
+    let n = 160usize;
+    let mut rng = Rng(59);
+    let a = rng.fill(n);
+    let b = rng.fill(4);
+    let ab = ctx.f32(&a, &[n as u32]);
+    let bb = ctx.f32(&b, &[4 as u32]);
+    let y = ctx.zero(&[n as u32]);
+
+    ctx.dispatch(
+        "mul",
+        &[("N", n as f64), ("M", 4.0)],
+        &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
+        [1, 1, 1],
+    );
+    agree(&ctx.read(&y), &cpu::mul(&a, &b, n, 4), 1e-6, 1e-7);
+}
+
+#[test]
+fn expert_gather_scatter() {
+    let mut ctx = Ctx::new();
+    let hidden = 32usize;
+    let mut rng = Rng(61);
+    // 4 rows packed into 2 experts: rows [1, 3] -> expert 0, rows [0, 2] -> expert 1.
+    let x = rng.fill(4 * hidden);
+    let rows: Vec<u32> = vec![1, 3, 0, 2];
+    let weights = [0.5f32, 1.5, 2.5, 3.5];
+    let xb = ctx.f32(&x, &[4 as u32, hidden as u32]);
+    let rb = Tensor::new(ctx.backend.storage(16, "rb"), vec![4], DType::U32);
+    ctx.backend.write_u32(&rb.buf, &rows);
+    let wb = ctx.f32(&weights, &[4 as u32]);
+    let packed = ctx.zero(&[16 as u32, hidden as u32]);
+    let acc = ctx.zero(&[4 as u32, hidden as u32]);
+
+    ctx.dispatch(
+        "expert_gather",
+        &[("ROWS", 16.0), ("HIDDEN", hidden as f64), ("COUNT", 4.0)],
+        &[
+            Binding::Full(&xb),
+            Binding::Slice(&rb, 0, 16),
+            Binding::Full(&packed),
+        ],
+        [1, 1, 1],
+    );
+    ctx.dispatch(
+        "expert_scatter",
+        &[
+            ("ROWS", 16.0),
+            ("HIDDEN", hidden as f64),
+            ("COUNT", 4.0),
+        ],
+        &[
+            Binding::Full(&acc),
+            Binding::Full(&packed),
+            Binding::Full(&rb),
+            Binding::Full(&wb),
+        ],
+        [1, 1, 1],
+    );
+    let gathered = cpu::expert_gather(&x, &rows, 16, hidden);
+    let mut expect = vec![0f32; 4 * hidden];
+    cpu::expert_scatter(&mut expect, &gathered, &rows, &weights, hidden);
+    agree(&ctx.read(&acc), &expect, 1e-6, 1e-7);
+}
+
+#[test]
+fn zero_rows() {
+    let mut ctx = Ctx::new();
+    let x = vec![1.0f32, 2.0, 3.0, 4.0];
+    let xb = ctx.f32(&x, &[4 as u32]);
+    ctx.dispatch(
+        "zero_rows",
+        &[("N_ELEM", 3.0)],
+        &[Binding::Full(&xb)],
+        [1, 1, 1],
+    );
+    let mut expect = x.clone();
+    cpu::zero_rows(&mut expect, 3);
+    agree(&ctx.read(&xb), &expect, 0.0, 0.0);
 }
 
 #[test]
@@ -892,6 +1031,7 @@ fn attn_case(
             ("SCALE", 1.0 / (hd as f64).sqrt()),
             ("WINDOW", window as f64),
             ("NQ_PER_KV", (nq / nkv) as f64),
+            ("STRIDE", (hd as u32 + 2) as f64),
         ],
         &[
             Binding::Full(&qb),
@@ -908,6 +1048,7 @@ fn attn_case(
             ("N_HEADS", nq as f64),
             ("KV_HEADS", nkv as f64),
             ("HEAD_DIM", hd as f64),
+            ("STRIDE", (hd as u32 + 2) as f64),
         ],
         &[Binding::Full(&scratch), Binding::Full(&y)],
         [m as u32, nkv as u32, 1],
@@ -1043,14 +1184,14 @@ fn anchor_norm_modes() {
     let inv = (2.5f32 + 1e-6).sqrt().recip(); // RMS of [1, 2]
     let x = [1.0f32, 2.0];
 
-    let direct = cpu::norm(2, &x, &[2.0, 3.0], &[], 1, 2, 2);
+    let direct = cpu::norm(2, &x, &[2.0, 3.0], &[], 1, 2, 2, 1e-6);
     assert_eq!(direct, vec![inv * 2.0, inv * 6.0]);
 
-    let offset = cpu::norm(0, &x, &[0.5, -0.25], &[], 1, 2, 2);
+    let offset = cpu::norm(0, &x, &[0.5, -0.25], &[], 1, 2, 2, 1e-6);
     assert_eq!(offset, vec![inv * 1.5, inv * 1.5]);
 
     let silu1 = 1.0 / (1.0 + (-1.0f32).exp());
-    let gated = cpu::norm(1, &x, &[2.0, 3.0], &[0.0, 1.0], 1, 2, 2);
+    let gated = cpu::norm(1, &x, &[2.0, 3.0], &[0.0, 1.0], 1, 2, 2, 1e-6);
     assert_eq!(gated[0], 0.0, "silu(0) gates the first element to zero");
     assert!((gated[1] - inv * 6.0 * silu1).abs() < 1e-6);
 }
@@ -1064,7 +1205,7 @@ fn anchor_elementwise() {
     assert_eq!(x, [11.0, 22.0, 13.0, 24.0]);
 
     let silu1 = 1.0 / (1.0 + (-1.0f32).exp());
-    let swi = cpu::swiglu(&[0.0, 1.0], &[2.0, 3.0]);
+    let swi = cpu::swiglu(&[0.0, 1.0], &[2.0, 3.0], 0);
     assert_eq!(swi[0], 0.0);
     assert!((swi[1] - silu1 * 3.0).abs() < 1e-6);
 
@@ -1197,3 +1338,6 @@ fn anchor_delta_recur_two_steps() {
     assert!((out[0] - 1.0 / r2).abs() < 1e-5);
     assert!((out[1] - 1.0 / r2).abs() < 1e-5);
 }
+
+
+

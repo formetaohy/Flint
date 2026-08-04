@@ -95,10 +95,12 @@ impl Tokenizer {
 
         // Base vocab keeps each non-special, non-unused token at its original
         // id. Unused tokens are dropped so the added special tokens land at the
-        // top of the vocab with their true ids.
+        // top of the vocab with their true ids. The unknown token stays: the
+        // BPE builder rejects an unk that is not in the vocab.
+        let unk_id = meta.u32("tokenizer.ggml.unknown_token_id").map(|i| i as usize);
         let mut vocab = AHashMap::with_capacity(tokens.len());
         for (i, t) in tokens.iter().enumerate() {
-            if !is_added(i) && !is_unused(i) {
+            if (!is_added(i) && !is_unused(i)) || Some(i) == unk_id {
                 vocab.insert(t.to_string(), i as u32);
             }
         }
@@ -108,10 +110,20 @@ impl Tokenizer {
                 m.split_once(' ')
                     .map(|(a, b)| (a.to_string(), b.to_string()))
             })
+            // Some GGUFs ship merges whose parts or results are missing from
+            // the vocab (a mojibake'd replacement char in phi4 GGUFs): the
+            // BPE build is fail-fast, so drop them up front.
+            .filter(|(a, b)| {
+                let res = format!("{a}{b}");
+                vocab.contains_key(a) && vocab.contains_key(b) && vocab.contains_key(&res)
+            })
             .collect();
 
-        let bpe = BPE::builder()
-            .vocab_and_merges(vocab, merges)
+        let mut bpe = BPE::builder().vocab_and_merges(vocab, merges);
+        if let Some(id) = unk_id {
+            bpe = bpe.unk_token(tokens[id].to_string());
+        }
+        let bpe = bpe
             .build()
             .map_err(|e| Error::Tokenizer(format!("BPE build: {e}")))?;
         let mut inner = HfTokenizer::new(bpe);

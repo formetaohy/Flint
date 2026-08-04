@@ -52,8 +52,10 @@ pub fn embed(ids: &[u32], table: &[f32], dim: usize, scale: f32) -> Vec<f32> {
     out
 }
 
-/// RMSNorm over `dim`. mode 0 = offset weight (1+w), 1 = gated (weight * silu(gate)),
-/// 2 = direct weight (w). `w_dim` is the weight length (may repeat across dim).
+/// Normalization over `dim`. mode 0 = offset weight (1+w), 1 = gated
+/// (weight * silu(gate)), 2 = direct weight (w), 3 = layer norm
+/// ((x - mean) * inv_std * w + bias, `gate` holds the bias). `w_dim` is the
+/// weight length (may repeat across dim).
 pub fn norm(
     mode: u32,
     x: &[f32],
@@ -62,17 +64,32 @@ pub fn norm(
     rows: usize,
     dim: usize,
     w_dim: usize,
+    eps: f32,
 ) -> Vec<f32> {
     let mut out = vec![0f32; rows * dim];
     for r in 0..rows {
         let row = &x[r * dim..(r + 1) * dim];
-        let mean = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
-        let inv = (mean + 1e-6).sqrt().recip();
+        let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+        let mean = match mode {
+            3 => row.iter().sum::<f32>() / dim as f32,
+            _ => 0.0,
+        };
+        let inv = match mode {
+            3 => {
+                let var = mean_sq - mean * mean;
+                (var + eps).sqrt().recip()
+            }
+            _ => (mean_sq + eps).sqrt().recip(),
+        };
         for d in 0..dim {
-            let base = row[d] * inv;
+            let base = match mode {
+                3 => (row[d] - mean) * inv,
+                _ => row[d] * inv,
+            };
             out[r * dim + d] = match mode {
                 0 => base * (1.0 + weight[d % w_dim]),
                 1 => base * weight[d % w_dim] * silu(gate[r * dim + d]),
+                3 => base * weight[d % w_dim] + gate[d % gate.len()],
                 _ => base * weight[d % w_dim],
             };
         }
@@ -91,8 +108,55 @@ pub fn bias(x: &mut [f32], bias: &[f32], dim: usize) {
     }
 }
 
-pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
-    gate.iter().zip(up).map(|(g, u)| silu(*g) * u).collect()
+/// mode 0 = silu, 1 = gelu (pytorch tanh approximation).
+pub fn swiglu(gate: &[f32], up: &[f32], mode: u32) -> Vec<f32> {
+    let act = |v: f32| match mode {
+        1 => 0.5 * v * (1.0 + (0.7978845608028654 * (v + 0.044715 * v * v * v)).tanh()),
+        _ => silu(v),
+    };
+    gate.iter().zip(up).map(|(g, u)| act(*g) * u).collect()
+}
+
+/// Logit softcapping: y[i] = cap * tanh(y[i] / cap), in place.
+pub fn softcap(x: &mut [f32], cap: f32) {
+    for v in x {
+        *v = cap * (*v / cap).tanh();
+    }
+}
+
+/// Elementwise multiply with broadcast: y[i] = a[i] * b[i % m].
+pub fn mul(a: &[f32], b: &[f32], n: usize, m: usize) -> Vec<f32> {
+    (0..n).map(|i| a[i] * b[i % m]).collect()
+}
+
+/// Copies COUNT rows of x [ROWS, HIDDEN] selected by ids into out rows 0..COUNT.
+pub fn expert_gather(x: &[f32], ids: &[u32], rows: usize, hidden: usize) -> Vec<f32> {
+    let mut out = vec![0f32; rows * hidden];
+    for (r, &id) in ids.iter().enumerate() {
+        out[r * hidden..(r + 1) * hidden].copy_from_slice(&x[id as usize * hidden..(id as usize + 1) * hidden]);
+    }
+    out
+}
+
+/// MoE weighted accumulation: acc[ids[i]] += weights[i] * src[i] over packed rows.
+pub fn expert_scatter(
+    acc: &mut [f32],
+    src: &[f32],
+    ids: &[u32],
+    weights: &[f32],
+    hidden: usize,
+) {
+    for (i, &id) in ids.iter().enumerate() {
+        let w = weights[i];
+        for c in 0..hidden {
+            acc[id as usize * hidden + c] += w * src[i * hidden + c];
+        }
+    }
+}
+
+/// Zeroes the first n elements.
+pub fn zero_rows(x: &mut [f32], n: usize) {
+    x[..n].fill(0.0);
 }
 
 pub fn sigmoid_mul(a: &[f32], b: &[f32]) -> Vec<f32> {

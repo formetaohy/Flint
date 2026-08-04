@@ -22,14 +22,14 @@ fn llama_json() -> Value {
 #[test]
 fn llama_parses_with_derived_head_dim() {
     let cfg = llama::parse_config(&llama_json()).unwrap();
-    assert_eq!(cfg.head_dim, 64, "derived as hidden / heads");
+    assert_eq!(cfg.head_dim(0), 64, "derived as hidden / heads");
     assert_eq!(cfg.eos, vec![7]);
     assert!(
         !cfg.tied && !cfg.qkv_bias && !cfg.qk_norm,
         "flags default to false"
     );
     assert!(
-        !cfg.sandwich && cfg.window.is_none(),
+        !cfg.sandwich && cfg.windows.iter().all(|&w| w == 0),
         "plain residual, global attention"
     );
     assert_eq!(cfg.embed_scale, 1.0);
@@ -44,7 +44,7 @@ fn llama_parses_with_explicit_head_dim_and_flags() {
     v["qk_norm"] = json!(true);
     v["eos_token_id"] = json!([1, 2]);
     let cfg = llama::parse_config(&v).unwrap();
-    assert_eq!(cfg.head_dim, 128);
+    assert_eq!(cfg.head_dim(0), 128);
     assert!(cfg.tied && cfg.qkv_bias && cfg.qk_norm);
     assert_eq!(cfg.eos, vec![1, 2]);
 }

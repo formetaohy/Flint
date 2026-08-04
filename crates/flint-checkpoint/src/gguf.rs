@@ -90,6 +90,7 @@ impl Metadata {
                 .map(|v| match v {
                     MetaVal::UInt(n) => u32::try_from(*n).ok(),
                     MetaVal::Int(n) => u32::try_from(*n).ok(),
+                    MetaVal::Bool(b) => Some(*b as u32),
                     _ => None,
                 })
                 .collect(),
@@ -224,7 +225,13 @@ impl Checkpoint for Gguf {
         // row-major over that, i.e. [N, K] with K contiguous — exactly Flint's
         // weight convention. Reverse the dim list to report [N, K].
         let shape: Vec<u32> = info.shape.iter().rev().cloned().collect();
-        let data = TensorData::F32(dequant::to_f32(info.ty, bytes, info.numel)?);
+        // bf16 stays packed (embeddings can exceed a gigabyte as f32); every
+        // other type dequantizes to f32.
+        let data = if info.ty == GgmlType::Bf16 {
+            TensorData::Bf16(bytes.to_vec())
+        } else {
+            TensorData::F32(dequant::to_f32(info.ty, bytes, info.numel)?)
+        };
         Ok(RawTensor { shape, data })
     }
 

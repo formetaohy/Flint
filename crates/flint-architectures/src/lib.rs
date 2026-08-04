@@ -5,8 +5,10 @@
 pub mod chat;
 pub mod dense;
 pub mod gemma;
+pub mod gemma4;
 pub mod gguf_config;
 pub mod llama;
+pub mod phi;
 pub mod qwen35;
 
 use std::path::Path;
@@ -18,8 +20,8 @@ use flint_model::LanguageModel;
 use flint_tokenizer::Tokenizer;
 use serde_json::Value;
 
-pub use chat::{ChatFormat, ChatMl, ChatMlThink, GemmaChat};
-pub use dense::{DenseConfig, DenseModel, SlidingWindow};
+pub use chat::{ChatFormat, ChatMl, ChatMlThink, Gemma4Chat, GemmaChat, Phi4Chat, PhiChat};
+pub use dense::{DenseConfig, DenseModel, MoeConfig};
 pub use gguf_config::{gguf_key, synthesize_config};
 pub use qwen35::{Qwen35, Qwen35Config};
 
@@ -38,6 +40,9 @@ pub enum Family {
     Qwen35,
     Llama,
     Gemma,
+    Phi,
+    PhiMoe,
+    Gemma4,
 }
 
 impl Family {
@@ -47,6 +52,9 @@ impl Family {
             Some("qwen3_5") => Ok(Family::Qwen35),
             Some("llama" | "qwen2" | "qwen3" | "mistral") => Ok(Family::Llama),
             Some("gemma" | "gemma2" | "gemma3" | "gemma3_text") => Ok(Family::Gemma),
+            Some("gemma4" | "gemma4_text") => Ok(Family::Gemma4),
+            Some("phi3") => Ok(Family::Phi),
+            Some("phimoe") => Ok(Family::PhiMoe),
             other => Err(Error::Config(format!("unsupported model_type {other:?}"))),
         }
     }
@@ -56,6 +64,9 @@ impl Family {
         match a {
             "llama" | "qwen2" | "qwen3" | "mistral" => Ok(Family::Llama),
             "gemma" | "gemma2" | "gemma3" => Ok(Family::Gemma),
+            "gemma4" => Ok(Family::Gemma4),
+            "phi3" => Ok(Family::Phi),
+            "phimoe" => Ok(Family::PhiMoe),
             other => Err(Error::Config(format!(
                 "unsupported GGUF architecture {other:?}"
             ))),
@@ -68,6 +79,9 @@ impl Family {
             Family::Qwen35 => Box::new(ChatMlThink),
             Family::Llama => Box::new(ChatMl),
             Family::Gemma => Box::new(GemmaChat),
+            Family::Phi => Box::new(Phi4Chat),
+            Family::PhiMoe => Box::new(PhiChat),
+            Family::Gemma4 => Box::new(Gemma4Chat),
         }
     }
 }
@@ -84,6 +98,9 @@ pub fn load(model_dir: &Path, max_seq: u32, backend: &Backend) -> Result<ChatMod
         Family::Qwen35 => Box::new(Qwen35::load(source.as_ref(), &config, max_seq, backend)?),
         Family::Llama => Box::new(llama::load(source.as_ref(), &config, max_seq, backend)?),
         Family::Gemma => Box::new(gemma::load(source.as_ref(), &config, max_seq, backend)?),
+        Family::Phi => Box::new(phi::load(source.as_ref(), &config, max_seq, backend)?),
+        Family::PhiMoe => Box::new(phi::load_moe(source.as_ref(), &config, max_seq, backend)?),
+        Family::Gemma4 => Box::new(gemma4::load(source.as_ref(), &config, max_seq, backend)?),
     };
     let tokenizer = Tokenizer::load(model_dir, source.as_ref())?;
     let chat = family.chat_format();

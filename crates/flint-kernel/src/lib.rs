@@ -40,7 +40,7 @@ const SHADERS: &[ShaderSpec] = &[
     ShaderSpec {
         name: "embed",
         source: include_str!("wgsl/embed.wgsl"),
-        read_only: &[true, true, false],
+        read_only: &[true, true, true, false],
     },
     ShaderSpec {
         name: "norm",
@@ -66,6 +66,31 @@ const SHADERS: &[ShaderSpec] = &[
         name: "swiglu",
         source: include_str!("wgsl/swiglu.wgsl"),
         read_only: &[true, true, false],
+    },
+    ShaderSpec {
+        name: "softcap",
+        source: include_str!("wgsl/softcap.wgsl"),
+        read_only: &[false],
+    },
+    ShaderSpec {
+        name: "mul",
+        source: include_str!("wgsl/mul.wgsl"),
+        read_only: &[true, true, false],
+    },
+    ShaderSpec {
+        name: "expert_gather",
+        source: include_str!("wgsl/expert_gather.wgsl"),
+        read_only: &[true, true, false],
+    },
+    ShaderSpec {
+        name: "expert_scatter",
+        source: include_str!("wgsl/expert_scatter.wgsl"),
+        read_only: &[false, true, true, true],
+    },
+    ShaderSpec {
+        name: "zero_rows",
+        source: include_str!("wgsl/zero_rows.wgsl"),
+        read_only: &[false],
     },
     ShaderSpec {
         name: "sigmoid_mul",

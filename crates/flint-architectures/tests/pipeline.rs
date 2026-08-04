@@ -149,6 +149,21 @@ fn prefill_qwen35_untied_embeddings() {
     prefill_equivalence("prefill_qwen35_untied", ToySpec::Qwen35Untied);
 }
 
+#[test]
+fn prefill_phi_partial_rotary() {
+    prefill_equivalence("prefill_phi", ToySpec::Phi);
+}
+
+#[test]
+fn prefill_phimoe_sparsemixer() {
+    prefill_equivalence("prefill_phimoe", ToySpec::PhiMoe);
+}
+
+#[test]
+fn prefill_gemma4_kv_sharing_ple() {
+    prefill_equivalence("prefill_gemma4", ToySpec::Gemma4);
+}
+
 // ---------------------------------------------------------------- generation
 
 fn generate(test: &str, spec: ToySpec, max_tokens: usize, speculate: bool) -> Vec<u32> {
@@ -181,6 +196,18 @@ fn generation_llama_greedy_terminates() {
 #[test]
 fn generation_qwen35_greedy_terminates() {
     let tokens = generate("gen_qwen35", ToySpec::Qwen35, 24, false);
+    assert!(!tokens.is_empty(), "generation produced nothing");
+}
+
+#[test]
+fn generation_phimoe_greedy_terminates() {
+    let tokens = generate("gen_phimoe", ToySpec::PhiMoe, 24, false);
+    assert!(!tokens.is_empty(), "generation produced nothing");
+}
+
+#[test]
+fn generation_gemma4_greedy_terminates() {
+    let tokens = generate("gen_gemma4", ToySpec::Gemma4, 24, false);
     assert!(!tokens.is_empty(), "generation produced nothing");
 }
 
@@ -402,3 +429,7 @@ fn engine_and_model_fail_fast() {
         "prompt exceeds context"
     );
 }
+
+
+
+

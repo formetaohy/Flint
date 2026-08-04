@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::dense::{DenseConfig, DenseModel, dense_plan};
 
 /// HF safetensors names -> canonical keys ("model." stripped, lm_head kept).
-fn hf_key(name: &str) -> Option<String> {
+pub(crate) fn hf_key(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("model.") {
         Some(rest.to_string())
     } else if name.starts_with("lm_head.") {

@@ -1,0 +1,173 @@
+//! Gemma 4 text model: the shared dense model configured for per-layer head
+//! dims and rope (global layers widen and use proportional rope), KV sharing
+//! from layer `num_hidden_layers - num_kv_shared_layers` on, GELU MLPs that
+//! double in width on the KV-shared layers, weightless V-norm, Per-Layer
+//! Embeddings, logit softcapping and alternating sliding-window attention.
+
+use flint_backend::Backend;
+use flint_checkpoint::Checkpoint;
+use flint_error::{Error, Result};
+use flint_model::loader::Plan;
+use flint_model::ops::Act;
+use serde_json::Value;
+
+use crate::dense::{DenseConfig, DenseModel, PerLayerConfig, RopeSpec, dense_plan};
+
+/// HF safetensors names -> canonical keys. The model-level Per-Layer
+/// Embedding tensors get explicit names; `model.layers.{i}.{tail}` passes the
+/// tail through (the canonical suffixes match the HF names for this family).
+fn hf_key(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("model.")?;
+    match rest {
+        "embed_tokens_per_layer.weight" | "per_layer_model_projection.weight"
+        | "per_layer_projection_norm.weight" => return Some(rest.to_string()),
+        "embed_tokens.weight" | "norm.weight" => return Some(rest.to_string()),
+        _ => {}
+    }
+    if name.starts_with("lm_head.") {
+        return Some(name.to_string());
+    }
+    let rest = rest.strip_prefix("layers.")?;
+    let (idx, tail) = rest.split_once('.')?;
+    Some(format!("layers.{idx}.{tail}"))
+}
+
+fn plan(gguf: bool) -> Plan {
+    dense_plan(gguf, hf_key)
+}
+
+/// Parses and validates a Gemma 4 text config (the `text_config` object of the
+/// multimodal wrapper, or a bare `gemma4_text` config).
+pub fn parse_config(v: &Value) -> Result<DenseConfig> {
+    let t = v.get("text_config").unwrap_or(v);
+    let mut cfg = DenseConfig::parse(t, true)?;
+    cfg.embed_scale = (cfg.hidden as f32).sqrt();
+    cfg.qk_norm = true;
+    cfg.v_norm = true;
+    cfg.act = match t.get("hidden_activation").and_then(Value::as_str) {
+        Some("gelu_pytorch_tanh") => Act::GeluTanh,
+        other => {
+            return Err(Error::Config(format!(
+                "unsupported hidden_activation {other:?}"
+            )));
+        }
+    };
+
+    let layer_types = t
+        .get("layer_types")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Config("gemma4_text missing layer_types".into()))?;
+    if layer_types.len() != cfg.layers as usize {
+        return Err(Error::Config("layer_types length mismatch".into()));
+    }
+    let global_hd = t
+        .get("global_head_dim")
+        .and_then(Value::as_u64)
+        .unwrap_or(512) as u32;
+    let sliding_hd = cfg.head_dims[0];
+    let window = t
+        .get("sliding_window")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    let mut head_dims = Vec::with_capacity(cfg.layers as usize);
+    let mut windows = Vec::with_capacity(cfg.layers as usize);
+    let mut layer_rope = Vec::with_capacity(cfg.layers as usize);
+    for lt in layer_types {
+        match lt.as_str() {
+            Some("sliding_attention") => {
+                head_dims.push(sliding_hd);
+                windows.push(window);
+                layer_rope.push(0);
+            }
+            Some("full_attention") => {
+                head_dims.push(global_hd);
+                windows.push(0);
+                layer_rope.push(1);
+            }
+            other => {
+                return Err(Error::Config(format!(
+                    "unknown layer type {other:?}"
+                )));
+            }
+        }
+    }
+    cfg.head_dims = head_dims;
+    cfg.windows = windows;
+    cfg.layer_rope = layer_rope;
+
+    // RoPE sets: sliding layers rotate fully at 1e4; global layers rotate a
+    // quarter of their widened head dim with proportional frequencies.
+    let rp = t
+        .get("rope_parameters")
+        .ok_or_else(|| Error::Config("gemma4_text missing rope_parameters".into()))?;
+    let theta = |k: &str| -> Result<f64> {
+        rp.get(k)
+            .and_then(|x| x.get("rope_theta"))
+            .and_then(Value::as_f64)
+            .ok_or_else(|| Error::Config(format!("rope_parameters.{k}.rope_theta missing")))
+    };
+    let rot = rp
+        .get("full_attention")
+        .and_then(|x| x.get("partial_rotary_factor"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.25);
+    cfg.rope = vec![
+        RopeSpec {
+            dim: sliding_hd,
+            freq_dim: sliding_hd,
+            theta: theta("sliding_attention")?,
+            scaling: None,
+        },
+        RopeSpec {
+            dim: (global_hd as f64 * rot) as u32,
+            freq_dim: global_hd,
+            theta: theta("full_attention")?,
+            scaling: None,
+        },
+    ];
+
+    // KV sharing: the trailing layers reuse the last same-type cache.
+    cfg.kv_shared = t
+        .get("num_kv_shared_layers")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    // Double-wide MLPs on the KV-shared layers.
+    if t.get("use_double_wide_mlp").and_then(Value::as_bool).unwrap_or(false) {
+        cfg.double_wide = (0..cfg.layers)
+            .map(|l| l >= cfg.first_shared())
+            .collect();
+    }
+    cfg.softcap = t
+        .get("final_logit_softcapping")
+        .and_then(Value::as_f64)
+        .map(|c| c as f32);
+    if let Some(d) = t.get("hidden_size_per_layer_input").and_then(Value::as_u64) {
+        if d > 0 {
+            cfg.per_layer = Some(PerLayerConfig { dim: d as u32 });
+        }
+    }
+    if t.get("enable_moe_block").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(Error::Config(
+            "Gemma 4 enable_moe_block (26B-A4B) is not supported".into(),
+        ));
+    }
+    cfg.validate()?;
+    Ok(cfg)
+}
+
+/// Loads a Gemma 4 checkpoint as a shared dense model.
+pub fn load(
+    source: &dyn Checkpoint,
+    v: &Value,
+    max_seq: u32,
+    backend: &Backend,
+) -> Result<DenseModel> {
+    let cfg = parse_config(v)?;
+    DenseModel::load(
+        source,
+        cfg,
+        &plan(source.kind() == "gguf"),
+        max_seq,
+        backend,
+    )
+}
