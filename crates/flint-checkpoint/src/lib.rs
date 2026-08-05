@@ -21,6 +21,8 @@ pub enum TensorData {
     F32(Vec<f32>),
     /// Little-endian bf16, two bytes per element.
     Bf16(Vec<u8>),
+    /// Raw ggml Q8_0 blocks: per block a 2-byte f16 scale plus 32 i8.
+    Q8 { bytes: Vec<u8>, numel: usize },
 }
 
 impl TensorData {
@@ -30,8 +32,15 @@ impl TensorData {
             TensorData::F32(v) => v,
             TensorData::Bf16(b) => b
                 .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .map(|c| flint_num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect(),
+            TensorData::Q8 { bytes, numel } => {
+                // Bytes are length-checked at checkpoint read; a Q8 stream is
+                // always decodable, so a block error here is a hard invariant
+                // violation, not a recoverable condition.
+                dequant::to_f32(dequant::GgmlType::Q8_0, &bytes, numel)
+                    .expect("Q8 block stream must be valid")
+            }
         }
     }
 }

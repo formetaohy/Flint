@@ -21,11 +21,8 @@ use flint_model::LanguageModel;
 use flint_tokenizer::Tokenizer;
 use serde_json::Value;
 
-pub use chat::{ChatFormat, ChatMl, ChatMlThink, Gemma4Chat, GemmaChat, Phi4Chat, PhiChat};
-pub use dense::{DenseConfig, DenseModel, MoeConfig};
-pub use gguf_config::synthesize_config;
-pub use names::gguf_key;
-pub use qwen35::{Qwen35, Qwen35Config};
+use crate::chat::{ChatFormat, ChatMl, ChatMlThink, Gemma4Chat, GemmaChat, Phi4Chat, PhiChat};
+use crate::qwen35::Qwen35;
 
 /// A fully assembled, chat-ready model: tensor engine, tokenizer, prompt format
 /// and reply terminators.

@@ -1,7 +1,7 @@
 //! Architecture config validation: each parser accepts a well-formed config
 //! and rejects every class of invalid input fail-fast.
 
-use flint_architectures::{Qwen35Config, gemma, llama};
+use flint_architectures::{gemma, llama, qwen35::Qwen35Config};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------- Llama

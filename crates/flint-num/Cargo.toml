@@ -1,0 +1,6 @@
+[package]
+name = "flint-num"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Narrow floating-point format conversions for Flint"

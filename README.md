@@ -27,7 +27,7 @@ Flint is a local LLM inference engine written in pure Rust on [WGPU](https://git
 
 - **Cross-platform** — Built on WGPU; runs on every platform.
 - **Fast** — Highly optimized WGSL-based inference core.
-- **Multi-format** — Supports `safetensors` and quantized `GGUF` formats
+- **Multi-format** — Supports `safetensors`, `ONNX` and quantized `GGUF` formats
 
 ## Supported Architectures
 

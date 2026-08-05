@@ -230,7 +230,7 @@ fn apply_min_p(c: &mut Vec<(f32, u32)>, min_p: f32) {
     c.truncate(cutoff.max(1));
 }
 
-pub fn argmax(logits: &[f32]) -> u32 {
+fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0u32;
     let mut best_v = f32::NEG_INFINITY;
     for (i, &v) in logits.iter().enumerate() {

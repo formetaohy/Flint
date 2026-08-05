@@ -152,6 +152,11 @@ fn prefill_phi_partial_rotary() {
 }
 
 #[test]
+fn prefill_phi_dense_layernorm() {
+    prefill_equivalence("prefill_phi_layernorm", ToySpec::PhiLayerNorm);
+}
+
+#[test]
 fn prefill_phimoe_sparsemixer() {
     prefill_equivalence("prefill_phimoe", ToySpec::PhiMoe);
 }

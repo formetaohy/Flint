@@ -34,6 +34,9 @@ pub enum ToySpec {
     Qwen35Untied,
     /// Phi-4-mini: partial rotary, GGUF arch `phi3`.
     Phi,
+    /// Phi-3 dense LayerNorm (safetensors): `layer_norm_epsilon` selects the
+    /// mean-centered norm variant with biases on every feeding norm.
+    PhiLayerNorm,
     /// Phi-MoE: LayerNorm, fused gate+up experts, sparsemixer, safetensors.
     PhiMoe,
     /// Gemma 4: per-layer head dims, KV sharing, GELU, PLE, softcap, GGUF.
@@ -48,6 +51,7 @@ impl ToySpec {
             ToySpec::Qwen35Split => write_qwen35(dir, 8, 16, true),
             ToySpec::Qwen35Untied => write_qwen35(dir, 16, 16, false),
             ToySpec::Phi => write_phi(dir),
+            ToySpec::PhiLayerNorm => write_phi_layernorm(dir),
             ToySpec::PhiMoe => write_phimoe(dir),
             ToySpec::Gemma4 => write_gemma4(dir),
             other => write_dense(other, dir),
@@ -192,7 +196,7 @@ fn dense_layer_keys(l: u32, qkv_bias: bool, qk_norm: bool, sandwich: bool) -> Ve
 // ---------------------------------------------------------------- dense (GGUF)
 
 /// GGUF-native name for a dense canonical key; the exact inverse of
-/// `flint_architectures::gguf_config::gguf_key`.
+/// `flint_architectures::names::gguf_key`.
 fn gguf_name(key: &str) -> String {
     if let Some(rest) = key.strip_prefix("layers.") {
         let (idx, tail) = rest.split_once('.').unwrap();
@@ -507,6 +511,117 @@ fn write_phi(dir: &Path) -> Result<()> {
         all.extend(dense_layer_keys(l, false, false, false));
     }
     write_gguf_tensors(&mut w, &mut rng, &all, dir)
+}
+
+/// Phi-3-style dense LayerNorm checkpoint (safetensors): `layer_norm_epsilon`
+/// drives the mean-centered norm variant, so the attention and MLP feeding
+/// norms carry biases the loader must pick up.
+fn write_phi_layernorm(dir: &Path) -> Result<()> {
+    let mut rng = Rng::new(0x1a10);
+    let mut all = vec![
+        Canon {
+            key: "model.embed_tokens.weight".into(),
+            shape: vec![VOCAB, HIDDEN],
+            role: Role::Bf16,
+        },
+        Canon {
+            key: "model.norm.weight".into(),
+            shape: vec![HIDDEN],
+            role: Role::F32,
+        },
+        Canon {
+            key: "model.norm.bias".into(),
+            shape: vec![HIDDEN],
+            role: Role::F32,
+        },
+        Canon {
+            key: "lm_head.weight".into(),
+            shape: vec![VOCAB, HIDDEN],
+            role: Role::Proj,
+        },
+    ];
+    for l in 0..LAYERS {
+        let p = format!("model.layers.{l}");
+        all.push(f32w(format!("{p}.input_layernorm.weight"), &[HIDDEN]));
+        all.push(f32w(format!("{p}.input_layernorm.bias"), &[HIDDEN]));
+        all.push(proj(
+            format!("{p}.self_attn.q_proj.weight"),
+            &[Q_HEADS * HEAD_DIM, HIDDEN],
+        ));
+        all.push(proj(
+            format!("{p}.self_attn.k_proj.weight"),
+            &[KV_HEADS * HEAD_DIM, HIDDEN],
+        ));
+        all.push(proj(
+            format!("{p}.self_attn.v_proj.weight"),
+            &[KV_HEADS * HEAD_DIM, HIDDEN],
+        ));
+        all.push(proj(
+            format!("{p}.self_attn.o_proj.weight"),
+            &[HIDDEN, Q_HEADS * HEAD_DIM],
+        ));
+        all.push(f32w(
+            format!("{p}.post_attention_layernorm.weight"),
+            &[HIDDEN],
+        ));
+        all.push(f32w(
+            format!("{p}.post_attention_layernorm.bias"),
+            &[HIDDEN],
+        ));
+        all.push(proj(
+            format!("{p}.mlp.gate_proj.weight"),
+            &[INTERMEDIATE, HIDDEN],
+        ));
+        all.push(proj(
+            format!("{p}.mlp.up_proj.weight"),
+            &[INTERMEDIATE, HIDDEN],
+        ));
+        all.push(proj(
+            format!("{p}.mlp.down_proj.weight"),
+            &[HIDDEN, INTERMEDIATE],
+        ));
+    }
+
+    let mut files: Vec<(String, Vec<u32>, Vec<u8>, bool)> = Vec::new();
+    for c in &all {
+        let data = rng.fill(c.shape.iter().map(|d| *d as usize).product());
+        let bytes = match c.role {
+            Role::F32 | Role::Proj => data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            Role::Bf16 => data
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect(),
+        };
+        files.push((
+            c.key.clone(),
+            c.shape.to_vec(),
+            bytes,
+            matches!(c.role, Role::Bf16),
+        ));
+    }
+    std::fs::create_dir_all(dir)
+        .map_err(|e| Error::Model(format!("create {}: {e}", dir.display())))?;
+    write_tensors(&dir.join("model.safetensors"), &files)?;
+    let cfg = json!({
+        "model_type": "phi3",
+        "hidden_size": HIDDEN,
+        "intermediate_size": INTERMEDIATE,
+        "num_hidden_layers": LAYERS,
+        "num_attention_heads": Q_HEADS,
+        "num_key_value_heads": KV_HEADS,
+        "head_dim": HEAD_DIM,
+        "vocab_size": VOCAB,
+        "rope_theta": 10000.0,
+        "eos_token_id": tokenizer::EOS_ID,
+        "tie_word_embeddings": false,
+        "partial_rotary_factor": 0.5,
+        "layer_norm_epsilon": 1e-5,
+    });
+    std::fs::write(dir.join("config.json"), cfg.to_string())
+        .map_err(|e| Error::Model(format!("write config.json: {e}")))?;
+    std::fs::write(dir.join("tokenizer.json"), tokenizer::tokenizer_json()?)
+        .map_err(|e| Error::Model(format!("write tokenizer.json: {e}")))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- Phi-MoE (safetensors)

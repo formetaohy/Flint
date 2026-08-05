@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use flint_backend::Backend;
 use flint_checkpoint::{Checkpoint, RawTensor, TensorData};
 use flint_error::{Error, Result};
+use flint_num::{f16_to_f32, f32_to_bf16};
 use flint_tensor::{Tensor, Weight};
+
 /// Where a weight's bytes live and how kernels consume them.
 pub enum Role {
     /// Decoded to f32 on the CPU (norms, biases, conv taps).
@@ -40,6 +42,37 @@ pub fn choose_group(k: u32) -> Result<u32> {
     Err(Error::Config(format!(
         "dimension {k} is not a multiple of 32; cannot quantize"
     )))
+}
+
+/// Repacks raw ggml Q8_0 blocks (row-major [rows, cols], 34 bytes per
+/// 32-element block) into Flint's block-major i8 layout with group = 32, so
+/// the original block scales survive untouched. Pure byte shuffling: no f32
+/// round trip, no second quantization.
+pub fn repack_q8(bytes: &[u8], rows: usize, cols: usize) -> Result<(Vec<u8>, Vec<f32>)> {
+    assert!(cols.is_multiple_of(32), "Q8_0 K must be a multiple of 32");
+    let groups = cols / 32;
+    let expect = rows * groups * 34;
+    if bytes.len() < expect {
+        return Err(Error::Model(format!(
+            "Q8_0 tensor truncated: need {expect} bytes, have {}",
+            bytes.len()
+        )));
+    }
+    let mut out = vec![0u8; rows * cols];
+    let mut scales = Vec::with_capacity(rows * groups);
+    for n in 0..rows {
+        let row = &bytes[n * groups * 34..];
+        for g in 0..groups {
+            let blk = &row[g * 34..g * 34 + 34];
+            scales.push(f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])));
+            for half in 0..2 {
+                let kb = g * 2 + half;
+                let dst = &mut out[(kb * rows + n) * 16..(kb * rows + n + 1) * 16];
+                dst.copy_from_slice(&blk[2 + half * 16..2 + half * 16 + 16]);
+            }
+        }
+    }
+    Ok((out, scales))
 }
 
 /// Row-wise group absmax quantization of f32 rows [rows, cols] with `group`
@@ -123,16 +156,24 @@ impl WeightSet {
 /// used by every architecture's MLP block.
 pub struct SwigluMlp {
     pub norm: Tensor,
+    /// Layer-norm bias of the feeding norm, when the family uses one.
+    pub norm_bias: Option<Tensor>,
     pub gate: Weight,
     pub up: Weight,
     pub down: Weight,
 }
 
-/// Takes an MLP's weights under `prefix` (e.g. `layers.0`).
-pub fn take_mlp(w: &mut WeightSet, prefix: &str) -> Result<SwigluMlp> {
+/// Takes an MLP's weights under `prefix` (e.g. `layers.0`); `layernorm`
+/// selects the mean-centered norm variant and loads its bias.
+pub fn take_mlp(w: &mut WeightSet, prefix: &str, layernorm: bool) -> Result<SwigluMlp> {
     let k = |n: &str| format!("{prefix}.{n}");
     Ok(SwigluMlp {
         norm: w.take_tensor(&k("post_attention_layernorm.weight"))?,
+        norm_bias: if layernorm {
+            Some(w.take_tensor(&k("post_attention_layernorm.bias"))?)
+        } else {
+            None
+        },
         gate: w.take(&k("mlp.gate_proj.weight"))?,
         up: w.take(&k("mlp.up_proj.weight"))?,
         down: w.take(&k("mlp.down_proj.weight"))?,
@@ -157,7 +198,7 @@ impl MlpBlock {
     /// Layer-norm bias of the feeding norm, when the family uses one.
     pub fn norm_bias(&self) -> Option<&Tensor> {
         match self {
-            MlpBlock::Dense(_) => None,
+            MlpBlock::Dense(m) => m.norm_bias.as_ref(),
             MlpBlock::Moe(m) => m.norm_bias.as_ref(),
         }
     }
@@ -413,7 +454,15 @@ pub fn upload(backend: &Backend, key: &str, raw: RawTensor, role: Role) -> Resul
                 TensorData::Bf16(b) => b,
                 TensorData::F32(f) => f
                     .iter()
-                    .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                    .flat_map(|v| f32_to_bf16(*v).to_le_bytes())
+                    .collect(),
+                // Row-gathered tensors (embeddings) must be dense; dequantize
+                // the Q8_0 blocks and pack to bf16.
+                TensorData::Q8 { .. } => raw
+                    .data
+                    .into_f32()
+                    .iter()
+                    .flat_map(|v| f32_to_bf16(*v).to_le_bytes())
                     .collect(),
             };
             Ok(Weight::plain(backend.tensor_bf16(&bytes, shape, &label)?))
@@ -424,15 +473,38 @@ pub fn upload(backend: &Backend, key: &str, raw: RawTensor, role: Role) -> Resul
                     "{key}: quantized weight must be a [N, K] matrix, got {shape:?}"
                 )));
             }
-            let group = choose_group(shape[1])?;
-            let data = raw.data.into_f32();
-            let (bytes, scales) = quantize(&data, shape[0] as usize, shape[1] as usize, group as usize);
-            let (n, groups) = (shape[0], shape[1] / group);
-            Ok(Weight::quant(
-                backend.tensor_i8(&bytes, shape, &label),
-                backend.tensor_f32(&scales, vec![n, groups], &format!("{label}.scale")),
-                group,
-            ))
+            let (n, k) = (shape[0], shape[1]);
+            match raw.data {
+                // GGUF Q8_0 stays quantized end to end: repack the raw blocks
+                // into the GPU i8 layout at group 32 (the original block
+                // scales), avoiding an f32 round trip and re-quantization.
+                TensorData::Q8 { bytes, numel } => {
+                    if numel != (n * k) as usize {
+                        return Err(Error::Model(format!(
+                            "{key}: Q8_0 numel {numel} does not match shape {shape:?}"
+                        )));
+                    }
+                    let (bytes, scales) =
+                        repack_q8(&bytes, n as usize, k as usize)?;
+                    Ok(Weight::quant(
+                        backend.tensor_i8(&bytes, shape, &label),
+                        backend.tensor_f32(&scales, vec![n, k / 32], &format!("{label}.scale")),
+                        32,
+                    ))
+                }
+                other => {
+                    let group = choose_group(k)?;
+                    let data = other.into_f32();
+                    let (bytes, scales) =
+                        quantize(&data, n as usize, k as usize, group as usize);
+                    let (n, groups) = (n, k / group);
+                    Ok(Weight::quant(
+                        backend.tensor_i8(&bytes, shape, &label),
+                        backend.tensor_f32(&scales, vec![n, groups], &format!("{label}.scale")),
+                        group,
+                    ))
+                }
+            }
         }
     }
 }

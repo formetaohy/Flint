@@ -8,7 +8,12 @@ flint-architectures.workspace = true
 flint-backend.workspace = true
 flint-checkpoint.workspace = true
 flint-error.workspace = true
+flint-kernel.workspace = true
 flint-model.workspace = true
+flint-profiler.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+flint-tensor.workspace = true
 

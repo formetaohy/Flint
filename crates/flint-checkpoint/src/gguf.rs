@@ -9,6 +9,7 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use flint_error::{Error, Result};
+use flint_num::{f32_to_bf16, f32_to_f16};
 
 use super::dequant::{self, GgmlType};
 use super::{Checkpoint, RawTensor, TensorData};
@@ -225,12 +226,16 @@ impl Checkpoint for Gguf {
         // row-major over that, i.e. [N, K] with K contiguous — exactly Flint's
         // weight convention. Reverse the dim list to report [N, K].
         let shape: Vec<u32> = info.shape.iter().rev().cloned().collect();
-        // bf16 stays packed (embeddings can exceed a gigabyte as f32); every
-        // other type dequantizes to f32.
-        let data = if info.ty == GgmlType::Bf16 {
-            TensorData::Bf16(bytes.to_vec())
-        } else {
-            TensorData::F32(dequant::to_f32(info.ty, bytes, info.numel)?)
+        // bf16 stays packed (embeddings can exceed a gigabyte as f32); Q8_0
+        // keeps its raw blocks for the direct GPU repack; every other type
+        // dequantizes to f32.
+        let data = match info.ty {
+            GgmlType::Bf16 => TensorData::Bf16(bytes.to_vec()),
+            GgmlType::Q8_0 => TensorData::Q8 {
+                bytes: bytes.to_vec(),
+                numel: info.numel,
+            },
+            _ => TensorData::F32(dequant::to_f32(info.ty, bytes, info.numel)?),
         };
         Ok(RawTensor { shape, data })
     }
@@ -425,7 +430,7 @@ impl GgufWriter {
     pub fn tensor_bf16(&mut self, name: &str, shape: &[u32], data: &[f32]) {
         let mut bytes = Vec::with_capacity(data.len() * 2);
         for v in data {
-            bytes.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+            bytes.extend_from_slice(&f32_to_bf16(*v).to_le_bytes());
         }
         self.tensors.push(TensorSpec {
             name: name.to_string(),
@@ -447,7 +452,7 @@ impl GgufWriter {
         for block in data.chunks_exact(32) {
             let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
             let d = if amax == 0.0 { 0.0 } else { amax / 127.0 };
-            bytes.extend_from_slice(&dequant::f32_to_f16(d).to_le_bytes());
+            bytes.extend_from_slice(&f32_to_f16(d).to_le_bytes());
             for v in block {
                 bytes.push(((v / d).round().clamp(-127.0, 127.0) as i8) as u8);
             }
@@ -514,18 +519,32 @@ fn write_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-/// Writes a metadata value including its type tag.
+/// Writes a metadata value including its type tag. Values must fit their
+/// narrowed wire type (u32 / f32); anything larger fails the serialization
+/// instead of silently truncating.
 fn write_value(out: &mut Vec<u8>, v: &MetaVal) {
     match v {
         MetaVal::UInt(n) => {
+            assert!(
+                *n <= u32::MAX as u64,
+                "GGUF writer: value {n} does not fit u32"
+            );
             out.extend_from_slice(&4u32.to_le_bytes());
             out.extend_from_slice(&(*n as u32).to_le_bytes());
         }
         MetaVal::Int(i) => {
+            assert!(
+                i64::from(*i as i32) == *i,
+                "GGUF writer: value {i} does not fit i32"
+            );
             out.extend_from_slice(&5u32.to_le_bytes());
             out.extend_from_slice(&(*i as i32).to_le_bytes());
         }
         MetaVal::Float(f) => {
+            assert!(
+                *f == (*f as f32) as f64,
+                "GGUF writer: value {f} does not fit f32"
+            );
             out.extend_from_slice(&6u32.to_le_bytes());
             out.extend_from_slice(&(*f as f32).to_le_bytes());
         }
@@ -558,9 +577,27 @@ fn write_value(out: &mut Vec<u8>, v: &MetaVal) {
 /// Writes an array element whose type tag was already emitted.
 fn write_value_typed(out: &mut Vec<u8>, v: &MetaVal) {
     match v {
-        MetaVal::UInt(n) => out.extend_from_slice(&(*n as u32).to_le_bytes()),
-        MetaVal::Int(i) => out.extend_from_slice(&(*i as i32).to_le_bytes()),
-        MetaVal::Float(f) => out.extend_from_slice(&(*f as f32).to_le_bytes()),
+        MetaVal::UInt(n) => {
+            assert!(
+                *n <= u32::MAX as u64,
+                "GGUF writer: value {n} does not fit u32"
+            );
+            out.extend_from_slice(&(*n as u32).to_le_bytes());
+        }
+        MetaVal::Int(i) => {
+            assert!(
+                i64::from(*i as i32) == *i,
+                "GGUF writer: value {i} does not fit i32"
+            );
+            out.extend_from_slice(&(*i as i32).to_le_bytes());
+        }
+        MetaVal::Float(f) => {
+            assert!(
+                *f == (*f as f32) as f64,
+                "GGUF writer: value {f} does not fit f32"
+            );
+            out.extend_from_slice(&(*f as f32).to_le_bytes());
+        }
         MetaVal::Str(s) => write_str(out, s),
         other => panic!("unsupported array element {other:?}"),
     }

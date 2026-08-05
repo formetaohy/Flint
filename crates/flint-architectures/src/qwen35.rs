@@ -236,7 +236,7 @@ fn take_full_layer(w: &mut WeightSet, p: &str) -> Result<Box<FullLayerW>> {
         o: w.take(&k("self_attn.o_proj.weight"))?,
         q_norm: w.take_tensor(&k("self_attn.q_norm.weight"))?,
         k_norm: w.take_tensor(&k("self_attn.k_norm.weight"))?,
-        mlp: take_mlp(w, p)?,
+        mlp: take_mlp(w, p, false)?,
     }))
 }
 
@@ -253,7 +253,7 @@ fn take_linear_layer(w: &mut WeightSet, p: &str) -> Result<Box<LinearLayerW>> {
         dt_bias: w.take_tensor(&k("dt_bias"))?,
         norm: w.take_tensor(&k("norm.weight"))?,
         out_proj: w.take(&k("out_proj.weight"))?,
-        mlp: take_mlp(w, p)?,
+        mlp: take_mlp(w, p, false)?,
     }))
 }
 
@@ -502,11 +502,7 @@ impl LanguageModel for Qwen35 {
         let mut ids = vec![0u32; M_MAX as usize];
         ids[..tokens.len()].copy_from_slice(tokens);
         backend.write_u32(&self.s.ids.buf, &ids);
-        // args: [pos, effective attention segments]; short prefixes use fewer
-        // split-K segments (see the dense model's forward).
-        let kv_len = self.pos + m;
-        let attn_segs = kv_len.div_ceil(ops::ATTN_SEGS).clamp(1, ops::ATTN_SEGS);
-        backend.write_u32(&self.s.args.buf, &[self.pos, attn_segs]);
+        ops::write_step_args(backend, &self.s.args, self.pos, self.pos + m);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder();
@@ -621,9 +617,7 @@ impl Speculator for Qwen35 {
         let mut ids = vec![0u32; M_MAX as usize];
         ids[0] = token;
         backend.write_u32(&self.s.ids.buf, &ids);
-        let kv_len = self.mtp_pos + 1;
-        let attn_segs = kv_len.div_ceil(ops::ATTN_SEGS).clamp(1, ops::ATTN_SEGS);
-        backend.write_u32(&self.s.args.buf, &[self.mtp_pos, attn_segs]);
+        ops::write_step_args(backend, &self.s.args, self.mtp_pos, self.mtp_pos + 1);
         backend.write_f32(&self.s.mtp_h.buf, hidden);
 
         let cfg = &self.cfg;

@@ -89,22 +89,8 @@ impl Engine {
             return None;
         }
         let rows = self.backend.profile_report();
-        let total: u64 = rows.iter().map(|r| r.total_ns).sum();
         let mut out = String::from("[flint] GPU kernel time breakdown (cumulative):\n");
-        for r in rows {
-            let pct = if total > 0 {
-                r.total_ns as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            };
-            out.push_str(&format!(
-                "  {:<12} {:9.2} ms  {:8} calls  {:5.1}%\n",
-                r.label,
-                r.total_ns as f64 / 1e6,
-                r.count,
-                pct
-            ));
-        }
+        out.push_str(&flint_profiler::breakdown(&rows));
         Some(out)
     }
 

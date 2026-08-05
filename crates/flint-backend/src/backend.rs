@@ -8,8 +8,8 @@ use wgpu::{
 };
 
 use flint_error::{Error, Result};
-use flint_kernel::Kernels;
-use flint_profiler::{GpuProfiler, ProfileRow};
+use flint_kernel::{Kernels, name};
+use flint_profiler::{ProfileRow, Profiler};
 use flint_tensor::{DType, Tensor, Weight};
 
 /// A whole tensor or a byte-aligned sub-slice of it.
@@ -118,10 +118,13 @@ pub struct Backend {
     dummy_scale: Tensor,
     /// Split-K gemv partials [SEGS, N] f32, grown on demand.
     gemv_partial: Tensor,
+    /// Split-K gemm partials [SEGS, M, Y_STRIDE] f32, grown on demand.
+    gemm_partial: Tensor,
+
     /// Bind groups keyed by their buffer signature, reused across steps.
     bg_cache: HashMap<BgKey, BindGroup>,
     /// GPU timestamp profiler; present only when FLINT_PROFILE is set and supported.
-    profiler: Option<GpuProfiler>,
+    profiler: Option<Profiler>,
 }
 
 impl Backend {
@@ -185,9 +188,18 @@ impl Backend {
         } else {
             wgpu::Features::empty()
         };
+        // Always request in-pass timestamps: on this driver stack their
+        // presence changes the DXIL path observably (see bench notes), so
+        // profile and non-profile runs must use the same features.
+        let ts = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
+        let base_features = if ts {
+            profile_features | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+        } else {
+            profile_features
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("flint"),
-            required_features: profile_features,
+            required_features: base_features,
             required_limits: limits,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: MemoryHints::Performance,
@@ -195,7 +207,8 @@ impl Backend {
         }))
         .map_err(|e| Error::Gpu(format!("device creation failed: {e}")))?;
 
-        let kernels = Kernels::new(&device)?;
+        let mut kernels = Kernels::new(&device)?;
+        warmup(&device, &queue, &mut kernels)?;
         let dummy_scale = Tensor::new(
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("dummy_scale"),
@@ -206,7 +219,7 @@ impl Backend {
             DType::F32,
         );
         let profiler = if profile_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
-            Some(GpuProfiler::new(&device, &queue, 4096))
+            Some(Profiler::new(&device, &queue, 4096))
         } else {
             if want_profile {
                 eprintln!(
@@ -216,6 +229,7 @@ impl Backend {
             None
         };
         let gemv_partial = Self::gemv_partial_buf(&device, 8 * 65536);
+        let gemm_partial = Self::gemv_partial_buf(&device, 4 * 128 * 16384);
         Ok(Self {
             device,
             queue,
@@ -223,6 +237,7 @@ impl Backend {
             adapter_name,
             dummy_scale,
             gemv_partial,
+            gemm_partial,
             bg_cache: HashMap::new(),
             profiler,
         })
@@ -256,6 +271,13 @@ impl Backend {
         match w.scale() {
             Some(s) => Binding::Full(s),
             None => Binding::Full(dummy),
+        }
+    }
+
+    /// Grows the gemm-partial buffer to hold `words` f32 elements.
+    fn ensure_gemm_partial(&mut self, words: u32) {
+        if words > self.gemm_partial.numel() as u32 {
+            self.gemm_partial = Self::gemv_partial_buf(&self.device, words as usize);
         }
     }
 
@@ -490,15 +512,14 @@ impl Backend {
         y_stride: u32,
     ) -> Result<()> {
         let (n, k, wb, wdtype) = Self::weight_io(w);
-        // Row-group width: 16 rows (256 lanes) for small batches, 64 rows
-        // (1024 lanes) for big ones; the last group may cover padding rows.
-        let rows_g = if rows <= 16 { 16 } else { 64 };
+        // Tile size is baked into the kernel: TN=64 columns x TM=64 rows;
+        // M_MAX chunks are exact multiples of TM.
         let consts = [
             ("N", n as f64),
             ("K", k as f64),
+            ("M", rows as f64),
             ("WDTYPE", wdtype),
             ("GROUP", w.group() as f64),
-            ("ROWS_G", rows_g as f64),
             ("ACC", acc as u32 as f64),
             (
                 "Y_STRIDE",
@@ -510,19 +531,60 @@ impl Backend {
             ),
             ("Y_OFF", y_off as f64),
         ];
+        // Split long-K multi-row gemms across the dispatch z axis; short-K
+        // shapes already saturate the SM count with column groups.
+        let segs = if rows > 1 && k >= 8192 { 4 } else { 1 };
+        let consts = consts.into_iter().chain([("SEGS", segs as f64)]).collect::<Vec<_>>();
         let span = self.prof_begin(pass);
-        let bufs = [x, wb, Self::scale_binding(&self.dummy_scale, w), y];
+        let (yb, yslice) = if segs > 1 {
+            let stride = if y_stride == 0 { n } else { y_stride };
+            self.ensure_gemm_partial(segs * rows * stride);
+            (
+                Binding::Slice(&self.gemm_partial, 0, (segs * rows * stride) as u64 * 4),
+                y,
+            )
+        } else {
+            (y, y)
+        };
+        let bufs = [x, wb, Self::scale_binding(&self.dummy_scale, w), yb];
         Self::set(
             &mut self.kernels,
             &mut self.bg_cache,
             &self.device,
             pass,
-            "gemm",
+            name::GEMM,
             &consts,
             &bufs,
-            [n / 16, rows.div_ceil(rows_g), 1],
+            [n.div_ceil(32), rows.div_ceil(32), segs],
         )?;
-        self.prof_end(pass, "gemm", span);
+        self.prof_end(pass, name::GEMM, span);
+        if segs > 1 {
+            let stride = if y_stride == 0 { n } else { y_stride };
+            let span = self.prof_begin(pass);
+            let mconsts = [
+                ("M", rows as f64),
+                ("N", n as f64),
+                ("Y_STRIDE", stride as f64),
+                ("Y_OFF", y_off as f64),
+                ("SEGS", segs as f64),
+                ("ACC", acc as u32 as f64),
+            ];
+            let bufs = [
+                Binding::Slice(&self.gemm_partial, 0, (segs * rows * stride) as u64 * 4),
+                yslice,
+            ];
+            Self::set(
+                &mut self.kernels,
+                &mut self.bg_cache,
+                &self.device,
+                pass,
+                name::MERGE_GEMM,
+                &mconsts,
+                &bufs,
+                [n.div_ceil(256), 1, 1],
+            )?;
+            self.prof_end(pass, name::MERGE_GEMM, span);
+        }
         Ok(())
     }
 
@@ -583,7 +645,7 @@ impl Backend {
             &mut self.bg_cache,
             &self.device,
             pass,
-            "gemv",
+            name::GEMV,
             &consts,
             &bufs,
             [n / 16, segs, 1],
@@ -598,7 +660,7 @@ impl Backend {
                 &mut self.bg_cache,
                 &self.device,
                 pass,
-                "merge_gemv",
+                name::MERGE_GEMV,
                 &[
                     ("N", n as f64),
                     ("SEGS", segs as f64),
@@ -608,7 +670,7 @@ impl Backend {
                 [n / 16, 1, 1],
             )?;
         }
-        self.prof_end(pass, "gemv", span);
+        self.prof_end(pass, name::GEMV, span);
         Ok(())
     }
 
@@ -679,7 +741,7 @@ impl Backend {
             &mut self.bg_cache,
             &self.device,
             pass,
-            "gemv_qkv",
+            name::GEMV_QKV,
             &consts,
             &bufs,
             [ntot / 16, segs, 1],
@@ -696,7 +758,7 @@ impl Backend {
                 &mut self.bg_cache,
                 &self.device,
                 pass,
-                "merge_qkv",
+                name::MERGE_QKV,
                 &[
                     ("NQ", nq as f64),
                     ("NK", nk as f64),
@@ -707,7 +769,7 @@ impl Backend {
                 [ntot / 16, 1, 1],
             )?;
         }
-        self.prof_end(pass, "gemv_qkv", span);
+        self.prof_end(pass, name::GEMV_QKV, span);
         Ok(())
     }
 
@@ -762,7 +824,7 @@ impl Backend {
             &mut self.bg_cache,
             &self.device,
             pass,
-            "gemv_gateup",
+            name::GEMV_GATEUP,
             &consts,
             &bufs,
             [ntot / 16, segs, 1],
@@ -778,13 +840,13 @@ impl Backend {
                 &mut self.bg_cache,
                 &self.device,
                 pass,
-                "merge_gateup",
+                name::MERGE_GATEUP,
                 &[("NG", n as f64), ("SEGS", segs as f64)],
                 &bufs,
                 [ntot / 16, 1, 1],
             )?;
         }
-        self.prof_end(pass, "gemv_gateup", span);
+        self.prof_end(pass, name::GEMV_GATEUP, span);
         Ok(())
     }
 
@@ -909,4 +971,65 @@ fn map_read(device: &Device, buf: &Buffer) -> Result<Vec<u8>> {
         .to_vec();
     buf.unmap();
     Ok(bytes)
+}
+
+/// Warms up the GPU after device creation: model loading leaves the clocks
+/// at idle levels on WDDM; a real compute dispatch + sync restores
+/// steady-state boost (empty passes do nothing — the driver elides them).
+/// Without it first-chunk timing swings 2-8x run to run.
+fn warmup(device: &Device, queue: &Queue, kernels: &mut Kernels) -> Result<()> {
+    let n = 1 << 20;
+    let mk = |label: &str, val: f32| Tensor::new(
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(&vec![val; n]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        }),
+        vec![n as u32],
+        DType::F32,
+    );
+    let wxa = mk("flint.warmup.a", 1.0);
+    let wxb = mk("flint.warmup.b", 1.0);
+    let wy = Tensor::new(
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("flint.warmup.y"),
+            contents: &vec![0u8; n * 4],
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        }),
+        vec![n as u32],
+        DType::F32,
+    );
+    for _ in 0..3 {
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("flint.warmup"),
+        });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("flint.warmup"),
+                timestamp_writes: None,
+            });
+            let layout = kernels.bind_group_layout(name::ADD)?;
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("flint.warmup.bg"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wxa.buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wxb.buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: wy.buf.as_entire_binding() },
+                ],
+            });
+            let pl = kernels.pipeline(device, name::ADD, &[("N_ELEM", n as f64)])?;
+            pass.set_pipeline(pl);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((n / 256) as u32, 1, 1);
+            drop(pass);
+        }
+        queue.submit([enc.finish()]);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    queue.on_submitted_work_done(move || {
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+    Ok(())
 }

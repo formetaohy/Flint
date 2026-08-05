@@ -5,6 +5,41 @@
 
 pub mod cpu;
 
+/// Canonical kernel names: the single source of truth for the string
+/// protocol shared by the shader table, the dispatch facade and the
+/// profiler labels.
+pub mod name {
+    pub const GEMM: &str = "gemm";
+    pub const MERGE_GEMM: &str = "merge_gemm";
+    pub const GEMV: &str = "gemv";
+    pub const MERGE_GEMV: &str = "merge_gemv";
+    pub const GEMV_QKV: &str = "gemv_qkv";
+    pub const MERGE_QKV: &str = "merge_qkv";
+    pub const GEMV_GATEUP: &str = "gemv_gateup";
+    pub const MERGE_GATEUP: &str = "merge_gateup";
+    pub const EMBED: &str = "embed";
+    pub const NORM: &str = "norm";
+    pub const ADD: &str = "add";
+    pub const BIAS: &str = "bias";
+    pub const CONCAT: &str = "concat";
+    pub const SWIGLU: &str = "swiglu";
+    pub const SOFTCAP: &str = "softcap";
+    pub const MUL: &str = "mul";
+    pub const EXPERT_GATHER: &str = "expert_gather";
+    pub const EXPERT_SCATTER: &str = "expert_scatter";
+    pub const ZERO_ROWS: &str = "zero_rows";
+    pub const SIGMOID_MUL: &str = "sigmoid_mul";
+    pub const DELTA_GATE: &str = "delta_gate";
+    pub const CONV1D: &str = "conv1d";
+    pub const DELTA_RECUR: &str = "delta_recur";
+    pub const REPEAT_QK: &str = "repeat_qk";
+    pub const ROPE: &str = "rope";
+    pub const ATTN: &str = "attn";
+    pub const MERGE_ATTN: &str = "merge_attn";
+    pub const KV_STORE: &str = "kv_store";
+    pub const SPLIT_QG: &str = "split_qg";
+}
+
 use std::collections::HashMap;
 
 use wgpu::{
@@ -23,146 +58,151 @@ struct ShaderSpec {
 
 const SHADERS: &[ShaderSpec] = &[
     ShaderSpec {
-        name: "gemm",
+        name: name::GEMM,
         source: include_str!("wgsl/gemm.wgsl"),
         read_only: &[true, true, true, false],
     },
     ShaderSpec {
-        name: "gemv",
+        name: name::MERGE_GEMM,
+        source: include_str!("wgsl/merge_gemm.wgsl"),
+        read_only: &[true, false],
+    },
+    ShaderSpec {
+        name: name::GEMV,
         source: include_str!("wgsl/gemv.wgsl"),
         read_only: &[true, true, true, false],
     },
     ShaderSpec {
-        name: "merge_gemv",
+        name: name::MERGE_GEMV,
         source: include_str!("wgsl/merge_gemv.wgsl"),
         read_only: &[true, false],
     },
     ShaderSpec {
-        name: "gemv_qkv",
+        name: name::GEMV_QKV,
         source: include_str!("wgsl/gemv_qkv.wgsl"),
         read_only: &[
             true, true, true, false, true, true, false, true, true, false, false,
         ],
     },
     ShaderSpec {
-        name: "merge_qkv",
+        name: name::MERGE_QKV,
         source: include_str!("wgsl/merge_qkv.wgsl"),
         read_only: &[true, false, false, false],
     },
     ShaderSpec {
-        name: "gemv_gateup",
+        name: name::GEMV_GATEUP,
         source: include_str!("wgsl/gemv_gateup.wgsl"),
         read_only: &[true, true, true, false, true, true, false, false],
     },
     ShaderSpec {
-        name: "merge_gateup",
+        name: name::MERGE_GATEUP,
         source: include_str!("wgsl/merge_gateup.wgsl"),
         read_only: &[true, false, false],
     },
     ShaderSpec {
-        name: "embed",
+        name: name::EMBED,
         source: include_str!("wgsl/embed.wgsl"),
         read_only: &[true, true, true, false],
     },
     ShaderSpec {
-        name: "norm",
+        name: name::NORM,
         source: include_str!("wgsl/norm.wgsl"),
         read_only: &[
             true, true, true, false, true, true, true, false, true, true, true,
         ],
     },
     ShaderSpec {
-        name: "add",
+        name: name::ADD,
         source: include_str!("wgsl/add.wgsl"),
         read_only: &[true, true, false],
     },
     ShaderSpec {
-        name: "bias",
+        name: name::BIAS,
         source: include_str!("wgsl/bias.wgsl"),
         read_only: &[false, true],
     },
     ShaderSpec {
-        name: "concat",
+        name: name::CONCAT,
         source: include_str!("wgsl/concat.wgsl"),
         read_only: &[true, true, false],
     },
     ShaderSpec {
-        name: "swiglu",
+        name: name::SWIGLU,
         source: include_str!("wgsl/swiglu.wgsl"),
         read_only: &[true, true, false],
     },
     ShaderSpec {
-        name: "softcap",
+        name: name::SOFTCAP,
         source: include_str!("wgsl/softcap.wgsl"),
         read_only: &[false],
     },
     ShaderSpec {
-        name: "mul",
+        name: name::MUL,
         source: include_str!("wgsl/mul.wgsl"),
         read_only: &[true, true, false],
     },
     ShaderSpec {
-        name: "expert_gather",
+        name: name::EXPERT_GATHER,
         source: include_str!("wgsl/expert_gather.wgsl"),
         read_only: &[true, true, false],
     },
     ShaderSpec {
-        name: "expert_scatter",
+        name: name::EXPERT_SCATTER,
         source: include_str!("wgsl/expert_scatter.wgsl"),
         read_only: &[false, true, true, true],
     },
     ShaderSpec {
-        name: "zero_rows",
+        name: name::ZERO_ROWS,
         source: include_str!("wgsl/zero_rows.wgsl"),
         read_only: &[false],
     },
     ShaderSpec {
-        name: "sigmoid_mul",
+        name: name::SIGMOID_MUL,
         source: include_str!("wgsl/sigmoid_mul.wgsl"),
         read_only: &[true, true, false],
     },
     ShaderSpec {
-        name: "delta_gate",
+        name: name::DELTA_GATE,
         source: include_str!("wgsl/delta_gate.wgsl"),
         read_only: &[true, true, true, true, false, false],
     },
     ShaderSpec {
-        name: "conv1d",
+        name: name::CONV1D,
         source: include_str!("wgsl/conv1d.wgsl"),
         read_only: &[true, true, false, false],
     },
     ShaderSpec {
-        name: "delta_recur",
+        name: name::DELTA_RECUR,
         source: include_str!("wgsl/delta_recur.wgsl"),
         read_only: &[true, true, true, true, true, false, false],
     },
     ShaderSpec {
-        name: "repeat_qk",
+        name: name::REPEAT_QK,
         source: include_str!("wgsl/repeat_qk.wgsl"),
         read_only: &[true, false],
     },
     ShaderSpec {
-        name: "rope",
+        name: name::ROPE,
         source: include_str!("wgsl/rope.wgsl"),
         read_only: &[true, true, false, true],
     },
     ShaderSpec {
-        name: "attn",
+        name: name::ATTN,
         source: include_str!("wgsl/attn.wgsl"),
         read_only: &[true, true, true, false, true],
     },
     ShaderSpec {
-        name: "merge_attn",
+        name: name::MERGE_ATTN,
         source: include_str!("wgsl/merge_attn.wgsl"),
         read_only: &[true, false, true],
     },
     ShaderSpec {
-        name: "kv_store",
+        name: name::KV_STORE,
         source: include_str!("wgsl/kv_store.wgsl"),
         read_only: &[true, true, false, false, true],
     },
     ShaderSpec {
-        name: "split_qg",
+        name: name::SPLIT_QG,
         source: include_str!("wgsl/split_qg.wgsl"),
         read_only: &[true, false, false],
     },
@@ -174,8 +214,8 @@ struct CompiledShader {
     bind_group_layout: BindGroupLayout,
 }
 
-/// Most constants any shader takes (attn: 8).
-const MAX_CONSTS: usize = 8;
+/// Most constants any shader takes (gemm: 9).
+const MAX_CONSTS: usize = 12;
 
 /// Allocation-free pipeline cache key: the shader plus its override constants
 /// (name interned as a static str, value as raw f64 bits).

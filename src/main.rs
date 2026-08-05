@@ -1,20 +1,80 @@
 use std::io::{BufRead, Write as _};
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand};
 
-use flint_architectures::ChatFormat;
+use flint_architectures::chat::ChatFormat;
 use flint_backend::Backend;
 use flint_error::Result;
 use flint_generate::{Engine, Sampler, SamplingParams};
+use flint_onnx::hub;
 
 /// Flint: a local LLM inference engine on WGPU.
 #[derive(Parser)]
 #[command(name = "flint", version, about)]
 struct Args {
+    #[command(subcommand)]
+    cmd: Option<Command>,
+
+    #[command(flatten)]
+    chat: Option<ChatArgs>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// ONNX model utilities: download from the Hub, inspect, run graphs.
+    Onnx(OnnxArgs),
+}
+
+#[derive(ClapArgs)]
+struct OnnxArgs {
+    #[command(subcommand)]
+    cmd: OnnxCmd,
+}
+
+#[derive(Subcommand)]
+enum OnnxCmd {
+    /// Downloads an ONNX model from the Hugging Face Hub into a directory.
+    Download {
+        /// Hub repo id, e.g. Xenova/all-MiniLM-L6-v2.
+        repo: String,
+        /// Repo file to fetch (default: onnx/model.onnx when present).
+        #[arg(long)]
+        file: Option<String>,
+        /// Local output directory.
+        #[arg(long, default_value = "onnx-models")]
+        out: PathBuf,
+    },
+    /// Runs an ONNX graph with the given inputs and prints the outputs.
+    Run {
+        /// Path to the .onnx model file.
+        model: PathBuf,
+        /// Inputs as JSON: {"name": [[values]], ...} (integers become i64,
+        /// floats f32, arrays are row-major with an implied shape).
+        #[arg(long)]
+        inputs: Option<String>,
+        /// Input JSON file with the same schema.
+        #[arg(long)]
+        inputs_file: Option<PathBuf>,
+        /// Print only this output tensor (repeatable).
+        #[arg(long)]
+        output: Vec<String>,
+        /// Print every element of each output instead of the first 8.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Prints graph structure and operator statistics.
+    Info {
+        /// Path to the .onnx model file.
+        model: PathBuf,
+    },
+}
+
+#[derive(ClapArgs)]
+struct ChatArgs {
     /// Directory containing config.json / tokenizer.json / safetensors shards.
     #[arg(long)]
-    model: PathBuf,
+    model: Option<PathBuf>,
 
     /// One-shot prompt; omit for an interactive session.
     #[arg(long)]
@@ -60,13 +120,186 @@ fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
 
+    match args.cmd {
+        Some(Command::Onnx(onnx)) => match onnx.cmd {
+            OnnxCmd::Download { repo, file, out } => {
+                let file = match file {
+                    Some(f) => f,
+                    None => hub::default_onnx_file(&repo)?,
+                };
+                let path = hub::download_file(&repo, &file, &out)?;
+                eprintln!("[flint] model saved to {}", path.display());
+                Ok(())
+            }
+            OnnxCmd::Run {
+                model,
+                inputs,
+                inputs_file,
+                output,
+                full,
+            } => onnx_run(&model, inputs, inputs_file, &output, full),
+            OnnxCmd::Info { model } => onnx_info(&model),
+        },
+        None => chat_main(args.chat.expect("chat args present without subcommand")),
+    }
+}
+
+/// `flint onnx run`: binds inputs, executes the graph and prints outputs.
+fn onnx_run(
+    model: &std::path::Path,
+    inputs: Option<String>,
+    inputs_file: Option<std::path::PathBuf>,
+    outputs: &[String],
+    full: bool,
+) -> Result<()> {
+    let json = match (inputs, inputs_file) {
+        (Some(_), Some(_)) => {
+            return Err(flint_error::Error::Model(
+                "provide either --inputs or --inputs-file, not both".into(),
+            ))
+        }
+        (Some(s), None) => s,
+        (None, Some(f)) => std::fs::read_to_string(&f)
+            .map_err(|e| flint_error::Error::Model(format!("cannot read {}: {e}", f.display())))?,
+        (None, None) => {
+            return Err(flint_error::Error::Model(
+                "onnx run requires --inputs or --inputs-file".into(),
+            ))
+        }
+    };
+    let inputs: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json)
+        .map_err(|e| flint_error::Error::Model(format!("invalid inputs JSON: {e}")))?;
+
+    let mut session = flint_onnx::Session::load(model)?;
+    for (name, value) in &inputs {
+        let t = json_to_tensor(value)?;
+        eprintln!("[flint] input {name}: shape {:?}", t.shape);
+        session.set_input(name, t)?;
+    }
+    // Fail fast on missing graph inputs.
+    for v in &session.graph().inputs {
+        if !inputs.contains_key(&v.name) {
+            return Err(flint_error::Error::Model(format!(
+                "graph input {:?} is not provided",
+                v.name
+            )));
+        }
+    }
+
+    let t0 = std::time::Instant::now();
+    let out = session.run()?;
+    eprintln!("[flint] ran in {:.2}s", t0.elapsed().as_secs_f64());
+
+    let mut names: Vec<String> = if outputs.is_empty() {
+        out.keys().cloned().collect()
+    } else {
+        outputs.to_vec()
+    };
+    names.sort();
+    for name in names {
+        let t = out.get(&name).ok_or_else(|| {
+            flint_error::Error::Model(format!("output {name:?} not produced"))
+        })?;
+        let limit = if full { usize::MAX } else { 8 };
+        println!("{name}: {}", t.describe(limit));
+    }
+    Ok(())
+}
+
+/// Converts a JSON value into a tensor: numbers -> f32, integers -> i64,
+/// booleans -> bool; nested arrays are row-major with an implied shape.
+fn json_to_tensor(v: &serde_json::Value) -> Result<flint_onnx::Tensor> {
+    fn flatten(v: &serde_json::Value, f32s: &mut Vec<f32>, i64s: &mut Vec<i64>, bools: &mut Vec<bool>) -> Result<()> {
+        match v {
+            serde_json::Value::Array(a) => {
+                for x in a {
+                    flatten(x, f32s, i64s, bools)?;
+                }
+            }
+            serde_json::Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    if f.fract() == 0.0 && f.abs() < 9e15 {
+                        i64s.push(f as i64);
+                    } else {
+                        f32s.push(f as f32);
+                    }
+                }
+            }
+            serde_json::Value::Bool(b) => bools.push(*b),
+            other => {
+                return Err(flint_error::Error::Model(format!(
+                    "unsupported input value {other:?}"
+                )))
+            }
+        }
+        Ok(())
+    }
+    fn shape_of(v: &serde_json::Value) -> Vec<usize> {
+        let mut s = vec![];
+        let mut cur = v;
+        while let serde_json::Value::Array(a) = cur {
+            s.push(a.len());
+            cur = a.first().unwrap_or(&serde_json::Value::Null);
+        }
+        s
+    }
+    let mut f32s = vec![];
+    let mut i64s = vec![];
+    let mut bools = vec![];
+    flatten(v, &mut f32s, &mut i64s, &mut bools)?;
+    let shape = shape_of(v);
+    let kinds = [(!f32s.is_empty()) as u8, (!i64s.is_empty()) as u8, (!bools.is_empty()) as u8];
+    match kinds {
+        [1, 0, 0] => Ok(flint_onnx::Tensor::f32(f32s, shape)),
+        [0, 1, 0] => Ok(flint_onnx::Tensor::i64(i64s, shape)),
+        [0, 0, 1] => Ok(flint_onnx::Tensor::bool(bools, shape)),
+        _ => Err(flint_error::Error::Model(
+            "inputs must be a homogeneous nested array of numbers or booleans".into(),
+        )),
+    }
+}
+
+/// `flint onnx info`: prints graph metadata and operator statistics.
+fn onnx_info(model: &std::path::Path) -> Result<()> {
+    let g = flint_onnx::Graph::load(model)?;
+    println!("graph: {:?}", g.name);
+    println!(
+        "nodes: {}  initializers: {}  inputs: {}  outputs: {}",
+        g.nodes.len(),
+        g.initializers.len(),
+        g.inputs.len(),
+        g.outputs.len()
+    );
+    let mut ops: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for n in &g.nodes {
+        *ops.entry(n.op_type.as_str()).or_insert(0) += 1;
+    }
+    println!("operators:");
+    for (op, count) in &ops {
+        println!("  {op}: {count}");
+    }
+    println!("inputs:");
+    for i in &g.inputs {
+        println!("  {} dims={:?}", i.name, i.dims);
+    }
+    println!("outputs:");
+    for o in &g.outputs {
+        println!("  {}", o.name);
+    }
+    Ok(())
+}
+
+fn chat_main(args: ChatArgs) -> Result<()> {
+    let model = args
+        .model
+        .ok_or_else(|| flint_error::Error::Model("--model is required for chat mode".into()))?;
     eprintln!("[flint] initializing GPU backend...");
     let backend = Backend::new()?;
     eprintln!("[flint] adapter: {}", backend.adapter_name());
 
-    eprintln!("[flint] loading weights from {}...", args.model.display());
+    eprintln!("[flint] loading weights from {}...", model.display());
     let load_t = std::time::Instant::now();
-    let chat_model = flint_architectures::load(&args.model, args.max_seq, &backend)?;
+    let chat_model = flint_architectures::load(&model, args.max_seq, &backend)?;
     eprintln!(
         "[flint] weights loaded in {:.1}s",
         load_t.elapsed().as_secs_f64()

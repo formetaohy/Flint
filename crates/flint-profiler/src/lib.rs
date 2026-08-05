@@ -3,7 +3,7 @@
 //! Brackets every dispatch with two timestamp queries and accumulates
 //! per-shader totals across frames. Constructed only when profiling is
 //! requested; readback is owned by the backend, which hands raw values to
-//! [`GpuProfiler::accumulate`].
+//! [`Profiler::accumulate`].
 
 use std::collections::HashMap;
 
@@ -18,6 +18,27 @@ pub struct ProfileRow {
     pub count: u64,
 }
 
+/// One breakdown line: share, percentage and call count.
+pub fn breakdown(rows: &[ProfileRow]) -> String {
+    let total: u64 = rows.iter().map(|r| r.total_ns).sum();
+    let mut out = String::new();
+    for r in rows {
+        let pct = if total > 0 {
+            r.total_ns as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
+        out.push_str(&format!(
+            "  {:<12} {:9.2} ms  {:8} calls  {:5.1}%\n",
+            r.label,
+            r.total_ns as f64 / 1e6,
+            r.count,
+            pct
+        ));
+    }
+    out
+}
+
 /// A bracketed dispatch: timestamps at `start` and `end` query slots.
 struct Span {
     label: &'static str,
@@ -27,7 +48,7 @@ struct Span {
 
 /// Times dispatches on the GPU via timestamp queries and accumulates
 /// per-shader totals. Frame state resets on each `accumulate`; totals persist.
-pub struct GpuProfiler {
+pub struct Profiler {
     set: QuerySet,
     resolve_buf: Buffer,
     read_buf: Buffer,
@@ -38,7 +59,7 @@ pub struct GpuProfiler {
     period_ns: f64,
 }
 
-impl GpuProfiler {
+impl Profiler {
     pub fn new(device: &Device, queue: &Queue, capacity: u32) -> Self {
         let set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("flint.profile"),

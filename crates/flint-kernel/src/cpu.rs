@@ -9,7 +9,7 @@ fn silu(v: f32) -> f32 {
 /// Round-to-bf16 (truncate the low 16 mantissa bits), modelling how the KV
 /// cache stores activations so the reference matches the GPU kernels.
 fn bf16(v: f32) -> f32 {
-    f32::from_bits((v.to_bits() >> 16) << 16)
+    flint_num::bf16_to_f32(flint_num::f32_to_bf16(v))
 }
 
 /// y[m, n] = x[m, k] @ w[n, k]^T.

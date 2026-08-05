@@ -4,7 +4,7 @@
 //! two backends cannot silently agree on wrong results.
 
 use flint_backend::{Backend, Binding, Pass};
-use flint_kernel::cpu;
+use flint_kernel::{cpu, name};
 use flint_tensor::{DType, Tensor, Weight};
 
 // ================================================================ harness
@@ -206,13 +206,14 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
     };
 
     ctx.dispatch(
-        "gemm",
+        name::GEMM,
         &[
             ("N", n as f64),
             ("K", k as f64),
+            ("M", m as f64),
+            ("SEGS", 1.0),
             ("WDTYPE", wdtype),
             ("GROUP", group),
-            ("ROWS_G", 16.0),
             ("ACC", 0.0),
             ("Y_STRIDE", n as f64),
             ("Y_OFF", 0.0),
@@ -223,7 +224,7 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
             Binding::Full(&sb),
             Binding::Full(&y),
         ],
-        [(n / 16) as u32, m.div_ceil(16) as u32, 1],
+        [n.div_ceil(32) as u32, m.div_ceil(32) as u32, 1],
     );
     agree(&ctx.read(&y), &cpu::gemm(&x, &cpu_w, m, n, k), rel, abs);
 }
@@ -240,7 +241,7 @@ fn gemm_bf16_multi_tile_m() {
 
 #[test]
 fn gemm_i8_group128() {
-    gemm_case(WType::I8(128), 16, 64, 256, 17);
+    gemm_case(WType::I8(128), 16, 256, 256, 17);
 }
 
 #[test]
@@ -289,7 +290,7 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
         Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64)
     };
     ctx.dispatch(
-        "gemv",
+        name::GEMV,
         &[
             ("N", n as f64),
             ("K", k as f64),
@@ -308,7 +309,7 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
     );
     if segs > 1 {
         ctx.dispatch(
-            "merge_gemv",
+        name::MERGE_GEMV,
             &[("N", n as f64), ("SEGS", segs as f64), ("ACC", 0.0)],
             &[
                 Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64),
@@ -369,7 +370,7 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
     let w = Weight::plain(tb);
 
     ctx.dispatch(
-        "embed",
+        name::EMBED,
         &[
             ("M", rows as f64),
             ("DIM", dim as f64),
@@ -418,7 +419,7 @@ fn norm_case(mode: u32, rows: usize, dim: usize, w_dim: usize, seed: u64) {
     let y = ctx.zero(&[rows as u32, dim as u32]);
 
     ctx.dispatch(
-        "norm",
+        name::NORM,
         &[
             ("MODE", mode as f64),
             ("DIM", dim as f64),
@@ -487,7 +488,7 @@ fn add() {
     let y = ctx.zero(&[n as u32]);
 
     ctx.dispatch(
-        "add",
+        name::ADD,
         &[("N_ELEM", n as f64)],
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
@@ -506,7 +507,7 @@ fn bias() {
     let bb = ctx.f32(&b, &[dim as u32]);
 
     ctx.dispatch(
-        "bias",
+        name::BIAS,
         &[("N_ELEM", (rows * dim) as f64), ("DIM", dim as f64)],
         &[Binding::Full(&xb), Binding::Full(&bb)],
         [1, 1, 1],
@@ -528,7 +529,7 @@ fn swiglu() {
     let y = ctx.zero(&[n as u32]);
 
     ctx.dispatch(
-        "swiglu",
+        name::SWIGLU,
         &[("N_ELEM", n as f64), ("MODE", 0.0)],
         &[Binding::Full(&gb), Binding::Full(&ub), Binding::Full(&y)],
         [1, 1, 1],
@@ -548,7 +549,7 @@ fn swiglu_gelu_tanh() {
     let y = ctx.zero(&[n as u32]);
 
     ctx.dispatch(
-        "swiglu",
+        name::SWIGLU,
         &[("N_ELEM", n as f64), ("MODE", 1.0)],
         &[Binding::Full(&gb), Binding::Full(&ub), Binding::Full(&y)],
         [1, 1, 1],
@@ -567,7 +568,7 @@ fn softcap() {
     }
     let xb = ctx.f32(&x, &[n as u32]);
     ctx.dispatch(
-        "softcap",
+        name::SOFTCAP,
         &[("N_ELEM", n as f64), ("CAP", 30.0)],
         &[Binding::Full(&xb)],
         [1, 1, 1],
@@ -588,7 +589,7 @@ fn mul_broadcast() {
     let y = ctx.zero(&[n as u32]);
 
     ctx.dispatch(
-        "mul",
+        name::MUL,
         &[("N", n as f64), ("M", 4.0)],
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
@@ -613,7 +614,7 @@ fn expert_gather_scatter() {
     let acc = ctx.zero(&[4u32, hidden as u32]);
 
     ctx.dispatch(
-        "expert_gather",
+        name::EXPERT_GATHER,
         &[("HIDDEN", hidden as f64), ("COUNT", 4.0)],
         &[
             Binding::Full(&xb),
@@ -623,7 +624,7 @@ fn expert_gather_scatter() {
         [1, 1, 1],
     );
     ctx.dispatch(
-        "expert_scatter",
+        name::EXPERT_SCATTER,
         &[("HIDDEN", hidden as f64), ("COUNT", 4.0)],
         &[
             Binding::Full(&acc),
@@ -645,7 +646,7 @@ fn zero_rows() {
     let x = vec![1.0f32, 2.0, 3.0, 4.0];
     let xb = ctx.f32(&x, &[4u32]);
     ctx.dispatch(
-        "zero_rows",
+        name::ZERO_ROWS,
         &[("N_ELEM", 3.0)],
         &[Binding::Full(&xb)],
         [1, 1, 1],
@@ -667,7 +668,7 @@ fn sigmoid_mul() {
     let y = ctx.zero(&[n as u32]);
 
     ctx.dispatch(
-        "sigmoid_mul",
+        name::SIGMOID_MUL,
         &[("N_ELEM", n as f64)],
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
@@ -687,7 +688,7 @@ fn concat() {
     let y = ctx.zero(&[rows as u32, 2 * d as u32]);
 
     ctx.dispatch(
-        "concat",
+        name::CONCAT,
         &[("ROWS", rows as f64), ("D", d as f64)],
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
@@ -720,7 +721,7 @@ fn rope_case(m: usize, heads: usize, hd: usize, rot: usize, pos: usize, seed: u6
     let args = ctx.arg(pos, pos + m);
 
     ctx.dispatch(
-        "rope",
+        name::ROPE,
         &[
             ("HEADS", heads as f64),
             ("HEAD_DIM", hd as f64),
@@ -769,7 +770,7 @@ fn conv1d_rolls_state_across_steps() {
     for x in &steps {
         ctx.backend.write_f32(&xb.buf, x);
         ctx.dispatch(
-            "conv1d",
+        name::CONV1D,
             &[("DIM", dim as f64)],
             &[
                 Binding::Full(&xb),
@@ -822,7 +823,7 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
             ctx.backend
                 .dispatch(
                     &mut pass,
-                    "conv1d",
+        name::CONV1D,
                     &[("DIM", conv_dim as f64)],
                     &[
                         Binding::Slice(&xb, row(t), conv_dim as u64 * 4),
@@ -843,7 +844,7 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
         ctx.backend
             .dispatch(
                 &mut pass,
-                "repeat_qk",
+        name::REPEAT_QK,
                 &[
                     ("ROWS", rows as f64),
                     ("N_K", n_k as f64),
@@ -882,7 +883,7 @@ fn repeat_qk_case(rows: usize, n_k: usize, n_v: usize, kd: usize, vd: usize, see
     let y = ctx.zero(&[rows as u32, out_dim as u32]);
 
     ctx.dispatch(
-        "repeat_qk",
+        name::REPEAT_QK,
         &[
             ("ROWS", rows as f64),
             ("N_K", n_k as f64),
@@ -947,7 +948,7 @@ fn delta_gate_selects_chunk_rows() {
 
     for row in [0usize, 2] {
         ctx.dispatch(
-            "delta_gate",
+        name::DELTA_GATE,
             &[("HEADS", heads as f64), ("ROW_T", row as f64)],
             &[
                 Binding::Full(&bb),
@@ -990,7 +991,7 @@ fn delta_recur_case(heads: usize, kd: usize, vd: usize, seed: u64) {
     let out = ctx.zero(&[heads as u32, vd as u32]);
 
     ctx.dispatch(
-        "delta_recur",
+        name::DELTA_RECUR,
         &[
             ("HEADS", heads as f64),
             ("K_DIM", kd as f64),
@@ -1055,7 +1056,7 @@ fn attn_case(
     let args = ctx.arg(pos, pos + m);
 
     ctx.dispatch(
-        "attn",
+        name::ATTN,
         &[
             ("N_HEADS", nq as f64),
             ("KV_HEADS", nkv as f64),
@@ -1076,7 +1077,7 @@ fn attn_case(
         [m as u32, nkv as u32, 32],
     );
     ctx.dispatch(
-        "merge_attn",
+        name::MERGE_ATTN,
         &[
             ("N_HEADS", nq as f64),
             ("KV_HEADS", nkv as f64),
@@ -1153,7 +1154,7 @@ fn split_qg() {
     let gb = ctx.zero(&[rows as u32, heads as u32, hd as u32]);
 
     ctx.dispatch(
-        "split_qg",
+        name::SPLIT_QG,
         &[
             ("ROWS", rows as f64),
             ("HEADS", heads as f64),
@@ -1181,7 +1182,7 @@ fn kv_store_writes_both_caches() {
     let args = ctx.arg(pos, pos + m);
 
     ctx.dispatch(
-        "kv_store",
+        name::KV_STORE,
         &[
             ("N_KV", nkv as f64),
             ("HEAD_DIM", hd as f64),

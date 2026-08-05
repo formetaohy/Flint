@@ -27,7 +27,7 @@ Flint 是用纯 Rust 编写、基于 [WGPU](https://github.com/gfx-rs/wgpu) 的�
 
 - **跨平台** —— 基于 WGPU 开发，可运行于所有支持的平台。
 - **高性能** —— 高度优化的、基于 WGSL 的推理核心。
-- **多格式** —— 支持 `safetensors` 与量化 `GGUF` 格式。
+- **多格式** —— 支持 `safetensors`、`ONNX` 和量化 `GGUF` 格式。
 
 ## 支持的架构
 

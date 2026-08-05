@@ -47,7 +47,7 @@ fn moe_key(name: &str) -> Option<(String, MoEPart)> {
 
 /// Parses a Phi-3.x dense config (Phi-4-mini): partial rotary, LongRoPE,
 /// family norm epsilon and activation.
-pub fn parse_dense(v: &Value) -> Result<DenseConfig> {
+fn parse_dense(v: &Value) -> Result<DenseConfig> {
     let mut cfg = DenseConfig::parse(v, true)?;
     let hd = cfg.head_dims[0];
     let factor = v
@@ -118,7 +118,7 @@ pub fn parse_dense(v: &Value) -> Result<DenseConfig> {
 
 /// Parses a Phi-MoE config: LayerNorm, QKV/logits biases, a uniform sliding
 /// window and the sparsemixer-routed MoE feed-forward.
-pub fn parse_moe(v: &Value) -> Result<DenseConfig> {
+fn parse_moe(v: &Value) -> Result<DenseConfig> {
     let mut cfg = DenseConfig::parse(v, false)?;
     cfg.layernorm = true;
     cfg.lm_bias = v

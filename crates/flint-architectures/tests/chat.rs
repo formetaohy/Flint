@@ -1,7 +1,7 @@
 //! Chat prompt rendering: exact turn structure per family. Markers are built
 //! by concatenation so this file never embeds a literal special-token string.
 
-use flint_architectures::{ChatFormat, ChatMl, ChatMlThink, GemmaChat};
+use flint_architectures::chat::{ChatFormat, ChatMl, ChatMlThink, GemmaChat};
 
 fn im(start: bool) -> String {
     format!("<|im_{}|>", if start { "start" } else { "end" })

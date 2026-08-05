@@ -28,8 +28,9 @@ impl Safetensors {
             Ok(raw) => serde_json::from_str(&raw).map_err(|e| {
                 Error::Model(format!("invalid index {}: {e}", index_path.display()))
             })?,
-            Err(_) => {
-                // Single-shard checkpoints have no index; fall back to scanning.
+            // A missing index means a single-shard checkpoint; any other
+            // read failure is a real error, not a fallback case.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let shard = dir.join("model.safetensors");
                 if !shard.exists() {
                     return Err(Error::Model(format!(
@@ -43,6 +44,12 @@ impl Safetensors {
                     weight_map.insert(n, "model.safetensors".to_string());
                 }
                 Index { weight_map }
+            }
+            Err(e) => {
+                return Err(Error::Model(format!(
+                    "cannot read {}: {e}",
+                    index_path.display()
+                )))
             }
         };
         Ok(Self {
@@ -146,5 +153,5 @@ fn f32_bytes(data: &[u8]) -> &[f32] {
 }
 
 fn f16(c: &[u8]) -> f32 {
-    super::dequant::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))
+    flint_num::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))
 }

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use flint_architectures::{DenseConfig, DenseModel};
+use flint_architectures::dense::{DenseConfig, DenseModel, dense_plan};
 use flint_backend::Backend;
 use flint_error::Result;
 use flint_model::LanguageModel;
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let source = SynthCheckpoint::new(spec);
     let cfg = config(&spec);
-    let plan = flint_architectures::dense::dense_plan(false);
+    let plan = dense_plan(false);
     let mut backend = backend;
     let mut model = DenseModel::load(&source, cfg, &plan, args.max_seq, &backend)?;
     eprintln!(
@@ -169,22 +169,8 @@ fn main() -> Result<()> {
 
     if backend.profiling() {
         let rows = backend.profile_report();
-        let total: u64 = rows.iter().map(|r| r.total_ns).sum();
         eprintln!("[bench] GPU kernel time breakdown (cumulative over prefill+decode):");
-        for r in rows {
-            let pct = if total > 0 {
-                r.total_ns as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            };
-            eprintln!(
-                "  {:<12} {:9.2} ms  {:8} calls  {:5.1}%",
-                r.label,
-                r.total_ns as f64 / 1e6,
-                r.count,
-                pct
-            );
-        }
+        eprint!("{}", flint_profiler::breakdown(&rows));
     }
     Ok(())
 }
@@ -205,7 +191,7 @@ fn bandwidth_probe() -> Result<()> {
             let mut pass = Pass::begin(&mut enc, "copy");
             backend.dispatch(
                 &mut pass,
-                "add",
+                flint_kernel::name::ADD,
                 &[("N_ELEM", n as f64)],
                 &[Binding::Full(&x), Binding::Full(&x), Binding::Full(&y)],
                 [1024, (n as u32).div_ceil(256 * 1024), 1],

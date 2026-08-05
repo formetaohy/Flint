@@ -4,6 +4,7 @@
 //! ggml struct definitions exactly.
 
 use flint_error::{Error, Result};
+use flint_num::{bf16_to_f32, f16_to_f32};
 
 /// The ggml_type enum values used in GGUF tensor info records. Explicit
 /// discriminants match the GGUF spec so `ty as u32` serializes correctly.
@@ -78,74 +79,6 @@ impl GgmlType {
     }
 }
 
-/// f32 -> IEEE-754 binary16, round-to-nearest-even.
-pub fn f32_to_f16(f: f32) -> u16 {
-    let b = f.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u16;
-    let exp = ((b >> 23) & 0xff) as i32;
-    let mant = b & 0x7f_ffff;
-
-    if exp == 0xff {
-        // inf / nan: keep the top mantissa bits.
-        return sign | 0x7c00 | ((mant >> 13) as u16);
-    }
-    let half_exp = exp - 127 + 15;
-    if half_exp >= 0x1f {
-        return sign | 0x7c00; // overflow -> inf
-    }
-    if half_exp <= 0 {
-        // Zero or subnormal; round-to-nearest-even on the shifted mantissa.
-        if half_exp < -10 {
-            return sign;
-        }
-        let m = mant | 0x80_0000;
-        let shift = 14 - half_exp;
-        let mut v = m >> shift;
-        let rem = m & ((1 << shift) - 1);
-        let half = 1 << (shift - 1);
-        if rem > half || (rem == half && v & 1 == 1) {
-            v += 1;
-        }
-        return sign | v as u16;
-    }
-    let mut m16 = (mant >> 13) as u16;
-    let rem = mant & 0x1fff;
-    if rem > 0x1000 || (rem == 0x1000 && m16 & 1 == 1) {
-        m16 += 1;
-        if m16 == 0x400 {
-            return sign | ((half_exp + 1) as u16) << 10;
-        }
-    }
-    sign | ((half_exp as u16) << 10) | m16
-}
-
-/// IEEE-754 binary16 -> f32.
-pub fn f16_to_f32(h: u16) -> f32 {
-    let sign = ((h >> 15) & 1) as u32;
-    let exp = (h >> 10) & 0x1f;
-    let mant = (h & 0x3ff) as u32;
-    let bits = if exp == 0 {
-        if mant == 0 {
-            sign << 31
-        } else {
-            // Subnormal: normalize.
-            let mut m = mant;
-            let mut e = 127 - 15 + 1;
-            while m & 0x400 == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            m &= 0x3ff;
-            (sign << 31) | (e << 23) | (m << 13)
-        }
-    } else if exp == 0x1f {
-        (sign << 31) | (0xff << 23) | (mant << 13)
-    } else {
-        (sign << 31) | (((exp as u32) + (127 - 15)) << 23) | (mant << 13)
-    };
-    f32::from_bits(bits)
-}
-
 fn half(bytes: &[u8], off: usize) -> f32 {
     f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]))
 }
@@ -186,7 +119,7 @@ fn decode_block(ty: GgmlType, blk: &[u8], y: &mut [f32]) {
         }
         GgmlType::Bf16 => {
             for (i, c) in blk.chunks_exact(2).enumerate().take(y.len()) {
-                y[i] = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                y[i] = bf16_to_f32(u16::from_le_bytes([c[0], c[1]]));
             }
         }
         GgmlType::Q8_0 => q8_0(blk, y),

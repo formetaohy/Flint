@@ -86,17 +86,21 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         let kb_rel = lane / BN;
         let seg_kb = (K / SEGS) / 16u;
         let kb_lo = seg * seg_kb;
-        let iters = (seg_kb + 15u) / 16u;
+        let iters = (seg_kb + 31u) / 32u;
         let lim = kb_lo + seg_kb;
 
         var acc0 = 0.0;
         var acc1 = 0.0;
+        var acc2 = 0.0;
+        var acc3 = 0.0;
         for (var it: u32 = 0u; it < iters; it += 1u) {
-            let kb0 = kb_lo + it * 16u + kb_rel;
+            let kb0 = kb_lo + it * 32u + kb_rel;
             if (kb0 >= lim) {
                 break;
             }
             let kb1 = kb0 + 8u;
+            let kb2 = kb0 + 16u;
+            let kb3 = kb0 + 24u;
             let xb = kb0 * 4u;
             let xv0 = x[xb];
             let xv1 = x[xb + 1u];
@@ -117,8 +121,30 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
                 acc1 += dot(xv4, deq_i8(w4b.x) * scb) + dot(xv5, deq_i8(w4b.y) * scb)
                     + dot(xv6, deq_i8(w4b.z) * scb) + dot(xv7, deq_i8(w4b.w) * scb);
             }
+            if (kb2 < lim) {
+                let xb2 = kb2 * 4u;
+                let xv8 = x[xb2];
+                let xv9 = x[xb2 + 1u];
+                let xv10 = x[xb2 + 2u];
+                let xv11 = x[xb2 + 3u];
+                let w4c = w[kb2 * N + n0 + c];
+                let scc = scales[(n0 + c) * ns + kb2 / (GROUP / 16u)];
+                acc2 += dot(xv8, deq_i8(w4c.x) * scc) + dot(xv9, deq_i8(w4c.y) * scc)
+                    + dot(xv10, deq_i8(w4c.z) * scc) + dot(xv11, deq_i8(w4c.w) * scc);
+            }
+            if (kb3 < lim) {
+                let xb3 = kb3 * 4u;
+                let xv12 = x[xb3];
+                let xv13 = x[xb3 + 1u];
+                let xv14 = x[xb3 + 2u];
+                let xv15 = x[xb3 + 3u];
+                let w4d = w[kb3 * N + n0 + c];
+                let scd = scales[(n0 + c) * ns + kb3 / (GROUP / 16u)];
+                acc3 += dot(xv12, deq_i8(w4d.x) * scd) + dot(xv13, deq_i8(w4d.y) * scd)
+                    + dot(xv14, deq_i8(w4d.z) * scd) + dot(xv15, deq_i8(w4d.w) * scd);
+            }
         }
-        var acc = acc0 + acc1;
+        var acc = acc0 + acc1 + acc2 + acc3;
 
         // Tree-reduce the 8 lanes sharing each column: stride 64, 32, 16
         // (descending) so every partial lands in lanes 0..15 (ascending

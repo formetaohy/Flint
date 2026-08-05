@@ -5,4 +5,5 @@ edition.workspace = true
 
 [dependencies]
 flint-error.workspace = true
+flint-num.workspace = true
 wgpu.workspace = true

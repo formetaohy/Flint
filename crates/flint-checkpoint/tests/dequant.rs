@@ -3,7 +3,8 @@
 //! loop structures than the production code, so index bugs cannot match).
 
 use flint_checkpoint::TensorData;
-use flint_checkpoint::dequant::{GgmlType, f16_to_f32, to_f32};
+use flint_checkpoint::dequant::{GgmlType, to_f32};
+use flint_num::f16_to_f32;
 
 // ---------------------------------------------------------------- f16
 
