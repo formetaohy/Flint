@@ -52,7 +52,6 @@ struct Args {
     #[arg(long)]
     attn_probe: bool,
 
-    #[cfg(feature = "profile")]
     #[arg(long)]
     profile: bool,
 }
@@ -113,7 +112,6 @@ fn main() -> Result<()> {
     eprintln!("[bench] initializing GPU backend...");
     let backend = Backend::new()?;
     eprintln!("[bench] adapter: {}", backend.adapter_name());
-    #[cfg(feature = "profile")]
     let mut profiler = if args.profile {
         Some(flint_profiler::GpuProfiler::new(backend.device())?)
     } else {
@@ -141,7 +139,6 @@ fn main() -> Result<()> {
     let warm_ids: Vec<u32> = (0..16).map(|i| i % (args.vocab - 1) + 1).collect();
     model.forward(&mut backend, &warm_ids, &[], &[])?;
     let _ = backend.read_f32(backend.dummy_scale().buf.as_ref(), 0, 1)?;
-    #[cfg(feature = "profile")]
     let prefill_span = match &mut profiler {
         Some(p) => Some(p.begin_span()?),
         None => None,
@@ -158,7 +155,6 @@ fn main() -> Result<()> {
         let ids: Vec<u32> = (t..t + rem).map(|i| i % (args.vocab - 1) + 1).collect();
         model.forward(&mut backend, &ids, &[], &[])?;
     }
-    #[cfg(feature = "profile")]
     if let (Some(p), Some(span)) = (&mut profiler, prefill_span) {
         p.end_span("prefill", span)?;
     }
@@ -174,7 +170,6 @@ fn main() -> Result<()> {
 
     let mut logits: Vec<f32> = Vec::new();
     let mut per_step: Vec<f64> = Vec::new();
-    #[cfg(feature = "profile")]
     let decode_span = match &mut profiler {
         Some(p) => Some(p.begin_span()?),
         None => None,
@@ -191,7 +186,6 @@ fn main() -> Result<()> {
         logits = out.logits[0].clone();
     }
     let decode_secs = t0.elapsed().as_secs_f64();
-    #[cfg(feature = "profile")]
     if let (Some(p), Some(span)) = (&mut profiler, decode_span) {
         p.end_span("decode", span)?;
     }
@@ -210,7 +204,6 @@ fn main() -> Result<()> {
         &logits[..4.min(logits.len())]
     );
 
-    #[cfg(feature = "profile")]
     if let Some(p) = &mut profiler {
         p.flush()?;
         eprintln!("[bench] GPU time breakdown (cumulative over prefill+decode):");

@@ -77,10 +77,6 @@ struct ChatArgs {
     #[arg(long, default_value_t = 8192)]
     ctx_size: u32,
 
-    #[cfg(feature = "profile")]
-    #[arg(long)]
-    profile: bool,
-
     #[arg(long)]
     speculate: bool,
 }
@@ -240,12 +236,6 @@ fn chat_main(model: &Path, args: ChatArgs) -> Result<()> {
         },
         args.seed,
     );
-    #[cfg(feature = "profile")]
-    let mut profiler = if args.profile {
-        Some(flint_profiler::GpuProfiler::new(backend.device())?)
-    } else {
-        None
-    };
     let mut engine = Engine::new(
         backend,
         chat_model.model,
@@ -256,12 +246,7 @@ fn chat_main(model: &Path, args: ChatArgs) -> Result<()> {
     );
     let chat = chat_model.chat;
 
-    #[cfg(feature = "profile")]
-    let span = match &mut profiler {
-        Some(p) => Some(p.begin_span()?),
-        None => None,
-    };
-    let reply = run_turn(
+    run_turn(
         &mut engine,
         chat.as_ref(),
         &args.system,
@@ -269,13 +254,6 @@ fn chat_main(model: &Path, args: ChatArgs) -> Result<()> {
         &prompt,
         args.max_tokens,
     )?;
-    #[cfg(feature = "profile")]
-    if let (Some(p), Some(span)) = (&mut profiler, span) {
-        p.end_span("turn", span)?;
-        p.flush()?;
-        eprint!("{}", flint_profiler::breakdown(&p.report()));
-    }
-    let _ = reply;
     Ok(())
 }
 

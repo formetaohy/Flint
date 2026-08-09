@@ -56,10 +56,6 @@ flint-backend.workspace = true
 flint-error.workspace = true
 flint-generate.workspace = true
 flint-onnx.workspace = true
-flint-profiler = { workspace = true, optional = true }
 clap.workspace = true
 env_logger.workspace = true
 serde_json.workspace = true
-
-[features]
-profile = ["dep:flint-profiler"]

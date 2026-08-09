@@ -10,7 +10,7 @@ flint-checkpoint.workspace = true
 flint-error.workspace = true
 flint-kernel.workspace = true
 flint-model.workspace = true
-flint-profiler = { workspace = true, optional = true }
+flint-profiler.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 saturn-core.workspace = true
@@ -18,7 +18,4 @@ saturn-core.workspace = true
 [dev-dependencies]
 flint-tensor.workspace = true
 saturn-core.workspace = true
-
-[features]
-profile = ["dep:flint-profiler"]
 
