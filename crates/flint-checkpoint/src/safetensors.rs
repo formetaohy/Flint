@@ -1,6 +1,3 @@
-//! Safetensors checkpoint source: a directory with a sharded index plus
-//! `config.json`. Native tensor names are the raw HF keys.
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -12,9 +9,8 @@ use safetensors::tensor::{Dtype, SafeTensors, TensorView};
 use flint_error::{Error, Result};
 
 use super::gguf::Metadata;
-use super::{Checkpoint, RawTensor, TensorData};
+use super::{Checkpoint, CheckpointKind, RawTensor, TensorData};
 
-/// A sharded safetensors checkpoint.
 pub struct Safetensors {
     dir: PathBuf,
     weight_map: HashMap<String, String>,
@@ -28,8 +24,7 @@ impl Safetensors {
             Ok(raw) => serde_json::from_str(&raw).map_err(|e| {
                 Error::Model(format!("invalid index {}: {e}", index_path.display()))
             })?,
-            // A missing index means a single-shard checkpoint; any other
-            // read failure is a real error, not a fallback case.
+
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let shard = dir.join("model.safetensors");
                 if !shard.exists() {
@@ -105,8 +100,8 @@ impl Checkpoint for Safetensors {
         Ok(Some(serde_json::from_str(&raw)?))
     }
 
-    fn kind(&self) -> &'static str {
-        "safetensors"
+    fn kind(&self) -> CheckpointKind {
+        CheckpointKind::Safetensors
     }
 }
 
@@ -125,9 +120,6 @@ fn shard_tensor_names(path: &Path) -> Result<Vec<String>> {
     Ok(tables.tensors().into_iter().map(|(n, _)| n).collect())
 }
 
-/// Writes tensors as a single-shard `model.safetensors` file. Each entry is
-/// `(native name, shape, little-endian bytes)`; `bf16` selects the BF16 dtype
-/// (two bytes per element), anything else is F32.
 pub fn write_tensors(path: &Path, tensors: &[(String, Vec<u32>, Vec<u8>, bool)]) -> Result<()> {
     let mut views = Vec::with_capacity(tensors.len());
     for (name, shape, data, bf16) in tensors {
@@ -153,5 +145,5 @@ fn f32_bytes(data: &[u8]) -> &[f32] {
 }
 
 fn f16(c: &[u8]) -> f32 {
-    flint_num::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))
+    saturn_core::num::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))
 }

@@ -5,8 +5,11 @@ edition.workspace = true
 
 [dependencies]
 flint-error.workspace = true
-flint-num.workspace = true
 memmap2.workspace = true
+saturn-core = { path = "../../saturn/crates/saturn-core" }
 safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+saturn-core = { path = "../../saturn/crates/saturn-core" }

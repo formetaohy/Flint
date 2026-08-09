@@ -1,5 +1,3 @@
-//! Group selection and row-wise group absmax quantization.
-
 use flint_model::loader::{choose_group, quantize};
 
 #[test]
@@ -23,11 +21,7 @@ fn group_rejects_unquantizable_width() {
 
 #[test]
 fn quantize_matches_hand_computed() {
-    // Two rows, one 32-wide group per row. Scales are amax/127 per block;
-    // codes are round(v / scale). Values avoid half-integer codes so f32
-    // division error cannot flip the rounding. The bytes are block-major
-    // [cols/16, rows, 16]: row 0's first 16 codes, then row 1's first 16,
-    // then both rows' second blocks.
+
     #[rustfmt::skip]
     let data: [f32; 64] = {
         let mut d = [0.0f32; 64];
@@ -41,7 +35,7 @@ fn quantize_matches_hand_computed() {
     #[rustfmt::skip]
     let expect: [i8; 64] = {
         let mut e = [0i8; 64];
-        // Row 0 block 0, then row 1 block 0.
+
         e[0] = 127; e[1] = -32;
         e[16] = -127; e[17] = 16; e[18] = 32; e[19] = -8;
         e
@@ -66,12 +60,12 @@ fn quantize_roundtrip_stays_within_half_a_step() {
     assert_eq!(bytes.len(), rows * cols);
     assert_eq!(scales.len(), rows * cols / group);
     for (i, &b) in bytes.iter().enumerate() {
-        // Block-major: byte (kb, row, i) at (kb * rows + row) * 16 + i.
+
         let kb = i / (rows * 16);
         let rem = i % (rows * 16);
         let (r, ii) = (rem / 16, rem % 16);
         let col = kb * 16 + ii;
-        let scale = scales[r * (cols / group) + col / group];
+        let scale = scales[(col / group) * rows + r];
         let deq = (b as i8) as f32 * scale;
         let err = (deq - data[r * cols + col]).abs();
         assert!(

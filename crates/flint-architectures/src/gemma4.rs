@@ -1,19 +1,11 @@
-//! Gemma 4 text model: the shared dense model configured for per-layer head
-//! dims and rope (global layers widen and use proportional rope), KV sharing
-//! from layer `num_hidden_layers - num_kv_shared_layers` on, GELU MLPs that
-//! double in width on the KV-shared layers, weightless V-norm, Per-Layer
-//! Embeddings, logit softcapping and alternating sliding-window attention.
-
 use flint_backend::Backend;
-use flint_checkpoint::Checkpoint;
+use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::{Error, Result};
 use flint_model::ops::Act;
 use serde_json::Value;
 
 use crate::dense::{DenseConfig, DenseModel, PerLayerConfig, RopeSpec, dense_plan};
 
-/// Parses and validates a Gemma 4 text config (the `text_config` object of the
-/// multimodal wrapper, or a bare `gemma4_text` config).
 pub fn parse_config(v: &Value) -> Result<DenseConfig> {
     let t = v.get("text_config").unwrap_or(v);
     let mut cfg = DenseConfig::parse(t, true)?;
@@ -66,8 +58,6 @@ pub fn parse_config(v: &Value) -> Result<DenseConfig> {
     cfg.windows = windows;
     cfg.layer_rope = layer_rope;
 
-    // RoPE sets: sliding layers rotate fully at 1e4; global layers rotate a
-    // quarter of their widened head dim with proportional frequencies.
     let rp = t
         .get("rope_parameters")
         .ok_or_else(|| Error::Config("gemma4_text missing rope_parameters".into()))?;
@@ -97,12 +87,11 @@ pub fn parse_config(v: &Value) -> Result<DenseConfig> {
         },
     ];
 
-    // KV sharing: the trailing layers reuse the last same-type cache.
     cfg.kv_shared = t
         .get("num_kv_shared_layers")
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
-    // Double-wide MLPs on the KV-shared layers.
+
     if t.get("use_double_wide_mlp")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -132,7 +121,6 @@ pub fn parse_config(v: &Value) -> Result<DenseConfig> {
     Ok(cfg)
 }
 
-/// Loads a Gemma 4 checkpoint as a shared dense model.
 pub fn load(
     source: &dyn Checkpoint,
     v: &Value,
@@ -143,7 +131,7 @@ pub fn load(
     DenseModel::load(
         source,
         cfg,
-        &dense_plan(source.kind() == "gguf"),
+        &dense_plan(source.kind() == CheckpointKind::Gguf),
         max_seq,
         backend,
     )

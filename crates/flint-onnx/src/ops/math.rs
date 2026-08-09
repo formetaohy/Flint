@@ -1,5 +1,3 @@
-//! Elementwise arithmetic, comparison, logic and reduction operators.
-
 use std::collections::HashMap;
 
 use flint_error::{Error, Result};
@@ -8,7 +6,6 @@ use crate::graph::Node;
 use crate::ops::{axes_attr, f32s, input, input_opt, norm_axis, output};
 use crate::tensor::{Data, Tensor, broadcast_shape, broadcast_to};
 
-/// Binary op on f32 or i64 inputs of equal dtype, numpy-broadcast.
 pub(crate) fn arith<FF, IF>(env: &mut HashMap<String, Tensor>, node: &Node, ff: FF, fi: IF) -> Result<()>
 where
     FF: Fn(f32, f32) -> f32,
@@ -38,7 +35,6 @@ where
     Ok(())
 }
 
-/// N-ary sum (Mean divides by the input count afterwards).
 pub(crate) fn variadic<FF, IF>(
     env: &mut HashMap<String, Tensor>,
     node: &Node,
@@ -114,7 +110,6 @@ where
     Ok(())
 }
 
-/// Boolean binary op.
 pub(crate) fn logic<BF>(env: &mut HashMap<String, Tensor>, node: &Node, f: BF) -> Result<()>
 where
     BF: Fn(bool, bool) -> bool,
@@ -150,7 +145,6 @@ pub(crate) fn not(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> 
     Ok(())
 }
 
-/// Comparison producing a bool tensor from f32 or i64 inputs.
 pub(crate) fn cmp<FF, IF>(env: &mut HashMap<String, Tensor>, node: &Node, ff: FF, fi: IF) -> Result<()>
 where
     FF: Fn(f32, f32) -> bool,
@@ -181,7 +175,6 @@ where
     Ok(())
 }
 
-/// `Where(cond, x, y)`: broadcast all three, dtype follows x/y.
 pub(crate) fn where3(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let c = input(env, node, 0)?;
     let x = input(env, node, 1)?;
@@ -236,7 +229,6 @@ pub(crate) fn where3(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<(
     Ok(())
 }
 
-/// Unary op preserving dtype (f32 or i64).
 pub(crate) fn unary_arith<FF, IF>(env: &mut HashMap<String, Tensor>, node: &Node, ff: FF, fi: IF) -> Result<()>
 where
     FF: Fn(f32) -> f32,
@@ -260,7 +252,6 @@ where
     Ok(())
 }
 
-/// Unary float-only op.
 pub(crate) fn unary_f32<F>(env: &mut HashMap<String, Tensor>, node: &Node, f: F) -> Result<()>
 where
     F: Fn(f32) -> f32,
@@ -334,8 +325,6 @@ pub(crate) fn selu(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()>
     })
 }
 
-/// Generic reduction over attribute `axes` (all axes when absent), f32 only.
-/// Folds with `combine` seeded by `seed`, then post-processes with `finish`.
 pub(crate) fn reduce<C, F>(
     env: &mut HashMap<String, Tensor>,
     node: &Node,
@@ -387,7 +376,6 @@ where
     Ok(())
 }
 
-/// Folds normalized `axes` of `v` (row-major) into the remaining dims.
 fn reduce_impl<C, F>(
     v: &[f32],
     shape: &[usize],
@@ -400,7 +388,7 @@ where
     C: Fn(f32, f32) -> f32,
     F: Fn(usize, f32) -> f32,
 {
-    // Permute so reduced dims are last, fold, then map back.
+
     let mut order: Vec<usize> = (0..shape.len()).filter(|d| !axes.contains(d)).collect();
     for a in axes {
         order.push(*a);
@@ -436,7 +424,6 @@ where
     out
 }
 
-/// ArgMax/ArgMin over `axis` (default 0), output i64. NaN counts as max.
 pub(crate) fn argmax(env: &mut HashMap<String, Tensor>, node: &Node, largest: bool) -> Result<()> {
     let x = input(env, node, 0)?;
     let rank = x.shape.len();
@@ -456,7 +443,7 @@ pub(crate) fn argmax(env: &mut HashMap<String, Tensor>, node: &Node, largest: bo
         .transpose()?
         .unwrap_or(0)
         != 0;
-    // Compare in f64: lossless for both f32 and i64 payloads.
+
     let v: Vec<f64> = x.data.as_f32().into_iter().map(f64::from).collect();
     let outer: usize = x.shape[..axis].iter().product();
     let dim = x.shape[axis];

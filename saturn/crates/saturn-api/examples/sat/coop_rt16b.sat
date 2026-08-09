@@ -1,0 +1,15 @@
+kernel rt16b [workgroup(16, 16, 1)] (src: buf<f16>, dst: buf<f16>, n: u32) {
+    shared tiles: [f16; 16 * 16 * 8];
+    let sg = subgroup_id;
+    let lty = thread.y - sg * 2;
+    if sg * 16 < n {
+        for j in 0..8 unroll {
+            let by = lty + j * 2;
+            tiles[sg * 256 + j * 32 + lty * 16 + thread.x] =
+                src[by * n + sg * 16 + thread.x];
+        }
+        barrier();
+        let m = coop_load_b(tiles[sg * 256], 16, true);
+        coop_store(dst[sg * 256], m, 16, true);
+    }
+}

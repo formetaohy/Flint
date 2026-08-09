@@ -1,0 +1,10 @@
+kernel split_qg [workgroup(256, 1, 1)] (x: buf<f32>, q: buf<f32>, gate: buf<f32>, ROWS: u32, HEADS: u32, HD: u32) {
+    if gid.x < ROWS * HEADS * HD {
+        let d = gid.x % HD;
+        let h = (gid.x / HD) % HEADS;
+        let m = gid.x / (HD * HEADS);
+        let base = (m * HEADS + h) * (2 * HD);
+        q[gid.x] = x[base + d];
+        gate[gid.x] = x[base + HD + d];
+    }
+}

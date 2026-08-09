@@ -1,0 +1,5 @@
+kernel bias [workgroup(256, 1, 1)] (x: buf<f32>, bias: buf<f32>, N_ELEM: u32, DIM: u32) {
+    if gid.x < N_ELEM {
+        x[gid.x] = x[gid.x] + bias[gid.x % DIM];
+    }
+}

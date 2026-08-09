@@ -1,6 +1,3 @@
-//! Integer quantization operators: DynamicQuantizeLinear, DequantizeLinear
-//! and MatMulInteger (QDQ-style int8 inference graphs).
-
 use std::collections::HashMap;
 
 use flint_error::{Error, Result};
@@ -9,8 +6,6 @@ use crate::graph::Node;
 use crate::ops::{f32s, i64s, input, input_opt, norm_axis, output};
 use crate::tensor::Tensor;
 
-/// Quantizes an f32 tensor to uint8 with a per-tensor scale and zero point:
-/// scale = (max - min) / 255, zp = round(-min / scale) clamped to [0, 255].
 pub(crate) fn dynamic_quantize_linear(
     env: &mut HashMap<String, Tensor>,
     node: &Node,
@@ -41,8 +36,6 @@ pub(crate) fn dynamic_quantize_linear(
     Ok(())
 }
 
-/// Dequantizes int8/uint8/int32 values: y = (x - zp) * scale, with scalar or
-/// per-axis scale/zero point along `axis` (default 1).
 pub(crate) fn dequantize_linear(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let x = input(env, node, 0)?;
     let scale = input(env, node, 1)?;
@@ -66,7 +59,7 @@ pub(crate) fn dequantize_linear(env: &mut HashMap<String, Tensor>, node: &Node) 
         output(env, node, 0, Tensor::f32(out, x.shape.clone()))?;
         return Ok(());
     }
-    // Per-axis: scale length must equal the axis dimension.
+
     let dim = x.shape[axis];
     if sv.len() != dim {
         return Err(Error::Model(format!(
@@ -97,8 +90,6 @@ pub(crate) fn dequantize_linear(env: &mut HashMap<String, Tensor>, node: &Node) 
     Ok(())
 }
 
-/// Integer matrix multiplication with optional zero points, accumulating in
-/// i32. Supports scalar and per-row zero points.
 pub(crate) fn matmul_integer(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let a = input(env, node, 0)?;
     let b = input(env, node, 1)?;
@@ -120,8 +111,7 @@ pub(crate) fn matmul_integer(env: &mut HashMap<String, Tensor>, node: &Node) -> 
     let mut shape = batch.clone();
     shape.extend_from_slice(&[m, n]);
     let mut out = vec![0i64; batch_n * m * n];
-    // Zero points: scalar, or per-row for A (rows of A) and per-column for
-    // B (columns of B) per the MatMulInteger spec.
+
     let a_z = |r: usize| -> i64 {
         a_zpv.as_ref().map_or(0, |z| if z.len() == 1 { z[0] } else { z[r] })
     };

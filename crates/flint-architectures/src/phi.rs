@@ -1,9 +1,5 @@
-//! Phi family: Phi-4-mini (dense, partial rotary, LongRoPE) and Phi-MoE
-//! (layer-normed MoE with the sparsemixer router), both as configurations of
-//! the shared dense model.
-
 use flint_backend::Backend;
-use flint_checkpoint::Checkpoint;
+use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::{Error, Result};
 use flint_model::loader::{MoEPart, MoEPlan, Plan, Role, load_moe_experts, upload};
 use flint_model::ops::{Act, RopeScaling};
@@ -14,10 +10,6 @@ use serde_json::Value;
 use crate::dense::{DenseConfig, DenseModel, MoeConfig, RopeSpec, dense_role};
 use crate::names::{gguf_key, gguf_moe_key, hf_key};
 
-/// HF safetensors names for Phi-MoE's expert set. Two layouts exist:
-/// `model.layers.{l}.mlp.{router,gate_up_proj,down_proj}` (fused 3D) and
-/// Mixtral-style `block_sparse_moe.{gate,experts.E.w1/w2/w3}` (w1 = gate,
-/// w2 = down, w3 = up).
 fn moe_key(name: &str) -> Option<(String, MoEPart)> {
     let rest = name.strip_prefix("model.layers.")?;
     let (idx, tail) = rest.split_once('.')?;
@@ -45,8 +37,6 @@ fn moe_key(name: &str) -> Option<(String, MoEPart)> {
     Some((format!("{prefix}.experts.{e}"), part))
 }
 
-/// Parses a Phi-3.x dense config (Phi-4-mini): partial rotary, LongRoPE,
-/// family norm epsilon and activation.
 fn parse_dense(v: &Value) -> Result<DenseConfig> {
     let mut cfg = DenseConfig::parse(v, true)?;
     let hd = cfg.head_dims[0];
@@ -62,7 +52,7 @@ fn parse_dense(v: &Value) -> Result<DenseConfig> {
     }
     let mut rope = RopeSpec {
         dim,
-        // Phi's inverse frequencies use the rotary dim as their denominator.
+
         freq_dim: dim,
         theta: cfg.rope[0].theta,
         scaling: None,
@@ -87,8 +77,7 @@ fn parse_dense(v: &Value) -> Result<DenseConfig> {
         }
     }
     cfg.rope = vec![rope];
-    // Phi-4-mini normalizes with RMSNorm; older Phi-3 checkpoints declare a
-    // LayerNorm epsilon instead.
+
     match v.get("rms_norm_eps").and_then(Value::as_f64) {
         Some(eps) => cfg.norm_eps = eps as f32,
         None => {
@@ -98,7 +87,7 @@ fn parse_dense(v: &Value) -> Result<DenseConfig> {
             }
         }
     }
-    // GGUF phi3 checkpoints carry no activation metadata; silu is the default.
+
     cfg.act = match v.get("hidden_act").and_then(Value::as_str) {
         None | Some("silu") => Act::Silu,
         Some("gelu_pytorch_tanh") => Act::GeluTanh,
@@ -116,8 +105,6 @@ fn parse_dense(v: &Value) -> Result<DenseConfig> {
     Ok(cfg)
 }
 
-/// Parses a Phi-MoE config: LayerNorm, QKV/logits biases, a uniform sliding
-/// window and the sparsemixer-routed MoE feed-forward.
 fn parse_moe(v: &Value) -> Result<DenseConfig> {
     let mut cfg = DenseConfig::parse(v, false)?;
     cfg.layernorm = true;
@@ -143,9 +130,6 @@ fn parse_moe(v: &Value) -> Result<DenseConfig> {
     Ok(cfg)
 }
 
-/// Phi's storage roles: the embedding table is group-quantized i8 like the
-/// projections — Phi-4-mini's table alone is 1.23 GiB as bf16, over budget on
-/// 6 GiB adapters.
 fn role(key: &str) -> Role {
     if key == "embed_tokens.weight" {
         Role::I8
@@ -161,7 +145,6 @@ fn plan(gguf: bool) -> Plan {
     }
 }
 
-/// Loads a Phi dense checkpoint (Phi-4-mini / Phi-3.x) as a shared dense model.
 pub fn load(
     source: &dyn Checkpoint,
     v: &Value,
@@ -169,7 +152,7 @@ pub fn load(
     backend: &Backend,
 ) -> Result<DenseModel> {
     let cfg = parse_dense(v)?;
-    let gguf = source.kind() == "gguf";
+    let gguf = source.kind() == CheckpointKind::Gguf;
     let extra = if gguf {
         gguf_split_qkv(backend, source, &cfg, role)?
     } else {
@@ -178,8 +161,6 @@ pub fn load(
     DenseModel::load_extra(source, cfg, &plan(gguf), extra, max_seq, backend)
 }
 
-/// Dense-plan key for Phi-MoE: expert-set tensors are excluded so the
-/// split loader owns them.
 fn hf_key_moe_dense(name: &str) -> Option<String> {
     if moe_key(name).is_some() {
         return None;
@@ -187,7 +168,6 @@ fn hf_key_moe_dense(name: &str) -> Option<String> {
     hf_key(name)
 }
 
-/// Loads a Phi-MoE checkpoint: the dense plan plus the split expert tensors.
 pub fn load_moe(
     source: &dyn Checkpoint,
     v: &Value,
@@ -196,7 +176,7 @@ pub fn load_moe(
 ) -> Result<DenseModel> {
     let cfg = parse_moe(v)?;
     let experts = cfg.moe.expect("MoE config").experts;
-    let gguf = source.kind() == "gguf";
+    let gguf = source.kind() == CheckpointKind::Gguf;
     let plan = if gguf {
         Plan {
             key: gguf_key,
@@ -217,7 +197,6 @@ pub fn load_moe(
     DenseModel::load_extra(source, cfg, &plan, extra, max_seq, backend)
 }
 
-/// LongRoPE factor lists (length must equal rotary dim / 2).
 fn f32_list(v: &Value, key: &str) -> Result<Vec<f32>> {
     v.get(key)
         .and_then(Value::as_array)
@@ -233,8 +212,6 @@ fn f32_list(v: &Value, key: &str) -> Result<Vec<f32>> {
         .unwrap_or_else(|| Err(Error::Config(format!("missing {key:?}"))))
 }
 
-/// GGUF phi3 checkpoints fuse QKV into `attn_qkv.weight` and gate+up into
-/// `ffn_up.weight`; splits both into the canonical keys.
 pub fn gguf_split_qkv(
     backend: &Backend,
     source: &dyn Checkpoint,
@@ -270,8 +247,7 @@ pub fn gguf_split_qkv(
             ],
         )?;
     }
-    // Fused gate+up in ffn_up: rows [N, 2*inter] split in half. Checkpoints
-    // with a plain up projection carry the single width and skip the split.
+
     for l in 0..cfg.layers {
         let name = format!("blk.{l}.ffn_up.weight");
         if !names.contains(&name) {
@@ -294,8 +270,6 @@ pub fn gguf_split_qkv(
     Ok(out)
 }
 
-/// Splits a raw [N, K] tensor's leading axis into ranges and uploads each as
-/// a canonical key (the fused QKV / gate+up paths).
 fn split_rows(
     backend: &Backend,
     raw: flint_checkpoint::RawTensor,

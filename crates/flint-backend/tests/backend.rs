@@ -1,6 +1,3 @@
-//! Backend resource layer: buffer factories, readback, copies, tensor
-//! geometry, weight invariants and fail-fast error paths.
-
 use flint_backend::{Backend, Binding, Pass};
 use flint_tensor::{DType, Weight};
 
@@ -8,40 +5,40 @@ use flint_tensor::{DType, Weight};
 fn f32_roundtrip() {
     let backend = Backend::new().unwrap();
     let data = [1.5f32, -2.25, 0.0, 1e30];
-    let t = backend.tensor_f32(&data, vec![4], "t");
-    assert_eq!(backend.read_f32(&t.buf, 0, 4).unwrap(), data);
+    let t = backend.tensor_f32(&data, vec![4]);
+    assert_eq!(backend.read_f32(t.buf.as_ref(), 0, 4).unwrap(), data);
 }
 
 #[test]
 fn read_f32_honors_byte_offset() {
     let backend = Backend::new().unwrap();
-    let t = backend.tensor_f32(&[1.0, 2.0, 3.0, 4.0], vec![4], "t");
-    assert_eq!(backend.read_f32(&t.buf, 8, 2).unwrap(), vec![3.0, 4.0]);
+    let t = backend.tensor_f32(&[1.0, 2.0, 3.0, 4.0], vec![4]);
+    assert_eq!(backend.read_f32(t.buf.as_ref(), 8, 2).unwrap(), vec![3.0, 4.0]);
 }
 
 #[test]
 fn zero_fill_resets_a_written_tensor() {
     let backend = Backend::new().unwrap();
-    let t = backend.tensor_f32(&[9.0; 4], vec![4], "t");
+    let t = backend.tensor_f32(&[9.0; 4], vec![4]);
     backend.zero_fill(&t);
-    assert_eq!(backend.read_f32(&t.buf, 0, 4).unwrap(), vec![0.0; 4]);
+    assert_eq!(backend.read_f32(t.buf.as_ref(), 0, 4).unwrap(), vec![0.0; 4]);
 }
 
 #[test]
 fn copy_duplicates_contents() {
     let backend = Backend::new().unwrap();
-    let src = backend.tensor_f32(&[5.0, 6.0], vec![2], "src");
-    let dst = backend.zero_tensor(&[2], "dst");
+    let src = backend.tensor_f32(&[5.0, 6.0], vec![2]);
+    let dst = backend.zero_tensor(&[2]);
     backend.copy(&src, &dst);
-    assert_eq!(backend.read_f32(&dst.buf, 0, 2).unwrap(), vec![5.0, 6.0]);
+    assert_eq!(backend.read_f32(dst.buf.as_ref(), 0, 2).unwrap(), vec![5.0, 6.0]);
 }
 
 #[test]
 fn write_u32_lands_little_endian() {
     let backend = Backend::new().unwrap();
-    let buf = backend.storage(8, "ids");
-    backend.write_u32(&buf, &[f32::to_bits(1.0), 42]);
-    let got = backend.read_f32(&buf, 0, 2).unwrap();
+    let buf = backend.storage(8);
+    backend.write_u32(buf.as_ref(), &[f32::to_bits(1.0), 42]);
+    let got = backend.read_f32(buf.as_ref(), 0, 2).unwrap();
     assert_eq!(got[0], 1.0);
     assert_eq!(got[1], f32::from_bits(42));
 }
@@ -49,15 +46,15 @@ fn write_u32_lands_little_endian() {
 #[test]
 fn tensor_geometry_per_dtype() {
     let backend = Backend::new().unwrap();
-    let f = backend.tensor_f32(&[0.0; 6], vec![2, 3], "f");
+    let f = backend.tensor_f32(&[0.0; 6], vec![2, 3]);
     assert_eq!(f.numel(), 6);
     assert_eq!(f.byte_len(), 24);
 
-    let b = backend.tensor_bf16(&[0u8; 12], vec![2, 3], "b").unwrap();
+    let b = backend.tensor_bf16(&[0u8; 12], vec![2, 3]).unwrap();
     assert_eq!(b.dtype, DType::Bf16Packed);
     assert_eq!(b.byte_len(), 12);
 
-    let i = backend.tensor_i8(&[0u8; 8], vec![2, 4], "i");
+    let i = backend.tensor_i8(&[0u8; 8], vec![2, 4]);
     assert_eq!(i.byte_len(), 8);
 }
 
@@ -65,7 +62,7 @@ fn tensor_geometry_per_dtype() {
 fn bf16_odd_byte_count_fails_fast() {
     let backend = Backend::new().unwrap();
     let err = backend
-        .tensor_bf16(&[0u8; 3], vec![1], "bad")
+        .tensor_bf16(&[0u8; 3], vec![1])
         .err()
         .expect("odd byte count must fail");
     assert!(err.to_string().contains("odd bf16"), "{err}");
@@ -75,15 +72,15 @@ fn bf16_odd_byte_count_fails_fast() {
 #[should_panic(expected = "multiple of 4")]
 fn i8_count_must_align_to_u32_words() {
     let backend = Backend::new().unwrap();
-    backend.tensor_i8(&[0u8; 3], vec![3], "bad");
+    backend.tensor_i8(&[0u8; 3], vec![3]);
 }
 
 #[test]
 fn unknown_shader_is_an_error_not_a_panic() {
     let mut backend = Backend::new().unwrap();
-    let t = backend.zero_tensor(&[1], "t");
-    let mut enc = backend.encoder();
-    let mut pass = Pass::begin(&mut enc, "k");
+    let t = backend.zero_tensor(&[1]);
+    let mut enc = backend.encoder().unwrap();
+    let mut pass = Pass::begin(enc.as_mut());
     let err = backend
         .dispatch(&mut pass, "nope", &[], &[Binding::Full(&t)], [1, 1, 1])
         .unwrap_err();
@@ -93,10 +90,10 @@ fn unknown_shader_is_an_error_not_a_panic() {
 #[test]
 fn weight_invariants() {
     let backend = Backend::new().unwrap();
-    let f = backend.tensor_f32(&[0.0; 4], vec![2, 2], "f");
-    let b = backend.tensor_bf16(&[0u8; 8], vec![2, 2], "b").unwrap();
-    let i = backend.tensor_i8(&[0u8; 4], vec![2, 2], "i");
-    let s = backend.tensor_f32(&[1.0; 2], vec![2, 1], "s");
+    let f = backend.tensor_f32(&[0.0; 4], vec![2, 2]);
+    let b = backend.tensor_bf16(&[0u8; 8], vec![2, 2]).unwrap();
+    let i = backend.tensor_i8(&[0u8; 4], vec![2, 2]);
+    let s = backend.tensor_f32(&[1.0; 2], vec![2, 1]);
 
     assert!(matches!(Weight::plain(f), Weight::Plain(_)));
     assert!(matches!(Weight::plain(b), Weight::Plain(_)));
@@ -105,17 +102,15 @@ fn weight_invariants() {
         Weight::Plain(_) => unreachable!(),
     }
 
-    // Accessors across variants: plain weights carry no scale and default
-    // the group to the preferred 128; quantized weights report their own.
-    let f = backend.tensor_f32(&[0.0; 4], vec![2, 2], "f");
+    let f = backend.tensor_f32(&[0.0; 4], vec![2, 2]);
     let w = Weight::plain(f);
     assert!(w.scale().is_none());
-    assert_eq!(w.group(), 128);
+    assert_eq!(w.group(), None);
     assert_eq!(w.tensor().shape, vec![2, 2]);
-    let i = backend.tensor_i8(&[0u8; 4], vec![2, 2], "i");
-    let s = backend.tensor_f32(&[1.0; 1], vec![1, 1], "s");
+    let i = backend.tensor_i8(&[0u8; 4], vec![2, 2]);
+    let s = backend.tensor_f32(&[1.0; 1], vec![1, 1]);
     let q = Weight::quant(i, s, 32);
-    assert_eq!(q.group(), 32);
+    assert_eq!(q.group(), Some(32));
     assert!(q.scale().is_some());
 }
 
@@ -123,7 +118,7 @@ fn weight_invariants() {
 #[should_panic(expected = "must be f32 or bf16")]
 fn plain_weight_rejects_i8() {
     let backend = Backend::new().unwrap();
-    let i = backend.tensor_i8(&[0u8; 4], vec![2, 2], "i");
+    let i = backend.tensor_i8(&[0u8; 4], vec![2, 2]);
     Weight::plain(i);
 }
 
@@ -131,8 +126,8 @@ fn plain_weight_rejects_i8() {
 #[should_panic(expected = "must be i8")]
 fn quant_weight_rejects_floats() {
     let backend = Backend::new().unwrap();
-    let f = backend.tensor_f32(&[0.0; 4], vec![2, 2], "f");
-    let s = backend.tensor_f32(&[1.0], vec![1], "s");
+    let f = backend.tensor_f32(&[0.0; 4], vec![2, 2]);
+    let s = backend.tensor_f32(&[1.0], vec![1]);
     Weight::quant(f, s, 128);
 }
 

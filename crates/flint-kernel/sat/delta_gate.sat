@@ -1,0 +1,13 @@
+kernel delta_gate [workgroup(256, 1, 1)]
+    (b_in: buf<f32>, a_in: buf<f32>, a_log: buf<f32>, dt_bias: buf<f32>, beta: buf<f32>, g: buf<f32>,
+     HEADS: u32, ROW_T: u32)
+{
+    if gid.x < HEADS {
+        let h = gid.x;
+        let row = ROW_T * HEADS;
+        beta[h] = 1.0 / (1.0 + exp(-b_in[row + h]));
+        let x = a_in[row + h] + dt_bias[h];
+        let sp = log(1.0 + exp(x));
+        g[h] = -exp(a_log[h]) * sp;
+    }
+}

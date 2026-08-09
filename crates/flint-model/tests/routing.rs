@@ -1,6 +1,3 @@
-//! CPU routing conformance: softmax top-k and the Phi-MoE sparsemixer must
-//! reproduce the reference selection semantics over deterministic logits.
-
 use flint_model::routing::{RouteKind, Routing};
 
 #[test]
@@ -18,8 +15,7 @@ fn softmax_topk_weights_sum_lt_one() {
 
 #[test]
 fn sparsemixer_masks_distant_experts() {
-    // Only experts within 2% of the max survive the first pass; the second
-    // pass re-thresholds against the runner-up.
+
     let logits: Vec<f32> = vec![
         10.0, 9.9, 5.0, -5.0, 9.95, 9.98, 0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0, 9.0, 9.99,
     ];
@@ -42,8 +38,7 @@ fn sparsemixer_masks_distant_experts() {
         hits.len() == 2,
         "exactly two experts selected, got {hits:?}"
     );
-    // Weights come from softmax over the near-max set: the runner-up's weight
-    // is large (the masked-away experts do not dilute it).
+
     let max_w = r.weights.iter().cloned().fold(0.0f32, f32::max);
     assert!(max_w > 0.2, "near-max softmax weight {max_w}");
 }
@@ -53,8 +48,7 @@ fn shared_expert_covers_every_row() {
     let logits: Vec<f32> = (0..64).map(|i| (i % 7) as f32).collect();
     let r = Routing::new(&logits, 4, 4, 2, RouteKind::Softmax, 0.5);
     assert_eq!(r.count(4), 4, "virtual shared expert covers all rows");
-    // Alignment: every expert's start is a 64-element boundary and the
-    // buffers hold the padded layout.
+
     for e in 0..=4 {
         assert_eq!(r.starts[e] % 64, 0, "expert {e} start aligned");
     }

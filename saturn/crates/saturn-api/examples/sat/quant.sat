@@ -1,0 +1,9 @@
+kernel quant [workgroup(64, 1, 1)]
+    (src: buf<f32>, w: buf<bf16>, q: buf<u8>, scale: f32)
+{
+    let v = src[gid.x];
+    w[gid.x] = v as bf16;
+    let r = w[gid.x] as f32;
+    let scaled = r * scale;
+    q[gid.x] = scaled > 255.0 ? 255 : (scaled < 0.0 ? 0 : scaled as u8);
+}

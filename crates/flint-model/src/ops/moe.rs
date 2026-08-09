@@ -1,6 +1,3 @@
-//! MoE dispatchers: router tiles, expert gather/scatter and the gated
-//! per-expert MLP.
-
 use flint_backend::{Backend, Binding, Pass};
 use flint_error::Result;
 use flint_kernel::name;
@@ -10,48 +7,39 @@ use crate::loader::{ExpertWeights, MoeMlp};
 use crate::ops::{Act, M_MAX, gemm, swiglu};
 use crate::routing::Routing;
 
-/// Per-forward scratch for one MoE block: router logits, per-expert packed
-/// row tiles and the shared gate/up/act/down tiles.
 pub struct MoeTiles {
     pub logits: Tensor,
-    /// Packed rows per expert (+ the shared expert slot): [M_MAX, hidden].
+
     pub packed: Vec<Tensor>,
     pub gate: Tensor,
     pub up: Tensor,
     pub act: Tensor,
     pub down: Tensor,
-    /// Weighted accumulator [M_MAX, hidden]; the MoE block's output.
+
     pub acc: Tensor,
-    /// Pair row ids and weights, ordered by expert (see [`Routing`]).
+
     pub rows: Tensor,
     pub weights: Tensor,
 }
 impl MoeTiles {
     pub fn new(cfg: &MoeTilesConfig, backend: &Backend) -> Self {
-        let z = |shape: &[u32], label: &str| backend.zero_tensor(shape, label);
-        // Worst-case pair slots: every expert's range pads to 64-element
-        // alignment, plus the shared expert's rows.
+        let z = |shape: &[u32]| backend.zero_tensor(shape);
+
         let pairs = (cfg.experts + 2) * 64 + cfg.rows * cfg.top_k + cfg.rows;
         MoeTiles {
-            logits: z(&[M_MAX, cfg.experts], "moe_logits"),
-            packed: (0..=cfg.experts)
-                .map(|e| z(&[M_MAX, cfg.hidden], &format!("moe_packed{e}")))
-                .collect(),
-            gate: z(&[M_MAX, cfg.intermediate], "moe_gate"),
-            up: z(&[M_MAX, cfg.intermediate], "moe_up"),
-            act: z(&[M_MAX, cfg.intermediate], "moe_act"),
-            down: z(&[M_MAX, cfg.hidden], "moe_down"),
-            acc: z(&[M_MAX, cfg.hidden], "moe_acc"),
-            rows: Tensor::new(
-                backend.storage(pairs as u64 * 4, "moe_rows"),
-                vec![pairs],
-                DType::U32,
-            ),
-            weights: z(&[pairs], "moe_weights"),
+            logits: z(&[M_MAX, cfg.experts]),
+            packed: (0..=cfg.experts).map(|_| z(&[M_MAX, cfg.hidden])).collect(),
+            gate: z(&[M_MAX, cfg.intermediate]),
+            up: z(&[M_MAX, cfg.intermediate]),
+            act: z(&[M_MAX, cfg.intermediate]),
+            down: z(&[M_MAX, cfg.hidden]),
+            acc: z(&[M_MAX, cfg.hidden]),
+            rows: Tensor::new(backend.storage(pairs as u64 * 4), vec![pairs], DType::U32),
+            weights: z(&[pairs]),
         }
     }
 }
-/// Sizing inputs for [`MoeTiles::new`].
+
 pub struct MoeTilesConfig {
     pub experts: u32,
     pub rows: u32,
@@ -75,7 +63,7 @@ pub fn moe_apply(
         if c == 0 {
             continue;
         }
-        // The shared expert's packed tile is the activation tile itself.
+
         let packed = if e < moe.experts.len() {
             let off = r.offset(e);
             expert_gather(
@@ -152,7 +140,7 @@ fn expert_mlp(
         rows,
     )
 }
-/// Copies `count` rows of x selected by ids into packed rows 0..count.
+
 pub fn expert_gather(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
@@ -188,7 +176,7 @@ pub fn expert_scatter(
         [(count * hidden).div_ceil(256), 1, 1],
     )
 }
-/// Zeroes the first `n` elements (the MoE accumulator before a block).
+
 pub fn zero_rows(backend: &mut Backend, pass: &mut Pass<'_>, x: Binding<'_>, n: u32) -> Result<()> {
     backend.dispatch(
         pass,

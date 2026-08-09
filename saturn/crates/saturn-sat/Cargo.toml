@@ -1,0 +1,19 @@
+[package]
+name = "saturn-sat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Compile-time SAT kernel embedding and validation"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+saturn-compiler.workspace = true
+saturn-core.workspace = true
+saturn-shader.workspace = true
+syn = { version = "2", features = ["full"] }
+
+[dev-dependencies]
+trybuild = "1"

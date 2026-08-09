@@ -1,12 +1,6 @@
-//! ggml block decoders, validated against independent reference decodes
-//! written straight from the ggml block struct layouts (deliberately different
-//! loop structures than the production code, so index bugs cannot match).
-
 use flint_checkpoint::TensorData;
 use flint_checkpoint::dequant::{GgmlType, to_f32};
-use flint_num::f16_to_f32;
-
-// ---------------------------------------------------------------- f16
+use saturn_core::num::f16_to_f32;
 
 #[test]
 fn f16_covers_the_ieee754_cases() {
@@ -18,9 +12,9 @@ fn f16_covers_the_ieee754_cases() {
         (0x4100, 2.5),
         (0x7C00, f32::INFINITY),
         (0xFC00, f32::NEG_INFINITY),
-        (0x0001, 2.0f32.powi(-24)), // smallest subnormal
-        (0x03FF, 2.0f32.powi(-14) * (1023.0 / 1024.0)), // largest subnormal
-        (0x3555, 1.0 / 3.0),        // normal with rounding
+        (0x0001, 2.0f32.powi(-24)), 
+        (0x03FF, 2.0f32.powi(-14) * (1023.0 / 1024.0)), 
+        (0x3555, 1.0 / 3.0),        
     ];
     for &(bits, want) in cases {
         let got = f16_to_f32(bits);
@@ -35,8 +29,6 @@ fn f16_covers_the_ieee754_cases() {
     }
     assert!(f16_to_f32(0x7E00).is_nan());
 }
-
-// ---------------------------------------------------------------- type table
 
 #[test]
 fn type_table_matches_ggml() {
@@ -68,9 +60,6 @@ fn type_table_matches_ggml() {
     }
 }
 
-// ---------------------------------------------------------------- drivers
-
-/// Deterministic byte filler so every block is exercised with arbitrary bits.
 struct Bytes(u64);
 impl Bytes {
     fn take(&mut self, n: usize) -> Vec<u8> {
@@ -87,7 +76,7 @@ impl Bytes {
 }
 
 fn half_bits(v: f32) -> [u8; 2] {
-    // Nearest-even enough for the small exact values used here.
+
     let b = v.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
     let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
@@ -106,12 +95,8 @@ fn half(bytes: &[u8], off: usize) -> f32 {
     f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]))
 }
 
-/// One reference block decoder, writing block_len values.
 type RefDecoder = fn(&[u8], &mut [f32]);
 
-/// Decodes two blocks of every quant type with random bytes and compares
-/// against the independent reference; also a non-block-aligned element count
-/// to pin the final-block truncation.
 #[test]
 fn block_decoders_match_reference() {
     let quants: &[(GgmlType, RefDecoder)] = &[
@@ -144,7 +129,6 @@ fn block_decoders_match_reference() {
             );
         }
 
-        // Ask for fewer elements than the last block holds.
         let truncated = to_f32(ty, &raw, bl + 5).unwrap();
         assert_eq!(truncated.len(), bl + 5);
         assert_eq!(&truncated[..bl], &want[..bl]);
@@ -201,10 +185,6 @@ fn tensor_data_materializes_f32() {
     );
 }
 
-// ---------------------------------------------------------------- references
-// Each reference indexes the flat output directly from the value position,
-// unlike the production decoders which stream per sub-block.
-
 fn ref_q8_0(b: &[u8], y: &mut [f32]) {
     let d = half(b, 0);
     for (i, out) in y.iter_mut().enumerate() {
@@ -234,8 +214,6 @@ fn ref_q4_1(b: &[u8], y: &mut [f32]) {
     }
 }
 
-/// 5th bit per value comes from the qh bit plane: bit i for values 0..16,
-/// bit i+16 for values 16..32.
 fn fifth(qh: u32, i: usize) -> u32 {
     ((qh >> i) & 1) << 4
 }
@@ -258,15 +236,11 @@ fn ref_q5_1(b: &[u8], y: &mut [f32]) {
     }
 }
 
-// K-quants: 256 values per block. For value v, (n, j, l) locate its 16-wide
-// sub-block: n = v/128 half-block, j = 0..4 bit-shift stage, l = 0..32 pair
-// position. Group index g selects the per-sub-block scale.
-
 fn ref_q2k(b: &[u8], y: &mut [f32]) {
     let (d, dmin) = (half(b, 68), half(b, 70));
     let (scales, qs) = (&b[0..16], &b[16..80]);
     for (v, out) in y.iter_mut().enumerate() {
-        let (n, r) = ((v / 128) * 32, v % 128); // byte half within qs
+        let (n, r) = ((v / 128) * 32, v % 128); 
         let (j, l) = (r / 32, r % 32);
         let g = (n / 32) * 8 + 2 * j + l / 16;
         let q = (qs[n + l % 16 + 16 * (l / 16)] >> (2 * j)) & 3;
@@ -274,8 +248,6 @@ fn ref_q2k(b: &[u8], y: &mut [f32]) {
     }
 }
 
-/// The 12 raw scale bytes hold 16 unsigned 6-bit scales: four bits from one
-/// byte, two from another, per the ggml packing.
 fn q3k_scale(raw: &[u8], j: usize) -> i32 {
     let s = match j {
         0..=3 => (raw[j] & 0xf) | ((raw[8 + j] & 0x3) << 4),
@@ -292,17 +264,16 @@ fn ref_q3k(b: &[u8], y: &mut [f32]) {
     for (v, out) in y.iter_mut().enumerate() {
         let (n, r) = ((v / 128) * 32, v % 128);
         let (j, l) = (r / 32, r % 32);
-        let qb = n + l % 16 + 16 * (l / 16); // qs advances with the half...
-        let hb = l % 16 + 16 * (l / 16); // ...hmask is reused for both halves
+        let qb = n + l % 16 + 16 * (l / 16); 
+        let hb = l % 16 + 16 * (l / 16); 
         let g = (n / 32) * 8 + 2 * j + l / 16;
         let low = (qs[qb] >> (2 * j)) & 3;
-        // High bits use planes 0..4 for the first half, 4..8 for the second.
+
         let high_kept = hmask[hb] & (1 << (j + 4 * (v / 128))) != 0;
         *out = d * q3k_scale(raw, g) as f32 * (low as i32 - if high_kept { 0 } else { 4 }) as f32;
     }
 }
 
-/// 6-bit scale / 6-bit min pair for sub-block j of q4k/q5k.
 fn k4_scale_min(s: &[u8], j: usize) -> (u32, u32) {
     if j < 4 {
         ((s[j] & 63) as u32, (s[j + 4] & 63) as u32)
@@ -353,8 +324,7 @@ fn ref_q6k(b: &[u8], y: &mut [f32]) {
     for (v, out) in y.iter_mut().enumerate() {
         let (n, r) = (v / 128, v % 128);
         let (q, l) = (r / 32, r % 32);
-        // Quarters 0/1 read the low nibble, 2/3 the high; odd quarters take
-        // the qs byte 32 ahead. Scale and qh shift advance by two per quarter.
+
         let qlb = ql[64 * n + l + 32 * (q % 2)];
         let low = if q >= 2 { qlb >> 4 } else { qlb & 0xf };
         let qval = (low | (((qh[32 * n + l] >> (2 * q)) & 3) << 4)) as i32 - 32;

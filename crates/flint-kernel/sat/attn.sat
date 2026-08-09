@@ -1,0 +1,215 @@
+kernel attn [workgroup(512, 1, 1)]
+    (q: buf<f32>, k_cache: buf<u32>, v_cache: buf<u32>, scratch: buf<f32>, args: buf<u32>,
+     N_HEADS: u32, KV_HEADS: u32, HEAD_DIM: u32, MAX_SEQ: u32, SCALE: f32,
+     WINDOW: u32, NQ_PER_KV: u32, STRIDE: u32)
+{
+    const CHUNK: u32 = 64;
+    const SEGS: u32 = 32;
+    const HALF: u32 = 128;
+    const STAGE: u32 = 4096;
+    const NEG_INF: f32 = -3.4e38;
+    shared kt: [u32; 4160];
+    shared scs: [f32; 512];
+    shared red: [f32; 512];
+    shared segstat: [f32; 16];
+    let pos = args[0];
+    let segs = min(SEGS, max(1, args[1]));
+    let m = block.x;
+    let kvh = block.y;
+    let seg = block.z;
+    if seg < segs {
+        let qpos = pos + m;
+        let kv_len = qpos + 1;
+        var win_start = 0;
+        if WINDOW != 0 && kv_len > WINDOW {
+            win_start = kv_len - WINDOW;
+        }
+        let seg_len = (kv_len + segs - 1) / segs;
+        let seg_lo = seg * seg_len;
+        let seg_hi = min(seg_lo + seg_len, kv_len);
+        let q0 = (m * N_HEADS + kvh * NQ_PER_KV) * HEAD_DIM;
+        let cache_plane = kvh * MAX_SEQ * HEAD_DIM;
+        let t = thread.x;
+        let hl = t / CHUNK;
+        let slot = t % CHUNK;
+        var o0 = 0.0;
+        var o1 = 0.0;
+        var o2 = 0.0;
+        var o3 = 0.0;
+        var c0 = seg_lo;
+        loop {
+            if c0 >= seg_hi {
+                break;
+            }
+            if c0 == seg_lo && slot == 0 && hl < 8 {
+                segstat[hl * 2] = NEG_INF;
+                segstat[hl * 2 + 1] = 0.0;
+            }
+            barrier();
+            let limit = min(CHUNK, seg_hi - c0);
+            var dot = 0.0;
+            let halves = (HEAD_DIM + HALF - 1) / HALF;
+            for half in 0..halves {
+                for j in 0..8 {
+                    let e = t + j * 512;
+                    let key = e / 64;
+                    let d2 = e % 64;
+                    if key < limit && half * HALF + d2 * 2 < HEAD_DIM {
+                        let ckey = cache_plane + (c0 + key) * HEAD_DIM + half * HALF + d2 * 2;
+                        kt[key * 65 + d2] = k_cache[ckey / 2];
+                    } else {
+                        kt[key * 65 + d2] = 0;
+                    }
+                }
+                barrier();
+                if hl < NQ_PER_KV && c0 + slot >= win_start && c0 + slot < seg_hi {
+                    let qb = q0 + hl * HEAD_DIM + half * HALF;
+                    for dd in 0..128 {
+                        if half * HALF + dd >= HEAD_DIM {
+                            break;
+                        }
+                        let e = slot * HALF + dd;
+                        let word = kt[slot * 65 + dd / 2];
+                        if e % 2 == 0 {
+                            dot = dot + q[qb + dd] * bitcast_f32((word & 65535) << 16);
+                        } else {
+                            dot = dot + q[qb + dd] * bitcast_f32((word >> 16) << 16);
+                        }
+                    }
+                }
+                barrier();
+            }
+            var sc = NEG_INF;
+            if hl < NQ_PER_KV && c0 + slot >= win_start && c0 + slot < seg_hi {
+                sc = dot * SCALE;
+            }
+            scs[hl * CHUNK + slot] = sc;
+            red[hl * CHUNK + slot] = sc;
+            barrier();
+            if slot < CHUNK / 32 {
+                var m = NEG_INF;
+                for w in 0..32 {
+                    m = max(m, red[hl * CHUNK + slot * 32 + w]);
+                }
+                red[hl * (CHUNK / 32) + slot] = m;
+            }
+            barrier();
+            var c_max = NEG_INF;
+            if slot == 0 {
+                var cm = NEG_INF;
+                for w in 0..(CHUNK / 32) {
+                    cm = max(cm, red[hl * (CHUNK / 32) + w]);
+                }
+                c_max = cm;
+                red[16 + hl] = c_max;
+            }
+            barrier();
+            c_max = red[16 + hl];
+            barrier();
+            var prev_max = NEG_INF;
+            var align = 1.0;
+            if hl < NQ_PER_KV && c0 != seg_lo {
+                prev_max = segstat[hl * 2];
+                if prev_max > NEG_INF / 2.0 {
+                    if c_max > prev_max {
+                        let r = exp(prev_max - c_max);
+                        o0 = o0 * r;
+                        o1 = o1 * r;
+                        o2 = o2 * r;
+                        o3 = o3 * r;
+                    } else {
+                        align = exp(c_max - prev_max);
+                    }
+                }
+            }
+            barrier();
+            var e = 0.0;
+            if hl < NQ_PER_KV && c0 + slot >= win_start && c0 + slot < seg_hi {
+                e = exp(sc - c_max) * align;
+                if sc == NEG_INF {
+                    e = 0.0;
+                }
+            }
+            scs[hl * CHUNK + slot] = e;
+            red[hl * CHUNK + slot] = e;
+            barrier();
+            if slot < CHUNK / 32 {
+                var s = 0.0;
+                for w in 0..32 {
+                    s = s + red[hl * CHUNK + slot * 32 + w];
+                }
+                red[hl * (CHUNK / 32) + slot] = s;
+            }
+            barrier();
+            var c_sum = 0.0;
+            if slot == 0 {
+                var cs = 0.0;
+                for w in 0..(CHUNK / 32) {
+                    cs = cs + red[hl * (CHUNK / 32) + w];
+                }
+                c_sum = cs;
+                red[16 + hl] = c_sum;
+            }
+            barrier();
+            c_sum = red[16 + hl];
+            barrier();
+            if hl < NQ_PER_KV {
+                for kk in 0..limit {
+                    let w = scs[hl * CHUNK + kk];
+                    let vk = (cache_plane + (c0 + kk) * HEAD_DIM) / 2;
+                    if slot % 2 == 0 {
+                        o0 = o0 + w * bitcast_f32((v_cache[vk + slot / 2] & 65535) << 16);
+                        if slot + CHUNK < HEAD_DIM {
+                            o1 = o1 + w * bitcast_f32((v_cache[vk + CHUNK / 2 + slot / 2] & 65535) << 16);
+                        }
+                        if slot + 2 * CHUNK < HEAD_DIM {
+                            o2 = o2 + w * bitcast_f32((v_cache[vk + CHUNK + slot / 2] & 65535) << 16);
+                            o3 = o3 + w * bitcast_f32((v_cache[vk + CHUNK + CHUNK / 2 + slot / 2] & 65535) << 16);
+                        }
+                    } else {
+                        o0 = o0 + w * bitcast_f32((v_cache[vk + slot / 2] >> 16) << 16);
+                        if slot + CHUNK < HEAD_DIM {
+                            o1 = o1 + w * bitcast_f32((v_cache[vk + CHUNK / 2 + slot / 2] >> 16) << 16);
+                        }
+                        if slot + 2 * CHUNK < HEAD_DIM {
+                            o2 = o2 + w * bitcast_f32((v_cache[vk + CHUNK + slot / 2] >> 16) << 16);
+                            o3 = o3 + w * bitcast_f32((v_cache[vk + CHUNK + CHUNK / 2 + slot / 2] >> 16) << 16);
+                        }
+                    }
+                }
+            }
+            if hl < NQ_PER_KV && slot == 0 {
+                let prev_max = segstat[hl * 2];
+                let prev_sum = segstat[hl * 2 + 1];
+                if prev_max == NEG_INF {
+                    segstat[hl * 2] = c_max;
+                    segstat[hl * 2 + 1] = c_sum;
+                } else if c_max > prev_max {
+                    segstat[hl * 2 + 1] = prev_sum * exp(prev_max - c_max) + c_sum;
+                    segstat[hl * 2] = c_max;
+                } else if c_max > NEG_INF / 2.0 {
+                    segstat[hl * 2 + 1] = prev_sum + c_sum * exp(c_max - prev_max);
+                }
+            }
+            barrier();
+            c0 = c0 + CHUNK;
+        }
+        if hl < NQ_PER_KV {
+            let sbase = ((m * KV_HEADS + kvh) * SEGS + seg) * (8 * STRIDE);
+            if slot < HEAD_DIM {
+                scratch[sbase + hl * STRIDE + slot] = o0;
+            }
+            if slot + CHUNK < HEAD_DIM {
+                scratch[sbase + hl * STRIDE + slot + CHUNK] = o1;
+            }
+            if slot + 2 * CHUNK < HEAD_DIM {
+                scratch[sbase + hl * STRIDE + slot + 2 * CHUNK] = o2;
+                scratch[sbase + hl * STRIDE + slot + 3 * CHUNK] = o3;
+            }
+            if slot == 0 {
+                scratch[sbase + hl * STRIDE + HEAD_DIM] = segstat[hl * 2];
+                scratch[sbase + hl * STRIDE + HEAD_DIM + 1] = segstat[hl * 2 + 1];
+            }
+        }
+    }
+}

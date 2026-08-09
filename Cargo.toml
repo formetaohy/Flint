@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "saturn/crates/*"]
 resolver = "3"
 
 [workspace.package]
@@ -10,7 +10,6 @@ repository = "https://github.com/formetaohy/Flint"
 
 [workspace.dependencies]
 flint-error = { path = "crates/flint-error" }
-flint-num = { path = "crates/flint-num" }
 flint-checkpoint = { path = "crates/flint-checkpoint" }
 flint-tensor = { path = "crates/flint-tensor" }
 flint-kernel = { path = "crates/flint-kernel" }
@@ -22,10 +21,20 @@ flint-generate = { path = "crates/flint-generate" }
 flint-onnx = { path = "crates/flint-onnx" }
 flint-profiler = { path = "crates/flint-profiler" }
 
+saturn-core = { path = "saturn/crates/saturn-core" }
+saturn-compiler = { path = "saturn/crates/saturn-compiler" }
+saturn-sat = { path = "saturn/crates/saturn-sat" }
+saturn-shader = { path = "saturn/crates/saturn-shader" }
+saturn-vk = { path = "saturn/crates/saturn-vk" }
+saturn-mtl = { path = "saturn/crates/saturn-mtl" }
+saturn-api = { path = "saturn/crates/saturn-api" }
+
 ahash = "0.8.12"
+ash = "0.38"
 bytemuck = "1.25.2"
 clap = { version = "4.6.5", features = ["derive"] }
 env_logger = "0.11.11"
+log = "0.4"
 memmap2 = "0.9.11"
 prost = "0.13"
 prost-build = "0.13"
@@ -37,7 +46,6 @@ serde = "1.0.229"
 serde_json = "1.0.151"
 thiserror = "2.0.19"
 tokenizers = "0.23.1"
-wgpu = "30.0.0"
 
 [package]
 name = "flint"

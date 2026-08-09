@@ -1,272 +1,139 @@
-use std::collections::HashMap;
-use std::sync::mpsc;
-
-use wgpu::{
-    BindGroup, BindGroupEntry, BindingResource, Buffer, BufferAddress, BufferBinding,
-    CommandEncoder, CommandEncoderDescriptor, Device, Instance, InstanceDescriptor, Limits,
-    MapMode, MemoryHints, PollType, PowerPreference, Queue, RequestAdapterOptions, util::DeviceExt,
-};
+use saturn_api::{BackendKind, open as open_device};
+use saturn_core::{BindingRef, Buffer, BufferSpec, CommandEncoder, Device};
 
 use flint_error::{Error, Result};
 use flint_kernel::{Kernels, name};
 use flint_profiler::{ProfileRow, Profiler};
 use flint_tensor::{DType, Tensor, Weight};
 
-/// A whole tensor or a byte-aligned sub-slice of it.
 #[derive(Clone, Copy)]
 pub enum Binding<'a> {
     Full(&'a Tensor),
-    Slice(&'a Tensor, BufferAddress, BufferAddress),
+    Slice(&'a Tensor, u64, u64),
 }
 
 impl<'a> Binding<'a> {
-    fn resolve(&self) -> BufferBinding<'a> {
+    fn resolve(&self, index: u32) -> BindingRef<'a> {
         match self {
-            Binding::Full(t) => BufferBinding {
-                buffer: &t.buf,
+            Binding::Full(t) => BindingRef {
+                index,
+                buffer: t.buf.as_ref(),
                 offset: 0,
-                size: None,
+                size: 0,
             },
-            Binding::Slice(t, off, size) => BufferBinding {
-                buffer: &t.buf,
+            Binding::Slice(t, off, size) => BindingRef {
+                index,
+                buffer: t.buf.as_ref(),
                 offset: *off,
-                size: std::num::NonZeroU64::new(*size),
+                size: *size,
             },
-        }
-    }
-
-    /// Cache signature: tensor identity plus bound byte range.
-    fn sig(&self) -> (u64, u64, u64) {
-        match self {
-            Binding::Full(t) => (t.id, 0, 0),
-            Binding::Slice(t, off, size) => (t.id, *off, *size),
         }
     }
 }
 
-/// Owns one GPU compute pass; the only way architectures interact with wgpu.
-pub struct Pass<'a>(wgpu::ComputePass<'a>);
+pub struct Pass<'a>(pub(crate) &'a mut dyn CommandEncoder);
 
 impl<'a> Pass<'a> {
-    pub fn begin(encoder: &'a mut CommandEncoder, label: &str) -> Self {
-        Self(encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(label),
-            ..Default::default()
-        }))
+    pub fn begin(encoder: &'a mut dyn CommandEncoder) -> Self {
+        Self(encoder)
+    }
+
+    pub fn raw(&mut self) -> &mut dyn CommandEncoder {
+        self.0
     }
 }
 
-/// Most bindings any shader takes (gemv_qkv: 11).
-const MAX_BINDINGS: usize = 12;
-
-/// Bind group cache key: shader plus each binding's (tensor id, offset, size).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct BgKey {
-    shader: &'static str,
-    len: u8,
-    sig: [(u64, u64, u64); MAX_BINDINGS],
-}
-
-impl BgKey {
-    fn new(shader: &'static str, bufs: &[Binding<'_>]) -> Self {
-        assert!(bufs.len() <= MAX_BINDINGS, "{shader}: too many bindings");
-        let mut sig = [(0u64, 0u64, 0u64); MAX_BINDINGS];
-        for (i, b) in bufs.iter().enumerate() {
-            sig[i] = b.sig();
-        }
-        Self {
-            shader,
-            len: bufs.len() as u8,
-            sig,
-        }
-    }
-}
-
-/// Gets or creates the bind group for `key`, caching it for reuse.
-fn cached_bind_group<'c>(
-    cache: &'c mut HashMap<BgKey, BindGroup>,
-    device: &Device,
-    layout: &wgpu::BindGroupLayout,
-    key: BgKey,
-    bufs: &[Binding<'_>],
-) -> &'c BindGroup {
-    cache.entry(key).or_insert_with(|| {
-        let resolved: Vec<BufferBinding<'_>> = bufs.iter().map(|b| b.resolve()).collect();
-        let entries: Vec<BindGroupEntry<'_>> = resolved
-            .iter()
-            .enumerate()
-            .map(|(i, b)| BindGroupEntry {
-                binding: i as u32,
-                resource: BindingResource::Buffer(b.clone()),
-            })
-            .collect();
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(key.shader),
-            layout,
-            entries: &entries,
-        })
-    })
-}
-
-/// Owns the wgpu device and every GPU-side resource factory.
 pub struct Backend {
-    pub device: Device,
-    pub queue: Queue,
-    pub kernels: Kernels,
-    adapter_name: String,
-    /// One-element f32 buffer bound as the gemm scale input of bf16 weights.
+    device: Box<dyn Device>,
+    kernels: Kernels,
     dummy_scale: Tensor,
-    /// Split-K gemv partials [SEGS, N] f32, grown on demand.
     gemv_partial: Tensor,
-    /// Split-K gemm partials [SEGS, M, Y_STRIDE] f32, grown on demand.
     gemm_partial: Tensor,
 
-    /// Bind groups keyed by their buffer signature, reused across steps.
-    bg_cache: HashMap<BgKey, BindGroup>,
-    /// GPU timestamp profiler; present only when FLINT_PROFILE is set and supported.
     profiler: Option<Profiler>,
+
+    pending: Vec<Box<dyn saturn_core::Submission>>,
+    retired: Vec<(Tensor, u32)>,
 }
 
 impl Backend {
     pub fn new() -> Result<Self> {
-        let instance = Instance::new(InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            flags: wgpu::InstanceFlags::default(),
-            memory_budget_thresholds: Default::default(),
-            backend_options: Default::default(),
-            display: None,
-        });
-        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
-            power_preference: PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .map_err(|e| Error::Gpu(format!("no suitable adapter: {e}")))?;
-        let adapter_name = adapter.get_info().name;
-
-        let limits = Limits {
-            max_storage_buffer_binding_size: (1u64 << 31) - 4,
-            // 2 GiB: Phi-4-mini's bf16 embedding table alone is 1.23 GiB.
-            max_buffer_size: 1u64 << 31,
-            // The attention kernel runs 512 threads and its staged KV tiles
-            // exceed the 16 KiB default workgroup storage.
-            max_compute_workgroup_size_x: 1024,
-            max_compute_invocations_per_workgroup: 1024,
-            max_compute_workgroup_storage_size: 48 * 1024,
-            // gemv_qkv binds three weights, their scales and three outputs.
-            max_storage_buffers_per_shader_stage: 16,
-            ..Limits::default()
-        };
-        // request_device rejects limits above the adapter's capability
-        // (lavapipe caps workgroup storage at 32 KiB), so downlevel each.
-        let supported = adapter.limits();
-        let limits = Limits {
-            max_storage_buffer_binding_size: limits
-                .max_storage_buffer_binding_size
-                .min(supported.max_storage_buffer_binding_size),
-            max_buffer_size: limits.max_buffer_size.min(supported.max_buffer_size),
-            max_compute_workgroup_size_x: limits
-                .max_compute_workgroup_size_x
-                .min(supported.max_compute_workgroup_size_x),
-            max_compute_invocations_per_workgroup: limits
-                .max_compute_invocations_per_workgroup
-                .min(supported.max_compute_invocations_per_workgroup),
-            max_compute_workgroup_storage_size: limits
-                .max_compute_workgroup_storage_size
-                .min(supported.max_compute_workgroup_storage_size),
-            max_storage_buffers_per_shader_stage: limits
-                .max_storage_buffers_per_shader_stage
-                .min(supported.max_storage_buffers_per_shader_stage),
-            ..limits
-        };
-        // Profiling is opt-in: request timestamp features only when asked.
-        let want_profile = std::env::var("FLINT_PROFILE").is_ok();
-        let profile_features = if want_profile {
-            adapter.features()
-                & (wgpu::Features::TIMESTAMP_QUERY
-                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES)
+        let kind = if cfg!(target_os = "macos") {
+            BackendKind::Metal
         } else {
-            wgpu::Features::empty()
+            BackendKind::Vulkan
         };
-        // Always request in-pass timestamps: on this driver stack their
-        // presence changes the DXIL path observably (see bench notes), so
-        // profile and non-profile runs must use the same features.
-        let ts = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
-        let base_features = if ts {
-            profile_features | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+        let device = open_device(kind)
+            .map_err(|e| Error::Gpu(format!("no suitable backend: {e}")))?;
+        let kernels = Kernels::new(device.as_ref())?;
+        Self::warmup(device.as_ref(), &kernels)?;
+        let dummy_scale = Tensor::new(Self::zeroed_buf(device.as_ref(), 4), vec![1], DType::F32);
+        let profiler = if std::env::var("FLINT_PROFILE").is_ok() {
+            Some(Profiler::new(device.as_ref(), 4096)?)
         } else {
-            profile_features
-        };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("flint"),
-            required_features: base_features,
-            required_limits: limits,
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: MemoryHints::Performance,
-            trace: wgpu::Trace::Off,
-        }))
-        .map_err(|e| Error::Gpu(format!("device creation failed: {e}")))?;
-
-        let mut kernels = Kernels::new(&device)?;
-        warmup(&device, &queue, &mut kernels)?;
-        let dummy_scale = Tensor::new(
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("dummy_scale"),
-                contents: &[0u8; 4],
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            }),
-            vec![1],
-            DType::F32,
-        );
-        let profiler = if profile_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
-            Some(Profiler::new(&device, &queue, 4096))
-        } else {
-            if want_profile {
-                eprintln!(
-                    "[flint] FLINT_PROFILE set but adapter lacks in-pass timestamp queries; profiling disabled"
-                );
-            }
             None
         };
-        let gemv_partial = Self::gemv_partial_buf(&device, 8 * 65536);
-        let gemm_partial = Self::gemv_partial_buf(&device, 4 * 128 * 16384);
+        let gemv_partial = Self::partial_buf(device.as_ref(), 8 * 65536)?;
+        let gemm_partial = Self::partial_buf(device.as_ref(), 4 * 128 * 16384)?;
         Ok(Self {
             device,
-            queue,
             kernels,
-            adapter_name,
             dummy_scale,
             gemv_partial,
             gemm_partial,
-            bg_cache: HashMap::new(),
             profiler,
+            pending: Vec::new(),
+            retired: Vec::new(),
         })
     }
 
     pub fn adapter_name(&self) -> &str {
-        &self.adapter_name
+        self.device.name()
     }
 
-    /// Allocates a zeroed gemv-partial buffer of `words` f32 elements; the
-    /// shape is a raw [words] view (bindings always slice it).
-    fn gemv_partial_buf(device: &Device, words: usize) -> Tensor {
-        Tensor::new(
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gemv_partial"),
-                contents: &vec![0u8; words * 4],
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            }),
+    pub fn kernel(&self, name: &str) -> Result<&dyn saturn_core::Kernel> {
+        self.kernels.get(name)
+    }
+
+    pub fn pack_scalars(
+        &self,
+        name: &str,
+        consts: &[(&'static str, f64)],
+    ) -> Result<Vec<u8>> {
+        self.kernels.pack_scalars(name, consts)
+    }
+
+    fn zeroed_buf(device: &dyn Device, size: u64) -> Box<dyn Buffer> {
+        let buf = device
+            .create_buffer(&BufferSpec {
+                size,
+                host_visible: false,
+            })
+            .expect("buffer allocation");
+        let mut enc = device.encoder().expect("encoder");
+        enc.clear(buf.as_ref(), 0, size).expect("clear");
+        let sub = device.submit(enc).expect("submit");
+        sub.wait().expect("wait");
+        buf
+    }
+
+    fn partial_buf(device: &dyn Device, words: usize) -> Result<Tensor> {
+        Ok(Tensor::new(
+            device
+                .create_buffer(&BufferSpec {
+                    size: words as u64 * 4,
+                    host_visible: false,
+                })
+                .map_err(|e| Error::Gpu(e.to_string()))?,
             vec![words as u32],
             DType::F32,
-        )
+        ))
     }
 
-    /// Scale-slot binding for non-quantized gemm weights.
     pub fn dummy_scale(&self) -> &Tensor {
         &self.dummy_scale
     }
 
-    /// Scale binding of a weight: its per-group scales, or the dummy slot.
     fn scale_binding<'a>(dummy: &'a Tensor, w: &'a Weight) -> Binding<'a> {
         match w.scale() {
             Some(s) => Binding::Full(s),
@@ -274,86 +141,102 @@ impl Backend {
         }
     }
 
-    /// Grows the gemm-partial buffer to hold `words` f32 elements.
     fn ensure_gemm_partial(&mut self, words: u32) {
         if words > self.gemm_partial.numel() as u32 {
-            self.gemm_partial = Self::gemv_partial_buf(&self.device, words as usize);
+            let old = std::mem::replace(
+                &mut self.gemm_partial,
+                Self::partial_buf(self.device.as_ref(), words as usize)
+                    .expect("gemm partial growth"),
+            );
+            self.retire(old);
         }
     }
 
-    /// Grows the gemv-partial buffer to hold `words` f32 elements.
     fn ensure_gemv_partial(&mut self, words: u32) {
         if words > self.gemv_partial.numel() as u32 {
-            self.gemv_partial = Self::gemv_partial_buf(&self.device, words as usize);
+            let old = std::mem::replace(
+                &mut self.gemv_partial,
+                Self::partial_buf(self.device.as_ref(), words as usize)
+                    .expect("gemv partial growth"),
+            );
+            self.retire(old);
         }
     }
 
-    /// Zero-initialized storage buffer.
-    pub fn storage(&self, size: u64, label: &str) -> Buffer {
-        self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
+    fn retire(&mut self, tensor: Tensor) {
+        let refs = self.pending.len() as u32 + 1;
+        self.retired.push((tensor, refs));
     }
 
-    /// Zero-initialized f32 tensor.
-    pub fn zero_tensor(&self, shape: &[u32], label: &str) -> Tensor {
-        let numel: u64 = shape.iter().map(|d| *d as u64).product();
-        Tensor::new(self.storage(numel * 4, label), shape.to_vec(), DType::F32)
+    fn settle_retired(&mut self) {
+        let mut i = 0;
+        while i < self.retired.len() {
+            self.retired[i].1 -= 1;
+            if self.retired[i].1 == 0 {
+                self.retired.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
-    /// Zero-initialized packed-bf16 tensor (two elements per u32).
-    pub fn zero_bf16_tensor(&self, shape: &[u32], label: &str) -> Tensor {
+    pub fn storage(&self, size: u64) -> Box<dyn Buffer> {
+        self.device
+            .create_buffer(&BufferSpec {
+                size,
+                host_visible: false,
+            })
+            .expect("buffer allocation")
+    }
+
+    pub fn zero_tensor(&self, shape: &[u32]) -> Tensor {
         let numel: u64 = shape.iter().map(|d| *d as u64).product();
         Tensor::new(
-            self.storage(numel * 2, label),
+            Self::zeroed_buf(self.device.as_ref(), numel * 4),
+            shape.to_vec(),
+            DType::F32,
+        )
+    }
+
+    pub fn zero_bf16_tensor(&self, shape: &[u32]) -> Tensor {
+        let numel: u64 = shape.iter().map(|d| *d as u64).product();
+        Tensor::new(
+            Self::zeroed_buf(self.device.as_ref(), numel * 2),
             shape.to_vec(),
             DType::Bf16Packed,
         )
     }
 
-    /// Zeroes a tensor's backing buffer.
     pub fn zero_fill(&self, t: &Tensor) {
-        let mut enc = self.encoder();
-        enc.clear_buffer(&t.buf, 0, None);
-        self.submit(enc);
+        let mut enc = self.device.encoder().expect("encoder");
+        enc.clear(t.buf.as_ref(), 0, t.byte_len()).expect("clear");
+        let sub = self.device.submit(enc).expect("submit");
+        sub.wait().expect("wait");
     }
 
-    /// Copies tensor contents byte-for-byte (recurrent state snapshots).
     pub fn copy(&self, src: &Tensor, dst: &Tensor) {
         assert_eq!(src.byte_len(), dst.byte_len(), "copy size mismatch");
-        let mut enc = self.encoder();
-        enc.copy_buffer_to_buffer(&src.buf, 0, &dst.buf, 0, src.byte_len());
-        self.submit(enc);
+        let mut enc = self.device.encoder().expect("encoder");
+        enc.copy(src.buf.as_ref(), 0, dst.buf.as_ref(), 0, src.byte_len())
+            .expect("copy");
+        let sub = self.device.submit(enc).expect("submit");
+        sub.wait().expect("wait");
     }
 
-    pub fn tensor_f32(&self, data: &[f32], shape: Vec<u32>, label: &str) -> Tensor {
-        let buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(data),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-            });
+    pub fn tensor_f32(&self, data: &[f32], shape: Vec<u32>) -> Tensor {
+        let buf = self.upload(bytemuck::cast_slice(data));
         Tensor::new(buf, shape, DType::F32)
     }
 
-    /// bf16 little-endian bytes, packed two-per-u32 for GPU-side unpacking.
-    pub fn tensor_bf16(&self, bytes: &[u8], shape: Vec<u32>, label: &str) -> Result<Tensor> {
+    pub fn tensor_bf16(&self, bytes: &[u8], shape: Vec<u32>) -> Result<Tensor> {
         if !bytes.len().is_multiple_of(2) {
-            return Err(Error::Model(format!("{label}: odd bf16 byte count")));
+            return Err(Error::Model("odd bf16 byte count".to_string()));
         }
         let packed: Vec<u32> = bytes
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        // Odd element count: pad the final pair.
+
         let padded = if bytes.len() % 4 == 2 {
             let mut v = packed;
             let last = &bytes[bytes.len() - 2..];
@@ -362,50 +245,77 @@ impl Backend {
         } else {
             packed
         };
-        let buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(&padded),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            });
+        let buf = self.upload(bytemuck::cast_slice(&padded));
         Ok(Tensor::new(buf, shape, DType::Bf16Packed))
     }
 
-    /// Raw i8 bytes, one element per byte; count must be a multiple of 4 so
-    /// the buffer addresses as array<u32> in shaders.
-    pub fn tensor_i8(&self, bytes: &[u8], shape: Vec<u32>, label: &str) -> Tensor {
+    pub fn tensor_i8(&self, bytes: &[u8], shape: Vec<u32>) -> Tensor {
         assert!(
             bytes.len().is_multiple_of(4),
-            "{label}: i8 count not a multiple of 4"
+            "i8 count not a multiple of 4"
         );
-        let buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            });
+        let buf = self.upload(bytes);
         Tensor::new(buf, shape, DType::I8)
     }
 
-    pub fn write_u32(&self, buf: &Buffer, data: &[u32]) {
-        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.queue.write_buffer(buf, 0, &bytes);
+    fn upload(&self, bytes: &[u8]) -> Box<dyn Buffer> {
+        Self::upload_buf(self.device.as_ref(), bytes)
     }
 
-    pub fn write_f32(&self, buf: &Buffer, data: &[f32]) {
-        self.queue.write_buffer(buf, 0, bytemuck::cast_slice(data));
-    }
-
-    pub fn encoder(&self) -> CommandEncoder {
-        self.device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("step"),
+    fn upload_buf(device: &dyn Device, bytes: &[u8]) -> Box<dyn Buffer> {
+        let staging = device
+            .create_buffer(&BufferSpec {
+                size: bytes.len() as u64,
+                host_visible: true,
             })
+            .expect("staging allocation");
+        staging.write(0, bytes).expect("staging write");
+        let dst = device
+            .create_buffer(&BufferSpec {
+                size: bytes.len() as u64,
+                host_visible: false,
+            })
+            .expect("buffer allocation");
+        let mut enc = device.encoder().expect("encoder");
+        enc.copy(staging.as_ref(), 0, dst.as_ref(), 0, bytes.len() as u64)
+            .expect("upload copy");
+        let sub = device.submit(enc).expect("submit");
+        sub.wait().expect("wait");
+        dst
     }
 
-    /// Encodes one kernel dispatch, reusing cached bind group and pipeline.
+    pub fn write_u32(&self, buf: &dyn Buffer, data: &[u32]) {
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.upload_to(buf, &bytes);
+    }
+
+    pub fn write_f32(&self, buf: &dyn Buffer, data: &[f32]) {
+        self.upload_to(buf, bytemuck::cast_slice(data));
+    }
+
+    fn upload_to(&self, dst: &dyn Buffer, bytes: &[u8]) {
+        Self::upload_to_buf(self.device.as_ref(), dst, bytes)
+    }
+
+    fn upload_to_buf(device: &dyn Device, dst: &dyn Buffer, bytes: &[u8]) {
+        let staging = device
+            .create_buffer(&BufferSpec {
+                size: bytes.len() as u64,
+                host_visible: true,
+            })
+            .expect("staging allocation");
+        staging.write(0, bytes).expect("staging write");
+        let mut enc = device.encoder().expect("encoder");
+        enc.copy(staging.as_ref(), 0, dst, 0, bytes.len() as u64)
+            .expect("upload copy");
+        let sub = device.submit(enc).expect("submit");
+        sub.wait().expect("wait");
+    }
+
+    pub fn encoder(&self) -> Result<Box<dyn CommandEncoder>> {
+        Ok(self.device.encoder()?)
+    }
+
     pub fn dispatch(
         &mut self,
         pass: &mut Pass<'_>,
@@ -414,64 +324,52 @@ impl Backend {
         bufs: &[Binding<'_>],
         groups: [u32; 3],
     ) -> Result<()> {
-        let span = self.prof_begin(pass);
-        Self::set(
-            &mut self.kernels,
-            &mut self.bg_cache,
-            &self.device,
-            pass,
-            name,
-            consts,
-            bufs,
-            groups,
-        )?;
-        self.prof_end(pass, name, span);
+        let span = self.prof_begin(pass)?;
+        Self::set(&self.kernels, pass, name, consts, bufs, groups)?;
+        self.prof_end(pass, name, span)?;
         Ok(())
     }
 
-    /// Binds the cached bind group and pipeline for `name` and dispatches.
-    /// Profiling spans are the caller's concern (fused kernels bracket both
-    /// of their dispatches with one span).
-    #[allow(clippy::too_many_arguments)]
     fn set(
-        kernels: &mut Kernels,
-        bg_cache: &mut HashMap<BgKey, BindGroup>,
-        device: &Device,
+        kernels: &Kernels,
         pass: &mut Pass<'_>,
         name: &'static str,
         consts: &[(&'static str, f64)],
         bufs: &[Binding<'_>],
         groups: [u32; 3],
     ) -> Result<()> {
-        let key = BgKey::new(name, bufs);
-        let layout = kernels.bind_group_layout(name)?.clone();
-        let bind_group = cached_bind_group(bg_cache, device, &layout, key, bufs);
-        let pipeline = kernels.pipeline(device, name, consts)?;
-        pass.0.set_pipeline(pipeline);
-        pass.0.set_bind_group(0, bind_group, &[]);
-        pass.0.dispatch_workgroups(groups[0], groups[1], groups[2]);
+        let kernel = kernels.get(name)?;
+        let bindings: Vec<BindingRef> = bufs
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b.resolve(i as u32))
+            .collect();
+        let scalars = kernels.pack_scalars(name, consts)?;
+        pass.0.barrier()?;
+        pass.0.bind(kernel, &bindings)?;
+        if !scalars.is_empty() {
+            pass.0.set_scalars(kernel, &scalars)?;
+        }
+        pass.0.dispatch(groups)?;
         Ok(())
     }
 
-    /// The gemm/gemv weight constants and scale binding for a weight.
-    fn weight_io(w: &Weight) -> (u32, u32, Binding<'_>, f64) {
+    fn weight_io(w: &Weight) -> (u32, u32, Binding<'_>, DType) {
         assert_eq!(
             w.tensor().shape.len(),
             2,
             "gemm weight must be a [N, K] matrix"
         );
         let (n, k) = (w.tensor().shape[0], w.tensor().shape[1]);
-        let wdtype = match w.tensor().dtype {
-            DType::Bf16Packed => 0.0,
-            DType::I8 => 1.0,
+        let dtype = match w.tensor().dtype {
+            DType::Bf16Packed | DType::I8 => w.tensor().dtype,
             DType::F32 | DType::U32 => {
                 unreachable!("gemm operands are weights, never index tensors")
             }
         };
-        (n, k, Binding::Full(w.tensor()), wdtype)
+        (n, k, Binding::Full(w.tensor()), dtype)
     }
 
-    /// y = x @ dequant(w)^T over `rows` activation rows (multiple of 16).
     pub fn gemm(
         &mut self,
         pass: &mut Pass<'_>,
@@ -480,11 +378,10 @@ impl Backend {
         y: Binding<'_>,
         rows: u32,
     ) -> Result<()> {
-        self.gemm_strided(pass, x, w, y, rows, false, 0, 0)
+        let n = w.tensor().shape[0];
+        self.gemm_strided(pass, x, w, y, rows, false, 0, n)
     }
 
-    /// [`Backend::gemm`] with residual accumulation into `y`.
-    #[allow(clippy::too_many_arguments)]
     pub fn gemm_acc(
         &mut self,
         pass: &mut Pass<'_>,
@@ -494,12 +391,10 @@ impl Backend {
         rows: u32,
         acc: bool,
     ) -> Result<()> {
-        self.gemm_strided(pass, x, w, y, rows, acc, 0, 0)
+        let n = w.tensor().shape[0];
+        self.gemm_strided(pass, x, w, y, rows, acc, 0, n)
     }
 
-    /// [`Backend::gemm`] writing column range [y_off, y_off + n) of a wider
-    /// y tile whose row stride is `y_stride` (fused qkv projections).
-    #[allow(clippy::too_many_arguments)]
     pub fn gemm_strided(
         &mut self,
         pass: &mut Pass<'_>,
@@ -511,36 +406,32 @@ impl Backend {
         y_off: u32,
         y_stride: u32,
     ) -> Result<()> {
-        let (n, k, wb, wdtype) = Self::weight_io(w);
-        // Tile size is baked into the kernel: TN=64 columns x TM=64 rows;
-        // M_MAX chunks are exact multiples of TM.
+        let (n, k, wb, dtype) = Self::weight_io(w);
+        assert!(
+            k.is_multiple_of(32),
+            "gemm K {k} is not a multiple of the BK=32 tile"
+        );
         let consts = [
             ("N", n as f64),
             ("K", k as f64),
             ("M", rows as f64),
-            ("WDTYPE", wdtype),
-            ("GROUP", w.group() as f64),
+            ("WDTYPE", dtype_flag(dtype)),
+            ("GROUP", group_const(w)),
             ("ACC", acc as u32 as f64),
-            (
-                "Y_STRIDE",
-                if y_stride == 0 {
-                    n as f64
-                } else {
-                    y_stride as f64
-                },
-            ),
+            ("Y_STRIDE", y_stride as f64),
             ("Y_OFF", y_off as f64),
         ];
-        // Split long-K multi-row gemms across the dispatch z axis; short-K
-        // shapes already saturate the SM count with column groups.
-        let segs = if rows > 1 && k >= 8192 { 4 } else { 1 };
+        let segs = if rows > 1 && k >= 8192 && k.is_multiple_of(128) {
+            4
+        } else {
+            1
+        };
         let consts = consts.into_iter().chain([("SEGS", segs as f64)]).collect::<Vec<_>>();
-        let span = self.prof_begin(pass);
+        let span = self.prof_begin(pass)?;
         let (yb, yslice) = if segs > 1 {
-            let stride = if y_stride == 0 { n } else { y_stride };
-            self.ensure_gemm_partial(segs * rows * stride);
+            self.ensure_gemm_partial(segs * rows * y_stride);
             (
-                Binding::Slice(&self.gemm_partial, 0, (segs * rows * stride) as u64 * 4),
+                Binding::Slice(&self.gemm_partial, 0, (segs * rows * y_stride) as u64 * 4),
                 y,
             )
         } else {
@@ -548,48 +439,39 @@ impl Backend {
         };
         let bufs = [x, wb, Self::scale_binding(&self.dummy_scale, w), yb];
         Self::set(
-            &mut self.kernels,
-            &mut self.bg_cache,
-            &self.device,
+            &self.kernels,
             pass,
             name::GEMM,
             &consts,
             &bufs,
             [n.div_ceil(32), rows.div_ceil(32), segs],
         )?;
-        self.prof_end(pass, name::GEMM, span);
         if segs > 1 {
-            let stride = if y_stride == 0 { n } else { y_stride };
-            let span = self.prof_begin(pass);
             let mconsts = [
                 ("M", rows as f64),
                 ("N", n as f64),
-                ("Y_STRIDE", stride as f64),
+                ("Y_STRIDE", y_stride as f64),
                 ("Y_OFF", y_off as f64),
                 ("SEGS", segs as f64),
                 ("ACC", acc as u32 as f64),
             ];
             let bufs = [
-                Binding::Slice(&self.gemm_partial, 0, (segs * rows * stride) as u64 * 4),
+                Binding::Slice(&self.gemm_partial, 0, (segs * rows * y_stride) as u64 * 4),
                 yslice,
             ];
             Self::set(
-                &mut self.kernels,
-                &mut self.bg_cache,
-                &self.device,
+                &self.kernels,
                 pass,
                 name::MERGE_GEMM,
                 &mconsts,
                 &bufs,
                 [n.div_ceil(256), 1, 1],
             )?;
-            self.prof_end(pass, name::MERGE_GEMM, span);
         }
+        self.prof_end(pass, name::GEMM, span)?;
         Ok(())
     }
 
-    /// y[n] = x[k] @ dequant(w)^T: the single-row (decode) fast path that
-    /// streams the weight matrix; narrow outputs split K across segments.
     pub fn gemv(
         &mut self,
         pass: &mut Pass<'_>,
@@ -600,8 +482,6 @@ impl Backend {
         self.gemv_acc(pass, x, w, y, false)
     }
 
-    /// [`Backend::gemv`] with residual accumulation into `y` (acc = true).
-    #[allow(clippy::too_many_arguments)]
     pub fn gemv_acc(
         &mut self,
         pass: &mut Pass<'_>,
@@ -610,17 +490,14 @@ impl Backend {
         y: Binding<'_>,
         acc: bool,
     ) -> Result<()> {
-        let (n, k, wb, wdtype) = Self::weight_io(w);
-        // K splits: SEGS=4 for wide outputs, SEGS=2 for mid ones (4096);
-        // each must divide K into 16-block segments (SEGS <= K/16).
-        let segs: u32 = if k.is_multiple_of(128) {
-            4
-        } else if k.is_multiple_of(32) {
-            2
-        } else {
-            1
-        };
-        let span = self.prof_begin(pass);
+        let (n, k, wb, dtype) = Self::weight_io(w);
+        let kb = k / 16;
+        let base = n.div_ceil(256);
+        let segs: u32 = [8u32, 4, 2, 1]
+            .into_iter()
+            .find(|s| kb % *s == 0 && base * *s >= 96)
+            .unwrap_or(1);
+        let span = self.prof_begin(pass)?;
         if segs > 1 {
             self.ensure_gemv_partial(n * segs);
         }
@@ -628,27 +505,25 @@ impl Backend {
         let consts = [
             ("N", n as f64),
             ("K", k as f64),
-            ("WDTYPE", wdtype),
-            ("GROUP", w.group() as f64),
+            ("WDTYPE", dtype_flag(dtype)),
+            ("GROUP", group_const(w)),
             ("SEGS", segs as f64),
             ("ACC", acc as u32 as f64),
         ];
         let out = if segs == 1 {
             y
         } else {
-            // gemv writes one row per segment: [SEGS, N] f32.
+
             Binding::Slice(&self.gemv_partial, 0, n as u64 * 4 * segs as u64)
         };
         let bufs = [x, wb, scale, out];
         Self::set(
-            &mut self.kernels,
-            &mut self.bg_cache,
-            &self.device,
+            &self.kernels,
             pass,
             name::GEMV,
             &consts,
             &bufs,
-            [n / 16, segs, 1],
+            [n.div_ceil(256), segs, 1],
         )?;
         if segs > 1 {
             let bufs = [
@@ -656,9 +531,7 @@ impl Backend {
                 y,
             ];
             Self::set(
-                &mut self.kernels,
-                &mut self.bg_cache,
-                &self.device,
+                &self.kernels,
                 pass,
                 name::MERGE_GEMV,
                 &[
@@ -667,16 +540,13 @@ impl Backend {
                     ("ACC", acc as u32 as f64),
                 ],
                 &bufs,
-                [n / 16, 1, 1],
+                [n.div_ceil(256), 1, 1],
             )?;
         }
-        self.prof_end(pass, name::GEMV, span);
+        self.prof_end(pass, name::GEMV, span)?;
         Ok(())
     }
 
-    /// Fused q/k/v projection (decode path): one dispatch computes all three
-    /// projections into separate outputs.
-    #[allow(clippy::too_many_arguments)]
     pub fn gemv_qkv(
         &mut self,
         pass: &mut Pass<'_>,
@@ -692,24 +562,18 @@ impl Backend {
         nv: u32,
         k: u32,
     ) -> Result<()> {
+        assert!(
+            wq.scale().is_some() && wk.scale().is_some() && wv.scale().is_some(),
+            "gemv_qkv requires quantized weights"
+        );
         let ntot = nq + nk + nv;
-        // The K split must divide K into 16-block segments (SEGS <= K/16).
-        let segs: u32 = if k.is_multiple_of(128) {
-            8
-        } else if k.is_multiple_of(32) {
-            2
-        } else {
-            1
-        };
-        let consts = [
-            ("NQ", nq as f64),
-            ("NK", nk as f64),
-            ("NV", nv as f64),
-            ("K", k as f64),
-            ("GROUP", wq.group() as f64),
-            ("SEGS", segs as f64),
-        ];
-        let span = self.prof_begin(pass);
+        let kb = k / 16;
+        let base = ntot.div_ceil(256);
+        let segs: u32 = [16u32, 8, 4, 2, 1]
+            .into_iter()
+            .find(|s| kb % *s == 0 && base * *s >= 256)
+            .unwrap_or(1);
+        let span = self.prof_begin(pass)?;
         if segs > 1 {
             self.ensure_gemv_partial(ntot * segs);
         }
@@ -737,14 +601,19 @@ impl Backend {
             out,
         ];
         Self::set(
-            &mut self.kernels,
-            &mut self.bg_cache,
-            &self.device,
+            &self.kernels,
             pass,
             name::GEMV_QKV,
-            &consts,
+            &[
+                ("NQ", nq as f64),
+                ("NK", nk as f64),
+                ("NV", nv as f64),
+                ("K", k as f64),
+                ("GROUP", group_const(wq)),
+                ("SEGS", segs as f64),
+            ],
             &bufs,
-            [ntot / 16, segs, 1],
+            [ntot.div_ceil(256), segs, 1],
         )?;
         if segs > 1 {
             let bufs = [
@@ -754,9 +623,7 @@ impl Backend {
                 yv,
             ];
             Self::set(
-                &mut self.kernels,
-                &mut self.bg_cache,
-                &self.device,
+                &self.kernels,
                 pass,
                 name::MERGE_QKV,
                 &[
@@ -766,16 +633,13 @@ impl Backend {
                     ("SEGS", segs as f64),
                 ],
                 &bufs,
-                [ntot / 16, 1, 1],
+                [ntot.div_ceil(256), 1, 1],
             )?;
         }
-        self.prof_end(pass, name::GEMV_QKV, span);
+        self.prof_end(pass, name::GEMV_QKV, span)?;
         Ok(())
     }
 
-    /// Fused gate/up projection (decode path): both MLP input projections
-    /// in one dispatch.
-    #[allow(clippy::too_many_arguments)]
     pub fn gemv_gateup(
         &mut self,
         pass: &mut Pass<'_>,
@@ -787,16 +651,18 @@ impl Backend {
         n: u32,
         k: u32,
     ) -> Result<()> {
-        // The K split must divide K into 16-block segments (SEGS <= K/16).
-        let segs: u32 = if k.is_multiple_of(32) { 2 } else { 1 };
-        let consts = [
-            ("NG", n as f64),
-            ("K", k as f64),
-            ("GROUP", wg.group() as f64),
-            ("SEGS", segs as f64),
-        ];
-        let span = self.prof_begin(pass);
+        assert!(
+            wg.scale().is_some() && wu.scale().is_some(),
+            "gemv_gateup requires quantized weights"
+        );
         let ntot = 2 * n;
+        let kb = k / 16;
+        let base = ntot.div_ceil(256);
+        let segs: u32 = [4u32, 2, 1]
+            .into_iter()
+            .find(|s| kb % *s == 0 && base * *s >= 192)
+            .unwrap_or(1);
+        let span = self.prof_begin(pass)?;
         if segs > 1 {
             self.ensure_gemv_partial(ntot * segs);
         }
@@ -820,14 +686,17 @@ impl Backend {
             out,
         ];
         Self::set(
-            &mut self.kernels,
-            &mut self.bg_cache,
-            &self.device,
+            &self.kernels,
             pass,
             name::GEMV_GATEUP,
-            &consts,
+            &[
+                ("NG", n as f64),
+                ("K", k as f64),
+                ("GROUP", group_const(wg)),
+                ("SEGS", segs as f64),
+            ],
             &bufs,
-            [ntot / 16, segs, 1],
+            [ntot.div_ceil(256), segs, 1],
         )?;
         if segs > 1 {
             let bufs = [
@@ -836,68 +705,65 @@ impl Backend {
                 yu,
             ];
             Self::set(
-                &mut self.kernels,
-                &mut self.bg_cache,
-                &self.device,
+                &self.kernels,
                 pass,
                 name::MERGE_GATEUP,
                 &[("NG", n as f64), ("SEGS", segs as f64)],
                 &bufs,
-                [ntot / 16, 1, 1],
+                [ntot.div_ceil(256), 1, 1],
             )?;
         }
-        self.prof_end(pass, name::GEMV_GATEUP, span);
+        self.prof_end(pass, name::GEMV_GATEUP, span)?;
         Ok(())
     }
 
-    pub fn submit(&self, encoder: CommandEncoder) {
-        self.queue.submit(Some(encoder.finish()));
+    pub fn submit(&mut self, encoder: Box<dyn CommandEncoder>) -> Result<()> {
+        if self.pending.len() >= 2 {
+            let done = self.pending.remove(0);
+            done.wait()?;
+            self.settle_retired();
+        }
+        self.pending.push(self.device.submit(encoder)?);
+        Ok(())
     }
 
-    /// Writes a start timestamp around a dispatch when profiling is active.
-    fn prof_begin(&mut self, pass: &mut Pass<'_>) -> Option<u32> {
-        self.profiler.as_mut().and_then(|p| p.begin(&mut pass.0))
-    }
-
-    /// Writes the matching end timestamp when profiling is active.
-    fn prof_end(&mut self, pass: &mut Pass<'_>, label: &'static str, span: Option<u32>) {
-        if let Some(p) = self.profiler.as_mut() {
-            p.end(&mut pass.0, label, span);
+    fn prof_begin(&mut self, pass: &mut Pass<'_>) -> Result<Option<u32>> {
+        match &mut self.profiler {
+            Some(p) => p.begin(pass.0),
+            None => Ok(None),
         }
     }
 
-    /// Resolves this frame's timestamps into the running totals; no-op when
-    /// profiling is disabled.
+    fn prof_end(
+        &mut self,
+        pass: &mut Pass<'_>,
+        label: &'static str,
+        span: Option<u32>,
+    ) -> Result<()> {
+        if let Some(p) = &mut self.profiler {
+            p.end(pass.0, label, span)?;
+        }
+        Ok(())
+    }
+
     pub fn flush_profile(&mut self) -> Result<()> {
         let Some(prof) = self.profiler.as_mut() else {
             return Ok(());
         };
-        let mut enc = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("step"),
-            });
-        prof.resolve(&mut enc);
-        self.queue.submit(Some(enc.finish()));
-        let pending = prof.pending();
-        let timestamps = if pending > 0 {
-            let bytes = map_read(&self.device, prof.read_buf())?;
-            bytes
-                .chunks_exact(8)
-                .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        prof.accumulate(&timestamps)
+        if prof.pending() == 0 {
+            return Ok(());
+        }
+        let mut enc = self.device.encoder()?;
+        prof.resolve(enc.as_mut())?;
+        let sub = self.device.submit(enc)?;
+        sub.wait()?;
+        prof.accumulate()
     }
 
-    /// Whether GPU profiling is active.
     pub fn profiling(&self) -> bool {
         self.profiler.is_some()
     }
 
-    /// Per-shader GPU time totals, sorted slowest first.
     pub fn profile_report(&self) -> Vec<ProfileRow> {
         self.profiler
             .as_ref()
@@ -905,131 +771,66 @@ impl Backend {
             .unwrap_or_default()
     }
 
-    /// Copy `count` f32 values from `offset` bytes of `src` into a fresh vec.
-    pub fn read_f32(&self, src: &Buffer, offset: BufferAddress, count: usize) -> Result<Vec<f32>> {
-        let bytes = read_back(&self.device, &self.queue, src, offset, count * 4)?;
+    pub fn read_f32(&self, src: &dyn Buffer, offset: u64, count: usize) -> Result<Vec<f32>> {
+        let staging = self.device.create_buffer(&BufferSpec {
+            size: count as u64 * 4,
+            host_visible: true,
+        })?;
+        let mut enc = self.device.encoder()?;
+        enc.copy(src, offset, staging.as_ref(), 0, count as u64 * 4)?;
+        let sub = self.device.submit(enc)?;
+        sub.wait()?;
+        let mut bytes = vec![0u8; count * 4];
+        staging.read(0, &mut bytes)?;
         Ok(bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
     }
-}
 
-/// Maps `len` bytes of `src` at `offset` via a staging buffer and blocks
-/// until ready (the wgpu map path is inherently asynchronous).
-fn read_back(
-    device: &Device,
-    queue: &Queue,
-    src: &Buffer,
-    offset: BufferAddress,
-    len: usize,
-) -> Result<Vec<u8>> {
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size: len as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
-        label: Some("readback"),
-    });
-    enc.copy_buffer_to_buffer(src, offset, &staging, 0, len as u64);
-    queue.submit(Some(enc.finish()));
-    map_read(device, &staging)
-}
-
-/// Maps a MAP_READ buffer directly and blocks for the result; the profiler's
-/// readback buffer is already mapable, so it skips the staging copy.
-fn map_read(device: &Device, buf: &Buffer) -> Result<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    buf.slice(..).map_async(MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    loop {
-        match rx.try_recv() {
-            Ok(result) => {
-                result.map_err(|e| Error::Gpu(format!("readback mapping failed: {e}")))?;
-                break;
+    fn warmup(device: &dyn Device, kernels: &Kernels) -> Result<()> {
+        let n = 1 << 20;
+        let mk = |val: f32| {
+            Tensor::new(
+                Self::upload_buf(device, bytemuck::cast_slice(&vec![val; n])),
+                vec![n as u32],
+                DType::F32,
+            )
+        };
+        let wxa = mk(1.0);
+        let wxb = mk(1.0);
+        let wy = Tensor::new(Self::zeroed_buf(device, n as u64 * 4), vec![n as u32], DType::F32);
+        for _ in 0..3 {
+            let mut enc = device.encoder()?;
+            {
+                let mut pass = Pass::begin(enc.as_mut());
+                Self::set(
+                    kernels,
+                    &mut pass,
+                    name::ADD,
+                    &[("N_ELEM", n as f64)],
+                    &[Binding::Full(&wxa), Binding::Full(&wxb), Binding::Full(&wy)],
+                    [(n / 256) as u32, 1, 1],
+                )?;
             }
-            Err(mpsc::TryRecvError::Empty) => {
-                device
-                    .poll(PollType::Wait {
-                        submission_index: None,
-                        timeout: None,
-                    })
-                    .map_err(|e| Error::Gpu(format!("device poll failed: {e}")))?;
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(Error::Gpu("readback channel closed".into()));
-            }
+            let sub = device.submit(enc)?;
+            sub.wait()?;
         }
+        Ok(())
     }
-    let bytes = buf
-        .slice(..)
-        .get_mapped_range()
-        .map_err(|e| Error::Gpu(format!("readback map failed: {e}")))?
-        .to_vec();
-    buf.unmap();
-    Ok(bytes)
 }
 
-/// Warms up the GPU after device creation: model loading leaves the clocks
-/// at idle levels on WDDM; a real compute dispatch + sync restores
-/// steady-state boost (empty passes do nothing — the driver elides them).
-/// Without it first-chunk timing swings 2-8x run to run.
-fn warmup(device: &Device, queue: &Queue, kernels: &mut Kernels) -> Result<()> {
-    let n = 1 << 20;
-    let mk = |label: &str, val: f32| Tensor::new(
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::cast_slice(&vec![val; n]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        }),
-        vec![n as u32],
-        DType::F32,
-    );
-    let wxa = mk("flint.warmup.a", 1.0);
-    let wxb = mk("flint.warmup.b", 1.0);
-    let wy = Tensor::new(
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("flint.warmup.y"),
-            contents: &vec![0u8; n * 4],
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        }),
-        vec![n as u32],
-        DType::F32,
-    );
-    for _ in 0..3 {
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("flint.warmup"),
-        });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("flint.warmup"),
-                timestamp_writes: None,
-            });
-            let layout = kernels.bind_group_layout(name::ADD)?;
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("flint.warmup.bg"),
-                layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wxa.buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wxb.buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: wy.buf.as_entire_binding() },
-                ],
-            });
-            let pl = kernels.pipeline(device, name::ADD, &[("N_ELEM", n as f64)])?;
-            pass.set_pipeline(pl);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups((n / 256) as u32, 1, 1);
-            drop(pass);
-        }
-        queue.submit([enc.finish()]);
+fn dtype_flag(dtype: DType) -> f64 {
+    match dtype {
+        DType::Bf16Packed => 0.0,
+        DType::I8 => 1.0,
+        DType::F32 | DType::U32 => unreachable!("gemm weights are bf16-packed or i8"),
     }
-    let (tx, rx) = std::sync::mpsc::channel();
-    queue.on_submitted_work_done(move || {
-        let _ = tx.send(());
-    });
-    let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
-    Ok(())
+}
+
+fn group_const(w: &Weight) -> f64 {
+    match w.group() {
+        Some(group) => group as f64,
+        None => 0.0,
+    }
 }

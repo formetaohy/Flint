@@ -1,5 +1,3 @@
-//! Shape manipulation and indexing operators.
-
 use std::collections::HashMap;
 
 use flint_error::{Error, Result};
@@ -91,15 +89,12 @@ pub(crate) fn transpose(env: &mut HashMap<String, Tensor>, node: &Node) -> Resul
     Ok(())
 }
 
-/// Reorders a row-major buffer by permutation of its axes.
 fn permute<T: Copy>(v: &[T], shape: &[usize], perm: &[usize]) -> Vec<T> {
     let rank = shape.len();
     let out_shape: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
     let n: usize = out_shape.iter().product();
     let mut out = vec![v[0]; n];
-    // Walk output coords, map back to the source flat index: output dim k
-    // is source dim perm[k], so build the source coordinate vector first,
-    // then expand it in the source's row-major layout.
+
     let mut idx = vec![0usize; rank];
     let mut src_coords = vec![0usize; rank];
     for (flat, o) in out.iter_mut().enumerate() {
@@ -129,7 +124,7 @@ pub(crate) fn concat(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<(
     for i in 0..node.inputs.len() {
         let t = input(env, node, i)?;
         if t.shape.len() != rank || t.shape[axis] == 0 {
-            // Rank mismatch is a hard error; empty tensors pass through.
+
         }
         if t.shape.len() != rank {
             return Err(Error::Model(format!(
@@ -192,8 +187,7 @@ pub(crate) fn concat(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<(
 
 pub(crate) fn split(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let x = input(env, node, 0)?;
-    // Clone payload and shape so outputs can be stored while the input is
-    // still being read inside the loop.
+
     let data = x.data.clone();
     let shape = x.shape.clone();
     let rank = shape.len();
@@ -264,9 +258,7 @@ pub(crate) fn slice(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()
     if starts.len() != ends.len() || starts.len() != axes.len() || starts.len() != steps.len() {
         return Err(Error::Model("Slice: starts/ends/axes/steps length mismatch".into()));
     }
-    // Normalized (start, end, step) per axis; numpy clamping semantics:
-    // positive steps clamp into [0, dim], negative into [-1, dim-1] after
-    // resolving negative inputs relative to the dimension.
+
     let mut slices: Vec<(usize, usize, i64)> = (0..rank).map(|d| (0, x.shape[d], 1)).collect();
     for (i, &ax) in axes.iter().enumerate() {
         let dim = x.shape[ax] as i64;
@@ -282,7 +274,7 @@ pub(crate) fn slice(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()
         };
         slices[ax] = (s as usize, e as usize, step);
     }
-    // Output shape from sliced axes.
+
     let mut shape = x.shape.clone();
     for (d, (s, e, step)) in slices.iter().enumerate() {
         let (s, e) = (*s, *e);
@@ -301,7 +293,6 @@ pub(crate) fn slice(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()
     Ok(())
 }
 
-/// Gathers elements under per-axis (start, end, step) ranges.
 fn slice_data<T: Copy>(v: &[T], shape: &[usize], slices: &[(usize, usize, i64)]) -> Vec<T> {
     let out_shape: Vec<usize> = shape
         .iter()
@@ -326,7 +317,7 @@ fn slice_data<T: Copy>(v: &[T], shape: &[usize], slices: &[(usize, usize, i64)])
             flat = flat * shape[d] + i;
         }
         out.push(v[flat]);
-        // Increment mixed-radix index in output space.
+
         for d in (0..shape.len()).rev() {
             idx[d] += 1;
             if idx[d] < out_shape[d] {
@@ -354,7 +345,7 @@ pub(crate) fn gather(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<(
         })
         .collect::<Result<_>>()?;
     let idx_shape = idx.shape.clone();
-    // Output shape: data[..axis] + indices.shape + data[axis+1..].
+
     let mut shape: Vec<usize> = x.shape[..axis].to_vec();
     shape.extend_from_slice(&idx_shape);
     shape.extend_from_slice(&x.shape[axis + 1..].to_vec());
@@ -744,7 +735,6 @@ pub(crate) fn constant(env: &mut HashMap<String, Tensor>, node: &Node) -> Result
     Ok(())
 }
 
-/// Cast to the ONNX `to` type; internally f32 / i64 / bool covers all.
 pub(crate) fn cast(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let x = input(env, node, 0)?;
     let to = node.need("to")?.i()?;
@@ -857,7 +847,7 @@ fn pad_data<T: Copy>(
         if src_ok {
             match mode {
                 "reflect" | "edge" => {
-                    // Reflect/edge paddings: mirror or clamp the coordinate.
+
                     let mut flat = 0usize;
                     for d in 0..rank {
                         let b = begins[d] as usize;
@@ -880,7 +870,7 @@ fn pad_data<T: Copy>(
                 _ => out[o] = v[flat],
             }
         }
-        // Increment mixed-radix index.
+
         for d in (0..rank).rev() {
             idx[d] += 1;
             if idx[d] < out_shape[d] {
@@ -921,7 +911,7 @@ pub(crate) fn topk(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()>
                 }
             });
             if !sorted {
-                // Unsorted: still take the top-k set, in original order.
+
                 let mut selected = pairs[..k].to_vec();
                 selected.sort_by_key(|p| p.1);
                 pairs = selected;
@@ -1002,7 +992,7 @@ pub(crate) fn scatter_nd(env: &mut HashMap<String, Tensor>, node: &Node) -> Resu
     };
     for r in 0..idx_rows {
         let idx_vec = &indices[r * k..(r + 1) * k];
-        // Validate and compute destination offset.
+
         let mut off = 0usize;
         for (d, &i) in idx_vec.iter().enumerate() {
             if i >= data.shape[d] {

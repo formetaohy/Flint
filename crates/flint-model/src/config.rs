@@ -1,8 +1,6 @@
 use flint_error::{Error, Result};
 use serde_json::Value;
 
-// Shared parsing helpers used by each architecture's config module.
-
 pub fn req<'a>(v: &'a Value, key: &str) -> Result<&'a Value> {
     v.get(key)
         .ok_or_else(|| Error::Config(format!("missing config field {key:?}")))
@@ -27,7 +25,6 @@ pub fn bool_field(v: &Value, key: &str) -> Result<bool> {
         .ok_or_else(|| Error::Config(format!("field {key:?} is not a bool")))
 }
 
-/// Accepts a missing field, a single id, or an array of ids.
 pub fn u32_list(v: &Value, key: &str) -> Result<Vec<u32>> {
     match v.get(key) {
         None | Some(Value::Null) => Ok(Vec::new()),
@@ -42,8 +39,6 @@ fn as_u32(n: Option<u64>, key: &str) -> Result<u32> {
         .ok_or_else(|| Error::Config(format!("field {key:?} is not a u32")))
 }
 
-/// Every gemm tiles a [16, 16] output block over a 64-wide K tile; reject
-/// configs whose projection dimensions cannot map.
 pub fn check_gemm_dims(pairs: &[(u32, u32)]) -> Result<()> {
     for &(n, k) in pairs {
         if !n.is_multiple_of(16) || !k.is_multiple_of(64) {
@@ -55,8 +50,6 @@ pub fn check_gemm_dims(pairs: &[(u32, u32)]) -> Result<()> {
     Ok(())
 }
 
-/// The attention kernel owns one output column per thread (max 512: eight
-/// 64-wide column pairs).
 pub fn check_head_dim(head_dim: u32) -> Result<()> {
     if !(64..=512).contains(&head_dim) {
         return Err(Error::Config(format!(

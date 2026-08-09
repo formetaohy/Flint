@@ -1,13 +1,8 @@
-//! SentencePiece Unigram tokenizer rebuilt from GGUF metadata (the "llama"
-//! tokenizer flavor): pieces keep their ids, control pieces become single-id
-//! specials, and text round-trips through the Metaspace pre-tokenizer.
-
 use std::collections::HashMap;
 
 use flint_checkpoint::{MetaVal, Metadata};
 use flint_tokenizer::Tokenizer;
 
-/// GGUF-style metadata for a tiny Unigram tokenizer.
 fn unigram_meta() -> Metadata {
     let tokens = [
         "<unk>",
@@ -75,9 +70,6 @@ fn unigram_streaming_roundtrip() {
     );
 }
 
-// ---------------------------------------------------------------- errors
-
-/// unigram_meta with one field replaced or removed.
 fn mutate_meta(remove: &str, insert: Option<(&str, MetaVal)>) -> Metadata {
     let mut kv = HashMap::new();
     let src = unigram_meta();

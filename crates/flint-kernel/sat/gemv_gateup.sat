@@ -1,0 +1,119 @@
+kernel gemv_gateup [workgroup(256, 1, 1)]
+    (x: buf<f32>, wg: buf<u32>, sg: buf<f32>, yg: buf<f32>,
+     wu: buf<u32>, su: buf<f32>, yu: buf<f32>, out: buf<f32>,
+     NG: u32, K: u32, GROUP: u32, SEGS: u32)
+{
+    let col = block.x * 256 + thread.x;
+    let seg = block.y;
+    let kb_total = (K / 16) / SEGS;
+    let kb_lo = seg * kb_total;
+    var acc = 0.0;
+    if col < NG {
+        for it in 0..kb_total {
+            let kb0 = kb_lo + it;
+            let xb = kb0 * 16;
+            let x0 = x[xb];
+            let x1 = x[xb + 1];
+            let x2 = x[xb + 2];
+            let x3 = x[xb + 3];
+            let x4 = x[xb + 4];
+            let x5 = x[xb + 5];
+            let x6 = x[xb + 6];
+            let x7 = x[xb + 7];
+            let x8 = x[xb + 8];
+            let x9 = x[xb + 9];
+            let x10 = x[xb + 10];
+            let x11 = x[xb + 11];
+            let x12 = x[xb + 12];
+            let x13 = x[xb + 13];
+            let x14 = x[xb + 14];
+            let x15 = x[xb + 15];
+            let wb = (kb0 * NG + col) * 4;
+            let sc = sg[(kb0 / (GROUP / 16)) * NG + col];
+            let q0 = wg[wb];
+            let q1 = wg[wb + 1];
+            let q2 = wg[wb + 2];
+            let q3 = wg[wb + 3];
+            let w00 = (((q0 & 255) << 24) as i32 >> 24) as f32;
+            let w01 = ((((q0 & 65280) << 16) as i32) >> 24) as f32;
+            let w02 = ((((q0 & 16711680) << 8) as i32) >> 24) as f32;
+            let w03 = (((q0 >> 24) << 24) as i32 >> 24) as f32;
+            let w10 = (((q1 & 255) << 24) as i32 >> 24) as f32;
+            let w11 = ((((q1 & 65280) << 16) as i32) >> 24) as f32;
+            let w12 = ((((q1 & 16711680) << 8) as i32) >> 24) as f32;
+            let w13 = (((q1 >> 24) << 24) as i32 >> 24) as f32;
+            let w20 = (((q2 & 255) << 24) as i32 >> 24) as f32;
+            let w21 = ((((q2 & 65280) << 16) as i32) >> 24) as f32;
+            let w22 = ((((q2 & 16711680) << 8) as i32) >> 24) as f32;
+            let w23 = (((q2 >> 24) << 24) as i32 >> 24) as f32;
+            let w30 = (((q3 & 255) << 24) as i32 >> 24) as f32;
+            let w31 = ((((q3 & 65280) << 16) as i32) >> 24) as f32;
+            let w32 = ((((q3 & 16711680) << 8) as i32) >> 24) as f32;
+            let w33 = (((q3 >> 24) << 24) as i32 >> 24) as f32;
+            var dot = x0 * w00 + x1 * w01 + x2 * w02 + x3 * w03;
+            dot = dot + x4 * w10 + x5 * w11 + x6 * w12 + x7 * w13;
+            dot = dot + x8 * w20 + x9 * w21 + x10 * w22 + x11 * w23;
+            dot = dot + x12 * w30 + x13 * w31 + x14 * w32 + x15 * w33;
+            acc = acc + dot * sc;
+        }
+        if SEGS == 1 {
+            yg[col] = acc;
+        } else {
+            out[seg * (2 * NG) + col] = acc;
+        }
+    } else if col < 2 * NG {
+        let c = col - NG;
+        for it in 0..kb_total {
+            let kb0 = kb_lo + it;
+            let xb = kb0 * 16;
+            let x0 = x[xb];
+            let x1 = x[xb + 1];
+            let x2 = x[xb + 2];
+            let x3 = x[xb + 3];
+            let x4 = x[xb + 4];
+            let x5 = x[xb + 5];
+            let x6 = x[xb + 6];
+            let x7 = x[xb + 7];
+            let x8 = x[xb + 8];
+            let x9 = x[xb + 9];
+            let x10 = x[xb + 10];
+            let x11 = x[xb + 11];
+            let x12 = x[xb + 12];
+            let x13 = x[xb + 13];
+            let x14 = x[xb + 14];
+            let x15 = x[xb + 15];
+            let wb = (kb0 * NG + c) * 4;
+            let sc = su[(kb0 / (GROUP / 16)) * NG + c];
+            let q0 = wu[wb];
+            let q1 = wu[wb + 1];
+            let q2 = wu[wb + 2];
+            let q3 = wu[wb + 3];
+            let w00 = (((q0 & 255) << 24) as i32 >> 24) as f32;
+            let w01 = ((((q0 & 65280) << 16) as i32) >> 24) as f32;
+            let w02 = ((((q0 & 16711680) << 8) as i32) >> 24) as f32;
+            let w03 = (((q0 >> 24) << 24) as i32 >> 24) as f32;
+            let w10 = (((q1 & 255) << 24) as i32 >> 24) as f32;
+            let w11 = ((((q1 & 65280) << 16) as i32) >> 24) as f32;
+            let w12 = ((((q1 & 16711680) << 8) as i32) >> 24) as f32;
+            let w13 = (((q1 >> 24) << 24) as i32 >> 24) as f32;
+            let w20 = (((q2 & 255) << 24) as i32 >> 24) as f32;
+            let w21 = ((((q2 & 65280) << 16) as i32) >> 24) as f32;
+            let w22 = ((((q2 & 16711680) << 8) as i32) >> 24) as f32;
+            let w23 = (((q2 >> 24) << 24) as i32 >> 24) as f32;
+            let w30 = (((q3 & 255) << 24) as i32 >> 24) as f32;
+            let w31 = ((((q3 & 65280) << 16) as i32) >> 24) as f32;
+            let w32 = ((((q3 & 16711680) << 8) as i32) >> 24) as f32;
+            let w33 = (((q3 >> 24) << 24) as i32 >> 24) as f32;
+            var dot = x0 * w00 + x1 * w01 + x2 * w02 + x3 * w03;
+            dot = dot + x4 * w10 + x5 * w11 + x6 * w12 + x7 * w13;
+            dot = dot + x8 * w20 + x9 * w21 + x10 * w22 + x11 * w23;
+            dot = dot + x12 * w30 + x13 * w31 + x14 * w32 + x15 * w33;
+            acc = acc + dot * sc;
+        }
+        if SEGS == 1 {
+            yu[c] = acc;
+        } else {
+            out[seg * (2 * NG) + NG + c] = acc;
+        }
+    }
+}

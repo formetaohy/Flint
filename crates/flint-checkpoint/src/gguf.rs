@@ -1,7 +1,3 @@
-//! GGUF container reader: header, metadata KV, tensor-info table and on-demand
-//! tensor dequantization. Format mechanics only — name mapping and config
-//! synthesis live in `flint-architectures`.
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -9,14 +5,13 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use flint_error::{Error, Result};
-use flint_num::{f32_to_bf16, f32_to_f16};
+use saturn_core::num::{f32_to_bf16, f32_to_f16};
 
 use super::dequant::{self, GgmlType};
-use super::{Checkpoint, RawTensor, TensorData};
+use super::{Checkpoint, CheckpointKind, RawTensor, TensorData};
 
-const MAGIC: u32 = 0x4655_4747; // "GGUF", little-endian
+const MAGIC: u32 = 0x4655_4747; 
 
-/// One GGUF metadata value, normalized to a small typed set.
 #[derive(Clone, Debug, PartialEq)]
 pub enum MetaVal {
     UInt(u64),
@@ -27,14 +22,13 @@ pub enum MetaVal {
     Arr(Vec<MetaVal>),
 }
 
-/// Typed accessors over the GGUF metadata KV table.
 #[derive(Default)]
 pub struct Metadata {
     kv: HashMap<String, MetaVal>,
 }
 
 impl Metadata {
-    /// Builds a metadata table from raw KV pairs.
+
     pub fn new(kv: HashMap<String, MetaVal>) -> Self {
         Self { kv }
     }
@@ -118,12 +112,11 @@ impl Metadata {
 struct TensorInfo {
     ty: GgmlType,
     shape: Vec<u32>,
-    /// Absolute byte offset of the tensor's data within the mmap.
+
     offset: usize,
     numel: usize,
 }
 
-/// A memory-mapped GGUF file.
 pub struct Gguf {
     mmap: Mmap,
     meta: Metadata,
@@ -177,7 +170,6 @@ impl Gguf {
             infos.push((name, ty, dims, numel, rel));
         }
 
-        // Tensor data starts at the next alignment boundary after the header.
         let data_start = align_up(r.1, alignment);
 
         let mut tensors = HashMap::with_capacity(tensor_count);
@@ -222,13 +214,9 @@ impl Checkpoint for Gguf {
             )));
         }
         let bytes = &self.mmap[info.offset..end];
-        // ggml lists dims fastest-first ([K, N] for a weight); its memory is
-        // row-major over that, i.e. [N, K] with K contiguous — exactly Flint's
-        // weight convention. Reverse the dim list to report [N, K].
+
         let shape: Vec<u32> = info.shape.iter().rev().cloned().collect();
-        // bf16 stays packed (embeddings can exceed a gigabyte as f32); Q8_0
-        // keeps its raw blocks for the direct GPU repack; every other type
-        // dequantizes to f32.
+
         let data = match info.ty {
             GgmlType::Bf16 => TensorData::Bf16(bytes.to_vec()),
             GgmlType::Q8_0 => TensorData::Q8 {
@@ -248,12 +236,11 @@ impl Checkpoint for Gguf {
         Ok(None)
     }
 
-    fn kind(&self) -> &'static str {
-        "gguf"
+    fn kind(&self) -> CheckpointKind {
+        CheckpointKind::Gguf
     }
 }
 
-/// Cursor over the mmap with little-endian reads.
 struct Reader<'a>(&'a [u8], usize);
 
 impl Reader<'_> {
@@ -302,8 +289,6 @@ impl Reader<'_> {
         self.value_typed(ty)
     }
 
-    /// Reads a value whose type tag was already consumed (array elements carry
-    /// no per-element tag; the array header gives it once).
     fn value_typed(&mut self, ty: u32) -> Result<MetaVal> {
         Ok(match ty {
             0 => MetaVal::UInt(self.u8()? as u64),
@@ -340,11 +325,6 @@ fn align_up(v: usize, a: usize) -> usize {
     v + (a - v % a) % a
 }
 
-// ================================================================ writing
-
-/// GGUF serializer: metadata KV table plus tensor payload, the exact inverse
-/// of [`Gguf::open`]. Tensors are written f32, packed bf16 or Q8_0; a written
-/// file round-trips through [`Gguf::open`] unchanged.
 pub struct GgufWriter {
     kvs: Vec<(String, MetaVal)>,
     tensors: Vec<TensorSpec>,
@@ -354,7 +334,7 @@ pub struct GgufWriter {
 struct TensorSpec {
     name: String,
     ty: GgmlType,
-    /// Fastest-first dims, as ggml stores them.
+
     shape: Vec<u32>,
     data: Vec<u8>,
 }
@@ -426,7 +406,6 @@ impl GgufWriter {
         });
     }
 
-    /// Stores f32 values as packed bf16, two bytes per element.
     pub fn tensor_bf16(&mut self, name: &str, shape: &[u32], data: &[f32]) {
         let mut bytes = Vec::with_capacity(data.len() * 2);
         for v in data {
@@ -440,8 +419,6 @@ impl GgufWriter {
         });
     }
 
-    /// Quantizes f32 values to ggml Q8_0 blocks (half d + 32 i8). The element
-    /// count must be a multiple of 32.
     pub fn tensor_q8_0(&mut self, name: &str, shape: &[u32], data: &[f32]) {
         assert!(
             data.len().is_multiple_of(32),
@@ -465,11 +442,10 @@ impl GgufWriter {
         });
     }
 
-    /// Serializes header, metadata, tensor table and aligned payload.
     pub fn finish(self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC.to_le_bytes());
-        out.extend_from_slice(&3u32.to_le_bytes()); // version
+        out.extend_from_slice(&3u32.to_le_bytes()); 
         out.extend_from_slice(&(self.tensors.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.kvs.len() as u64).to_le_bytes());
 
@@ -478,15 +454,12 @@ impl GgufWriter {
             write_value(&mut out, val);
         }
 
-        // Tensor info records; each ends with an offset slot written as zero
-        // now and patched once the payload layout is known.
         let header_end = out.len();
         let rec_len = |t: &TensorSpec| 8 + t.name.len() + 4 + t.shape.len() * 8 + 4 + 8;
         for t in &self.tensors {
             write_str(&mut out, &t.name);
             out.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());
-            // ggml stores dims fastest-first; the reader reverses them back
-            // to Flint's [N, K] convention, so write the reverse here.
+
             for d in t.shape.iter().rev() {
                 out.extend_from_slice(&(*d as u64).to_le_bytes());
             }
@@ -494,8 +467,6 @@ impl GgufWriter {
             out.extend_from_slice(&0u64.to_le_bytes());
         }
 
-        // Align the payload start, then lay out each tensor at its own
-        // alignment boundary, patching offsets as we go.
         let mut pos = align_up(out.len(), self.alignment);
         let mut cursor = 0usize;
         let mut rec_off = 0usize;
@@ -519,9 +490,6 @@ fn write_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-/// Writes a metadata value including its type tag. Values must fit their
-/// narrowed wire type (u32 / f32); anything larger fails the serialization
-/// instead of silently truncating.
 fn write_value(out: &mut Vec<u8>, v: &MetaVal) {
     match v {
         MetaVal::UInt(n) => {
@@ -574,7 +542,6 @@ fn write_value(out: &mut Vec<u8>, v: &MetaVal) {
     }
 }
 
-/// Writes an array element whose type tag was already emitted.
 fn write_value_typed(out: &mut Vec<u8>, v: &MetaVal) {
     match v {
         MetaVal::UInt(n) => {

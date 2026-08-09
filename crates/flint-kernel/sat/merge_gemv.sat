@@ -1,0 +1,12 @@
+kernel merge_gemv [workgroup(256, 1, 1)]
+    (partial: buf<f32>, y: buf<f32>, N: u32, SEGS: u32, ACC: u32)
+{
+    let col = block.x * 256 + thread.x;
+    if col < N {
+        var s = 0.0;
+        for i in 0..SEGS {
+            s = s + partial[i * N + col];
+        }
+        y[col] = s + ACC as f32 * y[col];
+    }
+}

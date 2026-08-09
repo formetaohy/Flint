@@ -1,0 +1,7 @@
+kernel expert_gather [workgroup(256, 1, 1)] (x: buf<f32>, ids: buf<u32>, out: buf<f32>, HIDDEN: u32, COUNT: u32) {
+    if gid.x < COUNT * HIDDEN {
+        let r = gid.x / HIDDEN;
+        let c = gid.x % HIDDEN;
+        out[r * HIDDEN + c] = x[ids[r] * HIDDEN + c];
+    }
+}

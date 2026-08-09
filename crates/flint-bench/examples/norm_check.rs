@@ -1,4 +1,3 @@
-//! Verifies norm MODE 2 (direct) against a CPU reference.
 use flint_backend::{Backend, Binding, Pass};
 use flint_error::Result;
 use flint_model::ops::{self, NormMode};
@@ -13,13 +12,13 @@ fn main() -> Result<()> {
         .map(|i| 1.0 + ((i as f32) * 0.01).sin() * 0.1)
         .collect();
     let ones: Vec<f32> = vec![1.0; dim as usize];
-    let xt = backend.tensor_f32(&x, vec![16, dim], "x");
-    let wt = backend.tensor_f32(&w, vec![dim], "w");
-    let ot = backend.tensor_f32(&ones, vec![dim], "ones");
-    let yt = backend.zero_tensor(&[16, dim], "y");
-    let mut enc = backend.encoder();
+    let xt = backend.tensor_f32(&x, vec![16, dim]);
+    let wt = backend.tensor_f32(&w, vec![dim]);
+    let ot = backend.tensor_f32(&ones, vec![dim]);
+    let yt = backend.zero_tensor(&[16, dim]);
+    let mut enc = backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(&mut enc, "t");
+        let mut pass = Pass::begin(enc.as_mut());
         ops::norm(
             &mut backend,
             &mut pass,
@@ -34,8 +33,8 @@ fn main() -> Result<()> {
             1e-6,
         )?;
     }
-    backend.submit(enc);
-    let y = backend.read_f32(&yt.buf, 0, (16 * dim) as usize)?;
+    backend.submit(enc).unwrap();
+    let y = backend.read_f32(yt.buf.as_ref(), 0, (16 * dim) as usize)?;
     let mut max_err = 0f32;
     for r in 0..16usize {
         let row = &x[r * dim as usize..(r + 1) * dim as usize];

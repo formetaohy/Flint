@@ -1,19 +1,10 @@
-//! Gemma 3: the shared dense model configured for Gemma's sandwich RMSNorm,
-//! always-on per-head QK-norm, input embedding scaling and alternating
-//! sliding-window attention.
-//!
-//! GGUF stores every Gemma norm weight already folded to its effective value
-//! (HF's offset `w` is saved as `1 + w`), so all norms apply the weight
-//! directly, like the rest of the dense family.
-
 use flint_backend::Backend;
-use flint_checkpoint::Checkpoint;
+use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::{Error, Result};
 use serde_json::Value;
 
 use crate::dense::{DenseConfig, DenseModel, dense_plan};
 
-/// Parses and validates a Gemma 3 text config.
 pub fn parse_config(v: &Value) -> Result<DenseConfig> {
     let mut cfg = DenseConfig::parse(v, true)?;
     cfg.embed_scale = (cfg.hidden as f32).sqrt();
@@ -44,7 +35,6 @@ pub fn parse_config(v: &Value) -> Result<DenseConfig> {
     Ok(cfg)
 }
 
-/// Loads a Gemma 3 checkpoint as a shared dense model.
 pub fn load(
     source: &dyn Checkpoint,
     v: &Value,
@@ -55,7 +45,7 @@ pub fn load(
     DenseModel::load(
         source,
         cfg,
-        &dense_plan(source.kind() == "gguf"),
+        &dense_plan(source.kind() == CheckpointKind::Gguf),
         max_seq,
         backend,
     )

@@ -1,0 +1,6 @@
+kernel sgtest [workgroup(64, 1, 1)] (a: buf<f32>, b: buf<f32>, c: buf<f32>, d: buf<f32>) {
+    let v = a[gid.x];
+    b[gid.x] = subgroup_reduce_add(v);
+    c[gid.x] = subgroup_broadcast(v, 0);
+    d[gid.x] = subgroup_shuffle(v, (lane + 1) % 4);
+}

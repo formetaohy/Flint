@@ -1,8 +1,6 @@
 use flint_backend::Backend;
 use flint_tensor::Tensor;
 
-/// Full-attention KV cache: [kv_heads, max_seq, head_dim] planes, packed bf16
-/// (two elements per u32) to halve the dominant runtime memory footprint.
 pub struct KvCache {
     pub k: Tensor,
     pub v: Tensor,
@@ -12,11 +10,11 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    pub fn new(backend: &Backend, kv_heads: u32, max_seq: u32, head_dim: u32, label: &str) -> Self {
+    pub fn new(backend: &Backend, kv_heads: u32, max_seq: u32, head_dim: u32) -> Self {
         let shape = [kv_heads, max_seq, head_dim];
         Self {
-            k: backend.zero_bf16_tensor(&shape, &format!("{label}.k")),
-            v: backend.zero_bf16_tensor(&shape, &format!("{label}.v")),
+            k: backend.zero_bf16_tensor(&shape),
+            v: backend.zero_bf16_tensor(&shape),
             kv_heads,
             max_seq,
             head_dim,
@@ -29,18 +27,16 @@ impl KvCache {
     }
 }
 
-/// Gated DeltaNet state: recurrent [heads, key_dim, value_dim] matrices plus
-/// a [conv_dim, 3] conv ring.
 pub struct RecurrentState {
     pub recur: Tensor,
     pub conv: Tensor,
 }
 
 impl RecurrentState {
-    pub fn new(backend: &Backend, recur_shape: [u32; 3], conv_dim: u32, label: &str) -> Self {
+    pub fn new(backend: &Backend, recur_shape: [u32; 3], conv_dim: u32) -> Self {
         Self {
-            recur: backend.zero_tensor(&recur_shape, &format!("{label}.recur")),
-            conv: backend.zero_tensor(&[conv_dim, 3], &format!("{label}.conv")),
+            recur: backend.zero_tensor(&recur_shape),
+            conv: backend.zero_tensor(&[conv_dim, 3]),
         }
     }
 

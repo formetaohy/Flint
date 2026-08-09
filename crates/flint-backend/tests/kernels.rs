@@ -1,13 +1,6 @@
-//! Kernel conformance. Every kernel runs on the WGPU backend and must match
-//! the CPU reference (`flint_kernel::cpu`) on identical inputs; the anchor
-//! tests at the bottom pin the CPU reference to hand-computed math, so the
-//! two backends cannot silently agree on wrong results.
-
 use flint_backend::{Backend, Binding, Pass};
 use flint_kernel::{cpu, name};
 use flint_tensor::{DType, Tensor, Weight};
-
-// ================================================================ harness
 
 struct Ctx {
     backend: Backend,
@@ -21,7 +14,7 @@ impl Ctx {
     }
 
     fn f32(&self, data: &[f32], shape: &[u32]) -> Tensor {
-        self.backend.tensor_f32(data, shape.to_vec(), "t")
+        self.backend.tensor_f32(data, shape.to_vec())
     }
 
     fn bf16(&self, data: &[f32], shape: &[u32]) -> Tensor {
@@ -30,33 +23,29 @@ impl Ctx {
             .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
             .collect();
         self.backend
-            .tensor_bf16(&bytes, shape.to_vec(), "t")
+            .tensor_bf16(&bytes, shape.to_vec())
             .unwrap()
     }
 
     fn zero(&self, shape: &[u32]) -> Tensor {
-        self.backend.zero_tensor(shape, "z")
+        self.backend.zero_tensor(shape)
     }
 
     fn zero_bf16(&self, shape: &[u32]) -> Tensor {
-        self.backend.zero_bf16_tensor(shape, "z")
+        self.backend.zero_bf16_tensor(shape)
     }
 
-    /// Step-args buffer: [position, effective attention segments]; rope,
-    /// kv_store and attn read it so the position stays out of the pipeline
-    /// constants.
     fn arg(&self, pos: usize, kv_len: usize) -> Tensor {
         let segs = kv_len.div_ceil(32).clamp(1, 32);
-        let t = Tensor::new(self.backend.storage(8, "args"), vec![2], DType::U32);
-        self.backend.write_u32(&t.buf, &[pos as u32, segs as u32]);
+        let t = Tensor::new(self.backend.storage(8), vec![2], DType::U32);
+        self.backend.write_u32(t.buf.as_ref(), &[pos as u32, segs as u32]);
         t
     }
 
-    /// Reads a packed-bf16 tensor back as f32 (two elements per u32).
     fn read_bf16(&self, t: &Tensor) -> Vec<f32> {
         let raw = self
             .backend
-            .read_f32(&t.buf, 0, (t.numel() / 2) as usize)
+            .read_f32(t.buf.as_ref(), 0, (t.numel() / 2) as usize)
             .unwrap();
         let mut out = Vec::with_capacity(t.numel() as usize);
         for w in raw {
@@ -74,24 +63,23 @@ impl Ctx {
         bufs: &[Binding<'_>],
         groups: [u32; 3],
     ) {
-        let mut enc = self.backend.encoder();
+        let mut enc = self.backend.encoder().unwrap();
         {
-            let mut pass = Pass::begin(&mut enc, "k");
+            let mut pass = Pass::begin(enc.as_mut());
             self.backend
                 .dispatch(&mut pass, name, consts, bufs, groups)
                 .unwrap();
         }
-        self.backend.submit(enc);
+        self.backend.submit(enc).unwrap();
     }
 
     fn read(&self, t: &Tensor) -> Vec<f32> {
         self.backend
-            .read_f32(&t.buf, 0, t.numel() as usize)
+            .read_f32(t.buf.as_ref(), 0, t.numel() as usize)
             .unwrap()
     }
 }
 
-/// Deterministic PRNG for reproducible inputs.
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> f32 {
@@ -112,7 +100,6 @@ fn bf16_round(v: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Asserts the WGPU and CPU results agree elementwise within tolerance.
 fn agree(gpu: &[f32], cpu: &[f32], rel: f32, abs: f32) {
     assert_eq!(
         gpu.len(),
@@ -130,19 +117,15 @@ fn agree(gpu: &[f32], cpu: &[f32], rel: f32, abs: f32) {
     }
 }
 
-/// Group absmax quantization in the production block-major layout
-/// [cols/16, rows, 16]: every 16-byte vec4 of a column's k range is
-/// contiguous. Written independently of `flint_model::loader` (which cannot
-/// be depended on here) so it also cross-checks the loader math.
 fn quant(data: &[f32], rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f32>) {
     let mut row_major = Vec::new();
-    let mut scales = Vec::new();
+    let mut scales = vec![0f32; rows * (cols / group)];
     for r in 0..rows {
         for g in 0..cols / group {
             let block = &data[r * cols + g * group..r * cols + (g + 1) * group];
             let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
             let scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
-            scales.push(scale);
+            scales[g * rows + r] = scale;
             for v in block {
                 row_major.push((v / scale).round().clamp(-127.0, 127.0) as i8 as u8);
             }
@@ -166,20 +149,16 @@ fn dequant(bytes: &[u8], scales: &[f32], rows: usize, cols: usize, group: usize)
             for i in 0..16 {
                 let byte = bytes[(kb * rows + r) * 16 + i];
                 let g = (kb * 16) / group;
-                out[r * cols + kb * 16 + i] = (byte as i8) as f32 * scales[r * (cols / group) + g];
+                out[r * cols + kb * 16 + i] = (byte as i8) as f32 * scales[g * rows + r];
             }
         }
     }
     out
 }
 
-// ================================================================ gemm
-// The streaming two-row matmul is the production prefill path; it must agree
-// with the CPU reference on every weight layout.
-
 enum WType {
     Bf16,
-    I8(usize), // group size
+    I8(usize), 
 }
 
 fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
@@ -199,7 +178,7 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
         WType::I8(group) => {
             let (wq, scales) = quant(&w, n, k, group);
             let cpu_w = dequant(&wq, &scales, n, k, group);
-            let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32], "wq");
+            let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
             let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
             (wb, sb, 1.0, group as f64, cpu_w, 1e-4, 1e-3)
         }
@@ -229,6 +208,8 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
     agree(&ctx.read(&y), &cpu::gemm(&x, &cpu_w, m, n, k), rel, abs);
 }
 
+
+
 #[test]
 fn gemm_bf16() {
     gemm_case(WType::Bf16, 16, 64, 128, 7);
@@ -246,7 +227,7 @@ fn gemm_i8_group128() {
 
 #[test]
 fn gemm_i8_group64() {
-    // SmolLM-style 960-wide hidden: K not a multiple of 128.
+
     gemm_case(WType::I8(64), 16, 64, 960, 19);
 }
 
@@ -254,11 +235,6 @@ fn gemm_i8_group64() {
 fn gemm_i8_group32() {
     gemm_case(WType::I8(32), 16, 32, 192, 23);
 }
-
-// ================================================================ gemv
-// The split-K decode gemv plus its merge pass. SEGS=1 exercises the direct
-// write; SEGS>1 the partial + merge path; every case must match the CPU
-// reference.
 
 fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
     let mut ctx = Ctx::new();
@@ -278,7 +254,7 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
         WType::I8(group) => {
             let (wq, scales) = quant(&w, n, k, group);
             let cpu_w = dequant(&wq, &scales, n, k, group);
-            let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32], "wq");
+            let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
             let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
             (wb, sb, 1.0, group as f64, cpu_w, 1e-4, 1e-3)
         }
@@ -305,7 +281,7 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
             Binding::Full(&sb),
             out,
         ],
-        [(n / 16) as u32, segs, 1],
+        [(n.div_ceil(256)) as u32, segs, 1],
     );
     if segs > 1 {
         ctx.dispatch(
@@ -315,7 +291,7 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
                 Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64),
                 Binding::Full(&y),
             ],
-            [(n / 16) as u32, 1, 1],
+            [(n.div_ceil(256)) as u32, 1, 1],
         );
     }
     agree(&ctx.read(&y), &cpu::gemv(&x, &cpu_w, n, k), rel, abs);
@@ -333,7 +309,7 @@ fn gemv_i8_group128() {
 
 #[test]
 fn gemv_i8_partial_chunk() {
-    // K not a multiple of BK=128 exercises the final partial-chunk guard.
+
     gemv_case(WType::I8(32), 32, 192, 41, 1);
 }
 
@@ -347,7 +323,33 @@ fn gemv_bf16_split8() {
     gemv_case(WType::Bf16, 32, 1024, 47, 8);
 }
 
-// ================================================================ embed
+#[test]
+fn gemv_bf16_split_segs_divide_k_blocks() {
+    let k = 1088u32;
+    let n = 5120u32;
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(51);
+    let x = rng.fill(k as usize);
+    let w = rng.fill((n * k) as usize);
+    let xb = ctx.f32(&x, &[k]);
+    let wb = ctx.bf16(&w, &[n, k]);
+    let wt = Weight::plain(wb);
+    let y = ctx.zero(&[n]);
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut pass = Pass::begin(enc.as_mut());
+        ctx.backend
+            .gemv(&mut pass, Binding::Full(&xb), &wt, Binding::Full(&y))
+            .unwrap();
+    }
+    ctx.backend.submit(enc).unwrap();
+    agree(
+        &ctx.read(&y),
+        &cpu::gemv(&x, &w, n as usize, k as usize),
+        2e-2,
+        5e-2,
+    );
+}
 
 fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
     let mut ctx = Ctx::new();
@@ -360,11 +362,11 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
 
     let tb = ctx.bf16(&table, &[vocab as u32, dim as u32]);
     let ib = Tensor::new(
-        ctx.backend.storage(rows as u64 * 4, "ids"),
+        ctx.backend.storage(rows as u64 * 4),
         vec![rows as u32],
         DType::F32,
     );
-    ctx.backend.write_u32(&ib.buf, &ids);
+    ctx.backend.write_u32(ib.buf.as_ref(), &ids);
     let y = ctx.zero(&[16u32, dim as u32]);
     let fallback = ctx.f32(&[1.0], &[1]);
     let w = Weight::plain(tb);
@@ -405,8 +407,6 @@ fn embed_gemma_scale() {
     embed_case(3, 16, 4.0, 13);
 }
 
-// ================================================================ norm
-
 fn norm_case(mode: u32, rows: usize, dim: usize, w_dim: usize, seed: u64) {
     let mut ctx = Ctx::new();
     let mut rng = Rng(seed);
@@ -429,13 +429,8 @@ fn norm_case(mode: u32, rows: usize, dim: usize, w_dim: usize, seed: u64) {
             ("ROT", 2.0),
             ("COS_STRIDE", 1.0),
         ],
-        // Scalar and vec4 views of the same buffers; the unused RoPE slots
-        // (8-10) bind the gate.
+
         &[
-            Binding::Full(&xb),
-            Binding::Full(&wb),
-            Binding::Full(&zb),
-            Binding::Full(&y),
             Binding::Full(&xb),
             Binding::Full(&wb),
             Binding::Full(&zb),
@@ -453,6 +448,96 @@ fn norm_case(mode: u32, rows: usize, dim: usize, w_dim: usize, seed: u64) {
         1e-5,
     );
 }
+
+fn norm_rope_cpu(
+    x: &[f32],
+    w: &[f32],
+    cos: &[f32],
+    sin: &[f32],
+    rows: usize,
+    dim: usize,
+    rot: usize,
+    heads: usize,
+    pos: usize,
+    stride: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let half = rot / 2;
+    let mut out = vec![0f32; rows * dim];
+    for r in 0..rows {
+        let row = &x[r * dim..(r + 1) * dim];
+        let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+        let inv = (mean_sq + eps).sqrt().recip();
+        let mut normed: Vec<f32> = (0..dim).map(|d| row[d] * inv * w[d]).collect();
+        let pos_m = pos + r / heads;
+        let orig = normed.clone();
+        for d in 0..rot {
+            let t = pos_m * stride + d % half;
+            normed[d] = if d < half {
+                orig[d] * cos[t] - orig[d + half] * sin[t]
+            } else {
+                orig[d] * cos[t] + orig[d - half] * sin[t]
+            };
+        }
+        out[r * dim..(r + 1) * dim].copy_from_slice(&normed);
+    }
+    out
+}
+
+#[test]
+fn norm_rope_mode4_pos72_repro() {
+    let (rows, dim, rot, heads, pos) = (32usize, 128usize, 128usize, 16usize, 72usize);
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(1234);
+    let x = rng.fill(rows * dim);
+    let w = rng.fill(dim);
+    let half = rot / 2;
+    let mut cos = Vec::with_capacity(4096 * half);
+    let mut sin = Vec::with_capacity(4096 * half);
+    for p in 0..4096usize {
+        for i in 0..half {
+            let inv = 1.0 / 1_000_000f64.powf((2 * i) as f64 / dim as f64);
+            let angle = p as f64 * inv;
+            cos.push(angle.cos() as f32);
+            sin.push(angle.sin() as f32);
+        }
+    }
+    let xb = ctx.f32(&x, &[rows as u32, dim as u32]);
+    let wb = ctx.f32(&w, &[dim as u32]);
+    let y = ctx.zero(&[rows as u32, dim as u32]);
+    let cb = ctx.f32(&cos, &[4096, half as u32]);
+    let sb = ctx.f32(&sin, &[4096, half as u32]);
+    let args = ctx.arg(pos, pos + 1);
+
+    ctx.dispatch(
+        name::NORM,
+        &[
+            ("MODE", 4.0),
+            ("DIM", dim as f64),
+            ("W_DIM", dim as f64),
+            ("EPS", 1e-6),
+            ("HEADS", heads as f64),
+            ("ROT", rot as f64),
+            ("COS_STRIDE", half as f64),
+        ],
+        &[
+            Binding::Full(&xb),
+            Binding::Full(&wb),
+            Binding::Full(&xb),
+            Binding::Full(&y),
+            Binding::Full(&cb),
+            Binding::Full(&sb),
+            Binding::Full(&args),
+        ],
+        [rows as u32, 1, 1],
+    );
+    let got = ctx.read(&y);
+    let want = norm_rope_cpu(&x, &w, &cos, &sin, rows, dim, rot, heads, pos, half, 1e-6);
+    agree(&got, &want, 1e-3, 1e-4);
+    eprintln!("nan in gpu: {}", got.iter().filter(|v| v.is_nan()).count());
+    eprintln!("nan in cpu: {}", want.iter().filter(|v| v.is_nan()).count());
+}
+
 
 #[test]
 fn norm_layer() {
@@ -474,12 +559,10 @@ fn norm_direct() {
     norm_case(2, 2, 32, 32, 27);
 }
 
-// ================================================================ elementwise
-
 #[test]
 fn add() {
     let mut ctx = Ctx::new();
-    let n = 100usize; // not a multiple of 256: exercises the bounds check
+    let n = 100usize; 
     let mut rng = Rng(33);
     let a = rng.fill(n);
     let b = rng.fill(n);
@@ -564,7 +647,7 @@ fn softcap() {
     let mut rng = Rng(53);
     let mut x = rng.fill(n);
     for v in x.iter_mut() {
-        *v *= 40.0; // push past the cap
+        *v *= 40.0; 
     }
     let xb = ctx.f32(&x, &[n as u32]);
     ctx.dispatch(
@@ -602,13 +685,13 @@ fn expert_gather_scatter() {
     let mut ctx = Ctx::new();
     let hidden = 32usize;
     let mut rng = Rng(61);
-    // 4 rows packed into 2 experts: rows [1, 3] -> expert 0, rows [0, 2] -> expert 1.
+
     let x = rng.fill(4 * hidden);
     let rows: Vec<u32> = vec![1, 3, 0, 2];
     let weights = [0.5f32, 1.5, 2.5, 3.5];
     let xb = ctx.f32(&x, &[4u32, hidden as u32]);
-    let rb = Tensor::new(ctx.backend.storage(16, "rb"), vec![4u32], DType::U32);
-    ctx.backend.write_u32(&rb.buf, &rows);
+    let rb = Tensor::new(ctx.backend.storage(16), vec![4u32], DType::U32);
+    ctx.backend.write_u32(rb.buf.as_ref(), &rows);
     let wb = ctx.f32(&weights, &[4u32]);
     let packed = ctx.zero(&[16u32, hidden as u32]);
     let acc = ctx.zero(&[4u32, hidden as u32]);
@@ -696,8 +779,6 @@ fn concat() {
     agree(&ctx.read(&y), &cpu::concat(&a, &b, rows, d), 0.0, 0.0);
 }
 
-// ================================================================ rope
-
 fn rope_case(m: usize, heads: usize, hd: usize, rot: usize, pos: usize, seed: u64) {
     let mut ctx = Ctx::new();
     let half = rot / 2;
@@ -751,8 +832,6 @@ fn rope_full_rotation() {
     rope_case(1, 1, 32, 32, 0, 53);
 }
 
-// ================================================================ conv1d
-
 #[test]
 fn conv1d_rolls_state_across_steps() {
     let mut ctx = Ctx::new();
@@ -768,7 +847,7 @@ fn conv1d_rolls_state_across_steps() {
     let y = ctx.zero(&[dim as u32]);
 
     for x in &steps {
-        ctx.backend.write_f32(&xb.buf, x);
+        ctx.backend.write_f32(xb.buf.as_ref(), x);
         ctx.dispatch(
         name::CONV1D,
             &[("DIM", dim as f64)],
@@ -786,15 +865,10 @@ fn conv1d_rolls_state_across_steps() {
     agree(&ctx.read(&st), &state, 0.0, 1e-6);
 }
 
-// ================================================================ repeat_qk
-
-/// Simulates the production sequence: conv1d writes a conv tile (per-row
-/// slices) and repeat_qk then reads the whole tile in the same pass.
 #[test]
 fn repeat_qk_sees_convd_writes_in_same_pass() {
     let mut ctx = Ctx::new();
-    // DIMS: conv_dim=192 (row stride 768 B) and exp row stride 256 B are
-    // both multiples of wgpu's 256 B min_storage_buffer_offset_alignment.
+
     let (n_k, n_v, kd, vd) = (2usize, 2usize, 16usize, 64usize);
     let conv_dim = 2 * n_k * kd + n_v * vd;
     let rows = 3usize;
@@ -809,15 +883,12 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
     let convd = ctx.zero(&[rows as u32, conv_dim as u32]);
     let y = ctx.zero(&[rows as u32, (2 * n_v * kd) as u32]);
 
-    // Stage the full input tile before the pass, like the gemm that feeds
-    // conv1d in production.
     let flat: Vec<f32> = x.iter().flatten().copied().collect();
-    ctx.backend.write_f32(&xb.buf, &flat);
+    ctx.backend.write_f32(xb.buf.as_ref(), &flat);
 
-    // Same pass: per-row conv1d writes, then a full-tile repeat_qk read.
-    let mut enc = ctx.backend.encoder();
+    let mut enc = ctx.backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(&mut enc, "k");
+        let mut pass = Pass::begin(enc.as_mut());
         let row = |t: usize| (t * conv_dim * 4) as u64;
         for t in 0..rows {
             ctx.backend
@@ -835,7 +906,7 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
                 )
                 .unwrap();
         }
-        // Reference: conv each row sequentially, then repeat_qk the tile.
+
         let mut conv_cpu = Vec::with_capacity(rows * conv_dim);
         let mut st2 = state.clone();
         for xrow in &x {
@@ -861,9 +932,8 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
             )
             .unwrap();
     }
-    ctx.backend.submit(enc);
+    ctx.backend.submit(enc).unwrap();
 
-    // Reference: conv each row sequentially, then repeat_qk the tile.
     let mut conv_cpu = Vec::with_capacity(rows * conv_dim);
     for xrow in &x {
         conv_cpu.extend(cpu::conv1d(xrow, &w, &mut state));
@@ -901,7 +971,6 @@ fn repeat_qk_case(rows: usize, n_k: usize, n_v: usize, kd: usize, vd: usize, see
     agree(&ctx.read(&y), &cpu_y, 0.0, 1e-6);
 }
 
-/// Exact production dims of the toy Qwen35 model (conv 384, exp 256).
 #[test]
 fn repeat_qk_production_dims() {
     repeat_qk_case(2, 16, 16, 8, 8, 211);
@@ -920,15 +989,12 @@ fn repeat_qk_expands_key_heads() {
 
 #[test]
 fn anchor_repeat_qk() {
-    // One row, q=[1,2] k=[3,4] v=[5,6,7] at key-head width; value heads
-    // double the q/k segments (repeat_interleave) and leave v untouched.
+
     let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
     let mut y = vec![0f32; 8];
     cpu::repeat_qk(&x, &mut y, 1, 1, 2, 2, 3);
     assert_eq!(y, [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
 }
-
-// ================================================================ delta_gate
 
 #[test]
 fn delta_gate_selects_chunk_rows() {
@@ -970,8 +1036,6 @@ fn delta_gate_selects_chunk_rows() {
         agree(&ctx.read(&g), &cg, 0.0, 1e-5);
     }
 }
-
-// ================================================================ delta_recur
 
 fn delta_recur_case(heads: usize, kd: usize, vd: usize, seed: u64) {
     let mut ctx = Ctx::new();
@@ -1024,11 +1088,6 @@ fn delta_recur_asymmetric_dims() {
     delta_recur_case(1, 16, 8, 83);
 }
 
-// ================================================================ attn
-// The split-K GQA attention (per-segment kernel + merge) is the production
-// path; it must match the CPU reference on GQA, sliding windows, empty
-// segments (short prefixes) and 8:1 GQA ratios.
-
 fn attn_case(
     m: usize,
     nq: usize,
@@ -1038,8 +1097,21 @@ fn attn_case(
     window: usize,
     seed: u64,
 ) {
+    attn_case_hd(m, nq, nkv, max_seq, pos, window, seed, 64);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attn_case_hd(
+    m: usize,
+    nq: usize,
+    nkv: usize,
+    max_seq: usize,
+    pos: usize,
+    window: usize,
+    seed: u64,
+    hd: usize,
+) {
     let mut ctx = Ctx::new();
-    let hd = 64usize;
     let mut rng = Rng(seed);
     let q = rng.fill(m * nq * hd);
     let kc = rng
@@ -1099,6 +1171,96 @@ fn attn_case(
     );
 }
 
+
+
+#[test]
+fn kv_store_attn_hd128_gqa2_pos71() {
+    let (m, nq, nkv, hd, max_seq, pos) = (2usize, 16usize, 8usize, 128usize, 4096usize, 71usize);
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(4321);
+    let k_src = rng.fill(m * nkv * hd);
+    let v_src = rng.fill(m * nkv * hd);
+    let q = rng.fill(m * nq * hd);
+    let kc = vec![0f32; nkv * max_seq * hd];
+    let vc = vec![0f32; nkv * max_seq * hd];
+    let qb = ctx.f32(&q, &[m as u32, nq as u32, hd as u32]);
+    let kb = ctx.f32(&k_src, &[m as u32, nkv as u32, hd as u32]);
+    let vb = ctx.f32(&v_src, &[m as u32, nkv as u32, hd as u32]);
+    let k_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
+    let v_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
+    let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
+    let scratch = ctx.zero(&[m as u32, nkv as u32, 32, 8, hd as u32 + 2]);
+    let args = ctx.arg(pos, pos + m);
+
+    ctx.dispatch(
+        name::KV_STORE,
+        &[
+            ("N_KV", nkv as f64),
+            ("HEAD_DIM", hd as f64),
+            ("MAX_SEQ", max_seq as f64),
+        ],
+        &[
+            Binding::Full(&kb),
+            Binding::Full(&vb),
+            Binding::Full(&k_cache),
+            Binding::Full(&v_cache),
+            Binding::Full(&args),
+        ],
+        [(nkv * hd / 2) as u32, m as u32, 1],
+    );
+    ctx.dispatch(
+        name::ATTN,
+        &[
+            ("N_HEADS", nq as f64),
+            ("KV_HEADS", nkv as f64),
+            ("HEAD_DIM", hd as f64),
+            ("MAX_SEQ", max_seq as f64),
+            ("SCALE", 1.0 / (hd as f64).sqrt()),
+            ("WINDOW", 0.0),
+            ("NQ_PER_KV", (nq / nkv) as f64),
+            ("STRIDE", (hd as u32 + 2) as f64),
+        ],
+        &[
+            Binding::Full(&qb),
+            Binding::Full(&k_cache),
+            Binding::Full(&v_cache),
+            Binding::Full(&scratch),
+            Binding::Full(&args),
+        ],
+        [m as u32, nkv as u32, 32],
+    );
+    ctx.dispatch(
+        name::MERGE_ATTN,
+        &[
+            ("N_HEADS", nq as f64),
+            ("KV_HEADS", nkv as f64),
+            ("HEAD_DIM", hd as f64),
+            ("STRIDE", (hd as u32 + 2) as f64),
+        ],
+        &[
+            Binding::Full(&scratch),
+            Binding::Full(&y),
+            Binding::Full(&args),
+        ],
+        [m as u32, nkv as u32, 1],
+    );
+    let mut kc = kc;
+    let mut vc = vc;
+    for i in 0..m {
+        for h in 0..nkv {
+            for d in 0..hd {
+                kc[(h * max_seq + pos + i) * hd + d] = k_src[(i * nkv + h) * hd + d];
+                vc[(h * max_seq + pos + i) * hd + d] = v_src[(i * nkv + h) * hd + d];
+            }
+        }
+    }
+    let got = ctx.read(&y);
+    let want = cpu::attn(&q, &kc, &vc, m, nq, nkv, hd, max_seq, pos, 0);
+    agree(&got, &want, 1e-2, 1e-2);
+    eprintln!("nan in gpu: {}", got.iter().filter(|v| v.is_nan()).count());
+}
+
+
 #[test]
 fn attn_gqa_multi_row() {
     attn_case(3, 2, 1, 16, 5, 0, 91);
@@ -1106,7 +1268,7 @@ fn attn_gqa_multi_row() {
 
 #[test]
 fn attn_sliding_window() {
-    // A 3-wide window over a prefix of 6..8 keys exercises the masked head/tail.
+
     attn_case(3, 2, 1, 16, 5, 3, 93);
 }
 
@@ -1122,7 +1284,7 @@ fn attn_gqa_4x_multi_chunk() {
 
 #[test]
 fn attn_split_short_prefix() {
-    // pos=2 with 32 segments: most segments are empty.
+
     attn_case(1, 2, 1, 16, 2, 0, 101);
 }
 
@@ -1140,8 +1302,6 @@ fn attn_split_sliding_window() {
 fn attn_gqa_8x() {
     attn_case(2, 8, 1, 64, 10, 0, 107);
 }
-
-// ================================================================ layout
 
 #[test]
 fn split_qg() {
@@ -1205,9 +1365,6 @@ fn kv_store_writes_both_caches() {
     agree(&ctx.read_bf16(&v_cache), &cpu_v, 0.0, 1e-7);
 }
 
-// ================================================================ anchors
-// Hand-computed cases pinning the CPU reference to independent arithmetic.
-
 #[test]
 fn anchor_gemm() {
     assert_eq!(
@@ -1227,7 +1384,7 @@ fn anchor_embed() {
 
 #[test]
 fn anchor_norm_modes() {
-    let inv = (2.5f32 + 1e-6).sqrt().recip(); // RMS of [1, 2]
+    let inv = (2.5f32 + 1e-6).sqrt().recip(); 
     let x = [1.0f32, 2.0];
 
     let direct = cpu::norm(2, &x, &[2.0, 3.0], &[], 1, 2, 2, 1e-6);
@@ -1279,7 +1436,7 @@ fn anchor_layout_ops() {
 
 #[test]
 fn anchor_rope() {
-    // One head, full rotation of hd=4 at position 1, theta = 1e4.
+
     let inv1 = 1.0 / 10000f64.powf(2.0 / 4.0);
     let (c0, s0) = (1.0f64.cos() as f32, 1.0f64.sin() as f32);
     let (c1, s1) = (inv1.cos() as f32, inv1.sin() as f32);
@@ -1307,16 +1464,14 @@ fn anchor_rope() {
 
 #[test]
 fn anchor_attn_causal_and_window() {
-    let k = [1.0, 0.0, 0.0, 1.0]; // two keys at t=0,1
+    let k = [1.0, 0.0, 0.0, 1.0]; 
     let v = [1.0, 2.0, 3.0, 4.0];
     let q = [1.0, 1.0];
 
-    // pos=1 attends to both keys; equal scores -> mean of the values.
     let full = cpu::attn(&q, &k, &v, 1, 1, 1, 2, 2, 1, 0);
     assert!((full[0] - 2.0).abs() < 1e-6);
     assert!((full[1] - 3.0).abs() < 1e-6);
 
-    // Window 1 keeps only the newest key -> its value verbatim.
     let win = cpu::attn(&q, &k, &v, 1, 1, 1, 2, 2, 1, 1);
     assert!((win[0] - 3.0).abs() < 1e-6);
     assert!((win[1] - 4.0).abs() < 1e-6);
@@ -1346,8 +1501,6 @@ fn anchor_delta_recur_two_steps() {
     let mut state = [0.0f32; 4];
     let r2 = 2.0f32.sqrt();
 
-    // Step 1: axis-aligned q/k make the norms trivial; zero state means the
-    // delta rule writes beta * (k-hat outer v) straight in.
     let out = cpu::delta_recur(
         &[4.0, 0.0],
         &[3.0, 0.0],
@@ -1365,7 +1518,6 @@ fn anchor_delta_recur_two_steps() {
     assert!((out[0] - 2.5 / r2).abs() < 1e-5);
     assert!((out[1] - 3.5 / r2).abs() < 1e-5);
 
-    // Step 2: decay halves the state; k-hat = [0, 1] writes into row 1.
     let out = cpu::delta_recur(
         &[0.0, 4.0],
         &[0.0, 2.0],
@@ -1384,3 +1536,14 @@ fn anchor_delta_recur_two_steps() {
     assert!((out[0] - 1.0 / r2).abs() < 1e-5);
     assert!((out[1] - 1.0 / r2).abs() < 1e-5);
 }
+
+#[test]
+fn gemv_bf16_wide() {
+    gemv_case(WType::Bf16, 256, 2560, 99, 1);
+}
+
+#[test]
+fn gemm_i8_9728() {
+    gemm_case(WType::I8(128), 16, 2560, 9728, 77);
+}
+

@@ -1,10 +1,5 @@
-//! Architecture config validation: each parser accepts a well-formed config
-//! and rejects every class of invalid input fail-fast.
-
 use flint_architectures::{gemma, llama, qwen35::Qwen35Config};
 use serde_json::{Value, json};
-
-// ---------------------------------------------------------------- Llama
 
 fn llama_json() -> Value {
     json!({
@@ -81,8 +76,6 @@ fn llama_rejects_invalid_configs() {
     assert!(llama::parse_config(&v).is_err(), "missing field");
 }
 
-// ---------------------------------------------------------------- Gemma
-
 fn gemma_json() -> Value {
     json!({
         "hidden_size": 256,
@@ -104,7 +97,7 @@ fn gemma_parses_and_alternates_windows() {
     assert!(cfg.tied, "gemma defaults to tied embeddings");
     assert!(cfg.sandwich && cfg.qk_norm, "gemma norms are always on");
     assert_eq!(cfg.embed_scale, 16.0, "sqrt(hidden)");
-    // Layers whose (l+1) is a multiple of the pattern attend globally.
+
     assert_ne!(cfg.window(0), 0, "local layer keeps the window");
     assert_eq!(cfg.window(1), 0, "global layer");
     assert_eq!(cfg.window(3), 0, "global layer");
@@ -126,8 +119,6 @@ fn gemma_rejects_zero_pattern() {
     v["sliding_window_pattern"] = json!(0);
     assert!(gemma::parse_config(&v).is_err());
 }
-
-// ---------------------------------------------------------------- Qwen3.5
 
 fn qwen35_json() -> Value {
     json!({

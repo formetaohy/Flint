@@ -1,0 +1,10 @@
+kernel id16 [workgroup(16, 16, 1)] (src: buf<f16>, dst: buf<f32>) {
+    shared tile: [f16; 16 * 16];
+    tile[thread.y * 16 + thread.x] = src[thread.y * 16 + thread.x];
+    barrier();
+    let a = coop_load_a(tile, 16, true);
+    let b = coop_load_b(tile, 16, true);
+    var acc: matrix<f32, acc> = coop_zero();
+    acc = coop_mul_add(a, b, acc);
+    coop_store(dst, acc, 16, true);
+}

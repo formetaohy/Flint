@@ -1,0 +1,7 @@
+error: cannot find sat/missing_kernel.sat from $DIR/tests/ui/missing_file.rs
+ --> tests/ui/missing_file.rs:4:13
+  |
+4 |     let _ = sat!("missing_kernel.sat");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `sat` (in Nightly builds, run with -Z macro-backtrace for more info)

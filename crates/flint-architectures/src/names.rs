@@ -1,11 +1,5 @@
-//! Tensor-name mapping for both checkpoint formats: HF safetensors and GGUF
-//! (`blk.N.*`) names to canonical keys / MoE parts.
-
 use flint_model::loader::MoEPart;
 
-/// HF safetensors names -> canonical keys. Every family shares one prefix
-/// grammar: `model.language_model.` (Qwen3.5 / Gemma 3) or `model.` (the
-/// rest) is stripped; `lm_head.` / `mtp.` names pass through unchanged.
 pub fn hf_key(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("model.language_model.") {
         Some(rest.to_string())
@@ -18,7 +12,6 @@ pub fn hf_key(name: &str) -> Option<String> {
     }
 }
 
-/// Maps a GGUF tensor name to its canonical registry key, or None to skip.
 pub fn gguf_key(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("token_embd.weight") {
         return Some(format!("embed_tokens.weight{rest}"));
@@ -29,8 +22,7 @@ pub fn gguf_key(name: &str) -> Option<String> {
     if name == "output_norm.weight" {
         return Some("norm.weight".into());
     }
-    // Gemma 4's Per-Layer Embeddings (model level); rope_freqs feeds config
-    // synthesis only.
+
     match name {
         "per_layer_token_embd.weight" => return Some("embed_tokens_per_layer.weight".into()),
         "per_layer_model_proj.weight" => return Some("per_layer_model_projection.weight".into()),
@@ -41,7 +33,7 @@ pub fn gguf_key(name: &str) -> Option<String> {
     let rest = name.strip_prefix("blk.")?;
     let (idx, tail) = rest.split_once('.')?;
     let layer: u32 = idx.parse().ok()?;
-    // The per-layer scalar buffer carries no suffix on the canonical side.
+
     if tail == "layer_output_scale.weight" {
         return Some(format!("layers.{layer}.layer_scalar"));
     }
@@ -58,10 +50,10 @@ pub fn gguf_key(name: &str) -> Option<String> {
         "ffn_gate" => "mlp.gate_proj",
         "ffn_up" => "mlp.up_proj",
         "ffn_down" => "mlp.down_proj",
-        // Gemma's sandwich norms, applied to the block outputs before residual.
+
         "post_attention_norm" => "post_attention_norm",
         "post_ffw_norm" => "post_ffw_norm",
-        // Gemma 4's Per-Layer Embeddings and per-layer scalar.
+
         "inp_gate" => "per_layer_input_gate",
         "proj" => "per_layer_projection",
         "post_norm" => "post_per_layer_input_norm",
@@ -71,9 +63,6 @@ pub fn gguf_key(name: &str) -> Option<String> {
     Some(format!("layers.{layer}.{canon}.{suffix}"))
 }
 
-/// Maps a GGUF MoE tensor name to its canonical block prefix plus part
-/// (llama.cpp conventions: `ffn_gate_inp` router, `*_exps` experts and
-/// `*_shexp` shared expert).
 pub fn gguf_moe_key(name: &str) -> Option<(String, MoEPart)> {
     let rest = name.strip_prefix("blk.")?;
     let (idx, tail) = rest.split_once('.')?;

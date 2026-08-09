@@ -1,0 +1,21 @@
+kernel rope [workgroup(256, 1, 1)]
+    (cos_tbl: buf<f32>, sin_tbl: buf<f32>, x: buf<f32>, args: buf<u32>,
+     HEADS: u32, HEAD_DIM: u32, ROT: u32, COS_STRIDE: u32)
+{
+    shared tile: [f32; 256];
+    let head_base = (block.x * HEADS + block.y) * HEAD_DIM;
+    if thread.x < HEAD_DIM {
+        tile[thread.x] = x[head_base + thread.x];
+    }
+    barrier();
+    if thread.x < ROT {
+        let half = ROT / 2;
+        let c = cos_tbl[(args[0] + block.x) * COS_STRIDE + thread.x % half];
+        let s = sin_tbl[(args[0] + block.x) * COS_STRIDE + thread.x % half];
+        if thread.x < half {
+            x[head_base + thread.x] = tile[thread.x] * c - tile[thread.x + half] * s;
+        } else {
+            x[head_base + thread.x] = tile[thread.x] * c + tile[thread.x - half] * s;
+        }
+    }
+}

@@ -1,7 +1,3 @@
-//! Format-agnostic tokenizer: text to token ids and back. Loads an HF
-//! `tokenizer.json` when present, otherwise rebuilds the tokenizer embedded in
-//! a GGUF checkpoint's metadata. Knows nothing about architectures or chat.
-
 use std::path::Path;
 
 use ahash::AHashMap;
@@ -21,15 +17,13 @@ use tokenizers::pre_tokenizers::byte_level::ByteLevel as ByteLevelPre;
 use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
 use tokenizers::tokenizer::{AddedToken, step_decode_stream};
 
-use flint_checkpoint::{Checkpoint, Metadata};
+use flint_checkpoint::{Checkpoint, CheckpointKind, Metadata};
 use flint_error::{Error, Result};
 
-/// Thin wrapper over the HF tokenizers crate.
 pub struct Tokenizer {
     inner: HfTokenizer,
 }
 
-/// Incremental decode state: buffers tokens until they form valid text.
 pub struct Decoder {
     ids: Vec<u32>,
     prefix: String,
@@ -37,9 +31,7 @@ pub struct Decoder {
 }
 
 impl Tokenizer {
-    /// Loads the tokenizer for a model directory plus its already-opened
-    /// checkpoint: `tokenizer.json` when present, otherwise the embedded GGUF
-    /// tokenizer.
+
     pub fn load(model_dir: &Path, source: &dyn Checkpoint) -> Result<Self> {
         let path = model_dir.join("tokenizer.json");
         if path.exists() {
@@ -48,27 +40,21 @@ impl Tokenizer {
         Self::from_source(source)
     }
 
-    /// Loads an HF `tokenizer.json`.
     pub fn from_file(path: &Path) -> Result<Self> {
         let inner = HfTokenizer::from_file(path)
             .map_err(|e| Error::Tokenizer(format!("{}: {e}", path.display())))?;
         Ok(Self { inner })
     }
 
-    /// Rebuilds the tokenizer embedded in a self-contained checkpoint.
     pub fn from_source(source: &dyn Checkpoint) -> Result<Self> {
-        if source.kind() != "gguf" {
-            return Err(Error::Tokenizer(format!(
-                "{} checkpoint carries no tokenizer metadata",
-                source.kind()
-            )));
+        if source.kind() != CheckpointKind::Gguf {
+            return Err(Error::Tokenizer(
+                "checkpoint carries no tokenizer metadata".into(),
+            ));
         }
         Self::from_gguf(source.metadata())
     }
 
-    /// Rebuilds a tokenizer from GGUF metadata, dispatching on the
-    /// SentencePiece model kind: `llama` is Unigram, anything else BPE.
-    /// Special tokens keep their original ids in both paths.
     pub fn from_gguf(meta: &Metadata) -> Result<Self> {
         match meta.str("tokenizer.ggml.model") {
             Some("llama") => Self::from_gguf_unigram(meta),
@@ -76,9 +62,6 @@ impl Tokenizer {
         }
     }
 
-    /// Rebuilds a byte-level BPE tokenizer. Special tokens (ggml types
-    /// CONTROL/USER_DEFINED) sit contiguously at the top of the vocab, so
-    /// re-adding them in order reproduces their original ids.
     fn from_gguf_bpe(meta: &Metadata) -> Result<Self> {
         let tokens = meta
             .str_array("tokenizer.ggml.tokens")
@@ -91,10 +74,6 @@ impl Tokenizer {
         let is_added = |i: usize| matches!(types.get(i), Some(3) | Some(4));
         let is_unused = |i: usize| matches!(types.get(i), Some(5));
 
-        // Base vocab keeps each non-special, non-unused token at its original
-        // id; unused tokens are dropped so the added special tokens land at
-        // the top with their true ids. The unknown token stays: the BPE
-        // builder rejects an unk not in the vocab.
         let unk_id = meta
             .u32("tokenizer.ggml.unknown_token_id")
             .map(|i| i as usize);
@@ -110,9 +89,7 @@ impl Tokenizer {
                 m.split_once(' ')
                     .map(|(a, b)| (a.to_string(), b.to_string()))
             })
-            // Some GGUFs ship merges whose parts or results are missing from
-            // the vocab (a mojibake'd replacement char in phi4 GGUFs): the
-            // BPE build is fail-fast, so drop them up front.
+
             .filter(|(a, b)| {
                 let res = format!("{a}{b}");
                 vocab.contains_key(a) && vocab.contains_key(b) && vocab.contains_key(&res)
@@ -140,8 +117,6 @@ impl Tokenizer {
         Ok(Self { inner })
     }
 
-    /// Rebuilds a SentencePiece Unigram tokenizer. The vocab keeps every piece at
-    /// its original id; byte tokens drive byte-fallback decoding.
     fn from_gguf_unigram(meta: &Metadata) -> Result<Self> {
         let tokens = meta
             .str_array("tokenizer.ggml.tokens")
@@ -169,7 +144,6 @@ impl Tokenizer {
             .map_err(|e| Error::Tokenizer(format!("Unigram build: {e}")))?;
         let mut inner = HfTokenizer::new(unigram);
 
-        // SentencePiece preprocessing: prepend ▁, fold spaces to ▁.
         let prepend = NormalizerWrapper::Prepend(Prepend::new("▁".to_string()));
         let replace = NormalizerWrapper::Replace(
             Replace::new(" ", "▁").map_err(|e| Error::Tokenizer(format!("normalizer: {e}")))?,
@@ -193,8 +167,6 @@ impl Tokenizer {
             ))));
         }
 
-        // Restore control / user-defined pieces (types 3/4) as special tokens so
-        // turn markers encode to single ids.
         let types = meta
             .u32_array("tokenizer.ggml.token_type")
             .unwrap_or_default();
@@ -216,7 +188,6 @@ impl Tokenizer {
         Ok(enc.get_ids().to_vec())
     }
 
-    /// Resolves a special token literal (e.g. "im_end") to its id.
     pub fn token_id(&self, token: &str) -> Option<u32> {
         self.inner.token_to_id(token)
     }
@@ -229,7 +200,6 @@ impl Tokenizer {
         }
     }
 
-    /// Feeds one committed token; returns the newly printable text, if any.
     pub fn step_decode(&self, st: &mut Decoder, id: u32) -> Result<Option<String>> {
         step_decode_stream(
             &self.inner,

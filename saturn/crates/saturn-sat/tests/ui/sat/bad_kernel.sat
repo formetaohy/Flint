@@ -1,0 +1,4 @@
+kernel bad [workgroup(1, 1, 1)] (a: buf<f32>) {
+    let x = 1;
+    a[0] = x;
+}

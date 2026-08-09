@@ -1,0 +1,27 @@
+kernel gemm_cm [workgroup(16, 16, 1)]
+    (a: buf<f16>, b: buf<f16>, c: buf<f32>, m: u32, n: u32, k: u32)
+{
+    const TILE: u32 = 16;
+    shared a_tile: [f16; 16 * 16];
+    shared b_tiles: [f16; 16 * 16 * 8];
+    let sg_count = (256 + subgroup_size - 1) / subgroup_size;
+    let sg = subgroup_id;
+    let base_row = block.y * TILE;
+    let base_col = block.x * 128 + sg * TILE;
+    var acc: matrix<f32, acc> = coop_zero();
+    if base_col < n {
+        barrier();
+        a_tile[thread.y * 16 + thread.x] = a[(base_row + thread.y) * k + thread.x];
+        let lty = thread.y - sg * 2;
+        for j in 0..8 unroll {
+            let by = lty + j * 2;
+            b_tiles[sg * 256 + j * 32 + lty * 16 + thread.x] =
+                b[by * n + base_col + thread.x];
+        }
+        barrier();
+        let am = coop_load_a(a_tile, 16, true);
+        let bm = coop_load_b(b_tiles[sg * 256], 16, true);
+        acc = coop_mul_add(am, bm, acc);
+        coop_store(c[base_row * n + base_col], acc, n, true);
+    }
+}

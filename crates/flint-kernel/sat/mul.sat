@@ -1,0 +1,5 @@
+kernel mul [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, N: u32, M: u32) {
+    if gid.x < N {
+        y[gid.x] = a[gid.x] * b[gid.x % M];
+    }
+}

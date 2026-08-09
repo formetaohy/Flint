@@ -1,0 +1,15 @@
+[package]
+name = "saturn-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+saturn-core.workspace = true
+saturn-vk.workspace = true
+saturn-mtl.workspace = true
+
+[dev-dependencies]
+saturn-core.workspace = true
+saturn-sat.workspace = true
+saturn-vk.workspace = true

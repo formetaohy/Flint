@@ -1,0 +1,5 @@
+kernel softcap [workgroup(256, 1, 1)] (x: buf<f32>, N_ELEM: u32, CAP: f32) {
+    if gid.x < N_ELEM {
+        x[gid.x] = CAP * tanh(x[gid.x] / CAP);
+    }
+}

@@ -1,0 +1,7 @@
+kernel hist [workgroup(64, 1, 1)] (a: buf<u32>, out: buf<u32>) {
+    atomic_add(out, 0, a[gid.x]);
+    barrier();
+    if thread.x == 0 {
+        out[1] = out[0];
+    }
+}

@@ -1,13 +1,9 @@
 use crate::{DType, Tensor};
 
-/// A model weight consumed by gemm/gemv: either a dense tensor (f32 or packed
-/// bf16) or a group-quantized i8 tensor with its per-group scales. The variants
-/// are disjoint by construction, so no weight can carry a meaningless scale or
-/// group.
 pub enum Weight {
-    /// Dense f32 or packed-bf16 tensor.
+
     Plain(Tensor),
-    /// Group-quantized i8 tensor plus its per-group f32 scales.
+
     Quantized {
         tensor: Tensor,
         scale: Tensor,
@@ -47,10 +43,10 @@ impl Weight {
         }
     }
 
-    pub fn group(&self) -> u32 {
+    pub fn group(&self) -> Option<u32> {
         match self {
-            Self::Plain(_) => 128,
-            Self::Quantized { group, .. } => *group,
+            Self::Plain(_) => None,
+            Self::Quantized { group, .. } => Some(*group),
         }
     }
 }

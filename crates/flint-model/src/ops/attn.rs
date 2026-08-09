@@ -1,6 +1,3 @@
-//! Attention-family dispatchers: norms, RoPE, cache store, attention,
-//! and the recurrent/conv mixing kernels (Gated DeltaNet).
-
 use flint_backend::{Backend, Binding, Pass};
 use flint_error::Result;
 use flint_kernel::name;
@@ -33,22 +30,8 @@ pub fn norm(
             ("ROT", 2.0),
             ("COS_STRIDE", 1.0),
         ],
-        // Scalar and vec4 views of the same buffers (vec4 lanes need
-        // 16B-aligned offsets, so every norm binding is a full tensor).
-        // The RoPE slots (8-10) are unused below MODE 4 and bind the gate.
-        &[
-            x,
-            Binding::Full(weight),
-            gate,
-            y,
-            x,
-            Binding::Full(weight),
-            gate,
-            y,
-            gate,
-            gate,
-            gate,
-        ],
+
+        &[x, Binding::Full(weight), gate, y, gate, gate, gate],
         [rows, 1, 1],
     )
 }
@@ -84,10 +67,6 @@ pub fn norm_rope(
             Binding::Full(weight),
             x,
             y,
-            x,
-            Binding::Full(weight),
-            x,
-            y,
             Binding::Full(cos),
             Binding::Full(sin),
             Binding::Full(args),
@@ -105,8 +84,7 @@ pub fn embed(
     dim: u32,
     scale: f32,
 ) -> Result<()> {
-    // The scales slot is unused below WDTYPE 1, so plain tables bind the
-    // table itself as a stable read-only stand-in.
+
     let (wdt, wd, group, scales) = match table {
         Weight::Plain(t) => (0.0, Binding::Full(t), 128.0, Binding::Full(t)),
         Weight::Quantized {
@@ -212,8 +190,7 @@ pub fn attn(
         "GQA ratio {} exceeds the attention shader's {MAX_GQA} head slots",
         q_heads / kv_heads
     );
-    // The KV range of each (row, kv head) splits into ATTN_SEGS parallel
-    // segments; merge_attn reassembles them.
+
     backend.dispatch(
         pass,
         name::ATTN,
@@ -271,8 +248,7 @@ pub fn split_qg(
         [(rows * heads * head_dim).div_ceil(256), 1, 1],
     )
 }
-/// One causal conv1d time step over a `dim`-wide row slice, updating the
-/// channel ring state in place.
+
 pub fn conv1d(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
@@ -390,12 +366,11 @@ pub fn rope_tables(
         }
     }
     (
-        backend.tensor_f32(&cos, vec![max_seq, half], "cos"),
-        backend.tensor_f32(&sin, vec![max_seq, half], "sin"),
+        backend.tensor_f32(&cos, vec![max_seq, half]),
+        backend.tensor_f32(&sin, vec![max_seq, half]),
     )
 }
 
-/// LongRoPE per-dimension frequency factors.
 #[derive(Clone, Debug)]
 pub struct RopeScaling {
     pub short: Vec<f32>,

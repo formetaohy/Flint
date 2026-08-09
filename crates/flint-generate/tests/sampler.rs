@@ -1,9 +1,3 @@
-//! Sampling transforms and speculative verification, tested as pure
-//! functions. The centerpiece is a distributional test: over many rounds the
-//! verify pipeline must reproduce the target distribution exactly, whatever
-//! the draft distribution is — the defining property of correct speculative
-//! sampling (arXiv:2211.17192).
-
 use flint_generate::{Dist, Sampler, SamplingParams, apply_repeat_penalty, softmax};
 
 fn params() -> SamplingParams {
@@ -23,7 +17,6 @@ fn probs(d: &Dist) -> &[f32] {
     }
 }
 
-/// Deterministic pseudo-logits so tests never embed a model.
 fn logits(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut s = seed;
     (0..n)
@@ -36,14 +29,12 @@ fn logits(n: usize, seed: u64, scale: f32) -> Vec<f32> {
         .collect()
 }
 
-// ---------------------------------------------------------------- transform
-
 #[test]
 fn greedy_transform_is_penalized_argmax() {
     let s = Sampler::greedy(1);
     let logits = [0.1f32, 5.0, -2.0, 4.9];
     assert_eq!(s.transform(&logits, &[]), Dist::Greedy(1));
-    // Penalizing token 1 hard enough flips the greedy pick to token 3.
+
     let penalized = Sampler::new(
         SamplingParams {
             temperature: 0.0,
@@ -155,8 +146,6 @@ fn draw_is_deterministic_per_seed() {
     }
 }
 
-// ---------------------------------------------------------------- penalties
-
 #[test]
 fn repeat_penalty_is_symmetric_around_zero() {
     let mut scores = [2.0f32, -2.0, 1.0];
@@ -196,8 +185,6 @@ fn default_params_match_common_chat_inference() {
     assert_eq!(d.repeat_last_n, 64);
 }
 
-// ---------------------------------------------------------------- softmax
-
 #[test]
 fn softmax_sums_to_one_and_sharpens() {
     let logits = [1.0f32, 2.0, 3.0];
@@ -215,8 +202,6 @@ fn softmax_sums_to_one_and_sharpens() {
         "max subtraction keeps large logits stable"
     );
 }
-
-// ---------------------------------------------------------------- verify
 
 fn transformed(s: &Sampler, logits: &[f32]) -> Dist {
     s.transform(logits, &[])
@@ -237,7 +222,7 @@ fn greedy_verify_accepts_only_argmax() {
 
 #[test]
 fn verify_accepts_whenever_target_covers_draft() {
-    // pt[d] >= pd[d] makes u * pd[d] < pt[d] hold for every u in [0, 1).
+
     let mut s = Sampler::new(params(), 3);
     let target = transformed(&s, &[5.0f32, 0.0, 0.0]);
     let draft = transformed(&s, &[1.0f32, 0.0, 0.0]);
@@ -252,8 +237,7 @@ fn verify_accepts_whenever_target_covers_draft() {
 
 #[test]
 fn verify_rejects_zero_target_mass_and_resamples_the_residual() {
-    // pt[1] underflows to exactly 0, so draft token 1 can never be accepted;
-    // the residual max(pt - pd, 0) has mass only on tokens 0 and 2.
+
     let mut s = Sampler::new(params(), 4);
     let target = transformed(&s, &[0.0f32, -1000.0, 0.0]);
     let draft = transformed(&s, &[0.0f32, 0.0, 0.0]);
@@ -264,12 +248,6 @@ fn verify_rejects_zero_target_mass_and_resamples_the_residual() {
     }
 }
 
-/// The defining property: draft tokens are drawn from pd, verification runs
-/// against pt, and the committed-token distribution must equal pt exactly —
-/// with every transform active (temperature, top-k, top-p, min-p, repeat
-/// penalty) and a deliberately divergent draft distribution. A verify that
-/// used raw logits (or any distribution other than the one drawn from)
-/// diverges by orders of magnitude on this statistic.
 #[test]
 fn verify_output_distribution_equals_target() {
     const VOCAB: usize = 64;
@@ -301,7 +279,6 @@ fn verify_output_distribution_equals_target() {
         counts[tok as usize] += 1;
     }
 
-    // Chi-square over bins with enough expected mass.
     let mut chi2 = 0.0f64;
     let mut df = 0;
     let mut max_dev = 0.0f32;
@@ -315,8 +292,7 @@ fn verify_output_distribution_equals_target() {
         }
     }
     df -= 1;
-    // Far beyond the p = 1e-6 critical value for any plausible df here, yet a
-    // mismatched proposal distribution scores in the tens of thousands.
+
     assert!(
         chi2 < (df as f64) * 3.0 + 50.0,
         "committed tokens do not follow the target distribution: chi2 {chi2:.1} at df {df}"
@@ -326,7 +302,6 @@ fn verify_output_distribution_equals_target() {
         "empirical frequency deviates {max_dev} from target probability"
     );
 
-    // Acceptance rate converges to sum(min(pt, pd)).
     let theoretical: f32 = pt.iter().zip(pd).map(|(&a, &b)| a.min(b)).sum();
     let empirical = accepted as f32 / N as f32;
     assert!(
@@ -335,9 +310,6 @@ fn verify_output_distribution_equals_target() {
     );
 }
 
-/// Greedy speculation is deterministic: verifying draft tokens against the
-/// target argmax reproduces plain greedy decoding token for token, whatever
-/// the draft model proposes.
 #[test]
 fn greedy_spec_sequence_matches_plain_greedy() {
     const STEPS: usize = 64;

@@ -4,4 +4,4 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-wgpu.workspace = true
+saturn-core = { path = "../../saturn/crates/saturn-core" }

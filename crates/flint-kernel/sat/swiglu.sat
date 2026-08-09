@@ -1,0 +1,11 @@
+kernel swiglu [workgroup(256, 1, 1)] (gate: buf<f32>, up: buf<f32>, y: buf<f32>, N_ELEM: u32, MODE: u32) {
+    if gid.x < N_ELEM {
+        let gv = gate[gid.x];
+        if MODE == 1 {
+            let v = gv * (gv * gv * 0.044715 + 1.0) * 0.7978845608028654;
+            y[gid.x] = (tanh(v) + 1.0) * 0.5 * gv * up[gid.x];
+        } else {
+            y[gid.x] = gv / (1.0 + exp(-gv)) * up[gid.x];
+        }
+    }
+}

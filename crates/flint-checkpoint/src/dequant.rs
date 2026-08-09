@@ -1,13 +1,6 @@
-//! CPU-side decoders for every ggml quantization block layout Flint reads.
-//! GGUF tensors dequantize to f32 (or stay bf16) on the host, then the
-//! role-based upload re-packs them for the GPU. Block byte orders follow the
-//! ggml struct definitions exactly.
-
 use flint_error::{Error, Result};
-use flint_num::{bf16_to_f32, f16_to_f32};
+use saturn_core::num::{bf16_to_f32, f16_to_f32};
 
-/// The ggml_type enum values used in GGUF tensor info records. Explicit
-/// discriminants match the GGUF spec so `ty as u32` serializes correctly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GgmlType {
     F32 = 0,
@@ -49,7 +42,6 @@ impl GgmlType {
         })
     }
 
-    /// Elements per quantization block (1 for dense float types).
     pub fn block_len(self) -> usize {
         match self {
             GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => 1,
@@ -60,7 +52,6 @@ impl GgmlType {
         }
     }
 
-    /// Bytes per quantization block.
     pub fn block_bytes(self) -> usize {
         match self {
             GgmlType::F32 => 4,
@@ -83,7 +74,6 @@ fn half(bytes: &[u8], off: usize) -> f32 {
     f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]))
 }
 
-/// Decodes `numel` elements of `ty` from `bytes` into f32.
 pub fn to_f32(ty: GgmlType, bytes: &[u8], numel: usize) -> Result<Vec<f32>> {
     let bl = ty.block_len();
     let bb = ty.block_bytes();
@@ -135,7 +125,6 @@ fn decode_block(ty: GgmlType, blk: &[u8], y: &mut [f32]) {
     }
 }
 
-// struct { half d; int8 qs[32] }
 fn q8_0(b: &[u8], y: &mut [f32]) {
     let d = half(b, 0);
     for i in 0..32 {
@@ -143,7 +132,6 @@ fn q8_0(b: &[u8], y: &mut [f32]) {
     }
 }
 
-// struct { half d; u8 qs[16] }  (nibble - 8) * d
 fn q4_0(b: &[u8], y: &mut [f32]) {
     let d = half(b, 0);
     for i in 0..16 {
@@ -153,7 +141,6 @@ fn q4_0(b: &[u8], y: &mut [f32]) {
     }
 }
 
-// struct { half d; half m; u8 qs[16] }  q*d + m
 fn q4_1(b: &[u8], y: &mut [f32]) {
     let d = half(b, 0);
     let m = half(b, 2);
@@ -164,7 +151,6 @@ fn q4_1(b: &[u8], y: &mut [f32]) {
     }
 }
 
-// struct { half d; u8 qh[4]; u8 qs[16] }  (q5 - 16) * d
 fn q5_0(b: &[u8], y: &mut [f32]) {
     let d = half(b, 0);
     let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
@@ -177,7 +163,6 @@ fn q5_0(b: &[u8], y: &mut [f32]) {
     }
 }
 
-// struct { half d; half m; u8 qh[4]; u8 qs[16] }  q5*d + m
 fn q5_1(b: &[u8], y: &mut [f32]) {
     let d = half(b, 0);
     let m = half(b, 2);
@@ -191,8 +176,6 @@ fn q5_1(b: &[u8], y: &mut [f32]) {
     }
 }
 
-// struct { u8 scales[16]; u8 qs[64]; half d; half dmin }
-// 256 values = 16 sub-blocks of 16; scales[is] low nibble = scale, high = min.
 fn q2k(b: &[u8], y: &mut [f32]) {
     let d = half(b, 68);
     let min = half(b, 70);
@@ -226,9 +209,6 @@ fn q2k(b: &[u8], y: &mut [f32]) {
     }
 }
 
-// struct { u8 hmask[32]; u8 qs[64]; u8 scales[12]; half d }
-// 12 scale bytes unpack to 16 signed 6-bit scales; hmask carries one high bit
-// per value, read bit-plane by bit-plane as `m` walks 1,2,4,...,128.
 fn q3k(b: &[u8], y: &mut [f32]) {
     let d = half(b, 108);
     let hmask = &b[0..32];
@@ -281,7 +261,6 @@ fn q3k(b: &[u8], y: &mut [f32]) {
     }
 }
 
-// struct { half d; half dmin; u8 scales[12]; u8 qs[128] }
 fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
@@ -319,7 +298,6 @@ fn q4k(b: &[u8], y: &mut [f32]) {
     }
 }
 
-// struct { half d; half dmin; u8 scales[12]; u8 qh[32]; u8 qs[128] }
 fn q5k(b: &[u8], y: &mut [f32]) {
     let d = half(b, 0);
     let min = half(b, 2);
@@ -338,8 +316,7 @@ fn q5k(b: &[u8], y: &mut [f32]) {
         let m2 = min * m as f32;
         let base = j * 32;
         for l in 0..32 {
-            // qh holds one high bit per value: byte l, bit plane u1 (low
-            // half) / u2 (high half), advancing two planes per 64-value group.
+
             let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
             y[o] = d1 * ((ql[base + l] & 0xf) + hi) as f32 - m1;
             o += 1;
@@ -355,7 +332,6 @@ fn q5k(b: &[u8], y: &mut [f32]) {
     }
 }
 
-// struct { u8 ql[128]; u8 qh[64]; i8 scales[16]; half d }
 fn q6k(b: &[u8], y: &mut [f32]) {
     let d = half(b, 208);
     let ql = &b[0..128];

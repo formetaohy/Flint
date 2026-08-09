@@ -1,10 +1,3 @@
-//! End-to-end MiniLM test: runs the real model when present locally and
-//! compares against reference outputs produced with onnxruntime.
-//!
-//! Set `ONNX_TEST_MODEL` to the model path, or place the model at
-//! `temp/onnx-test/model.onnx` (fetch with: flint onnx download
-//! Xenova/all-MiniLM-L6-v2 --file onnx/model.onnx --out temp/onnx-test).
-
 use flint_onnx::tensor::Data;
 use flint_onnx::{Session, Tensor};
 
@@ -16,8 +9,6 @@ fn model_path() -> Option<std::path::PathBuf> {
     p.exists().then(|| p.to_path_buf())
 }
 
-/// Reference output for input_ids [101, 7592, 2087, 2023, 2003, 1037, 3710,
-/// 102] with all-ones attention mask, produced with onnxruntime (fp32).
 const REF_FIRST: [f32; 8] = [
     0.05258789, -0.07846259, 0.25362775, -0.19136892, -0.59708065, -0.06743392, 0.06855663,
     -0.19574150,
@@ -41,21 +32,20 @@ fn minilm_end_to_end() {
         panic!("output not f32");
     };
     assert_eq!(v.len(), 8 * 384);
-    // Match the onnxruntime reference within fp32 accumulation noise.
+
     for (i, (a, b)) in v.iter().take(8).zip(REF_FIRST).enumerate() {
         assert!(
             (a - b).abs() < 1e-4,
             "element {i}: flint {a} vs reference {b}"
         );
     }
-    // Output rows are finite and small (BERT hidden states).
+
     assert!(v.iter().all(|x| x.is_finite() && x.abs() < 100.0));
 }
 
 #[test]
 fn minilm_matches_fp16_and_int8_variants() {
-    // When sibling variants are present, fp16/int8 outputs must stay within
-    // quantization error of the fp32 output.
+
     let Some(base) = model_path() else {
         eprintln!("skipping: model not found");
         return;

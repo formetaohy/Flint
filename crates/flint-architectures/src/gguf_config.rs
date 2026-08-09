@@ -1,14 +1,9 @@
-//! Synthesizes a HF-shaped config `Value` from GGUF metadata for each
-//! architecture's parser. Tensor-name mapping lives in `crate::names`; this
-//! module only produces configs.
-
 use flint_checkpoint::{Checkpoint, Metadata};
 use flint_error::{Error, Result};
 use serde_json::{Value, json};
 
 use crate::Family;
 
-/// Builds the config the target architecture's parser expects.
 pub fn synthesize_config(source: &dyn Checkpoint, family: Family) -> Result<Value> {
     match family {
         Family::Llama => dense_config(source, false),
@@ -21,9 +16,6 @@ pub fn synthesize_config(source: &dyn Checkpoint, family: Family) -> Result<Valu
     }
 }
 
-/// Synthesizes the config for a dense-GQA family (Llama or Gemma). Gemma adds
-/// sliding-window fields and terminates on <end_of_turn>; Llama detects QKV
-/// biases and QK-norm from the layer-0 tensor names.
 fn dense_config(source: &dyn Checkpoint, gemma: bool) -> Result<Value> {
     let m = source.metadata();
     let arch = m
@@ -68,7 +60,7 @@ fn dense_config(source: &dyn Checkpoint, gemma: bool) -> Result<Value> {
         let sliding_window_pattern = m.u32(&key("attention.sliding_window_pattern")).unwrap_or(6);
         cfg["sliding_window"] = json!(sliding_window);
         cfg["sliding_window_pattern"] = json!(sliding_window_pattern);
-        // Gemma also terminates on the <end_of_turn> marker when chatting.
+
         if let Some(id) = m.str_array("tokenizer.ggml.tokens").and_then(|t| {
             t.iter()
                 .position(|s| *s == "<end_of_turn>")
@@ -78,9 +70,9 @@ fn dense_config(source: &dyn Checkpoint, gemma: bool) -> Result<Value> {
             cfg["eos_token_id"] = json!([eos.as_slice(), &[id]].concat());
         }
     } else {
-        // Q/K/V biases: present in Qwen2 small models and Phi.
+
         let bias = source.names().iter().any(|n| n == "blk.0.attn_q.bias");
-        // QK-norm: present in Qwen3 (per-head RMSNorm weights on Q and K).
+
         let qk_norm = source
             .names()
             .iter()
@@ -92,8 +84,6 @@ fn dense_config(source: &dyn Checkpoint, gemma: bool) -> Result<Value> {
     Ok(cfg)
 }
 
-/// Synthesizes the config for Phi-3.x / Phi-4-mini GGUFs (arch `phi3`): the
-/// llama-style fields plus the rotary range and norm epsilon.
 fn phi_config(source: &dyn Checkpoint) -> Result<Value> {
     let m = source.metadata();
     let key = |k: &str| format!("phi3.{k}");
@@ -126,7 +116,7 @@ fn phi_config(source: &dyn Checkpoint) -> Result<Value> {
         "eos_token_id": eos_ids(m),
         "tie_word_embeddings": tied(source),
     });
-    // LongRoPE factors travel as dedicated tensors in phi3 GGUFs.
+
     if let (Ok(sf), Ok(lf)) = (
         source.read("rope_factors_short.weight"),
         source.read("rope_factors_long.weight"),
@@ -150,9 +140,6 @@ fn phi_config(source: &dyn Checkpoint) -> Result<Value> {
     Ok(cfg)
 }
 
-/// Synthesizes the config for Gemma 4 GGUFs: per-layer head dims and windows
-/// (from the per-layer sliding flags), per-layer rope, KV sharing, double-wide
-/// MLPs, softcapping, Per-Layer Embeddings and GELU activation.
 fn gemma4_config(source: &dyn Checkpoint) -> Result<Value> {
     let m = source.metadata();
     let key = |k: &str| format!("gemma4.{k}");
@@ -169,8 +156,7 @@ fn gemma4_config(source: &dyn Checkpoint) -> Result<Value> {
     let sliding = m
         .u32_array(&key("attention.sliding_window_pattern"))
         .or_else(|| {
-            // Boolean arrays read as u32 via u32_array are rejected; a plain
-            // pattern integer alternates every `pattern` layers.
+
             m.u32(&key("attention.sliding_window_pattern")).map(|p| {
                 (0..layers)
                     .map(|l| (l + 1) % p != 0)
@@ -194,7 +180,7 @@ fn gemma4_config(source: &dyn Checkpoint) -> Result<Value> {
             })
         })
         .collect();
-    // The base FFN width: per-layer arrays report the double-wide widths too.
+
     let intermediate = m
         .u32_array(&key("feed_forward_length"))
         .map(|v| *v.iter().min().unwrap())
@@ -253,7 +239,6 @@ fn gemma4_config(source: &dyn Checkpoint) -> Result<Value> {
     Ok(cfg)
 }
 
-/// Vocab size: explicit field, else the tokenizer token table length.
 fn vocab_size(m: &Metadata, arch: &str) -> Result<u32> {
     m.u32(&format!("{arch}.vocab_size"))
         .or_else(|| m.str_array("tokenizer.ggml.tokens").map(|t| t.len() as u32))

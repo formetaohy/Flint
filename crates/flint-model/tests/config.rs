@@ -1,5 +1,3 @@
-//! Config parsing helpers: typed field access and dimension validation.
-
 use flint_model::config::{
     bool_field, check_gemm_dims, check_head_dim, f64_field, req, u32_field, u32_list,
 };

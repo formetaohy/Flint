@@ -1,8 +1,3 @@
-//! Operator dispatch plus the execution helpers every op shares. Each op is
-//! a pure function over the environment: it reads named inputs and inserts
-//! named outputs, so order of execution (topological) fully determines
-//! results.
-
 pub mod math;
 pub mod nn;
 pub mod quant;
@@ -15,10 +10,9 @@ use flint_error::{Error, Result};
 use crate::graph::Node;
 use crate::tensor::{Data, Tensor};
 
-/// Runs one node, mutating the value environment.
 pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
     match node.op_type.as_str() {
-        // Elementwise arithmetic and comparison.
+
         "Add" => math::arith(env, node, |a, b| a + b, |a, b| a + b),
         "Sub" => math::arith(env, node, |a, b| a - b, |a, b| a - b),
         "Mul" => math::arith(env, node, |a, b| a * b, |a, b| a * b),
@@ -40,7 +34,6 @@ pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
         "LessOrEqual" => math::cmp(env, node, |a, b| a <= b, |a, b| a <= b),
         "Where" => math::where3(env, node),
 
-        // Unary.
         "Abs" => math::unary_arith(env, node, f32::abs, i64::abs),
         "Neg" => math::unary_arith(env, node, |x| -x, |x| -x),
         "Sign" => math::unary_arith(env, node, |x| x.signum(), |x| x.signum()),
@@ -62,7 +55,6 @@ pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
         "PRelu" => math::prelu(env, node),
         "Selu" => math::selu(env, node),
 
-        // Reductions.
         "ReduceMean" => math::reduce(env, node, 0.0, |acc, x| acc + x, |n, s| s / n as f32),
         "ReduceSum" => math::reduce(env, node, 0.0, |acc, x| acc + x, |_, s| s),
         "ReduceMax" => math::reduce(env, node, f32::NEG_INFINITY, |a, b| a.max(b), |_, s| s),
@@ -72,7 +64,6 @@ pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
         "ArgMax" => math::argmax(env, node, true),
         "ArgMin" => math::argmax(env, node, false),
 
-        // Shape and indexing.
         "Shape" => tensor::shape(env, node),
         "Size" => tensor::size(env, node),
         "Reshape" => tensor::reshape(env, node),
@@ -100,7 +91,6 @@ pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
         "ScatterND" => tensor::scatter_nd(env, node),
         "ScatterElements" => tensor::scatter_elements(env, node),
 
-        // Neural network.
         "MatMul" => nn::matmul(env, node),
         "Gemm" => nn::gemm(env, node),
         "Softmax" => nn::softmax(env, node),
@@ -113,12 +103,10 @@ pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
         "MaxPool" => nn::max_pool(env, node),
         "GRU" => nn::gru(env, node),
 
-        // Integer quantization (QDQ graphs).
         "DynamicQuantizeLinear" => quant::dynamic_quantize_linear(env, node),
         "DequantizeLinear" => quant::dequantize_linear(env, node),
         "MatMulInteger" => quant::matmul_integer(env, node),
 
-        // Control flow.
         "If" => crate::graph_ops::if_op(env, node),
         "Loop" => crate::graph_ops::loop_op(env, node),
 
@@ -126,7 +114,6 @@ pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
     }
 }
 
-/// Fetches input `i` by name; empty or missing names fail fast.
 pub(crate) fn input<'a>(
     env: &'a HashMap<String, Tensor>,
     node: &Node,
@@ -145,7 +132,6 @@ pub(crate) fn input<'a>(
     })
 }
 
-/// Optional input: None when absent or empty-named.
 pub(crate) fn input_opt<'a>(
     env: &'a HashMap<String, Tensor>,
     node: &Node,
@@ -160,7 +146,6 @@ pub(crate) fn input_opt<'a>(
     }
 }
 
-/// Stores output `i`.
 pub(crate) fn output(
     env: &mut HashMap<String, Tensor>,
     node: &Node,
@@ -190,7 +175,6 @@ pub(crate) fn i64s(t: &Tensor) -> Result<&[i64]> {
     }
 }
 
-/// Normalizes a possibly negative axis against `rank`.
 pub(crate) fn norm_axis(axis: i64, rank: usize) -> Result<usize> {
     let a = if axis < 0 { axis + rank as i64 } else { axis };
     if a < 0 || a >= rank as i64 {
@@ -199,7 +183,6 @@ pub(crate) fn norm_axis(axis: i64, rank: usize) -> Result<usize> {
     Ok(a as usize)
 }
 
-/// Reads an `axes` attribute, normalizing negatives against `rank`.
 pub(crate) fn axes_attr(node: &Node, rank: usize) -> Result<Option<Vec<usize>>> {
     let Some(attr) = node.attr("axes") else {
         return Ok(None);
@@ -212,7 +195,6 @@ pub(crate) fn axes_attr(node: &Node, rank: usize) -> Result<Option<Vec<usize>>> 
     ))
 }
 
-/// Gauss error function, Abramowitz-Stegun 7.1.26 (max abs error 1.5e-7).
 pub(crate) fn erf(x: f32) -> f32 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();

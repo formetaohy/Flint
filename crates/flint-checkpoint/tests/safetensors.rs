@@ -1,14 +1,9 @@
-//! Safetensors checkpoint source: sharded index dispatch, single-shard
-//! fallback, dtype decoding (f32 / bf16 / f16), config.json and the
-//! fail-fast error paths. Round-trips through `write_tensors` so no external
-//! files are needed.
-
 use std::path::PathBuf;
 
 use safetensors::serialize;
 use safetensors::tensor::{Dtype, TensorView};
 
-use flint_checkpoint::{Checkpoint, Safetensors, write_tensors};
+use flint_checkpoint::{Checkpoint, CheckpointKind, Safetensors, write_tensors};
 
 fn tmp_dir(test: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("flint-safetensors-{test}-{}", std::process::id()));
@@ -21,7 +16,6 @@ fn err_str<T>(r: flint_error::Result<T>) -> String {
     r.err().expect("expected an error").to_string()
 }
 
-/// One tensor as (name, shape, little-endian bytes, bf16?).
 fn tensor(name: &str, shape: &[u32], data: &[f32]) -> (String, Vec<u32>, Vec<u8>, bool) {
     let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     (name.to_string(), shape.to_vec(), bytes, false)
@@ -38,7 +32,7 @@ fn single_shard_roundtrip_without_index() {
     std::fs::write(dir.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
 
     let st = Safetensors::open(&dir).unwrap();
-    assert_eq!(st.kind(), "safetensors");
+    assert_eq!(st.kind(), CheckpointKind::Safetensors);
 
     let mut names = st.names();
     names.sort();
@@ -64,7 +58,7 @@ fn single_shard_roundtrip_without_index() {
 #[test]
 fn bf16_and_f16_decode_to_f32() {
     let dir = tmp_dir("f16");
-    // bf16 via write_tensors' bf16 flag.
+
     let bf16_bytes: Vec<u8> = [1.0f32, -2.0, 0.5]
         .iter()
         .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
@@ -75,13 +69,12 @@ fn bf16_and_f16_decode_to_f32() {
     )
     .unwrap();
 
-    // f16 via the raw serialize path (write_tensors never emits f16).
     let f16_bytes: Vec<u8> = [1.0f32, -2.0, 2.5]
         .iter()
         .flat_map(|v| f16_bits(*v).to_le_bytes())
         .collect();
     let view = TensorView::new(Dtype::F16, vec![3], &f16_bytes).unwrap();
-    // Both tensors in one shard: bf16 (write_tensors) plus f16 (raw serialize).
+
     let st_bytes = std::fs::read(dir.join("model.safetensors")).unwrap();
     let both = serialize(
         vec![
@@ -140,17 +133,14 @@ fn sharded_index_dispatches_across_files() {
 fn fail_fast_paths() {
     let dir = tmp_dir("fail");
 
-    // No index and no single shard.
     assert!(
         err_str(Safetensors::open(&dir)).contains("no safetensors index"),
         "empty dir must fail"
     );
 
-    // Corrupt index JSON.
     std::fs::write(dir.join("model.safetensors.index.json"), "not json").unwrap();
     assert!(Safetensors::open(&dir).is_err());
 
-    // Index referencing a missing shard.
     std::fs::write(
         dir.join("model.safetensors.index.json"),
         r#"{"weight_map": {"a": "gone.safetensors"}}"#,
@@ -162,7 +152,6 @@ fn fail_fast_paths() {
         "missing shard"
     );
 
-    // Unsupported dtype (F64 is never produced by Flint writers).
     let view = TensorView::new(Dtype::F64, vec![2], &[0u8; 16]).unwrap();
     let bytes = serialize(vec![("d".to_string(), view)], None).unwrap();
     std::fs::write(dir.join("d.safetensors"), bytes).unwrap();
@@ -187,14 +176,11 @@ fn open_requires_something_parseable() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Re-extracts one tensor view from an existing serialized file so the bf16
-/// tensor written by `write_tensors` can be merged with the f16 one.
 fn tensor_view_from<'a>(bytes: &'a [u8], name: &str) -> safetensors::tensor::TensorView<'a> {
     let st = safetensors::SafeTensors::deserialize(bytes).unwrap();
     st.tensor(name).unwrap()
 }
 
-/// Nearest-even f32 -> f16, enough for the exact small values used here.
 fn f16_bits(v: f32) -> u16 {
     let b = v.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;

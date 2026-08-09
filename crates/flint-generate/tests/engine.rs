@@ -1,9 +1,3 @@
-//! Engine state machine over a scripted fake model: stop-token and token
-//! budget termination, statistics accounting, and multi-turn reset
-//! determinism. The fake model owns no GPU state — its logits are pure
-//! functions of the position — so every behavioral claim is exact, unlike
-//! pipeline tests over random toy weights.
-
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
@@ -15,19 +9,15 @@ use flint_model::{ChunkOut, LanguageModel, M_MAX};
 use flint_tokenizer::Tokenizer;
 
 const VOCAB: u32 = 32;
-const EOS: u32 = 31; // last id, outside the plain-token cycle
+const EOS: u32 = 31; 
 const MAX_SEQ: u32 = 512;
 
-/// The adapter is a single shared, memory-limited resource: serialize GPU work.
 static GPU: Mutex<()> = Mutex::new(());
 
 fn gpu() -> MutexGuard<'static, ()> {
     GPU.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Scripted model: the next token after position p is (p*7 + 3) % 31, except
-/// at `eos_at`, where it is the eos id. Deterministic and position-dependent,
-/// so reset bugs show up as divergent second turns.
 struct FakeModel {
     pos: u32,
     eos_at: Option<u32>,
@@ -94,8 +84,6 @@ impl LanguageModel for FakeModel {
     }
 }
 
-/// A unigram tokenizer whose vocab covers ids 0..VOCAB, so any scripted token
-/// sequence round-trips through the engine's streaming decoder.
 fn tokenizer() -> Tokenizer {
     let tokens: Vec<String> = (0..VOCAB).map(|i| format!("t{i}")).collect();
     let scores: Vec<f64> = (0..VOCAB).map(|i| -(i as f64) - 1.0).collect();
@@ -113,10 +101,6 @@ fn tokenizer() -> Tokenizer {
     Tokenizer::from_gguf(&Metadata::new(kv)).unwrap()
 }
 
-/// Collects the committed token ids of one stream run. `eos_after` puts the
-/// eos prediction k decoded positions past the prefill (0 = the very first
-/// pending token is eos). The prompt's true encoded length is measured, not
-/// assumed, because the unigram tokenizer folds spaces/unknowns into ids.
 fn run(prompt: &str, max_tokens: usize, eos_after: Option<u32>) -> (Vec<u32>, GenStats, u32) {
     let _g = gpu();
     let backend = Backend::new().unwrap();
@@ -151,8 +135,7 @@ fn run(prompt: &str, max_tokens: usize, eos_after: Option<u32>) -> (Vec<u32>, Ge
 
 #[test]
 fn eos_terminates_generation_without_emitting_it() {
-    // The eos is predicted two decoded positions past the prefill: the first
-    // two committed tokens stream out, the third pending token halts.
+
     let (tokens, stats, n) = run("t0 t1 t2", 64, Some(2));
     let want = [((n - 1) * 7 + 3) % (VOCAB - 1), (n * 7 + 3) % (VOCAB - 1)];
     assert_eq!(tokens, want, "eos must not be emitted");
@@ -205,8 +188,7 @@ fn multi_turn_reset_reproduces_output() {
 
 #[test]
 fn stats_account_prefill_and_decode() {
-    // 200 space-separated words encode to well over M_MAX tokens, forcing
-    // chunked prefill; the count is measured from the same tokenizer.
+
     let prompt = (0..200)
         .map(|i| format!("t{}", i % 31))
         .collect::<Vec<_>>()

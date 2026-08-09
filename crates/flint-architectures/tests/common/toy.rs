@@ -1,13 +1,3 @@
-//! Deterministic toy checkpoints for the test suite. A toy is a
-//! minimal-dimension model with fixed-seed random weights, written in its
-//! native format (GGUF for the dense families, safetensors for Qwen3.5), so
-//! the complete load -> forward -> generate path runs in tests with zero
-//! external weight files.
-//!
-//! Structural invariants (chunked vs sequential prefill, speculative vs plain
-//! decoding, snapshot/restore, tokenizer round-trips) are weight-independent:
-//! they compare execution paths over identical inputs, not output quality.
-
 use std::path::Path;
 
 use super::tokenizer;
@@ -15,36 +5,34 @@ use flint_checkpoint::{GgufWriter, write_tensors};
 use flint_error::{Error, Result};
 use serde_json::json;
 
-/// Which minimal checkpoint to materialize.
 #[derive(Clone, Copy, Debug)]
 pub enum ToySpec {
-    /// Dense GQA, GGUF, untied head, no biases/QK-norm.
+
     Llama,
-    /// Dense GQA with QKV projection biases (Qwen2-style).
+
     LlamaQkvBias,
-    /// Dense GQA with per-head QK-norm (Qwen3-style).
+
     LlamaQkNorm,
-    /// Gemma 3: sandwich norms, sliding window, always-on QK-norm, tied head.
+
     Gemma,
-    /// Qwen3.5 hybrid Gated DeltaNet + MTP draft head, safetensors.
+
     Qwen35,
-    /// Qwen3.5 with fewer linear key heads than value heads (repeat path).
+
     Qwen35Split,
-    /// Qwen3.5 with untied embeddings (separate lm_head).
+
     Qwen35Untied,
-    /// Phi-4-mini: partial rotary, GGUF arch `phi3`.
+
     Phi,
-    /// Phi-3 dense LayerNorm (safetensors): `layer_norm_epsilon` selects the
-    /// mean-centered norm variant with biases on every feeding norm.
+
     PhiLayerNorm,
-    /// Phi-MoE: LayerNorm, fused gate+up experts, sparsemixer, safetensors.
+
     PhiMoe,
-    /// Gemma 4: per-layer head dims, KV sharing, GELU, PLE, softcap, GGUF.
+
     Gemma4,
 }
 
 impl ToySpec {
-    /// Writes the checkpoint (plus tokenizer and config) into `dir`.
+
     pub fn write(self, dir: &Path) -> Result<()> {
         match self {
             ToySpec::Qwen35 => write_qwen35(dir, 16, 16, true),
@@ -59,10 +47,6 @@ impl ToySpec {
     }
 }
 
-// ---------------------------------------------------------------- dims
-
-/// Toy dimensions satisfy every kernel and config constraint: N % 16, K % 64,
-/// head_dim in [64, 256], q heads a multiple of kv heads, vocab % 16.
 const HIDDEN: u32 = 64;
 const Q_HEADS: u32 = 4;
 const KV_HEADS: u32 = 1;
@@ -71,9 +55,6 @@ const INTERMEDIATE: u32 = 128;
 const LAYERS: u32 = 2;
 const VOCAB: u32 = tokenizer::VOCAB as u32;
 
-// ---------------------------------------------------------------- rng
-
-/// Deterministic LCG, identical to the kernel test harness.
 struct Rng(u64);
 
 impl Rng {
@@ -92,22 +73,20 @@ impl Rng {
     }
 }
 
-/// One f32 tensor in canonical (HF) naming, before format conversion.
 struct Canon {
     key: String,
     shape: Vec<u32>,
-    /// Storage role as the loader will re-pack it.
+
     role: Role,
 }
 
 #[derive(Clone, Copy)]
 enum Role {
-    /// Norms, biases, conv taps: stored f32.
+
     F32,
-    /// Embedding table: packed bf16.
+
     Bf16,
-    /// Projections: Q8_0 in GGUF, plain f32 in safetensors (re-quantized on
-    /// upload either way).
+
     Proj,
 }
 
@@ -193,15 +172,10 @@ fn dense_layer_keys(l: u32, qkv_bias: bool, qk_norm: bool, sandwich: bool) -> Ve
     v
 }
 
-// ---------------------------------------------------------------- dense (GGUF)
-
-/// GGUF-native name for a dense canonical key; the exact inverse of
-/// `flint_architectures::names::gguf_key`.
 fn gguf_name(key: &str) -> String {
     if let Some(rest) = key.strip_prefix("layers.") {
         let (idx, tail) = rest.split_once('.').unwrap();
-        // Suffixless canonical keys (the layer_scalar buffer) carry no dot;
-        // the GGUF tensor name keeps the .weight suffix either way.
+
         let (stem, suffix) = match tail.rsplit_once('.') {
             Some((s, f)) => (s, format!(".{f}")),
             None => (tail, ".weight".to_string()),
@@ -316,17 +290,12 @@ fn write_dense(spec: ToySpec, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- Qwen3.5 (safetensors)
-
-/// Materializes a Qwen3.5 toy with the given linear-attention key/value head
-/// counts and embedding tying; the MTP draft head is always present.
 fn write_qwen35(dir: &Path, lin_key_heads: u32, lin_val_heads: u32, tied: bool) -> Result<()> {
     let (lin_key, lin_val) = (8u32, 8u32);
     let key_dim = lin_key_heads * lin_key;
     let val_dim = lin_val_heads * lin_val;
     let conv_dim = key_dim * 2 + val_dim;
 
-    // Full-attention layer weights under a prefix (target layers + MTP head).
     let full = |p: &str| -> Vec<Canon> {
         vec![
             f32w(format!("{p}.input_layernorm.weight"), &[HIDDEN]),
@@ -354,7 +323,7 @@ fn write_qwen35(dir: &Path, lin_key_heads: u32, lin_val_heads: u32, tied: bool) 
             proj(format!("{p}.mlp.down_proj.weight"), &[HIDDEN, INTERMEDIATE]),
         ]
     };
-    // Gated DeltaNet layer weights under its prefix.
+
     let linear = |p: &str| -> Vec<Canon> {
         vec![
             f32w(format!("{p}.input_layernorm.weight"), &[HIDDEN]),
@@ -474,10 +443,7 @@ fn qwen35_config(lin_key_heads: u32, lin_val_heads: u32, tied: bool) -> serde_js
         }
     })
 }
-// ---------------------------------------------------------------- Phi (GGUF)
 
-/// Phi-4-mini toy: GGUF arch `phi3` with partial rotary (half the head dim)
-/// and a 1e-5 norm epsilon.
 fn write_phi(dir: &Path) -> Result<()> {
     let mut rng = Rng::new(0xf1a0);
     let mut w = GgufWriter::new(32);
@@ -513,9 +479,6 @@ fn write_phi(dir: &Path) -> Result<()> {
     write_gguf_tensors(&mut w, &mut rng, &all, dir)
 }
 
-/// Phi-3-style dense LayerNorm checkpoint (safetensors): `layer_norm_epsilon`
-/// drives the mean-centered norm variant, so the attention and MLP feeding
-/// norms carry biases the loader must pick up.
 fn write_phi_layernorm(dir: &Path) -> Result<()> {
     let mut rng = Rng::new(0x1a10);
     let mut all = vec![
@@ -624,11 +587,6 @@ fn write_phi_layernorm(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- Phi-MoE (safetensors)
-
-/// Phi-MoE toy: 2 layers, 4 experts, top-2, fused gate+up, LayerNorm with
-/// biases, logits bias and a uniform sliding window. Written safetensors with
-/// HF names so the loader's MoE split path runs.
 fn write_phimoe(dir: &Path) -> Result<()> {
     const EXPERTS: u32 = 16;
     let mut rng = Rng::new(0x100e);
@@ -699,7 +657,7 @@ fn write_phimoe(dir: &Path) -> Result<()> {
             format!("{p}.self_attn.v_proj.bias"),
             &[KV_HEADS * HEAD_DIM],
         ));
-        // Fused gate+up experts: [E, 2 * intermediate, hidden].
+
         all.push(Canon {
             key: format!("{p}.mlp.gate_up_proj"),
             shape: vec![EXPERTS, 2 * INTERMEDIATE, HIDDEN],
@@ -759,11 +717,6 @@ fn write_phimoe(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- Gemma 4 (GGUF)
-
-/// Gemma 4 toy: 4 layers alternating sliding (hd 64) / full (hd 128) with the
-/// trailing two layers sharing the leading KV, double-wide GELU MLPs on the
-/// shared layers, Per-Layer Embeddings, logit softcapping and per-layer rope.
 fn write_gemma4(dir: &Path) -> Result<()> {
     const PLE: u32 = 64;
     const FULL_HD: u32 = 128;
@@ -882,8 +835,6 @@ fn write_gemma4(dir: &Path) -> Result<()> {
     write_gguf_tensors(&mut w, &mut rng, &all, dir)
 }
 
-// ---------------------------------------------------------------- helpers
-
 fn write_gguf_tokenizer(w: &mut GgufWriter) {
     let tokens = tokenizer::tokens();
     w.kv_str("tokenizer.ggml.model", "bpe");
@@ -893,8 +844,6 @@ fn write_gguf_tokenizer(w: &mut GgufWriter) {
     w.kv_u32("tokenizer.ggml.eos_token_id", tokenizer::EOS_ID);
 }
 
-/// Writes GGUF tensors (proj roles quantized Q8_0; 3D expert tensors
-/// flattened per the writer's fastest-first dims) plus the tokenizer.
 fn write_gguf_tensors(w: &mut GgufWriter, rng: &mut Rng, all: &[Canon], dir: &Path) -> Result<()> {
     for c in all {
         let data = rng.fill(c.shape.iter().map(|d| *d as usize).product());

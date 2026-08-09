@@ -19,3 +19,9 @@ impl From<serde_json::Error> for Error {
         Error::Config(e.to_string())
     }
 }
+
+impl From<saturn_core::Error> for Error {
+    fn from(e: saturn_core::Error) -> Self {
+        Error::Gpu(e.to_string())
+    }
+}

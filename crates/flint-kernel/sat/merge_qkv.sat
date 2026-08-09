@@ -1,0 +1,26 @@
+kernel merge_qkv [workgroup(256, 1, 1)]
+    (partial: buf<f32>, yq: buf<f32>, yk: buf<f32>, yv: buf<f32>,
+     NQ: u32, NK: u32, NV: u32, SEGS: u32)
+{
+    let ntot = NQ + NK + NV;
+    let col = block.x * 256 + thread.x;
+    var s = 0.0;
+    if col < NQ {
+        for i in 0..SEGS {
+            s = s + partial[i * ntot + col];
+        }
+        yq[col] = s;
+    } else if col < NQ + NK {
+        let c = col - NQ;
+        for i in 0..SEGS {
+            s = s + partial[i * ntot + NQ + c];
+        }
+        yk[c] = s;
+    } else if col < ntot {
+        let c = col - NQ - NK;
+        for i in 0..SEGS {
+            s = s + partial[i * ntot + NQ + NK + c];
+        }
+        yv[c] = s;
+    }
+}

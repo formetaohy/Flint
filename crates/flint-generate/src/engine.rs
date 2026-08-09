@@ -1,10 +1,3 @@
-//! Prefill/decode engine with optional speculative decoding.
-//!
-//! Speculation is exact by construction: the sampler's `transform` is the
-//! single source of sampling distributions, so the draft and target
-//! distributions carry identical configuration over identical context, and
-//! committed tokens follow the target distribution exactly (arXiv:2211.17192).
-
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -15,8 +8,6 @@ use flint_tokenizer::{Decoder, Tokenizer};
 
 use crate::sampler::{Dist, Sampler};
 
-/// One committed token plus its freshly decoded text (may be empty while the
-/// decoder buffers a partial character).
 pub struct Piece {
     pub token: u32,
     pub text: String,
@@ -31,7 +22,7 @@ pub struct GenStats {
 }
 
 impl GenStats {
-    /// One-line throughput summary; printing is the caller's job.
+
     pub fn summary(&self) -> String {
         let pp = if self.prefill_secs > 0.0 {
             self.prefill_tokens as f64 / self.prefill_secs
@@ -54,7 +45,6 @@ impl GenStats {
     }
 }
 
-/// Owns backend, model, tokenizer and sampler; produces token streams.
 pub struct Engine {
     backend: Backend,
     model: Box<dyn LanguageModel>,
@@ -83,7 +73,6 @@ impl Engine {
         }
     }
 
-    /// Formatted per-kernel GPU time breakdown, or None when profiling is off.
     pub fn profile_report(&self) -> Option<String> {
         if !self.backend.profiling() {
             return None;
@@ -98,7 +87,6 @@ impl Engine {
         self.model.reset(&self.backend);
     }
 
-    /// Starts prompt prefill + autoregressive decode as a piece stream.
     pub fn stream(&mut self, prompt: &str, max_tokens: usize) -> Result<Stream<'_>> {
         let prompt_ids = self.tokenizer.encode(prompt)?;
         if prompt_ids.is_empty() {
@@ -146,8 +134,7 @@ enum Phase {
     Plain {
         pending: u32,
     },
-    /// pending is sampled from the target; draft_token was drawn from
-    /// draft_dist, which verification must reproduce exactly.
+
     Spec {
         pending: u32,
         draft_token: u32,
@@ -156,7 +143,6 @@ enum Phase {
     Done,
 }
 
-/// Iterator over committed pieces; `stats()` is final once the stream ends.
 pub struct Stream<'a> {
     backend: &'a mut Backend,
     model: &'a mut dyn LanguageModel,
@@ -166,7 +152,7 @@ pub struct Stream<'a> {
     speculate: bool,
     decoder: Decoder,
     prompt_ids: Vec<u32>,
-    /// Every committed token; feeds the repetition penalty.
+
     context: Vec<u32>,
     max_tokens: usize,
     phase: Phase,
@@ -184,14 +170,10 @@ impl Stream<'_> {
         &self.stats
     }
 
-    /// Sampling distribution over plain committed context.
     fn dist(&mut self, logits: &[f32]) -> Dist {
         self.sampler.transform(logits, &self.context)
     }
 
-    /// Sampling distribution for the token following `prev`: the repetition
-    /// penalty sees the committed context plus `prev` itself, which is not
-    /// committed yet (it is the pending token, or a draft about to be).
     fn dist_after(&mut self, logits: &[f32], prev: u32) -> Dist {
         self.context.push(prev);
         let d = self.sampler.transform(logits, &self.context);
@@ -203,7 +185,6 @@ impl Stream<'_> {
         self.stop.contains(&token) || self.stats.decode_tokens >= self.max_tokens
     }
 
-    /// Commits one token: repetition context, decode text, decode stats.
     fn piece(&mut self, token: u32) -> Result<Piece> {
         let text = self
             .tokenizer
@@ -219,7 +200,6 @@ impl Stream<'_> {
         self.decode_start = Some(Instant::now());
     }
 
-    /// Advances the state machine until one piece is queued or generation ends.
     fn advance(&mut self) -> Result<()> {
         loop {
             if !self.queue.is_empty() {
@@ -304,8 +284,6 @@ impl Stream<'_> {
             .model
             .forward(self.backend, &[pending, draft_token], &[0, 1], &[0, 1])?;
 
-        // draft_dist was computed over context + [pending]; verification
-        // reproduces that exact distribution for the target logits.
         let target_dist = self.dist_after(&out.logits[0], pending);
         let (accepted, chosen) = self.sampler.verify(&target_dist, &draft_dist, draft_token);
 
@@ -318,10 +296,7 @@ impl Stream<'_> {
             }
             let p2 = self.piece(draft_token)?;
             self.queue.push_back(p2);
-            // Context now ends with both committed tokens: sample the bonus,
-            // then advance the draft head through each committed token (the
-            // first draft call only syncs head state — the target already
-            // supplied the bonus).
+
             let bonus_dist = self.dist(&out.logits[1]);
             let bonus = self.sampler.draw(&bonus_dist);
             let spec = self
@@ -340,8 +315,6 @@ impl Stream<'_> {
             return Ok(());
         }
 
-        // Rejected: roll the verification chunk back and replay the committed
-        // token alone to restore generation state.
         self.model
             .speculator()
             .expect("spec phase implies a speculator")

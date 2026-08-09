@@ -1,13 +1,5 @@
-//! Compute kernels: the WGSL implementations, their compilation and
-//! per-constants pipeline cache, and the CPU reference that defines the
-//! intended semantics of every kernel. The WGPU kernels are tested against
-//! the reference so the two cannot silently disagree.
-
 pub mod cpu;
 
-/// Canonical kernel names: the single source of truth for the string
-/// protocol shared by the shader table, the dispatch facade and the
-/// profiler labels.
 pub mod name {
     pub const GEMM: &str = "gemm";
     pub const MERGE_GEMM: &str = "merge_gemm";
@@ -42,300 +34,201 @@ pub mod name {
 
 use std::collections::HashMap;
 
-use wgpu::{
-    BindGroupLayout, BindGroupLayoutEntry, BindingType, BufferBindingType, ComputePipeline, Device,
-    PipelineCompilationOptions, PipelineLayout, ShaderModule, ShaderSource,
-};
+use saturn_core::{Device, Kernel, KernelSpec, Scalar, ScalarLayout};
+use saturn_sat::sat;
 
 use flint_error::{Error, Result};
 
-/// One shader source plus the read-only flag of each of its bindings.
 struct ShaderSpec {
     name: &'static str,
     source: &'static str,
-    read_only: &'static [bool],
 }
 
 const SHADERS: &[ShaderSpec] = &[
     ShaderSpec {
         name: name::GEMM,
-        source: include_str!("wgsl/gemm.wgsl"),
-        read_only: &[true, true, true, false],
+        source: sat!("gemm.sat"),
     },
     ShaderSpec {
         name: name::MERGE_GEMM,
-        source: include_str!("wgsl/merge_gemm.wgsl"),
-        read_only: &[true, false],
+        source: sat!("merge_gemm.sat"),
     },
     ShaderSpec {
         name: name::GEMV,
-        source: include_str!("wgsl/gemv.wgsl"),
-        read_only: &[true, true, true, false],
+        source: sat!("gemv.sat"),
     },
     ShaderSpec {
         name: name::MERGE_GEMV,
-        source: include_str!("wgsl/merge_gemv.wgsl"),
-        read_only: &[true, false],
+        source: sat!("merge_gemv.sat"),
     },
     ShaderSpec {
         name: name::GEMV_QKV,
-        source: include_str!("wgsl/gemv_qkv.wgsl"),
-        read_only: &[
-            true, true, true, false, true, true, false, true, true, false, false,
-        ],
+        source: sat!("gemv_qkv.sat"),
     },
     ShaderSpec {
         name: name::MERGE_QKV,
-        source: include_str!("wgsl/merge_qkv.wgsl"),
-        read_only: &[true, false, false, false],
+        source: sat!("merge_qkv.sat"),
     },
     ShaderSpec {
         name: name::GEMV_GATEUP,
-        source: include_str!("wgsl/gemv_gateup.wgsl"),
-        read_only: &[true, true, true, false, true, true, false, false],
+        source: sat!("gemv_gateup.sat"),
     },
     ShaderSpec {
         name: name::MERGE_GATEUP,
-        source: include_str!("wgsl/merge_gateup.wgsl"),
-        read_only: &[true, false, false],
+        source: sat!("merge_gateup.sat"),
     },
     ShaderSpec {
         name: name::EMBED,
-        source: include_str!("wgsl/embed.wgsl"),
-        read_only: &[true, true, true, false],
+        source: sat!("embed.sat"),
     },
     ShaderSpec {
         name: name::NORM,
-        source: include_str!("wgsl/norm.wgsl"),
-        read_only: &[
-            true, true, true, false, true, true, true, false, true, true, true,
-        ],
+        source: sat!("norm.sat"),
     },
     ShaderSpec {
         name: name::ADD,
-        source: include_str!("wgsl/add.wgsl"),
-        read_only: &[true, true, false],
+        source: sat!("add.sat"),
     },
     ShaderSpec {
         name: name::BIAS,
-        source: include_str!("wgsl/bias.wgsl"),
-        read_only: &[false, true],
+        source: sat!("bias.sat"),
     },
     ShaderSpec {
         name: name::CONCAT,
-        source: include_str!("wgsl/concat.wgsl"),
-        read_only: &[true, true, false],
+        source: sat!("concat.sat"),
     },
     ShaderSpec {
         name: name::SWIGLU,
-        source: include_str!("wgsl/swiglu.wgsl"),
-        read_only: &[true, true, false],
+        source: sat!("swiglu.sat"),
     },
     ShaderSpec {
         name: name::SOFTCAP,
-        source: include_str!("wgsl/softcap.wgsl"),
-        read_only: &[false],
+        source: sat!("softcap.sat"),
     },
     ShaderSpec {
         name: name::MUL,
-        source: include_str!("wgsl/mul.wgsl"),
-        read_only: &[true, true, false],
+        source: sat!("mul.sat"),
     },
     ShaderSpec {
         name: name::EXPERT_GATHER,
-        source: include_str!("wgsl/expert_gather.wgsl"),
-        read_only: &[true, true, false],
+        source: sat!("expert_gather.sat"),
     },
     ShaderSpec {
         name: name::EXPERT_SCATTER,
-        source: include_str!("wgsl/expert_scatter.wgsl"),
-        read_only: &[false, true, true, true],
+        source: sat!("expert_scatter.sat"),
     },
     ShaderSpec {
         name: name::ZERO_ROWS,
-        source: include_str!("wgsl/zero_rows.wgsl"),
-        read_only: &[false],
+        source: sat!("zero_rows.sat"),
     },
     ShaderSpec {
         name: name::SIGMOID_MUL,
-        source: include_str!("wgsl/sigmoid_mul.wgsl"),
-        read_only: &[true, true, false],
+        source: sat!("sigmoid_mul.sat"),
     },
     ShaderSpec {
         name: name::DELTA_GATE,
-        source: include_str!("wgsl/delta_gate.wgsl"),
-        read_only: &[true, true, true, true, false, false],
+        source: sat!("delta_gate.sat"),
     },
     ShaderSpec {
         name: name::CONV1D,
-        source: include_str!("wgsl/conv1d.wgsl"),
-        read_only: &[true, true, false, false],
+        source: sat!("conv1d.sat"),
     },
     ShaderSpec {
         name: name::DELTA_RECUR,
-        source: include_str!("wgsl/delta_recur.wgsl"),
-        read_only: &[true, true, true, true, true, false, false],
+        source: sat!("delta_recur.sat"),
     },
     ShaderSpec {
         name: name::REPEAT_QK,
-        source: include_str!("wgsl/repeat_qk.wgsl"),
-        read_only: &[true, false],
+        source: sat!("repeat_qk.sat"),
     },
     ShaderSpec {
         name: name::ROPE,
-        source: include_str!("wgsl/rope.wgsl"),
-        read_only: &[true, true, false, true],
+        source: sat!("rope.sat"),
     },
     ShaderSpec {
         name: name::ATTN,
-        source: include_str!("wgsl/attn.wgsl"),
-        read_only: &[true, true, true, false, true],
+        source: sat!("attn.sat"),
     },
     ShaderSpec {
         name: name::MERGE_ATTN,
-        source: include_str!("wgsl/merge_attn.wgsl"),
-        read_only: &[true, false, true],
+        source: sat!("merge_attn.sat"),
     },
     ShaderSpec {
         name: name::KV_STORE,
-        source: include_str!("wgsl/kv_store.wgsl"),
-        read_only: &[true, true, false, false, true],
+        source: sat!("kv_store.sat"),
     },
     ShaderSpec {
         name: name::SPLIT_QG,
-        source: include_str!("wgsl/split_qg.wgsl"),
-        read_only: &[true, false, false],
+        source: sat!("split_qg.sat"),
     },
 ];
 
-struct CompiledShader {
-    module: ShaderModule,
-    layout: PipelineLayout,
-    bind_group_layout: BindGroupLayout,
-}
-
-/// Most constants any shader takes (gemm: 9).
-const MAX_CONSTS: usize = 12;
-
-/// Allocation-free pipeline cache key: the shader plus its override constants
-/// (name interned as a static str, value as raw f64 bits).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct PipelineKey {
-    shader: &'static str,
-    len: u8,
-    pairs: [(&'static str, u64); MAX_CONSTS],
-}
-
-fn pipeline_key(shader: &'static str, consts: &[(&'static str, f64)]) -> PipelineKey {
-    assert!(
-        consts.len() <= MAX_CONSTS,
-        "{shader}: too many pipeline constants"
-    );
-    let mut pairs = [("", 0u64); MAX_CONSTS];
-    for (i, (k, v)) in consts.iter().enumerate() {
-        pairs[i] = (*k, v.to_bits());
-    }
-    PipelineKey {
-        shader,
-        len: consts.len() as u8,
-        pairs,
-    }
-}
-
-/// Lazily compiles shaders and caches one pipeline per (shader, constants)
-/// pair. Bind groups are owned by the backend, which caches them per buffer
-/// set; this type only manages pipelines and bind group layouts.
 pub struct Kernels {
-    shaders: HashMap<&'static str, CompiledShader>,
-    pipelines: HashMap<PipelineKey, ComputePipeline>,
+    kernels: HashMap<&'static str, Box<dyn Kernel>>,
 }
 
 impl Kernels {
-    pub fn new(device: &Device) -> Result<Self> {
-        let mut shaders = HashMap::new();
+    pub fn new(device: &dyn Device) -> Result<Self> {
+        let mut kernels = HashMap::new();
         for spec in SHADERS {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(spec.name),
-                source: ShaderSource::Wgsl(spec.source.into()),
-            });
-            let entries: Vec<BindGroupLayoutEntry> = spec
-                .read_only
-                .iter()
-                .enumerate()
-                .map(|(i, &ro)| BindGroupLayoutEntry {
-                    binding: i as u32,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: ro },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                })
-                .collect();
-            let bind_group_layout =
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some(spec.name),
-                    entries: &entries,
-                });
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(spec.name),
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: 0,
-            });
-            shaders.insert(
+            let kernel = device.create_kernel(&KernelSpec {
+                name: format!("sat/{}", spec.name),
+                source: spec.source,
+            })?;
+            assert_eq!(
+                kernel.name(),
                 spec.name,
-                CompiledShader {
-                    module,
-                    layout,
-                    bind_group_layout,
-                },
+                "kernel entry point mismatch"
             );
+            kernels.insert(spec.name, kernel);
         }
-        Ok(Self {
-            shaders,
-            pipelines: HashMap::new(),
+        Ok(Self { kernels })
+    }
+
+    pub fn get(&self, name: &str) -> Result<&dyn Kernel> {
+        Ok(self
+            .kernels
+            .get(name)
+            .ok_or_else(|| Error::Gpu(format!("unknown shader {name}")))?
+            .as_ref())
+    }
+
+    pub fn scalar_layout(&self, name: &str) -> Result<&ScalarLayout> {
+        let kernel = self.get(name)?;
+        kernel.scalar_layout().ok_or_else(|| {
+            Error::Gpu(format!("shader {name} has no scalar parameters"))
         })
     }
 
-    /// The bind group layout for a shader; the backend builds and caches bind
-    /// groups against it.
-    pub fn bind_group_layout(&self, name: &str) -> Result<&BindGroupLayout> {
-        Ok(&self
-            .shaders
-            .get(name)
-            .ok_or_else(|| Error::Gpu(format!("unknown shader {name}")))?
-            .bind_group_layout)
-    }
-
-    /// The pipeline for a (shader, constants) pair, compiled once and cached.
-    /// Allocation happens only on a cache miss.
-    pub fn pipeline(
-        &mut self,
-        device: &Device,
-        name: &'static str,
+    pub fn pack_scalars(
+        &self,
+        name: &str,
         consts: &[(&'static str, f64)],
-    ) -> Result<&ComputePipeline> {
-        let key = pipeline_key(name, consts);
-        if !self.pipelines.contains_key(&key) {
-            let shader = self
-                .shaders
-                .get(name)
-                .ok_or_else(|| Error::Gpu(format!("unknown shader {name}")))?;
-            let pairs: Vec<(&str, f64)> = consts.to_vec();
-            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(name),
-                layout: Some(&shader.layout),
-                module: &shader.module,
-                entry_point: Some("main"),
-                compilation_options: PipelineCompilationOptions {
-                    constants: &pairs,
-                    ..Default::default()
-                },
-                cache: None,
-            });
-            self.pipelines.insert(key, pipeline);
+    ) -> Result<Vec<u8>> {
+        let layout = self.scalar_layout(name)?;
+        if consts.len() != layout.fields.len() {
+            return Err(Error::Gpu(format!(
+                "shader {name}: expected {} constants, got {}",
+                layout.fields.len(),
+                consts.len()
+            )));
         }
-        Ok(self.pipelines.get(&key).expect("just inserted"))
+        let mut bytes = vec![0u8; layout.size as usize];
+        for field in &layout.fields {
+            let value = consts
+                .iter()
+                .find(|(key, _)| *key == field.name)
+                .ok_or_else(|| {
+                    Error::Gpu(format!("shader {name}: missing constant {}", field.name))
+                })?
+                .1;
+            let end = (field.offset + field.ty.width()) as usize;
+            encode_scalar(&mut bytes[field.offset as usize..end], field.ty, value);
+        }
+        Ok(bytes)
     }
+}
+
+fn encode_scalar(out: &mut [u8], ty: Scalar, value: f64) {
+    out.copy_from_slice(&ty.encode(value)[..ty.width() as usize]);
 }

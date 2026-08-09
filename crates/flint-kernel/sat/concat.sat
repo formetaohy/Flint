@@ -1,0 +1,11 @@
+kernel concat [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, ROWS: u32, D: u32) {
+    if gid.x < ROWS * 2 * D {
+        let row = gid.x / (2 * D);
+        let d = gid.x % (2 * D);
+        if d < D {
+            y[gid.x] = a[row * D + d];
+        } else {
+            y[gid.x] = b[row * D + d - D];
+        }
+    }
+}

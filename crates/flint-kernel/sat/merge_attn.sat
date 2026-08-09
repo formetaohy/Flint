@@ -1,0 +1,84 @@
+kernel merge_attn [workgroup(512, 1, 1)]
+    (scratch: buf<f32>, y: buf<f32>, args: buf<u32>,
+     N_HEADS: u32, KV_HEADS: u32, HEAD_DIM: u32, STRIDE: u32)
+{
+    const CHUNK: u32 = 64;
+    const SEGS: u32 = 32;
+    const NEG_INF: f32 = -3.4e38;
+    let m = block.x;
+    let kvh = block.y;
+    let t = thread.x;
+    let hl = t / CHUNK;
+    let slot = t % CHUNK;
+    let segs = min(SEGS, max(1, args[1]));
+    var mx = NEG_INF;
+    for s in 0..segs {
+        let base = ((m * KV_HEADS + kvh) * SEGS + s) * (8 * STRIDE) + hl * STRIDE;
+        mx = max(mx, scratch[base + HEAD_DIM]);
+    }
+    var wsum = 0.0;
+    var o0 = 0.0;
+    var o1 = 0.0;
+    var o2 = 0.0;
+    var o3 = 0.0;
+    var o4 = 0.0;
+    var o5 = 0.0;
+    var o6 = 0.0;
+    var o7 = 0.0;
+    for s in 0..segs {
+        let base = ((m * KV_HEADS + kvh) * SEGS + s) * (8 * STRIDE) + hl * STRIDE;
+        let w = exp(scratch[base + HEAD_DIM] - mx);
+        wsum = wsum + w * scratch[base + HEAD_DIM + 1];
+        if slot < HEAD_DIM {
+            o0 = o0 + w * scratch[base + slot];
+        }
+        if slot + CHUNK < HEAD_DIM {
+            o1 = o1 + w * scratch[base + slot + CHUNK];
+        }
+        if slot + 2 * CHUNK < HEAD_DIM {
+            o2 = o2 + w * scratch[base + slot + 2 * CHUNK];
+        }
+        if slot + 3 * CHUNK < HEAD_DIM {
+            o3 = o3 + w * scratch[base + slot + 3 * CHUNK];
+        }
+        if slot + 4 * CHUNK < HEAD_DIM {
+            o4 = o4 + w * scratch[base + slot + 4 * CHUNK];
+        }
+        if slot + 5 * CHUNK < HEAD_DIM {
+            o5 = o5 + w * scratch[base + slot + 5 * CHUNK];
+        }
+        if slot + 6 * CHUNK < HEAD_DIM {
+            o6 = o6 + w * scratch[base + slot + 6 * CHUNK];
+        }
+        if slot + 7 * CHUNK < HEAD_DIM {
+            o7 = o7 + w * scratch[base + slot + 7 * CHUNK];
+        }
+    }
+    if hl < N_HEADS / KV_HEADS {
+        let ob = (m * N_HEADS + kvh * (N_HEADS / KV_HEADS) + hl) * HEAD_DIM;
+        if slot < HEAD_DIM {
+            y[ob + slot] = o0 / wsum;
+        }
+        if slot + CHUNK < HEAD_DIM {
+            y[ob + slot + CHUNK] = o1 / wsum;
+        }
+        if slot + 2 * CHUNK < HEAD_DIM {
+            y[ob + slot + 2 * CHUNK] = o2 / wsum;
+        }
+        if slot + 3 * CHUNK < HEAD_DIM {
+            y[ob + slot + 3 * CHUNK] = o3 / wsum;
+        }
+        if slot + 4 * CHUNK < HEAD_DIM {
+            y[ob + slot + 4 * CHUNK] = o4 / wsum;
+        }
+        if slot + 5 * CHUNK < HEAD_DIM {
+            y[ob + slot + 5 * CHUNK] = o5 / wsum;
+        }
+        if slot + 6 * CHUNK < HEAD_DIM {
+            y[ob + slot + 6 * CHUNK] = o6 / wsum;
+        }
+        if slot + 7 * CHUNK < HEAD_DIM {
+            y[ob + slot + 7 * CHUNK] = o7 / wsum;
+        }
+    }
+}

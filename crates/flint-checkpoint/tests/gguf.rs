@@ -1,12 +1,6 @@
-//! GGUF container reading against synthesized files: metadata value types,
-//! custom alignment, tensor info + dequantization, dim reversal and the
-//! format-detection dispatch.
-
 use std::path::{Path, PathBuf};
 
-use flint_checkpoint::{Checkpoint, Gguf, MetaVal};
-
-// ---------------------------------------------------------------- writer
+use flint_checkpoint::{Checkpoint, CheckpointKind, Gguf, MetaVal};
 
 fn w_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -37,14 +31,12 @@ fn f16_bytes(v: f32) -> [u8; 2] {
     h.to_le_bytes()
 }
 
-/// Builds a GGUF v3 file: mixed metadata plus an f32 [3,2] matrix and a
-/// q8_0 [32] vector, under a non-default alignment of 64.
 fn synth_gguf() -> Vec<u8> {
     let mut h = Vec::new();
-    w_u32(&mut h, 0x4655_4747); // "GGUF"
+    w_u32(&mut h, 0x4655_4747); 
     w_u32(&mut h, 3);
-    w_u64(&mut h, 2); // tensors
-    w_u64(&mut h, 8); // kv pairs
+    w_u64(&mut h, 2); 
+    w_u64(&mut h, 8); 
 
     w_kv_str(&mut h, "general.architecture", "llama");
     w_kv_u32(&mut h, "general.alignment", 64);
@@ -72,19 +64,18 @@ fn synth_gguf() -> Vec<u8> {
     w_u32(&mut h, 1);
     h.push((-5i8) as u8);
 
-    // Tensor infos: dims are fastest-first, offsets relative to data start.
     w_str(&mut h, "t_f32");
     w_u32(&mut h, 2);
-    w_u64(&mut h, 3); // fastest dim -> reported shape [2, 3]
+    w_u64(&mut h, 3); 
     w_u64(&mut h, 2);
-    w_u32(&mut h, 0); // F32
+    w_u32(&mut h, 0); 
     w_u64(&mut h, 0);
 
     w_str(&mut h, "t_q8");
     w_u32(&mut h, 1);
     w_u64(&mut h, 32);
-    w_u32(&mut h, 8); // Q8_0
-    w_u64(&mut h, 64); // after the 24-byte f32 matrix, aligned to 64
+    w_u32(&mut h, 8); 
+    w_u64(&mut h, 64); 
 
     while h.len() % 64 != 0 {
         h.push(0);
@@ -95,8 +86,8 @@ fn synth_gguf() -> Vec<u8> {
     while h.len() % 64 != 0 {
         h.push(0);
     }
-    h.extend_from_slice(&f16_bytes(2.0)); // d = 2.0
-    h.extend((0i8..32).map(|q| q as u8)); // qs = 0..32 -> values 0,2,..,62
+    h.extend_from_slice(&f16_bytes(2.0)); 
+    h.extend((0i8..32).map(|q| q as u8)); 
 
     h
 }
@@ -115,19 +106,16 @@ fn write_synth(test: &str, file: &str) -> PathBuf {
     path
 }
 
-/// Extracts the error text (the Ok types here do not implement Debug).
 fn err_str<T>(r: flint_error::Result<T>) -> String {
     r.err().expect("expected an error").to_string()
 }
-
-// ---------------------------------------------------------------- tests
 
 #[test]
 fn reads_metadata_and_tensors() {
     let path = write_synth("main", "m.gguf");
     let gguf = Gguf::open(&path).unwrap();
 
-    assert_eq!(gguf.kind(), "gguf");
+    assert_eq!(gguf.kind(), CheckpointKind::Gguf);
     assert!(gguf.config_json().unwrap().is_none());
 
     let meta = gguf.metadata();
@@ -180,12 +168,11 @@ fn rejects_bad_magic_and_truncation() {
 
 #[test]
 fn open_dispatches_on_directory_contents() {
-    // A lone .gguf wins.
+
     let dir = tmp_dir("open");
     std::fs::write(dir.join("m.gguf"), synth_gguf()).unwrap();
-    assert_eq!(flint_checkpoint::open(&dir).unwrap().kind(), "gguf");
+    assert_eq!(flint_checkpoint::open(&dir).unwrap().kind(), CheckpointKind::Gguf);
 
-    // Split shards fail fast.
     std::fs::write(dir.join("m-00001.gguf"), synth_gguf()).unwrap();
     assert!(
         err_str(flint_checkpoint::open(&dir)).contains("shards"),
@@ -193,7 +180,6 @@ fn open_dispatches_on_directory_contents() {
     );
     std::fs::remove_dir_all(&dir).ok();
 
-    // Neither format present.
     let empty = tmp_dir("empty");
     assert!(flint_checkpoint::open(&empty).is_err());
     std::fs::remove_dir_all(&empty).ok();
@@ -201,18 +187,12 @@ fn open_dispatches_on_directory_contents() {
     assert!(flint_checkpoint::open(Path::new("./no-such-dir-flint")).is_err());
 }
 
-// ---------------------------------------------------------------- writer round-trip
-
-// ---------------------------------------------------------------- value types
-
-/// Hand-writes every metadata value type the reader accepts: u8/i8/u16/i16/
-/// i32/u64/i64/f64 plus a f32 array.
 fn synth_full_types() -> Vec<u8> {
     let mut h = Vec::new();
     w_u32(&mut h, 0x4655_4747);
     w_u32(&mut h, 3);
-    w_u64(&mut h, 0); // tensors
-    w_u64(&mut h, 9); // kv pairs
+    w_u64(&mut h, 0); 
+    w_u64(&mut h, 9); 
 
     let kv = |out: &mut Vec<u8>, key: &str, ty: u32, body: &[u8]| {
         w_str(out, key);
@@ -227,7 +207,7 @@ fn synth_full_types() -> Vec<u8> {
     kv(&mut h, "t_u64", 10, &(1u64 << 40).to_le_bytes());
     kv(&mut h, "t_i64", 11, &(-(1i64 << 40)).to_le_bytes());
     kv(&mut h, "t_f64", 12, &std::f64::consts::PI.to_le_bytes());
-    // f32 array (element tag 6).
+
     let mut arr = Vec::new();
     w_u32(&mut arr, 6);
     w_u64(&mut arr, 2);
@@ -257,7 +237,6 @@ fn reads_every_metadata_value_type() {
     assert_eq!(meta.f64("t_u8"), Some(200.0));
     assert_eq!(meta.f64_array("t_arr_f32").unwrap(), vec![1.5, -2.0]);
 
-    // Type-mismatched accessors return None rather than panicking.
     assert_eq!(meta.str("t_u8"), None);
     assert_eq!(meta.u32("t_f64"), None);
     assert_eq!(
@@ -274,9 +253,8 @@ fn reads_every_metadata_value_type() {
 fn rejects_unknown_value_types_and_versions() {
     let dir = tmp_dir("bad-ty");
 
-    // Unknown metadata value tag 13: patch the first record's tag byte.
     let mut bad = synth_full_types();
-    let tag_off = 8 + 8 + 8 + 8 + 4; // magic+version, counts, key len, key "t_u8"
+    let tag_off = 8 + 8 + 8 + 8 + 4; 
     bad[tag_off] = 13;
     let p = dir.join("bad.gguf");
     std::fs::write(&p, &bad).unwrap();
@@ -285,14 +263,12 @@ fn rejects_unknown_value_types_and_versions() {
         "unknown tag must fail"
     );
 
-    // Version 4 is out of the supported 2..=3 range.
     let mut v4 = synth_gguf();
     v4[4..8].copy_from_slice(&4u32.to_le_bytes());
     let p = dir.join("v4.gguf");
     std::fs::write(&p, &v4).unwrap();
     assert!(err_str(Gguf::open(&p)).contains("unsupported GGUF version"));
 
-    // Version 2 reads like version 3 (identical header layout).
     let mut v2 = synth_gguf();
     v2[4..8].copy_from_slice(&2u32.to_le_bytes());
     let p = dir.join("v2.gguf");
@@ -316,7 +292,6 @@ fn writer_roundtrips_through_reader() {
     w.kv_u32_array("tokenizer.ggml.token_type", &[0, 0, 3]);
     w.kv_f64_array("tokenizer.ggml.scores", &[1.5, 0.5, -1.0]);
 
-    // One tensor per storage flavor: F32, bf16, Q8_0.
     let f32_data: Vec<f32> = (0..32).map(|i| i as f32 - 16.0).collect();
     let bf16_data: Vec<f32> = (0..64).map(|i| i as f32 * 0.5).collect();
     let q8_data: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 3.0).collect();
@@ -326,7 +301,7 @@ fn writer_roundtrips_through_reader() {
     std::fs::write(dir.join("m.gguf"), w.finish()).unwrap();
 
     let g = Gguf::open(&dir.join("m.gguf")).unwrap();
-    assert_eq!(g.kind(), "gguf");
+    assert_eq!(g.kind(), CheckpointKind::Gguf);
     assert_eq!(g.metadata().str("general.architecture"), Some("llama"));
     assert_eq!(g.metadata().u32("llama.block_count"), Some(2));
     assert_eq!(g.metadata().f64("llama.rope.freq_base"), Some(10000.0));
@@ -370,7 +345,7 @@ fn writer_roundtrips_through_reader() {
     assert_eq!(q8.shape, vec![2, 32]);
     let got = q8.data.into_f32();
     for (a, b) in got.iter().zip(&q8_data) {
-        // Q8_0 error is bounded by d/2 (one 127th of the block max).
+
         assert!((a - b).abs() < 0.5, "{a} vs {b}");
     }
     std::fs::remove_dir_all(&dir).ok();

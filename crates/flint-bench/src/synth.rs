@@ -1,13 +1,8 @@
-//! In-memory synthetic checkpoint: deterministic random weights at real-model
-//! dimensions, generated on demand with no disk I/O. Used by the benchmark to
-//! measure kernel throughput without downloading any weights.
-
 use std::collections::HashMap;
 
-use flint_checkpoint::{Checkpoint, Metadata, RawTensor, TensorData};
+use flint_checkpoint::{Checkpoint, CheckpointKind, Metadata, RawTensor, TensorData};
 use flint_error::Result;
 
-/// Dimensions of the synthetic dense model.
 #[derive(Clone, Copy, Debug)]
 pub struct BenchSpec {
     pub hidden: u32,
@@ -20,21 +15,19 @@ pub struct BenchSpec {
 }
 
 impl BenchSpec {
-    /// Total weight bytes as stored on the GPU (i8 projections, bf16 embed,
-    /// f32 norms), for bandwidth sanity checks.
+
     pub fn weight_bytes(&self) -> u64 {
         let h = self.hidden as u64;
         let i = self.intermediate as u64;
         let l = self.layers as u64;
         let per_layer = (4 * h * h) + (3 * i * h) + (h + h) * 4;
-        let proj_bytes = per_layer * l * 33 / 32; // Q8_0-style i8 + scales
-        let embed = self.vocab as u64 * h * 2; // bf16
-        let head = self.vocab as u64 * h * 33 / 32; // untied lm_head, i8
+        let proj_bytes = per_layer * l * 33 / 32; 
+        let embed = self.vocab as u64 * h * 2; 
+        let head = self.vocab as u64 * h * 33 / 32; 
         proj_bytes + embed + head + h * 4
     }
 }
 
-/// Canonical tensor descriptors: (shape, f32 byte count).
 fn tensors(s: &BenchSpec) -> Vec<(String, Vec<u32>)> {
     let mut v = vec![
         ("model.embed_tokens.weight".into(), vec![s.vocab, s.hidden]),
@@ -70,7 +63,6 @@ fn tensors(s: &BenchSpec) -> Vec<(String, Vec<u32>)> {
     v
 }
 
-/// FNV-1a hash seeding the per-tensor generator.
 fn seed_of(name: &str) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     for b in name.bytes() {
@@ -80,7 +72,6 @@ fn seed_of(name: &str) -> u64 {
     h
 }
 
-/// Deterministic xorshift64 PRNG; values in [-1, 1).
 fn fill(seed: u64, gain: f32, out: &mut [f32]) {
     let mut s = seed | 1;
     let mut next = move || {
@@ -94,10 +85,9 @@ fn fill(seed: u64, gain: f32, out: &mut [f32]) {
     }
 }
 
-/// A checkpoint that materializes random f32 tensors from their names.
 pub struct SynthCheckpoint {
     hidden: u32,
-    /// name -> (shape, seed); built once, read many.
+
     index: HashMap<String, (Vec<u32>, u64)>,
 }
 
@@ -129,8 +119,7 @@ impl Checkpoint for SynthCheckpoint {
             .ok_or_else(|| flint_error::Error::Model(format!("unknown tensor {name}")))?;
         let n = shape.iter().map(|d| *d as usize).product();
         let mut data = vec![0f32; n];
-        // Xavier-style gain keeps attention logits bounded so the softmax
-        // never overflows on untrained weights: q/k dot products stay O(1).
+
         let gain = if name.ends_with("_proj.weight") || name.ends_with("lm_head.weight") {
             1.0 / (self.hidden as f32).sqrt()
         } else {
@@ -152,7 +141,7 @@ impl Checkpoint for SynthCheckpoint {
         Ok(None)
     }
 
-    fn kind(&self) -> &'static str {
-        "synth"
+    fn kind(&self) -> CheckpointKind {
+        CheckpointKind::Safetensors
     }
 }

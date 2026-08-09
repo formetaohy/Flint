@@ -1,7 +1,3 @@
-//! Concrete model architectures, their chat prompt formats, and the
-//! config/format-driven registry that assembles them into a ready-to-chat
-//! bundle. Depends on the `flint-model` abstraction framework.
-
 pub mod chat;
 pub mod dense;
 pub mod gemma;
@@ -15,7 +11,7 @@ pub mod qwen35;
 use std::path::Path;
 
 use flint_backend::Backend;
-use flint_checkpoint::{Checkpoint, open};
+use flint_checkpoint::{Checkpoint, CheckpointKind, open};
 use flint_error::{Error, Result};
 use flint_model::LanguageModel;
 use flint_tokenizer::Tokenizer;
@@ -24,8 +20,6 @@ use serde_json::Value;
 use crate::chat::{ChatFormat, ChatMl, ChatMlThink, Gemma4Chat, GemmaChat, Phi4Chat, PhiChat};
 use crate::qwen35::Qwen35;
 
-/// A fully assembled, chat-ready model: tensor engine, tokenizer, prompt format
-/// and reply terminators.
 pub struct ChatModel {
     pub model: Box<dyn LanguageModel>,
     pub tokenizer: Tokenizer,
@@ -33,7 +27,6 @@ pub struct ChatModel {
     pub stop: Vec<u32>,
 }
 
-/// Architecture families Flint can instantiate.
 #[derive(Clone, Copy)]
 pub enum Family {
     Qwen35,
@@ -45,7 +38,7 @@ pub enum Family {
 }
 
 impl Family {
-    /// Dispatches on a safetensors config's `model_type`.
+
     fn from_model_type(t: Option<&str>) -> Result<Self> {
         match t {
             Some("qwen3_5") => Ok(Family::Qwen35),
@@ -58,7 +51,6 @@ impl Family {
         }
     }
 
-    /// Dispatches on a GGUF `general.architecture`.
     fn from_gguf_arch(a: &str) -> Result<Self> {
         match a {
             "llama" | "qwen2" | "qwen3" | "mistral" => Ok(Family::Llama),
@@ -72,7 +64,6 @@ impl Family {
         }
     }
 
-    /// The family's chat prompt format.
     fn chat_format(self) -> Box<dyn ChatFormat> {
         match self {
             Family::Qwen35 => Box::new(ChatMlThink),
@@ -85,10 +76,6 @@ impl Family {
     }
 }
 
-/// Opens the checkpoint once, resolves its architecture and config,
-/// instantiates the model and packages it with its tokenizer, chat format and
-/// stop tokens. Format-agnostic: safetensors dirs and single-file GGUF both
-/// work.
 pub fn load(model_dir: &Path, max_seq: u32, backend: &Backend) -> Result<ChatModel> {
     let source = open(model_dir)?;
     let family = family_of(source.as_ref())?;
@@ -112,8 +99,6 @@ pub fn load(model_dir: &Path, max_seq: u32, backend: &Backend) -> Result<ChatMod
     })
 }
 
-/// Model eos plus the family's reply terminators, resolved against the vocab
-/// (literals absent from the vocab are skipped, duplicates dropped).
 fn stop_tokens(eos: &[u32], tokenizer: &Tokenizer, literals: &[&str]) -> Vec<u32> {
     let mut stop = eos.to_vec();
     for lit in literals {
@@ -128,33 +113,27 @@ fn stop_tokens(eos: &[u32], tokenizer: &Tokenizer, literals: &[&str]) -> Vec<u32
 
 fn family_of(source: &dyn Checkpoint) -> Result<Family> {
     match source.kind() {
-        "safetensors" => {
+        CheckpointKind::Safetensors => {
             let v = source
                 .config_json()?
                 .ok_or_else(|| Error::Config("safetensors checkpoint has no config.json".into()))?;
             Family::from_model_type(v["model_type"].as_str())
         }
-        "gguf" => {
+        CheckpointKind::Gguf => {
             let arch = source
                 .metadata()
                 .str("general.architecture")
                 .ok_or_else(|| Error::Config("GGUF missing general.architecture".into()))?;
             Family::from_gguf_arch(arch)
         }
-        other => Err(Error::Config(format!(
-            "unknown checkpoint format {other:?}"
-        ))),
     }
 }
 
 fn config_for(source: &dyn Checkpoint, family: Family) -> Result<Value> {
     match source.kind() {
-        "safetensors" => source
+        CheckpointKind::Safetensors => source
             .config_json()?
             .ok_or_else(|| Error::Config("safetensors checkpoint has no config.json".into())),
-        "gguf" => gguf_config::synthesize_config(source, family),
-        other => Err(Error::Config(format!(
-            "unknown checkpoint format {other:?}"
-        ))),
+        CheckpointKind::Gguf => gguf_config::synthesize_config(source, family),
     }
 }

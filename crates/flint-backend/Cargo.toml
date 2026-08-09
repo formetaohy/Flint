@@ -9,5 +9,5 @@ flint-error.workspace = true
 flint-kernel.workspace = true
 flint-profiler.workspace = true
 flint-tensor.workspace = true
-pollster.workspace = true
-wgpu.workspace = true
+saturn-api = { path = "../../saturn/crates/saturn-api" }
+saturn-core = { path = "../../saturn/crates/saturn-core" }

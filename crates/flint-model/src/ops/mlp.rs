@@ -1,15 +1,11 @@
-//! MLP and elementwise dispatchers: SwiGLU blocks, activations, adds.
-
 use flint_backend::{Backend, Binding, Pass};
 use flint_error::Result;
 use flint_kernel::name;
 use flint_tensor::Tensor;
 
 use crate::loader::SwigluMlp;
-use crate::ops::{Act, gemm, gemm_acc};
+use crate::ops::{Act, gemm, gemm_acc, gemv};
 
-/// Scratch tiles for one SwiGLU MLP: gate/up projections, SiLU activation
-/// and the down-projection target. `down_out` doubles as the residual addend.
 pub struct MlpTiles {
     pub gate_out: Tensor,
     pub up_out: Tensor,
@@ -29,16 +25,8 @@ pub fn swiglu_mlp(
     acc_y: bool,
 ) -> Result<()> {
     if rows == 1 {
-        backend.gemv_gateup(
-            pass,
-            x,
-            &mlp.gate,
-            &mlp.up,
-            Binding::Full(&t.gate_out),
-            Binding::Full(&t.up_out),
-            intermediate,
-            mlp.gate.tensor().shape[1],
-        )?;
+        gemv(backend, pass, x, &mlp.gate, Binding::Full(&t.gate_out))?;
+        gemv(backend, pass, x, &mlp.up, Binding::Full(&t.up_out))?;
     } else {
         gemm(
             backend,
@@ -85,7 +73,7 @@ pub fn add(
         [n_elem.div_ceil(256), 1, 1],
     )
 }
-/// In-place row-broadcast bias over a [rows, dim] tile: x += bias per row.
+
 pub fn bias(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
@@ -120,7 +108,7 @@ pub fn swiglu(
         [n_elem.div_ceil(256), 1, 1],
     )
 }
-/// In-place logit softcapping (Gemma 4): x = cap * tanh(x / cap).
+
 pub fn softcap(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
@@ -136,7 +124,7 @@ pub fn softcap(
         [n_elem.div_ceil(256), 1, 1],
     )
 }
-/// Elementwise multiply with broadcast: y = a * b (b length divides a's).
+
 pub fn mul(
     backend: &mut Backend,
     pass: &mut Pass<'_>,

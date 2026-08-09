@@ -1,12 +1,7 @@
-//! Runtime tensor values. Integers are widened to i64 and floats to f32 at
-//! load time, so operators work on exactly two numeric representations;
-//! f16/bf16/f64 weights are converted on load.
-
 use std::path::Path;
 
 use flint_error::{Error, Result};
 
-/// Numeric payload of a tensor.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Data {
     F32(Vec<f32>),
@@ -32,7 +27,6 @@ impl Data {
     }
 }
 
-/// A shaped runtime tensor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tensor {
     pub data: Data,
@@ -69,8 +63,6 @@ impl Tensor {
         self.shape.iter().product()
     }
 
-    /// Broadcasts this tensor against `other` following numpy rules and
-    /// returns both as equal-length f32 buffers.
     pub fn broadcast_f32(&self, other: &Self) -> Result<(Vec<f32>, Vec<f32>)> {
         let shape = broadcast_shape(&self.shape, &other.shape)?;
         Ok((
@@ -79,14 +71,11 @@ impl Tensor {
         ))
     }
 
-    /// Expands this tensor to `shape` (numpy broadcasting rules) as f32.
     pub fn broadcast_to_f32(&self, shape: &[usize]) -> Result<Vec<f32>> {
         let src = self.data.as_f32();
         Ok(broadcast_to(&src, &self.shape, shape)?)
     }
 
-    /// Loads from its protobuf representation, resolving external data
-    /// relative to `model_dir`.
     pub fn from_proto(t: &crate::onnx::TensorProto, model_dir: &Path) -> Result<Tensor> {
         let shape: Vec<usize> = t.dims.iter().map(|&d| d.max(0) as usize).collect();
         let data = match t.data_type {
@@ -97,13 +86,13 @@ impl Tensor {
             10 => Data::F32(
                 raw(t, model_dir, 2)?
                     .chunks_exact(2)
-                    .map(|c| flint_num::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .map(|c| saturn_core::num::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect(),
             ),
             16 => Data::F32(
                 raw(t, model_dir, 2)?
                     .chunks_exact(2)
-                    .map(|c| flint_num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .map(|c| saturn_core::num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect(),
             ),
             11 => Data::F32(
@@ -139,7 +128,6 @@ impl Tensor {
         }
     }
 
-    /// Formats for CLI display: dtype, shape and up to `limit` elements.
     pub fn describe(&self, limit: usize) -> String {
         let dt = match self.data {
             Data::F32(_) => "f32",
@@ -161,8 +149,6 @@ impl Tensor {
     }
 }
 
-/// Expands row-major `data` of shape `src` to `dst` (numpy broadcasting
-/// rules). Scalar (empty shape) sources fill; incompatible shapes error.
 pub fn broadcast_to<T: Copy>(data: &[T], src: &[usize], dst: &[usize]) -> Result<Vec<T>> {
     if src.is_empty() {
         return Ok(vec![data[0]; dst.iter().product()]);
@@ -184,7 +170,7 @@ pub fn broadcast_to<T: Copy>(data: &[T], src: &[usize], dst: &[usize]) -> Result
             )));
         }
     }
-    // Element strides within the source layout (0 for broadcast dims).
+
     let mut src_strides = vec![0usize; src.len()];
     let mut acc = 1usize;
     for i in (0..src.len()).rev() {
@@ -209,7 +195,6 @@ pub fn broadcast_to<T: Copy>(data: &[T], src: &[usize], dst: &[usize]) -> Result
     Ok(out)
 }
 
-/// numpy-style broadcast result shape, or an error if incompatible.
 pub fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
     let n = a.len().max(b.len());
     let mut out = vec![0usize; n];
@@ -246,9 +231,6 @@ fn external_value(t: &crate::onnx::TensorProto, key: &str) -> Option<String> {
         .map(|e| e.value.clone())
 }
 
-/// Raw element bytes: in-proto raw_data, typed repeated fields, or the
-/// requested slice of an external data file. `elem` is the byte width used
-/// to validate in-proto typed payloads.
 fn raw(t: &crate::onnx::TensorProto, model_dir: &Path, elem: usize) -> Result<Vec<u8>> {
     if !t.raw_data.is_empty() {
         return Ok(t.raw_data.clone());
@@ -264,7 +246,6 @@ fn raw(t: &crate::onnx::TensorProto, model_dir: &Path, elem: usize) -> Result<Ve
     external_bytes(t, model_dir)
 }
 
-/// Raw bytes from external data, honoring offset/length.
 fn external_bytes(t: &crate::onnx::TensorProto, model_dir: &Path) -> Result<Vec<u8>> {
     let Some(loc) = external_value(t, "location") else {
         return Err(Error::Model(format!(
@@ -291,43 +272,41 @@ fn external_bytes(t: &crate::onnx::TensorProto, model_dir: &Path) -> Result<Vec<
     Ok(bytes[offset as usize..end as usize].to_vec())
 }
 
-/// Integer payload widened to i64, from raw bytes or typed repeated fields.
-/// Signed types sign-extend to preserve values.
 fn int_data(t: &crate::onnx::TensorProto, model_dir: &Path) -> Result<Vec<i64>> {
     if !t.raw_data.is_empty() {
         return Ok(match t.data_type {
-            2 | 9 => t.raw_data.iter().map(|&b| b as i64).collect(),        // uint8 / bool
-            3 => t.raw_data.iter().map(|&b| (b as i8) as i64).collect(),    // int8
+            2 | 9 => t.raw_data.iter().map(|&b| b as i64).collect(),        
+            3 => t.raw_data.iter().map(|&b| (b as i8) as i64).collect(),    
             4 => t
                 .raw_data
                 .chunks_exact(2)
                 .map(|c| i64::from(u16::from_le_bytes([c[0], c[1]])))
-                .collect(),                                                  // uint16
+                .collect(),                                                  
             5 => t
                 .raw_data
                 .chunks_exact(2)
                 .map(|c| i64::from(i16::from_le_bytes([c[0], c[1]])))
-                .collect(),                                                  // int16
+                .collect(),                                                  
             6 => t
                 .raw_data
                 .chunks_exact(4)
                 .map(|c| i64::from(i32::from_le_bytes(c.try_into().unwrap())))
-                .collect(),                                                  // int32
+                .collect(),                                                  
             12 => t
                 .raw_data
                 .chunks_exact(4)
                 .map(|c| i64::from(u32::from_le_bytes(c.try_into().unwrap())))
-                .collect(),                                                  // uint32
+                .collect(),                                                  
             7 => t
                 .raw_data
                 .chunks_exact(8)
                 .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-                .collect(),                                                  // int64
+                .collect(),                                                  
             13 => t
                 .raw_data
                 .chunks_exact(8)
                 .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-                .collect(),                                                  // uint64 (wraps)
+                .collect(),                                                  
             _ => return Err(Error::Model("unsupported integer type".into())),
         });
     }

@@ -1,13 +1,3 @@
-//! Full-pipeline tests over toy checkpoints. Every supported architecture
-//! materializes a minimal deterministic-weight model via `common::toy`, and
-//! the complete load -> prefill -> generate path runs with zero external
-//! weight files.
-//!
-//! Assertions are structural, not qualitative: chunked vs sequential prefill
-//! must agree, speculative decoding must reproduce plain decoding
-//! token-for-token, snapshot/restore must be lossless, tokenizers must
-//! round-trip.
-
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
@@ -20,14 +10,12 @@ use flint_architectures::ChatModel;
 mod common;
 use common::toy::ToySpec;
 
-/// The adapter is a single shared, memory-limited resource: serialize GPU work.
 static GPU: Mutex<()> = Mutex::new(());
 
 fn gpu() -> MutexGuard<'static, ()> {
     GPU.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Per-test scratch directory (parallel tests never collide).
 fn toy_dir(test: &str, spec: ToySpec) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("flint-toy-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -49,7 +37,6 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot / (na * nb)
 }
 
-/// Replays the prompt one token at a time; returns the final logits.
 fn sequential_logits(
     model: &mut Box<dyn LanguageModel>,
     backend: &mut Backend,
@@ -67,7 +54,6 @@ fn sequential_logits(
     logits
 }
 
-/// Prefills in M_MAX-wide chunks; returns the last chunk's final-row logits.
 fn chunked_logits(
     model: &mut Box<dyn LanguageModel>,
     backend: &mut Backend,
@@ -90,11 +76,6 @@ fn chunked_logits(
     logits
 }
 
-/// Chunked prefill (16-wide) must reproduce a one-token-at-a-time replay of
-/// the same prompt. The WGPU backend has run-to-run reduction nondeterminism
-/// and the KV cache is packed bf16, so the equivalence signal is cosine
-/// similarity of the full logit vector; a wrong graph collapses far below
-/// the floor, a correct one stays well above it.
 fn prefill_equivalence(test: &str, spec: ToySpec) {
     let _g = gpu();
     let (mut backend, mut cm) = load(test, spec, 256);
@@ -108,8 +89,6 @@ fn prefill_equivalence(test: &str, spec: ToySpec) {
     let cos = cosine(&chunked, &seq);
     assert!(cos > 0.98, "logit distribution diverges (cosine {cos})");
 }
-
-// ---------------------------------------------------------------- prefill
 
 #[test]
 fn prefill_llama_gguf() {
@@ -166,8 +145,6 @@ fn prefill_gemma4_kv_sharing_ple() {
     prefill_equivalence("prefill_gemma4", ToySpec::Gemma4);
 }
 
-// ---------------------------------------------------------------- generation
-
 fn generate(test: &str, spec: ToySpec, max_tokens: usize, speculate: bool) -> Vec<u32> {
     let _g = gpu();
     let (backend, cm) = load(test, spec, 256);
@@ -187,8 +164,6 @@ fn generate(test: &str, spec: ToySpec, max_tokens: usize, speculate: bool) -> Ve
     tokens
 }
 
-/// Greedy decoding on random weights must still terminate (via stop tokens
-/// or the token budget) without panicking.
 #[test]
 fn generation_llama_greedy_terminates() {
     let tokens = generate("gen_llama", ToySpec::Llama, 24, false);
@@ -213,8 +188,6 @@ fn generation_gemma4_greedy_terminates() {
     assert!(!tokens.is_empty(), "generation produced nothing");
 }
 
-/// Speculative decoding must emit exactly the same tokens as the plain loop:
-/// speculation changes speed, never output.
 #[test]
 fn generation_qwen35_speculative_matches_plain() {
     let plain = generate("gen_qwen35_plain", ToySpec::Qwen35, 40, false);
@@ -222,12 +195,6 @@ fn generation_qwen35_speculative_matches_plain() {
     assert_eq!(spec, plain, "speculative decoding diverged from plain");
 }
 
-// ---------------------------------------------------------------- multi-turn
-
-/// A second `stream` on the same engine must replay the first turn exactly:
-/// `reset` clears every piece of state (position, KV caches, recurrent
-/// states, MTP head) or the second turn diverges. Exercised on both a dense
-/// model (KV-only state) and the hybrid with recurrent + MTP state.
 #[test]
 fn multi_turn_reset_replays_identically() {
     for (test, spec) in [
@@ -261,16 +228,10 @@ fn multi_turn_reset_replays_identically() {
     }
 }
 
-// ---------------------------------------------------------------- format dispatch
-
-/// Unknown model_type / missing GGUF architecture fail the load fast, before
-/// any weight is touched.
 #[test]
 fn unsupported_formats_fail_fast() {
     let _g = gpu();
 
-    // safetensors with an unknown model_type: the container must open, so a
-    // minimal valid shard is written first.
     let dir = std::env::temp_dir().join(format!("flint-badfmt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -284,7 +245,6 @@ fn unsupported_formats_fail_fast() {
     let err = flint_architectures::load(&dir, 64, &backend).err().unwrap();
     assert!(err.to_string().contains("unsupported model_type"), "{err}");
 
-    // GGUF without general.architecture.
     let gguf_dir = std::env::temp_dir().join(format!("flint-badarch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&gguf_dir);
     std::fs::create_dir_all(&gguf_dir).unwrap();
@@ -302,8 +262,6 @@ fn unsupported_formats_fail_fast() {
     std::fs::remove_dir_all(&gguf_dir).ok();
 }
 
-/// The split-head and untied variants must also survive speculative decoding
-/// (repeat_qk runs on the draft path too, and the lm_head must score drafts).
 #[test]
 fn generation_qwen35_variants_speculative_matches_plain() {
     for spec in [ToySpec::Qwen35Split, ToySpec::Qwen35Untied] {
@@ -314,10 +272,6 @@ fn generation_qwen35_variants_speculative_matches_plain() {
     }
 }
 
-// ---------------------------------------------------------------- model api
-
-/// A 2-token verify chunk must produce the same row-0 logits as a single
-/// forward from identical recurrent state (snapshot/restore correctness).
 #[test]
 fn verify_chunk_row0_matches_single_forward() {
     let _g = gpu();
@@ -356,10 +310,6 @@ fn verify_chunk_row0_matches_single_forward() {
     assert!(max_diff < 1e-2, "row-0 drift {max_diff}");
 }
 
-// ---------------------------------------------------------------- tokenizer
-
-/// Special markers encode as single ids and streaming decode round-trips
-/// plain text, for both tokenizer sources: GGUF-embedded BPE and HF JSON.
 #[test]
 fn tokenizer_markers_and_streaming_roundtrip() {
     for (test, spec) in [("tok_gguf", ToySpec::Llama), ("tok_json", ToySpec::Qwen35)] {
@@ -384,9 +334,6 @@ fn tokenizer_markers_and_streaming_roundtrip() {
     }
 }
 
-// ---------------------------------------------------------------- errors
-
-/// Engine and model fail fast on invalid input.
 #[test]
 fn engine_and_model_fail_fast() {
     let _g = gpu();

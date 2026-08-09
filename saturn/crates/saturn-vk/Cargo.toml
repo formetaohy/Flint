@@ -1,0 +1,12 @@
+[package]
+name = "saturn-vk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+saturn-core.workspace = true
+saturn-compiler.workspace = true
+saturn-shader.workspace = true
+ash.workspace = true
+log.workspace = true

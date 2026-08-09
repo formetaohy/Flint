@@ -1,15 +1,10 @@
-//! LLaMA family (LLaMA / Qwen2 / Qwen3 / Mistral): dense GQA with SwiGLU MLP,
-//! optional QKV biases and per-head QK-norm. A configuration of the shared
-//! `DenseModel`, no forward graph of its own.
-
 use flint_backend::Backend;
-use flint_checkpoint::Checkpoint;
+use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::Result;
 use serde_json::Value;
 
 use crate::dense::{DenseConfig, DenseModel, dense_plan};
 
-/// Parses and validates a LLaMA-family config.
 pub fn parse_config(v: &Value) -> Result<DenseConfig> {
     let mut cfg = DenseConfig::parse(v, false)?;
     cfg.qkv_bias = v
@@ -21,7 +16,6 @@ pub fn parse_config(v: &Value) -> Result<DenseConfig> {
     Ok(cfg)
 }
 
-/// Loads a LLaMA-family checkpoint as a shared dense model.
 pub fn load(
     source: &dyn Checkpoint,
     v: &Value,
@@ -32,7 +26,7 @@ pub fn load(
     DenseModel::load(
         source,
         cfg,
-        &dense_plan(source.kind() == "gguf"),
+        &dense_plan(source.kind() == CheckpointKind::Gguf),
         max_seq,
         backend,
     )

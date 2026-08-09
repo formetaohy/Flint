@@ -9,7 +9,6 @@ use flint_error::Result;
 use flint_generate::{Engine, Sampler, SamplingParams};
 use flint_onnx::hub;
 
-/// Flint: a local LLM inference engine on WGPU.
 #[derive(Parser)]
 #[command(name = "flint", version, about)]
 struct Args {
@@ -22,7 +21,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// ONNX model utilities: download from the Hub, inspect, run graphs.
+
     Onnx(OnnxArgs),
 }
 
@@ -34,49 +33,47 @@ struct OnnxArgs {
 
 #[derive(Subcommand)]
 enum OnnxCmd {
-    /// Downloads an ONNX model from the Hugging Face Hub into a directory.
+
     Download {
-        /// Hub repo id, e.g. Xenova/all-MiniLM-L6-v2.
+
         repo: String,
-        /// Repo file to fetch (default: onnx/model.onnx when present).
+
         #[arg(long)]
         file: Option<String>,
-        /// Local output directory.
+
         #[arg(long, default_value = "onnx-models")]
         out: PathBuf,
     },
-    /// Runs an ONNX graph with the given inputs and prints the outputs.
+
     Run {
-        /// Path to the .onnx model file.
+
         model: PathBuf,
-        /// Inputs as JSON: {"name": [[values]], ...} (integers become i64,
-        /// floats f32, arrays are row-major with an implied shape).
+
         #[arg(long)]
         inputs: Option<String>,
-        /// Input JSON file with the same schema.
+
         #[arg(long)]
         inputs_file: Option<PathBuf>,
-        /// Print only this output tensor (repeatable).
+
         #[arg(long)]
         output: Vec<String>,
-        /// Print every element of each output instead of the first 8.
+
         #[arg(long)]
         full: bool,
     },
-    /// Prints graph structure and operator statistics.
+
     Info {
-        /// Path to the .onnx model file.
+
         model: PathBuf,
     },
 }
 
 #[derive(ClapArgs)]
 struct ChatArgs {
-    /// Directory containing config.json / tokenizer.json / safetensors shards.
+
     #[arg(long)]
     model: Option<PathBuf>,
 
-    /// One-shot prompt; omit for an interactive session.
     #[arg(long)]
     prompt: Option<String>,
 
@@ -95,23 +92,18 @@ struct ChatArgs {
     #[arg(long, default_value_t = 20)]
     top_k: usize,
 
-    /// Drop tokens whose probability is below min_p * max_prob.
     #[arg(long, default_value_t = 0.0)]
     min_p: f32,
 
-    /// Multiplicative repetition penalty (1.0 disables).
     #[arg(long, default_value_t = 1.0)]
     repeat_penalty: f32,
 
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    /// Context window (also bounds the KV cache allocation).
     #[arg(long, default_value_t = 4096)]
     max_seq: u32,
 
-    /// Enable MTP speculative decoding (correct but only faster on
-    /// bandwidth-rich adapters; the draft head shares the vocab projection).
     #[arg(long)]
     speculate: bool,
 }
@@ -144,7 +136,6 @@ fn main() -> Result<()> {
     }
 }
 
-/// `flint onnx run`: binds inputs, executes the graph and prints outputs.
 fn onnx_run(
     model: &std::path::Path,
     inputs: Option<String>,
@@ -176,7 +167,7 @@ fn onnx_run(
         eprintln!("[flint] input {name}: shape {:?}", t.shape);
         session.set_input(name, t)?;
     }
-    // Fail fast on missing graph inputs.
+
     for v in &session.graph().inputs {
         if !inputs.contains_key(&v.name) {
             return Err(flint_error::Error::Model(format!(
@@ -206,8 +197,6 @@ fn onnx_run(
     Ok(())
 }
 
-/// Converts a JSON value into a tensor: numbers -> f32, integers -> i64,
-/// booleans -> bool; nested arrays are row-major with an implied shape.
 fn json_to_tensor(v: &serde_json::Value) -> Result<flint_onnx::Tensor> {
     fn flatten(v: &serde_json::Value, f32s: &mut Vec<f32>, i64s: &mut Vec<i64>, bools: &mut Vec<bool>) -> Result<()> {
         match v {
@@ -259,7 +248,6 @@ fn json_to_tensor(v: &serde_json::Value) -> Result<flint_onnx::Tensor> {
     }
 }
 
-/// `flint onnx info`: prints graph metadata and operator statistics.
 fn onnx_info(model: &std::path::Path) -> Result<()> {
     let g = flint_onnx::Graph::load(model)?;
     println!("graph: {:?}", g.name);
@@ -345,8 +333,6 @@ fn chat_main(args: ChatArgs) -> Result<()> {
     Ok(())
 }
 
-/// Interactive REPL: reads user turns, keeps them as history, and streams each
-/// assistant reply back to stdout.
 fn interactive(
     engine: &mut Engine,
     chat: &dyn ChatFormat,
@@ -377,8 +363,6 @@ fn interactive(
     Ok(())
 }
 
-/// Generates one assistant turn, streaming pieces to stdout. Returns the
-/// assembled reply text.
 fn run_turn(
     engine: &mut Engine,
     chat: &dyn ChatFormat,

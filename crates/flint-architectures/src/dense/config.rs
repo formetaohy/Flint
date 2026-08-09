@@ -1,43 +1,37 @@
-//! Validated dense GQA configuration shared by every family parser.
-
 use flint_error::{Error, Result};
 use flint_model::config::{check_gemm_dims, check_head_dim, f64_field, u32_field, u32_list};
 use flint_model::ops::{Act, RopeScaling};
 use flint_model::routing::RouteKind;
 use serde_json::Value;
 
-/// One RoPE variant; layers reference a set by index (`layer_rope`).
 #[derive(Clone, Debug)]
 pub struct RopeSpec {
-    /// Rotated dims (partial rotary leaves the rest untouched).
+
     pub dim: u32,
-    /// Inverse-frequency denominator (the head dim for proportional rope).
+
     pub freq_dim: u32,
     pub theta: f64,
-    /// LongRoPE per-dimension factors; None for plain rope.
+
     pub scaling: Option<RopeScaling>,
 }
 
-/// MoE FFN configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct MoeConfig {
     pub experts: u32,
     pub top_k: u32,
-    /// Router-logit scale applied before softmax.
+
     pub scale: f32,
-    /// Weight of the shared expert (0 disables it).
+
     pub shared_scale: f32,
-    /// Routing scheme.
+
     pub kind: RouteKind,
 }
 
-/// Per-Layer Embeddings (PLE, Gemma 4): `dim` extra floats per token per layer.
 #[derive(Clone, Copy, Debug)]
 pub struct PerLayerConfig {
     pub dim: u32,
 }
 
-/// Validated dense GQA config covering every supported family.
 #[derive(Clone, Debug)]
 pub struct DenseConfig {
     pub hidden: u32,
@@ -45,48 +39,48 @@ pub struct DenseConfig {
     pub layers: u32,
     pub q_heads: u32,
     pub kv_heads: u32,
-    /// Per-layer attention head dims (Gemma 4: global layers widen).
+
     pub head_dims: Vec<u32>,
     pub vocab: u32,
     pub eos: Vec<u32>,
     pub tied: bool,
-    /// Input embedding scale (Gemma: sqrt(hidden); everyone else 1).
+
     pub embed_scale: f32,
-    /// Q/K/V projection biases (Qwen2 small models, Phi-MoE).
+
     pub qkv_bias: bool,
-    /// Per-head RMSNorm on Q and K before RoPE (Qwen3; always on for Gemma).
+
     pub qk_norm: bool,
-    /// Scale-less RMSNorm on V before the cache (Gemma 4).
+
     pub v_norm: bool,
-    /// Sandwich norms on attention and MLP outputs before the residual (Gemma 3).
+
     pub sandwich: bool,
-    /// Attention window per layer; 0 attends to the full causal prefix.
+
     pub windows: Vec<u32>,
-    /// Norm epsilon (RMSNorm families vary; LayerNorm reads it too).
+
     pub norm_eps: f32,
-    /// Mean-centered norm with bias (Phi-MoE's LayerNorm).
+
     pub layernorm: bool,
-    /// Logits projection bias (Phi-MoE's lm_head_bias).
+
     pub lm_bias: bool,
-    /// MLP activation (Phi-4-mini / Gemma 4 use GELU).
+
     pub act: Act,
-    /// Double-wide MLP per layer (Gemma 4's KV-shared layers).
+
     pub double_wide: Vec<bool>,
-    /// RoPE sets plus the per-layer index into them.
+
     pub rope: Vec<RopeSpec>,
     pub layer_rope: Vec<u32>,
-    /// Layers from `layers - kv_shared` on reuse the last same-type KV (Gemma 4).
+
     pub kv_shared: u32,
-    /// Final-logit softcap (Gemma 4); None disables.
+
     pub softcap: Option<f32>,
-    /// MoE FFN config; None means a dense SwiGLU MLP.
+
     pub moe: Option<MoeConfig>,
-    /// Per-Layer Embeddings (Gemma 4); None disables.
+
     pub per_layer: Option<PerLayerConfig>,
 }
 
 impl DenseConfig {
-    /// Parses fields common to every dense family; family knobs stay at LLaMA defaults.
+
     pub fn parse(v: &Value, tied_default: bool) -> Result<Self> {
         let hidden = u32_field(v, "hidden_size")?;
         let q_heads = u32_field(v, "num_attention_heads")?;
@@ -214,7 +208,6 @@ impl DenseConfig {
         ])
     }
 
-    /// MLP width of layer `l` (double-wide layers double the intermediate).
     pub fn mlp_width(&self, l: u32) -> u32 {
         if self.double_wide[l as usize] {
             2 * self.intermediate
@@ -223,35 +216,27 @@ impl DenseConfig {
         }
     }
 
-    /// Largest MLP width across layers (scratch sizing).
     pub(crate) fn max_mlp_width(&self) -> u32 {
         (0..self.layers).map(|l| self.mlp_width(l)).max().unwrap()
     }
 
-    /// Layers at and beyond this index share the last same-type KV.
     pub fn first_shared(&self) -> u32 {
         self.layers - self.kv_shared
     }
 
-    /// Attention window of layer `l`.
     pub fn window(&self, l: u32) -> u32 {
         self.windows[l as usize]
     }
 
-    /// Head dim of layer `l`.
     pub fn head_dim(&self, l: u32) -> u32 {
         self.head_dims[l as usize]
     }
 
-    /// Whether layer `l` owns its KV projections (Gemma 4 sharing).
     pub fn has_kv(&self, l: u32) -> bool {
         l < self.first_shared()
     }
 
-    /// Whether the layer carries a PLE block.
     pub fn has_ple(&self) -> bool {
         self.per_layer.is_some()
     }
 }
-
-// ---------------------------------------------------------------- weights

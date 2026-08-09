@@ -1,16 +1,11 @@
-//! Operator unit tests: small hand-built ONNX graphs executed through the
-//! session, checked against hand-computed references.
-
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use flint_onnx::onnx;
 use flint_onnx::tensor::Data;
 use flint_onnx::{Session, Tensor};
 
-/// Unique temp-file suffix so parallel tests never share a model path.
 static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
 
-/// Builds a model with one node from a protobuf node; returns its bytes.
 fn one_op(
     op_type: &str,
     inputs: &[&str],
@@ -129,7 +124,7 @@ fn add_broadcast() {
 
 #[test]
 fn matmul_2d_and_batched() {
-    // 2D: [2,3] x [3,2]
+
     let bytes = one_op("MatMul", &["a", "b"], &["y"], vec![], vec![], &["a", "b"]);
     let (_, out) = run_bytes(
         &bytes,
@@ -138,10 +133,9 @@ fn matmul_2d_and_batched() {
             ("b", Tensor::f32(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2])),
         ],
     );
-    // [[58, 64], [139, 154]]
+
     assert_eq!(f32s(&out["y"]), &[58.0, 64.0, 139.0, 154.0]);
 
-    // Batched: [2,1,3] x [2,3,1]
     let (_, out) = run_bytes(
         &bytes,
         &[
@@ -162,7 +156,7 @@ fn transpose_4d() {
         vec![],
         &["x"],
     );
-    // x[i0,i1,i2,i3] = i0*1000 + i1*100 + i2*10 + i3, shape [1,2,3,4]
+
     let mut x = Vec::with_capacity(24);
     for a in 0..1 {
         for b in 0..2 {
@@ -176,7 +170,7 @@ fn transpose_4d() {
     let (_, out) = run_bytes(&bytes, &[("x", Tensor::f32(x, vec![1, 2, 3, 4]))]);
     let y = f32s(&out["y"]);
     assert_eq!(out["y"].shape, vec![1, 3, 2, 4]);
-    // y[i0,i1,i2,i3] = x[i0,i2,i1,i3]
+
     for i0 in 0..1 {
         for i1 in 0..3 {
             for i2 in 0..2 {
@@ -199,7 +193,7 @@ fn softmax_axis() {
         vec![],
         &["x"],
     );
-    // [[1, 2], [3, 4]] softmax over axis 1.
+
     let (_, out) = run_bytes(&bytes, &[("x", Tensor::f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]))]);
     let y = f32s(&out["y"]);
     let e = |v: f32| v.exp();
@@ -213,7 +207,7 @@ fn softmax_axis() {
 
 #[test]
 fn layernorm_decomposition() {
-    // LayerNorm via the classic decomposition: mean, sub, pow, sqrt, div, mul, add.
+
     let inits = vec![
         init_f32("w", &[3], &[1.0, 2.0, 3.0]),
         init_f32("b", &[3], &[0.1, 0.2, 0.3]),
@@ -284,7 +278,7 @@ fn layernorm_decomposition() {
     let x = Tensor::f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
     let (_, out) = run_bytes(&bytes, &[("x", x.clone())]);
     let y = f32s(&out["y"]);
-    // Hand-computed reference.
+
     let xv: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     let (w, b) = ([1.0, 2.0, 3.0], [0.1, 0.2, 0.3]);
     for row in 0..2 {
@@ -299,7 +293,7 @@ fn layernorm_decomposition() {
 
 #[test]
 fn gather_negative_and_reshape() {
-    // Gather with negative index, then reshape with -1.
+
     let mut g1 = onnx::NodeProto::default();
     g1.op_type = "Gather".into();
     g1.input = vec!["data".into(), "idx".into()];
@@ -378,7 +372,7 @@ fn erf_accuracy() {
 
 #[test]
 fn if_control_flow() {
-    // If(cond > 0): then branch adds 1, else branch subtracts 1.
+
     let mut then_g = onnx::GraphProto::default();
     let mut add = onnx::NodeProto::default();
     add.op_type = "Add".into();

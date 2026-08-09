@@ -1,5 +1,3 @@
-//! i8 embedding kernel conformance (large tables halve their footprint).
-
 use flint_backend::{Backend, Binding, Pass};
 use flint_model::ops;
 use flint_tensor::{DType, Tensor, Weight};
@@ -29,17 +27,17 @@ fn embed_i8_matches_cpu_dequant() {
         }
     }
     let w = Weight::quant(
-        backend.tensor_i8(&bytes, vec![rows, dim], "t"),
-        backend.tensor_f32(&scales, vec![rows, groups], "s"),
+        backend.tensor_i8(&bytes, vec![rows, dim]),
+        backend.tensor_f32(&scales, vec![rows, groups]),
         group,
     );
-    let ids_t = Tensor::new(backend.storage(16, "ids"), vec![4], DType::U32);
-    backend.write_u32(&ids_t.buf, &[3, 1, 0, 2]);
-    let y = backend.zero_tensor(&[16, dim], "y");
+    let ids_t = Tensor::new(backend.storage(16), vec![4], DType::U32);
+    backend.write_u32(ids_t.buf.as_ref(), &[3, 1, 0, 2]);
+    let y = backend.zero_tensor(&[16, dim]);
     {
-        let mut enc = backend.encoder();
+        let mut enc = backend.encoder().unwrap();
         {
-            let mut pass = Pass::begin(&mut enc, "k");
+            let mut pass = Pass::begin(enc.as_mut());
             ops::embed(
                 &mut backend,
                 &mut pass,
@@ -52,9 +50,9 @@ fn embed_i8_matches_cpu_dequant() {
             )
             .unwrap();
         }
-        backend.submit(enc);
+        backend.submit(enc).unwrap();
     }
-    let got = backend.read_f32(&y.buf, 0, (4 * dim) as usize).unwrap();
+    let got = backend.read_f32(y.buf.as_ref(), 0, (4 * dim) as usize).unwrap();
     let ids = [3u32, 1, 0, 2];
     for r in 0..rows {
         let src = ids[r as usize];

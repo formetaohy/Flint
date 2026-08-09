@@ -1,8 +1,5 @@
-//! Qwen3.5 text model: hybrid Gated DeltaNet + gated grouped attention, with
-//! an optional single-layer MTP draft head behind the `Speculator` trait.
-
 use flint_backend::{Backend, Binding, Pass};
-use flint_checkpoint::Checkpoint;
+use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::{Error, Result};
 use flint_model::cache::{KvCache, RecurrentState};
 use flint_model::config::{check_gemm_dims, check_head_dim, f64_field, req, u32_field, u32_list};
@@ -36,7 +33,6 @@ pub enum LayerKind {
     Full,
 }
 
-/// Validated Qwen3.5 text config (hybrid Gated DeltaNet + gated full attention).
 pub struct Qwen35Config {
     pub hidden: u32,
     pub intermediate: u32,
@@ -46,17 +42,16 @@ pub struct Qwen35Config {
     pub head_dim: u32,
     pub vocab: u32,
     pub layer_types: Vec<LayerKind>,
-    /// Linear-attention key heads (query/key projection width).
+
     pub lin_key_heads: u32,
-    /// Linear-attention value heads (recurrence heads; b/a/beta/g width).
+
     pub lin_val_heads: u32,
     pub lin_key_dim: u32,
     pub lin_val_dim: u32,
     pub rope_theta: f64,
     pub partial_rotary: f64,
     pub eos: Vec<u32>,
-    /// Tied embeddings share the table as the logits head; untied models
-    /// load a separate `lm_head`.
+
     pub tied: bool,
     pub has_mtp: bool,
 }
@@ -154,18 +149,17 @@ impl Qwen35Config {
         ])
     }
 
-    /// Key-head width of the conv tile's q/k segments.
     pub fn key_dim(&self) -> u32 {
         self.lin_key_heads * self.lin_key_dim
     }
-    /// Value-head width of the conv tile's v segment and the recurrence state.
+
     pub fn value_dim(&self) -> u32 {
         self.lin_val_heads * self.lin_val_dim
     }
     pub fn conv_dim(&self) -> u32 {
         self.key_dim() * 2 + self.value_dim()
     }
-    /// Expanded q/k width after repeat_interleave to the value heads.
+
     pub fn qk_exp_dim(&self) -> u32 {
         self.lin_val_heads * self.lin_key_dim * 2
     }
@@ -174,9 +168,6 @@ impl Qwen35Config {
     }
 }
 
-// ---------------------------------------------------------------- weights
-
-/// Gated grouped full-attention layer (also used by the MTP head).
 struct FullLayerW {
     attn_norm: Tensor,
     q: Weight,
@@ -188,7 +179,6 @@ struct FullLayerW {
     mlp: SwigluMlp,
 }
 
-/// Gated DeltaNet layer.
 struct LinearLayerW {
     attn_norm: Tensor,
     in_proj_qkv: Weight,
@@ -203,8 +193,6 @@ struct LinearLayerW {
     mlp: SwigluMlp,
 }
 
-/// One hybrid layer: weights plus the cache kind the layer type requires.
-/// Weight structs are boxed so the enum stays small and uniform.
 enum Layer {
     Full {
         w: Box<FullLayerW>,
@@ -216,7 +204,6 @@ enum Layer {
     },
 }
 
-/// Single-layer MTP draft head.
 struct Mtp {
     pre_fc_norm_embedding: Tensor,
     pre_fc_norm_hidden: Tensor,
@@ -257,19 +244,16 @@ fn take_linear_layer(w: &mut WeightSet, p: &str) -> Result<Box<LinearLayerW>> {
     }))
 }
 
-// ---------------------------------------------------------------- model
-
-/// Per-forward scratch tiles, all [M_MAX, dim].
 struct Scratch {
     ids: Tensor,
-    /// Step args [pos, attn segments]; rope/kv_store/attn read it.
+
     args: Tensor,
     hidden: Tensor,
     hidden2: Tensor,
     normed: Tensor,
     qkv_raw: Tensor,
     convd: Tensor,
-    /// Conv q/k segments expanded from key heads to value heads.
+
     qk_exp: Tensor,
     z: Tensor,
     b: Tensor,
@@ -278,7 +262,7 @@ struct Scratch {
     g: Tensor,
     attn_out: Tensor,
     attn_out2: Tensor,
-    /// Split-K attention partials: [m, kv_heads, ATTN_SEGS, 4, hd+2] f32.
+
     attn_scratch: Tensor,
     qg: Tensor,
     q: Tensor,
@@ -297,67 +281,62 @@ struct Scratch {
 fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
     let h = cfg.hidden;
     let i = cfg.intermediate;
-    let z = |shape: &[u32], label: &str| backend.zero_tensor(shape, label);
+    let z = |shape: &[u32]| backend.zero_tensor(shape);
     Scratch {
         ids: ops::token_ids(backend),
         args: ops::step_args(backend),
-        hidden: z(&[M_MAX, h], "hidden"),
-        hidden2: z(&[M_MAX, h], "hidden2"),
-        normed: z(&[M_MAX, h], "normed"),
-        qkv_raw: z(&[M_MAX, cfg.conv_dim()], "qkv_raw"),
-        convd: z(&[M_MAX, cfg.conv_dim()], "convd"),
-        qk_exp: z(&[M_MAX, cfg.qk_exp_dim()], "qk_exp"),
-        z: z(&[M_MAX, cfg.value_dim()], "z"),
-        b: z(&[M_MAX, cfg.lin_val_heads], "b"),
-        a: z(&[M_MAX, cfg.lin_val_heads], "a"),
-        beta: z(&[cfg.lin_val_heads], "beta"),
-        g: z(&[cfg.lin_val_heads], "g"),
-        attn_out: z(&[M_MAX, cfg.value_dim()], "attn_out"),
-        attn_out2: z(&[M_MAX, cfg.value_dim()], "attn_out2"),
-        attn_scratch: z(
-            &[
-                M_MAX,
-                cfg.kv_heads,
-                ops::ATTN_SEGS,
-                ops::MAX_GQA,
-                cfg.head_dim + 2,
-            ],
-            "attn_scratch",
-        ),
-        qg: z(&[M_MAX, cfg.q_heads * cfg.head_dim * 2], "qg"),
-        q: z(&[M_MAX, cfg.q_heads * cfg.head_dim], "q"),
-        q2: z(&[M_MAX, cfg.q_heads * cfg.head_dim], "q2"),
-        gate: z(&[M_MAX, cfg.q_heads * cfg.head_dim], "gate"),
-        k1: z(&[M_MAX, cfg.kv_heads * cfg.head_dim], "k1"),
-        k2: z(&[M_MAX, cfg.kv_heads * cfg.head_dim], "k2"),
-        v1: z(&[M_MAX, cfg.kv_heads * cfg.head_dim], "v1"),
+        hidden: z(&[M_MAX, h]),
+        hidden2: z(&[M_MAX, h]),
+        normed: z(&[M_MAX, h]),
+        qkv_raw: z(&[M_MAX, cfg.conv_dim()]),
+        convd: z(&[M_MAX, cfg.conv_dim()]),
+        qk_exp: z(&[M_MAX, cfg.qk_exp_dim()]),
+        z: z(&[M_MAX, cfg.value_dim()]),
+        b: z(&[M_MAX, cfg.lin_val_heads]),
+        a: z(&[M_MAX, cfg.lin_val_heads]),
+        beta: z(&[cfg.lin_val_heads]),
+        g: z(&[cfg.lin_val_heads]),
+        attn_out: z(&[M_MAX, cfg.value_dim()]),
+        attn_out2: z(&[M_MAX, cfg.value_dim()]),
+        attn_scratch: z(&[
+            M_MAX,
+            cfg.kv_heads,
+            ops::ATTN_SEGS,
+            ops::MAX_GQA,
+            cfg.head_dim + 2,
+        ]),
+        qg: z(&[M_MAX, cfg.q_heads * cfg.head_dim * 2]),
+        q: z(&[M_MAX, cfg.q_heads * cfg.head_dim]),
+        q2: z(&[M_MAX, cfg.q_heads * cfg.head_dim]),
+        gate: z(&[M_MAX, cfg.q_heads * cfg.head_dim]),
+        k1: z(&[M_MAX, cfg.kv_heads * cfg.head_dim]),
+        k2: z(&[M_MAX, cfg.kv_heads * cfg.head_dim]),
+        v1: z(&[M_MAX, cfg.kv_heads * cfg.head_dim]),
         mlp: MlpTiles {
-            gate_out: z(&[M_MAX, i], "mlp_gate"),
-            up_out: z(&[M_MAX, i], "mlp_up"),
-            act: z(&[M_MAX, i], "mlp_act"),
-            down_out: z(&[M_MAX, h], "mlp_down"),
+            gate_out: z(&[M_MAX, i]),
+            up_out: z(&[M_MAX, i]),
+            act: z(&[M_MAX, i]),
+            down_out: z(&[M_MAX, h]),
         },
-        logits: z(&[M_MAX, cfg.vocab], "logits"),
-        mtp_e: z(&[M_MAX, h], "mtp_e"),
-        mtp_h: z(&[M_MAX, h], "mtp_h"),
-        mtp_cat: z(&[M_MAX, 2 * h], "mtp_cat"),
+        logits: z(&[M_MAX, cfg.vocab]),
+        mtp_e: z(&[M_MAX, h]),
+        mtp_h: z(&[M_MAX, h]),
+        mtp_cat: z(&[M_MAX, 2 * h]),
     }
 }
 
-/// Qwen3.5 text model: hybrid Gated DeltaNet + gated grouped attention,
-/// with an optional single-layer MTP draft head.
 pub struct Qwen35 {
     cfg: Qwen35Config,
     max_seq: u32,
     pos: u32,
     embed: Weight,
-    /// Untied logits head; tied models score with the embedding table.
+
     lm_head: Option<Weight>,
     norm: Tensor,
     layers: Vec<Layer>,
     mtp: Option<Mtp>,
     s: Scratch,
-    /// Recurrent-state rollback buffers, one per linear layer (MTP runs only).
+
     snap: Vec<RecurrentState>,
     cos: Tensor,
     sin: Tensor,
@@ -366,7 +345,7 @@ pub struct Qwen35 {
 }
 
 impl Qwen35 {
-    /// The weight the logits projection scores against.
+
     fn logit_head(&self) -> &Weight {
         self.lm_head.as_ref().unwrap_or(&self.embed)
     }
@@ -377,7 +356,7 @@ impl Qwen35 {
         max_seq: u32,
         backend: &Backend,
     ) -> Result<Self> {
-        if source.kind() == "gguf" {
+        if source.kind() == CheckpointKind::Gguf {
             return Err(Error::Model("Qwen3.5 has no GGUF representation".into()));
         }
         let cfg = Qwen35Config::parse(v)?;
@@ -402,13 +381,7 @@ impl Qwen35 {
             match kind {
                 LayerKind::Full => layers.push(Layer::Full {
                     w: take_full_layer(&mut w, &p)?,
-                    kv: KvCache::new(
-                        backend,
-                        cfg.kv_heads,
-                        max_seq,
-                        cfg.head_dim,
-                        &format!("l{i}"),
-                    ),
+                    kv: KvCache::new(backend, cfg.kv_heads, max_seq, cfg.head_dim),
                 }),
                 LayerKind::Linear => {
                     linear_layers += 1;
@@ -418,7 +391,6 @@ impl Qwen35 {
                             backend,
                             [cfg.lin_val_heads, cfg.lin_key_dim, cfg.lin_val_dim],
                             cfg.conv_dim(),
-                            &format!("l{i}"),
                         ),
                     })
                 }
@@ -432,7 +404,7 @@ impl Qwen35 {
                 fc: w.take("mtp.fc.weight")?,
                 layer: take_full_layer(&mut w, "mtp.layers.0")?,
                 norm: w.take_tensor("mtp.norm.weight")?,
-                kv: KvCache::new(backend, cfg.kv_heads, max_seq, cfg.head_dim, "mtp"),
+                kv: KvCache::new(backend, cfg.kv_heads, max_seq, cfg.head_dim),
             })
         } else {
             None
@@ -440,12 +412,11 @@ impl Qwen35 {
 
         let snap = if cfg.has_mtp {
             (0..linear_layers)
-                .map(|i| {
+                .map(|_| {
                     RecurrentState::new(
                         backend,
                         [cfg.lin_val_heads, cfg.lin_key_dim, cfg.lin_val_dim],
                         cfg.conv_dim(),
-                        &format!("snap{i}"),
                     )
                 })
                 .collect()
@@ -501,13 +472,13 @@ impl LanguageModel for Qwen35 {
         }
         let mut ids = vec![0u32; M_MAX as usize];
         ids[..tokens.len()].copy_from_slice(tokens);
-        backend.write_u32(&self.s.ids.buf, &ids);
+        backend.write_u32(self.s.ids.buf.as_ref(), &ids);
         ops::write_step_args(backend, &self.s.args, self.pos, self.pos + m);
 
         let cfg = &self.cfg;
-        let mut enc = backend.encoder();
+        let mut enc = backend.encoder()?;
         {
-            let mut pass = Pass::begin(&mut enc, "forward");
+            let mut pass = Pass::begin(enc.as_mut());
             let s = &self.s;
             ops::embed(
                 backend,
@@ -553,7 +524,7 @@ impl LanguageModel for Qwen35 {
                 m,
             )?;
         }
-        backend.submit(enc);
+        backend.submit(enc)?;
 
         let out = ChunkOut {
             logits: ops::read_rows(backend, &self.s.logits, logit_rows, m, cfg.vocab)?,
@@ -616,14 +587,14 @@ impl Speculator for Qwen35 {
 
         let mut ids = vec![0u32; M_MAX as usize];
         ids[0] = token;
-        backend.write_u32(&self.s.ids.buf, &ids);
+        backend.write_u32(self.s.ids.buf.as_ref(), &ids);
         ops::write_step_args(backend, &self.s.args, self.mtp_pos, self.mtp_pos + 1);
-        backend.write_f32(&self.s.mtp_h.buf, hidden);
+        backend.write_f32(self.s.mtp_h.buf.as_ref(), hidden);
 
         let cfg = &self.cfg;
-        let mut enc = backend.encoder();
+        let mut enc = backend.encoder()?;
         {
-            let mut pass = Pass::begin(&mut enc, "draft");
+            let mut pass = Pass::begin(enc.as_mut());
             let s = &self.s;
             ops::embed(
                 backend,
@@ -705,9 +676,9 @@ impl Speculator for Qwen35 {
                 1,
             )?;
         }
-        backend.submit(enc);
+        backend.submit(enc)?;
 
-        let logits = backend.read_f32(&self.s.logits.buf, 0, cfg.vocab as usize)?;
+        let logits = backend.read_f32(self.s.logits.buf.as_ref(), 0, cfg.vocab as usize)?;
         self.mtp_pos += 1;
         backend.flush_profile()?;
         Ok(logits)
@@ -740,10 +711,6 @@ impl Speculator for Qwen35 {
     }
 }
 
-// ---------------------------------------------------------------- layers
-
-/// Gated full transformer layer: input norm, gated attention, residual,
-/// post norm, SwiGLU MLP, residual. hidden -> hidden.
 #[allow(clippy::too_many_arguments)]
 fn full_layer(
     backend: &mut Backend,
@@ -782,8 +749,6 @@ fn full_layer(
     post_mlp(backend, pass, cfg, s, &w.mlp, m)
 }
 
-/// Gated DeltaNet layer: input norm, sequential recurrence over the chunk's
-/// rows, residual, post norm, SwiGLU MLP, residual. hidden -> hidden.
 fn linear_layer(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
@@ -818,7 +783,6 @@ fn linear_layer(
     post_mlp(backend, pass, cfg, s, &w.mlp, m)
 }
 
-/// Gated grouped full attention; result lands in s.mlp.down_out.
 #[allow(clippy::too_many_arguments)]
 fn full_attn_block(
     backend: &mut Backend,
@@ -968,10 +932,6 @@ fn full_attn_block(
     )
 }
 
-/// Gated DeltaNet attention; the recurrence runs row by row over the chunk.
-/// Result lands in s.mlp.down_out. The conv tile carries q/k segments at
-/// key-head width; `repeat_qk` expands them to value-head width for the
-/// recurrence.
 fn linear_attn_block(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
@@ -1041,11 +1001,10 @@ fn linear_attn_block(
         cfg.lin_val_dim,
     )?;
     let exp_d = cfg.qk_exp_dim();
-    // Byte span of the expanded q segment (half the row).
+
     let qkb = exp_d as u64 * 2;
     for t in 0..m {
-        // delta_gate overwrites the shared beta/g scratch, so gate and recur
-        // must run back-to-back per row.
+
         ops::delta_gate(
             backend,
             pass,
@@ -1100,7 +1059,6 @@ fn linear_attn_block(
     )
 }
 
-/// Post-norm + SwiGLU MLP + residual; result lands back in s.hidden.
 fn post_mlp(
     backend: &mut Backend,
     pass: &mut Pass<'_>,
@@ -1133,7 +1091,6 @@ fn post_mlp(
     )
 }
 
-/// SwiGLU MLP; result lands in s.mlp.down_out.
 fn mlp_block(
     backend: &mut Backend,
     pass: &mut Pass<'_>,

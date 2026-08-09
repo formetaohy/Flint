@@ -1,0 +1,5 @@
+kernel zero_rows [workgroup(256, 1, 1)] (x: buf<f32>, N_ELEM: u32) {
+    if gid.x < N_ELEM {
+        x[gid.x] = 0.0;
+    }
+}

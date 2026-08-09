@@ -1,26 +1,20 @@
-//! Kernel correctness check: gemv/gemm against a CPU reference, exercising
-//! both the block-major i8 layout and the row-major bf16 path.
-//! Run: cargo run --release --example gemv_check
-
 use flint_backend::{Backend, Binding, Pass};
 use flint_error::Result;
 use flint_model::loader::quantize;
 use flint_tensor::Weight;
 
-/// Block-major [K/16, N, 16] i8 decode: byte (kb, n, i) at kb*N*16 + n*16 + i.
 #[allow(clippy::too_many_arguments)]
 fn cpu_dequant_i8(
     weights: &[u8],
     scales: &[f32],
     n: usize,
     n_total: usize,
-    k: usize,
     group: usize,
     kb: usize,
     i: usize,
 ) -> f32 {
     let byte = weights[kb * n_total * 16 + n * 16 + i];
-    let s = scales[n * (k / group) + kb * 16 / group];
+    let s = scales[(kb * 16 / group) * n_total + n];
     (byte as i8 as f32) * s
 }
 
@@ -30,7 +24,7 @@ fn cpu_gemv(x: &[f32], bytes: &[u8], scales: &[f32], n: usize, k: usize, group: 
         let mut acc = 0f32;
         for kb in 0..k / 16 {
             for i in 0..16 {
-                acc += x[kb * 16 + i] * cpu_dequant_i8(bytes, scales, nn, n, k, group, kb, i);
+                acc += x[kb * 16 + i] * cpu_dequant_i8(bytes, scales, nn, n, group, kb, i);
             }
         }
         *wy = acc;
@@ -44,21 +38,21 @@ fn check_gemv_tall(backend: &mut Backend, n: u32, k: u32, group: u32) -> Result<
         .collect();
     let (bytes, scales) = quantize(&data, n as usize, k as usize, group as usize);
     let w = Weight::quant(
-        backend.tensor_i8(&bytes, vec![n, k], "w"),
-        backend.tensor_f32(&scales, vec![n, k / group], "ws"),
+        backend.tensor_i8(&bytes, vec![n, k]),
+        backend.tensor_f32(&scales, vec![k / group, n]),
         group,
     );
-    // x is a [16, K] tile; the kernel must read row 0. y is a [16, N] tile.
+
     let xs: Vec<f32> = (0..16 * k).map(|i| ((i as f32) * 0.31).cos()).collect();
-    let xt = backend.tensor_f32(&xs, vec![16, k], "x");
-    let yt = backend.zero_tensor(&[16, n], "y");
-    let mut enc = backend.encoder();
+    let xt = backend.tensor_f32(&xs, vec![16, k]);
+    let yt = backend.zero_tensor(&[16, n]);
+    let mut enc = backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(&mut enc, "t");
+        let mut pass = Pass::begin(enc.as_mut());
         backend.gemv(&mut pass, Binding::Full(&xt), &w, Binding::Full(&yt))?;
     }
-    backend.submit(enc);
-    let y = backend.read_f32(&yt.buf, 0, n as usize)?;
+    backend.submit(enc).unwrap();
+    let y = backend.read_f32(yt.buf.as_ref(), 0, n as usize)?;
     let ref_y = cpu_gemv(
         &xs[..k as usize],
         &bytes,
@@ -86,20 +80,20 @@ fn check_gemv(backend: &mut Backend, n: u32, k: u32, group: u32) -> Result<()> {
         .collect();
     let (bytes, scales) = quantize(&data, n as usize, k as usize, group as usize);
     let w = Weight::quant(
-        backend.tensor_i8(&bytes, vec![n, k], "w"),
-        backend.tensor_f32(&scales, vec![n, k / group], "ws"),
+        backend.tensor_i8(&bytes, vec![n, k]),
+        backend.tensor_f32(&scales, vec![k / group, n]),
         group,
     );
     let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.31).cos()).collect();
-    let xt = backend.tensor_f32(&x, vec![k], "x");
-    let yt = backend.zero_tensor(&[n], "y");
-    let mut enc = backend.encoder();
+    let xt = backend.tensor_f32(&x, vec![k]);
+    let yt = backend.zero_tensor(&[n]);
+    let mut enc = backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(&mut enc, "t");
+        let mut pass = Pass::begin(enc.as_mut());
         backend.gemv(&mut pass, Binding::Full(&xt), &w, Binding::Full(&yt))?;
     }
-    backend.submit(enc);
-    let y = backend.read_f32(&yt.buf, 0, n as usize)?;
+    backend.submit(enc).unwrap();
+    let y = backend.read_f32(yt.buf.as_ref(), 0, n as usize)?;
     let ref_y = cpu_gemv(&x, &bytes, &scales, n as usize, k as usize, group as usize);
     let mut max_err = 0f32;
     for (a, b) in y.iter().zip(ref_y.iter()) {
@@ -135,17 +129,17 @@ fn check_gemv_bf16(backend: &mut Backend, n: u32, k: u32) -> Result<()> {
         .iter()
         .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
         .collect();
-    let w = Weight::plain(backend.tensor_bf16(&bytes, vec![n, k], "wb")?);
+    let w = Weight::plain(backend.tensor_bf16(&bytes, vec![n, k])?);
     let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.31).cos()).collect();
-    let xt = backend.tensor_f32(&x, vec![k], "x");
-    let yt = backend.zero_tensor(&[n], "y");
-    let mut enc = backend.encoder();
+    let xt = backend.tensor_f32(&x, vec![k]);
+    let yt = backend.zero_tensor(&[n]);
+    let mut enc = backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(&mut enc, "t");
+        let mut pass = Pass::begin(enc.as_mut());
         backend.gemv(&mut pass, Binding::Full(&xt), &w, Binding::Full(&yt))?;
     }
-    backend.submit(enc);
-    let y = backend.read_f32(&yt.buf, 0, n as usize)?;
+    backend.submit(enc).unwrap();
+    let y = backend.read_f32(yt.buf.as_ref(), 0, n as usize)?;
     let ref_y = cpu_gemv_bf16(&x, &wf, n as usize, k as usize);
     let mut max_err = 0f32;
     for (a, b) in y.iter().zip(ref_y.iter()) {
@@ -166,22 +160,22 @@ fn check_gemm(backend: &mut Backend, n: u32, k: u32, group: u32, m: u32) -> Resu
         .collect();
     let (bytes, scales) = quantize(&data, n as usize, k as usize, group as usize);
     let w = Weight::quant(
-        backend.tensor_i8(&bytes, vec![n, k], "w"),
-        backend.tensor_f32(&scales, vec![n, k / group], "ws"),
+        backend.tensor_i8(&bytes, vec![n, k]),
+        backend.tensor_f32(&scales, vec![k / group, n]),
         group,
     );
     let xs: Vec<f32> = (0..m * k)
         .map(|i| ((i as f32) * 0.71).cos() * 0.8)
         .collect();
-    let xt = backend.tensor_f32(&xs, vec![m, k], "x");
-    let yt = backend.zero_tensor(&[m, n], "y");
-    let mut enc = backend.encoder();
+    let xt = backend.tensor_f32(&xs, vec![m, k]);
+    let yt = backend.zero_tensor(&[m, n]);
+    let mut enc = backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(&mut enc, "t");
+        let mut pass = Pass::begin(enc.as_mut());
         backend.gemm(&mut pass, Binding::Full(&xt), &w, Binding::Full(&yt), m)?;
     }
-    backend.submit(enc);
-    let y = backend.read_f32(&yt.buf, 0, (m * n) as usize)?;
+    backend.submit(enc).unwrap();
+    let y = backend.read_f32(yt.buf.as_ref(), 0, (m * n) as usize)?;
     let mut max_err = 0f32;
     let mut bad = (0usize, 0usize, 0f32, 0f32);
     for row in 0..m as usize {
@@ -209,7 +203,7 @@ fn check_gemm(backend: &mut Backend, n: u32, k: u32, group: u32, m: u32) -> Resu
         "gemm N={n} K={k} G={group} M={m}: max_err={max_err:.2e} at (r={},c={}) got={} ref={}",
         bad.0, bad.1, bad.2, bad.3
     );
-    // INT8 activation quantization tolerates ~0.5 absolute on ~10-scale logits.
+
     if max_err > 0.5 {
         return Err(flint_error::Error::Model(format!(
             "gemm mismatch: max_err {max_err:.2e}"
@@ -233,8 +227,8 @@ fn check_gemv_qkv(
         let (bytes, scales) = quantize(&data, n as usize, k as usize, group as usize);
         (
             Weight::quant(
-                backend.tensor_i8(&bytes, vec![n, k], "wq"),
-                backend.tensor_f32(&scales, vec![n, k / group], "ws"),
+                backend.tensor_i8(&bytes, vec![n, k]),
+                backend.tensor_f32(&scales, vec![k / group, n]),
                 group,
             ),
             bytes,
@@ -245,32 +239,21 @@ fn check_gemv_qkv(
     let (wk, bk, sk) = mk(nk);
     let (wv, bv, sv) = mk(nv);
     let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.71).cos() * 0.8).collect();
-    let xt = backend.tensor_f32(&x, vec![k], "x");
-    let yq_t = backend.zero_tensor(&[nq], "yq");
-    let yk_t = backend.zero_tensor(&[nk], "yk");
-    let yv_t = backend.zero_tensor(&[nv], "yv");
-    let mut enc = backend.encoder();
+    let xt = backend.tensor_f32(&x, vec![k]);
+    let yq_t = backend.zero_tensor(&[nq]);
+    let yk_t = backend.zero_tensor(&[nk]);
+    let yv_t = backend.zero_tensor(&[nv]);
+    let mut enc = backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(&mut enc, "t");
-        backend.gemv_qkv(
-            &mut pass,
-            Binding::Full(&xt),
-            &wq,
-            &wk,
-            &wv,
-            Binding::Full(&yq_t),
-            Binding::Full(&yk_t),
-            Binding::Full(&yv_t),
-            nq,
-            nk,
-            nv,
-            k,
-        )?;
+        let mut pass = Pass::begin(enc.as_mut());
+        backend.gemv(&mut pass, Binding::Full(&xt), &wq, Binding::Full(&yq_t))?;
+        backend.gemv(&mut pass, Binding::Full(&xt), &wk, Binding::Full(&yk_t))?;
+        backend.gemv(&mut pass, Binding::Full(&xt), &wv, Binding::Full(&yv_t))?;
     }
-    backend.submit(enc);
-    let mut y = backend.read_f32(&yq_t.buf, 0, nq as usize)?;
-    y.extend(backend.read_f32(&yk_t.buf, 0, nk as usize)?);
-    y.extend(backend.read_f32(&yv_t.buf, 0, nv as usize)?);
+    backend.submit(enc).unwrap();
+    let mut y = backend.read_f32(yq_t.buf.as_ref(), 0, nq as usize)?;
+    y.extend(backend.read_f32(yk_t.buf.as_ref(), 0, nk as usize)?);
+    y.extend(backend.read_f32(yv_t.buf.as_ref(), 0, nv as usize)?);
     let rq = cpu_gemv(&x, &bq, &sq, nq as usize, k as usize, group as usize);
     let rk = cpu_gemv(&x, &bk, &sk, nk as usize, k as usize, group as usize);
     let rv = cpu_gemv(&x, &bv, &sv, nv as usize, k as usize, group as usize);
@@ -296,32 +279,32 @@ fn check_gemm_qkv(
     group: u32,
     m: u32,
 ) -> Result<()> {
-    let mk = |n: u32, tag: &str| -> (flint_tensor::Weight, Vec<u8>, Vec<f32>) {
+    let mk = |n: u32| -> (flint_tensor::Weight, Vec<u8>, Vec<f32>) {
         let data: Vec<f32> = (0..n * k)
             .map(|i| ((i as f32) * 0.137 - 3.0).sin() * 0.5)
             .collect();
         let (bytes, scales) = quantize(&data, n as usize, k as usize, group as usize);
         (
             Weight::quant(
-                backend.tensor_i8(&bytes, vec![n, k], tag),
-                backend.tensor_f32(&scales, vec![n, k / group], "ws"),
+                backend.tensor_i8(&bytes, vec![n, k]),
+                backend.tensor_f32(&scales, vec![k / group, n]),
                 group,
             ),
             bytes,
             scales,
         )
     };
-    let (wq, bq, sq) = mk(nq, "wq");
-    let (wk, bk, sk) = mk(nk, "wk");
-    let (wv, bv, sv) = mk(nv, "wv");
+    let (wq, bq, sq) = mk(nq);
+    let (wk, bk, sk) = mk(nk);
+    let (wv, bv, sv) = mk(nv);
     let xs: Vec<f32> = (0..m * k)
         .map(|i| ((i as f32) * 0.71).cos() * 0.8)
         .collect();
-    let xt = backend.tensor_f32(&xs, vec![m, k], "x");
-    let yt = backend.zero_tensor(&[m, nq + nk + nv], "y");
-    let mut enc = backend.encoder();
+    let xt = backend.tensor_f32(&xs, vec![m, k]);
+    let yt = backend.zero_tensor(&[m, nq + nk + nv]);
+    let mut enc = backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(&mut enc, "t");
+        let mut pass = Pass::begin(enc.as_mut());
         let ntot = nq + nk + nv;
         backend.gemm_strided(
             &mut pass,
@@ -354,8 +337,8 @@ fn check_gemm_qkv(
             ntot,
         )?;
     }
-    backend.submit(enc);
-    let y = backend.read_f32(&yt.buf, 0, (m * (nq + nk + nv)) as usize)?;
+    backend.submit(enc).unwrap();
+    let y = backend.read_f32(yt.buf.as_ref(), 0, (m * (nq + nk + nv)) as usize)?;
     let mut max_err = 0f32;
     for row in 0..m as usize {
         let xr = &xs[row * k as usize..(row + 1) * k as usize];
@@ -393,49 +376,44 @@ fn check_gemm_qkv(
 }
 
 fn check_gemv_gateup(backend: &mut Backend, n: u32, k: u32, group: u32) -> Result<()> {
-    let mk = |tag: &str| -> (flint_tensor::Weight, Vec<u8>, Vec<f32>) {
-        let data: Vec<f32> = (0..n * k)
-            .map(|i| ((i as f32) * 0.13 - 1.7).cos() * 0.4)
+    let mk = |dim: u32| -> (flint_tensor::Weight, Vec<u8>, Vec<f32>) {
+        let data: Vec<f32> = (0..dim * k)
+            .map(|i| ((i as f32) * 0.137 - 3.0).sin() * 0.5)
             .collect();
-        let (bytes, scales) = quantize(&data, n as usize, k as usize, group as usize);
+        let (bytes, scales) = quantize(&data, dim as usize, k as usize, group as usize);
         (
             Weight::quant(
-                backend.tensor_i8(&bytes, vec![n, k], tag),
-                backend.tensor_f32(&scales, vec![n, k / group], "ws"),
+                backend.tensor_i8(&bytes, vec![dim, k]),
+                backend.tensor_f32(&scales, vec![k / group, dim]),
                 group,
             ),
             bytes,
             scales,
         )
     };
-    let (wg, bg, sg) = mk("wg");
-    let (wu, bu, su) = mk("wu");
+    let (wg, bg, sg) = mk(n);
+    let (wu, bu, su) = mk(n);
     let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.71).cos() * 0.8).collect();
-    let xt = backend.tensor_f32(&x, vec![k], "x");
-    let yg_t = backend.zero_tensor(&[n], "yg");
-    let yu_t = backend.zero_tensor(&[n], "yu");
-    let mut enc = backend.encoder();
+    let xt = backend.tensor_f32(&x, vec![k]);
+    let yg_t = backend.zero_tensor(&[n]);
+    let yu_t = backend.zero_tensor(&[n]);
+    let mut enc = backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(&mut enc, "t");
-        backend.gemv_gateup(
-            &mut pass,
-            Binding::Full(&xt),
-            &wg,
-            &wu,
-            Binding::Full(&yg_t),
-            Binding::Full(&yu_t),
-            n,
-            k,
-        )?;
+        let mut pass = Pass::begin(enc.as_mut());
+        backend.gemv(&mut pass, Binding::Full(&xt), &wg, Binding::Full(&yg_t))?;
+        backend.gemv(&mut pass, Binding::Full(&xt), &wu, Binding::Full(&yu_t))?;
     }
-    backend.submit(enc);
-    let yg = backend.read_f32(&yg_t.buf, 0, n as usize)?;
-    let yu = backend.read_f32(&yu_t.buf, 0, n as usize)?;
+    backend.submit(enc).unwrap();
+    let yg = backend.read_f32(yg_t.buf.as_ref(), 0, n as usize)?;
+    let yu = backend.read_f32(yu_t.buf.as_ref(), 0, n as usize)?;
     let rg = cpu_gemv(&x, &bg, &sg, n as usize, k as usize, group as usize);
     let ru = cpu_gemv(&x, &bu, &su, n as usize, k as usize, group as usize);
     let mut max_err = 0f32;
-    for (a, b) in yg.iter().zip(rg.iter()).chain(yu.iter().zip(ru.iter())) {
-        max_err = max_err.max((a - b).abs());
+    for (i, v) in rg.iter().enumerate() {
+        max_err = max_err.max((yg[i] - v).abs());
+    }
+    for (i, v) in ru.iter().enumerate() {
+        max_err = max_err.max((yu[i] - v).abs());
     }
     eprintln!("gemv_gateup N={n} K={k}: max_err={max_err:.2e}");
     if max_err > 1e-3 {

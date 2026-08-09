@@ -1,0 +1,25 @@
+kernel gemm [workgroup(16, 16, 1)]
+    (a: buf<f16>, b: buf<f16>, c: buf<f32>, m: u32, n: u32, k: u32)
+{
+    const TILE: u32 = 16;
+    shared a_tile: [f16; 16 * 16];
+    shared b_tile: [f16; 16 * 16];
+    let row = block.y * TILE + thread.y;
+    let col = block.x * TILE + thread.x;
+    var acc: f32 = 0.0;
+    for i in 0..((k + 15) / 16) {
+        barrier();
+        let base = i * 16;
+        let ai = (block.y * 16 + thread.y) * k + base + thread.x;
+        a_tile[thread.y * 16 + thread.x] = ai < m * k ? a[ai] : 0.0 as f16;
+        let bi = (base + thread.y) * n + block.x * 16 + thread.x;
+        b_tile[thread.y * 16 + thread.x] = bi < k * n ? b[bi] : 0.0 as f16;
+        barrier();
+        for j in 0..16 unroll {
+            acc += a_tile[thread.y * 16 + j] as f32 * b_tile[j * 16 + thread.x] as f32;
+        }
+    }
+    if row < m && col < n {
+        c[row * n + col] = acc;
+    }
+}

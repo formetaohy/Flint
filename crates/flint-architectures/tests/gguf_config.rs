@@ -1,9 +1,7 @@
-//! GGUF -> canonical name mapping and config synthesis from metadata.
-
 use std::collections::HashMap;
 
 use flint_architectures::names::gguf_key;
-use flint_checkpoint::{Checkpoint, MetaVal, Metadata, RawTensor};
+use flint_checkpoint::{Checkpoint, CheckpointKind, MetaVal, Metadata, RawTensor};
 use serde_json::json;
 
 #[test]
@@ -74,7 +72,6 @@ fn name_mapping_covers_the_dense_family() {
     assert_eq!(gguf_key("blk.0.unknown_stem.weight"), None);
 }
 
-/// In-memory GGUF source: metadata-driven tests never touch tensor bytes.
 struct FakeSource {
     meta: Metadata,
     tensor_names: Vec<String>,
@@ -107,8 +104,8 @@ impl Checkpoint for FakeSource {
     fn config_json(&self) -> flint_error::Result<Option<serde_json::Value>> {
         Ok(None)
     }
-    fn kind(&self) -> &'static str {
-        "gguf"
+    fn kind(&self) -> CheckpointKind {
+        CheckpointKind::Gguf
     }
 }
 
@@ -177,7 +174,7 @@ fn gemma_synthesis_adds_end_of_turn_to_eos() {
             ),
             ("tokenizer.ggml.eos_token_id", MetaVal::UInt(1)),
         ],
-        &["token_embd.weight"], // no output.weight -> tied
+        &["token_embd.weight"], 
     );
     let cfg =
         flint_architectures::gguf_config::synthesize_config(&src, flint_architectures::Family::Gemma).unwrap();

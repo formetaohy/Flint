@@ -5,4 +5,4 @@ edition.workspace = true
 
 [dependencies]
 flint-error.workspace = true
-wgpu.workspace = true
+saturn-core = { path = "../../saturn/crates/saturn-core" }

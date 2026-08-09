@@ -1,0 +1,5 @@
+kernel sigmoid_mul [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, N_ELEM: u32) {
+    if gid.x < N_ELEM {
+        y[gid.x] = a[gid.x] / (1.0 + exp(-b[gid.x]));
+    }
+}

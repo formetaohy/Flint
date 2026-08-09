@@ -1,6 +1,3 @@
-//! Parses a serialized ONNX `ModelProto` into a runnable [`Graph`]: nodes
-//! topologically sorted, attributes normalized, initializers decoded.
-
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -8,7 +5,6 @@ use flint_error::{Error, Result};
 
 use crate::tensor::Tensor;
 
-/// One graph node after attribute normalization.
 #[derive(Debug)]
 pub struct Node {
     pub op_type: String,
@@ -31,7 +27,6 @@ impl Node {
         self.attrs.get(name)
     }
 
-    /// Required attribute, fail-fast when missing.
     pub fn need(&self, name: &str) -> Result<&Attr> {
         self.attr(name).ok_or_else(|| {
             Error::Model(format!("node {} missing attribute {name}", self.op_type))
@@ -39,7 +34,6 @@ impl Node {
     }
 }
 
-/// Normalized attribute values (graph attributes are parsed recursively).
 #[derive(Debug)]
 pub enum Attr {
     F(f32),
@@ -91,17 +85,15 @@ impl Attr {
     }
 }
 
-/// Graph input/output descriptor.
 #[derive(Debug)]
 pub struct ValueInfo {
     pub name: String,
-    /// ONNX `TensorProto::DataType` element type; 0 when untyped.
+
     pub elem_type: i32,
-    /// Static dims; 0 marks a dynamic dimension.
+
     pub dims: Vec<i64>,
 }
 
-/// A parsed, executable graph.
 #[derive(Debug)]
 pub struct Graph {
     pub name: String,
@@ -112,7 +104,7 @@ pub struct Graph {
 }
 
 impl Graph {
-    /// Parses a model file and its main graph.
+
     pub fn load(path: &Path) -> Result<Graph> {
         let bytes = std::fs::read(path)
             .map_err(|e| Error::Model(format!("cannot read {}: {e}", path.display())))?;
@@ -248,8 +240,6 @@ impl Graph {
     }
 }
 
-/// Kahn's algorithm. Duplicate producers are hard errors; a node consuming
-/// its own output (legal in-place patterns) is treated as ready.
 fn topo_sort(nodes: &mut Vec<Node>) -> Result<()> {
     let mut producer: HashMap<&str, usize> = HashMap::new();
     for (i, n) in nodes.iter().enumerate() {

@@ -1,6 +1,3 @@
-//! The dense GQA transformer model: forward graph over config and weights
-//! (dense or MoE FFNs).
-
 use flint_backend::{Backend, Binding, Pass};
 use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
@@ -19,23 +16,23 @@ pub struct DenseModel {
     max_seq: u32,
     pos: u32,
     embed: Weight,
-    /// Untied logits projection; None reuses the embedding table.
+
     head: Option<Weight>,
-    /// Logits bias (Phi-MoE's lm_head_bias).
+
     lm_bias: Option<Tensor>,
     norm: Tensor,
     norm_bias: Option<Tensor>,
     layers: Vec<LayerW>,
-    /// KV caches plus per-layer source index (Gemma 4 shared layers read the last same-type cache).
+
     kv: Vec<KvCache>,
     kv_src: Vec<usize>,
-    /// Ones tensor for weightless (scale-less) norms.
+
     ones: Tensor,
     s: Scratch,
-    /// RoPE tables, one pair per rope set.
+
     cos: Vec<Tensor>,
     sin: Vec<Tensor>,
-    /// PLE weights (Gemma 4).
+
     ple_emb: Option<Weight>,
     ple_proj: Option<Weight>,
     ple_norm: Option<Tensor>,
@@ -52,7 +49,6 @@ impl DenseModel {
         Self::load_extra(source, cfg, plan, Vec::new(), max_seq, backend)
     }
 
-    /// Loads with pre-uploaded extra weights (MoE expert sets).
     pub fn load_extra(
         source: &dyn Checkpoint,
         cfg: DenseConfig,
@@ -96,7 +92,6 @@ impl DenseModel {
             .map(|l| take_layer(&mut w, &cfg, l, backend))
             .collect::<Result<Vec<_>>>()?;
 
-        // KV caches: shared layers map to the last non-shared layer of their class.
         let first_shared = cfg.first_shared();
         let mut kv = Vec::new();
         let mut kv_src = vec![0usize; cfg.layers as usize];
@@ -107,20 +102,14 @@ impl DenseModel {
                 kv_src[l] = last_by_class[class].expect("KV-shared layer without a source");
             } else {
                 let idx = kv.len();
-                kv.push(KvCache::new(
-                    backend,
-                    cfg.kv_heads,
-                    max_seq,
-                    cfg.head_dim(l as u32),
-                    &format!("l{l}"),
-                ));
+                kv.push(KvCache::new(backend, cfg.kv_heads, max_seq, cfg.head_dim(l as u32)));
                 kv_src[l] = idx;
                 last_by_class[(cfg.window(l as u32) > 0) as usize] = Some(idx);
             }
         }
 
         let max_hd = *cfg.head_dims.iter().max().unwrap();
-        let ones = backend.tensor_f32(&vec![1.0; max_hd as usize], vec![max_hd], "ones");
+        let ones = backend.tensor_f32(&vec![1.0; max_hd as usize], vec![max_hd]);
         let s = alloc_scratch(&cfg, backend);
         let mut cos = Vec::new();
         let mut sin = Vec::new();
@@ -162,7 +151,6 @@ impl DenseModel {
         self.head.as_ref().unwrap_or(&self.embed)
     }
 
-    /// Norm mode: direct weights (RMSNorm) or mean-centered with bias (LayerNorm).
     fn norm_mode(&self) -> NormMode {
         if self.cfg.layernorm {
             NormMode::Layer
@@ -171,13 +159,11 @@ impl DenseModel {
         }
     }
 
-    /// Bias binding for a norm (the norm's own bias, or the unused ones tile).
     fn norm_bias<'a>(&'a self, b: Option<&'a Tensor>) -> Binding<'a> {
         b.map(Binding::Full).unwrap_or(Binding::Full(&self.ones))
     }
 }
 
-/// Residual add with an optional sandwich norm on `y`.
 #[allow(clippy::too_many_arguments)]
 fn residual_add(
     backend: &mut Backend,
@@ -232,13 +218,13 @@ impl LanguageModel for DenseModel {
         }
         let mut ids = vec![0u32; M_MAX as usize];
         ids[..tokens.len()].copy_from_slice(tokens);
-        backend.write_u32(&self.s.ids.buf, &ids);
+        backend.write_u32(self.s.ids.buf.as_ref(), &ids);
         ops::write_step_args(backend, &self.s.args, self.pos, self.pos + m);
 
         let cfg = &self.cfg;
-        let mut enc = backend.encoder();
+        let mut enc = backend.encoder()?;
         {
-            let mut pass = Pass::begin(&mut enc, "forward");
+            let mut pass = Pass::begin(enc.as_mut());
             let s = &self.s;
             ops::embed(
                 backend,
@@ -251,7 +237,6 @@ impl LanguageModel for DenseModel {
                 cfg.embed_scale,
             )?;
 
-            // PLE: token identity + context projection, combined and normalized.
             if let (Some(pe), Some(pp), Some(pn)) = (&self.ple_emb, &self.ple_proj, &self.ple_norm)
             {
                 let (pt, pc, po) = (
@@ -318,9 +303,9 @@ impl LanguageModel for DenseModel {
                     cfg.hidden,
                     cfg.norm_eps,
                 )?;
-                let (nq_g, nk_g, nv_g) = match (&lw.k, &lw.v) {
-                    (Some(_), Some(_)) => (nq * hd, nkv * hd, nkv * hd),
-                    _ => (nq * hd, 0, 0),
+                let nk_g = match (&lw.k, &lw.v) {
+                    (Some(_), Some(_)) => nkv * hd,
+                    _ => 0,
                 };
                 let (yq, yk, yv) = if lw.k.is_some() {
                     (
@@ -346,9 +331,7 @@ impl LanguageModel for DenseModel {
                     yk,
                     yv,
                     m,
-                    nq_g,
                     nk_g,
-                    nv_g,
                 )?;
 
                 if let (Some(qb), Some(kb), Some(vb)) = (&lw.q_bias, &lw.k_bias, &lw.v_bias) {
@@ -357,7 +340,6 @@ impl LanguageModel for DenseModel {
                     ops::bias(backend, &mut pass, Binding::Full(&lw.v_t), vb, m, nkv * hd)?;
                 }
 
-                // QK-norm before RoPE; K/V exist only on layers owning their cache.
                 let ri = cfg.layer_rope[l];
                 let (cos, sin) = (&self.cos[ri as usize], &self.sin[ri as usize]);
                 let rot = cfg.rope[ri as usize].dim;
@@ -399,7 +381,6 @@ impl LanguageModel for DenseModel {
                     _ => (&lw.q_t, lw.k.as_ref().map(|_| &lw.k_t)),
                 };
 
-                // Weightless V norm before the cache (Gemma 4).
                 if cfg.v_norm && lw.k.is_some() {
                     ops::norm(
                         backend,
@@ -465,23 +446,23 @@ impl LanguageModel for DenseModel {
                 }
 
                 ops::attn(
-                    backend,
-                    &mut pass,
-                    Binding::Full(q_src),
-                    &kv.k,
-                    &kv.v,
-                    &s.attn_scratch,
-                    Binding::Full(&lw.attn_out),
-                    nq,
-                    nkv,
-                    hd,
-                    kv.max_seq,
-                    &self.s.args,
-                    m,
-                    cfg.window(l as u32),
-                    s.attn_stride,
+                        backend,
+                        &mut pass,
+                        Binding::Full(q_src),
+                        &kv.k,
+                        &kv.v,
+                        &s.attn_scratch,
+                        Binding::Full(&lw.attn_out),
+                        nq,
+                        nkv,
+                        hd,
+                        kv.max_seq,
+                        &self.s.args,
+                        m,
+                        cfg.window(l as u32),
+                        s.attn_stride,
                 )?;
-                // Non-sandwich families fuse o_proj into the layer input.
+
                 let attn_fused = lw.post_attn_norm.is_none();
                 ops::gemm_acc(
                     backend,
@@ -527,7 +508,7 @@ impl LanguageModel for DenseModel {
 
                 match &lw.mlp {
                     MlpBlock::Dense(mlp) => {
-                        // Non-sandwich families accumulate down_proj in place.
+
                         let ffn_fused = attn_fused && lw.post_ffn_norm.is_none();
                         let y = Binding::Full(if ffn_fused { &s.hidden } else { &s.mlp.down_out });
                         ops::swiglu_mlp(
@@ -560,7 +541,7 @@ impl LanguageModel for DenseModel {
                     MlpBlock::Moe(moe) => {
                         let moe_cfg = cfg.moe.expect("MoE block without MoE config");
                         let mt = s.moe.as_ref().expect("MoE block without MoE scratch");
-                        // Router logits close this encoder; routing runs on CPU.
+
                         ops::gemm(
                             backend,
                             &mut pass,
@@ -570,9 +551,9 @@ impl LanguageModel for DenseModel {
                             m,
                         )?;
                         drop(pass);
-                        backend.submit(enc);
+                        backend.submit(enc)?;
                         let logits =
-                            backend.read_f32(&mt.logits.buf, 0, (m * moe_cfg.experts) as usize)?;
+                            backend.read_f32(mt.logits.buf.as_ref(), 0, (m * moe_cfg.experts) as usize)?;
                         let r = Routing::new(
                             &logits,
                             m,
@@ -581,10 +562,10 @@ impl LanguageModel for DenseModel {
                             moe_cfg.kind,
                             moe.shared_scale,
                         );
-                        backend.write_u32(&mt.rows.buf, &r.rows);
-                        backend.write_f32(&mt.weights.buf, &r.weights);
-                        enc = backend.encoder();
-                        pass = Pass::begin(&mut enc, "forward");
+                        backend.write_u32(mt.rows.buf.as_ref(), &r.rows);
+                        backend.write_f32(mt.weights.buf.as_ref(), &r.weights);
+                        enc = backend.encoder()?;
+                        pass = Pass::begin(enc.as_mut());
                         ops::zero_rows(backend, &mut pass, Binding::Full(&mt.acc), m * cfg.hidden)?;
                         ops::moe_apply(
                             backend,
@@ -612,7 +593,6 @@ impl LanguageModel for DenseModel {
                     }
                 }
 
-                // PLE block: inject the layer's slice, then scale the layer (Gemma 4).
                 if let (Some(gate), Some(proj), Some(pn), Some(os)) = (
                     &lw.per_layer_gate,
                     &lw.per_layer_proj,
@@ -734,7 +714,7 @@ impl LanguageModel for DenseModel {
                 )?;
             }
         }
-        backend.submit(enc);
+        backend.submit(enc)?;
 
         let out = ChunkOut {
             logits: ops::read_rows(backend, &self.s.logits, logit_rows, m, cfg.vocab)?,
@@ -765,4 +745,3 @@ impl LanguageModel for DenseModel {
         &self.cfg.eos
     }
 }
-

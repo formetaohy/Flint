@@ -1,24 +1,15 @@
-//! GPU timestamp profiling for Flint's compute kernels.
-//!
-//! Brackets every dispatch with two timestamp queries and accumulates
-//! per-shader totals across frames. Constructed only when profiling is
-//! requested; readback is owned by the backend, which hands raw values to
-//! [`Profiler::accumulate`].
-
 use std::collections::HashMap;
 
-use wgpu::{Buffer, BufferUsages, CommandEncoder, ComputePass, Device, QuerySet, QueryType, Queue};
+use saturn_core::{Buffer, BufferSpec, CommandEncoder, Device, TimestampSet};
 
 use flint_error::Result;
 
-/// One aggregated row: total GPU time spent in a shader across all frames.
 pub struct ProfileRow {
     pub label: &'static str,
     pub total_ns: u64,
     pub count: u64,
 }
 
-/// One breakdown line: share, percentage and call count.
 pub fn breakdown(rows: &[ProfileRow]) -> String {
     let total: u64 = rows.iter().map(|r| r.total_ns).sum();
     let mut out = String::new();
@@ -39,19 +30,15 @@ pub fn breakdown(rows: &[ProfileRow]) -> String {
     out
 }
 
-/// A bracketed dispatch: timestamps at `start` and `end` query slots.
 struct Span {
     label: &'static str,
     start: u32,
     end: u32,
 }
 
-/// Times dispatches on the GPU via timestamp queries and accumulates
-/// per-shader totals. Frame state resets on each `accumulate`; totals persist.
 pub struct Profiler {
-    set: QuerySet,
-    resolve_buf: Buffer,
-    read_buf: Buffer,
+    set: Box<dyn TimestampSet>,
+    read_buf: Box<dyn Buffer>,
     capacity: u32,
     next: u32,
     spans: Vec<Span>,
@@ -60,100 +47,79 @@ pub struct Profiler {
 }
 
 impl Profiler {
-    pub fn new(device: &Device, queue: &Queue, capacity: u32) -> Self {
-        let set = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("flint.profile"),
-            count: capacity,
-            ty: QueryType::Timestamp,
-        });
-        let bytes = capacity as u64 * 8;
-        let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("flint.profile.resolve"),
-            size: bytes,
-            usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("flint.profile.read"),
-            size: bytes,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        Self {
+    pub fn new(device: &dyn Device, capacity: u32) -> Result<Self> {
+        let set = device.create_timestamp_set(capacity)?;
+        let read_buf = device.create_buffer(&BufferSpec {
+            size: capacity as u64 * 8,
+            host_visible: true,
+        })?;
+        Ok(Self {
             set,
-            resolve_buf,
             read_buf,
             capacity,
             next: 0,
             spans: Vec::new(),
             totals: HashMap::new(),
-            period_ns: queue.get_timestamp_period() as f64,
-        }
+            period_ns: device.timestamp_period_ns(),
+        })
     }
 
-    /// Writes a start timestamp and returns its query slot, or `None` once
-    /// the frame's query budget is exhausted (the dispatch still runs).
-    pub fn begin(&mut self, pass: &mut ComputePass) -> Option<u32> {
+    pub fn begin(&mut self, encoder: &mut dyn CommandEncoder) -> Result<Option<u32>> {
         if self.next + 2 > self.capacity {
-            return None;
+            return Ok(None);
         }
         let start = self.next;
         self.next += 1;
-        pass.write_timestamp(&self.set, start);
-        Some(start)
+        encoder.write_timestamp(self.set.as_ref(), start)?;
+        Ok(Some(start))
     }
 
-    /// Writes the matching end timestamp and records the span.
-    pub fn end(&mut self, pass: &mut ComputePass, label: &'static str, start: Option<u32>) {
-        let Some(start) = start else { return };
+    pub fn end(
+        &mut self,
+        encoder: &mut dyn CommandEncoder,
+        label: &'static str,
+        start: Option<u32>,
+    ) -> Result<()> {
+        let Some(start) = start else {
+            return Ok(());
+        };
         let end = self.next;
         self.next += 1;
-        pass.write_timestamp(&self.set, end);
+        encoder.write_timestamp(self.set.as_ref(), end)?;
         self.spans.push(Span { label, start, end });
+        Ok(())
     }
 
-    /// Resolves this frame's timestamps into the readback buffer. The caller
-    /// submits the encoder, then calls `accumulate`.
-    pub fn resolve(&self, encoder: &mut CommandEncoder) {
+    pub fn resolve(&self, encoder: &mut dyn CommandEncoder) -> Result<()> {
         if self.next == 0 {
-            return;
+            return Ok(());
         }
-        encoder.resolve_query_set(&self.set, 0..self.next, &self.resolve_buf, 0);
-        encoder.copy_buffer_to_buffer(
-            &self.resolve_buf,
+        Ok(encoder.resolve_timestamps(
+            self.set.as_ref(),
             0,
-            &self.read_buf,
+            self.next,
+            self.read_buf.as_ref(),
             0,
-            self.next as u64 * 8,
-        );
+        )?)
     }
 
-    /// Resolved-timestamp readback target; the backend maps this after
-    /// submitting the resolve encoder.
-    pub fn read_buf(&self) -> &Buffer {
-        &self.read_buf
-    }
-
-    /// Number of query slots this frame used (0 when nothing was timed).
     pub fn pending(&self) -> u32 {
         self.next
     }
 
-    /// Folds the resolved timestamps of this frame's spans into the running
-    /// totals, then resets the frame state.
-    pub fn accumulate(&mut self, timestamps: &[u64]) -> Result<()> {
+    pub fn accumulate(&mut self) -> Result<()> {
         let count = self.next as usize;
-        if self.spans.is_empty() || count == 0 {
+        if count == 0 {
             self.next = 0;
             self.spans.clear();
             return Ok(());
         }
-        if timestamps.len() < count {
-            return Err(flint_error::Error::Gpu(format!(
-                "profile readback returned {} timestamps, need {count}",
-                timestamps.len()
-            )));
-        }
+        let mut bytes = vec![0u8; count * 8];
+        self.read_buf.read(0, &mut bytes)?;
+        let timestamps: Vec<u64> = bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().expect("timestamp chunk is 8 bytes")))
+            .collect();
         for span in &self.spans {
             let start = timestamps[span.start as usize];
             let end = timestamps[span.end as usize];
@@ -167,7 +133,6 @@ impl Profiler {
         Ok(())
     }
 
-    /// Per-shader totals sorted by total time, descending.
     pub fn report(&self) -> Vec<ProfileRow> {
         let mut rows: Vec<ProfileRow> = self
             .totals

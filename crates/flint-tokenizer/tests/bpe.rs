@@ -1,16 +1,9 @@
-//! Byte-level BPE tokenizer rebuilt from GGUF metadata (the non-"llama"
-//! flavor): vocab keeps original ids, merges are honored, control pieces
-//! become single-id specials, unused pieces are dropped. Also covers the
-//! `Tokenizer::load` source dispatch and its fail-fast paths.
-
 use std::collections::HashMap;
 use std::path::Path;
 
-use flint_checkpoint::{Checkpoint, GgufWriter, MetaVal, Metadata, RawTensor};
+use flint_checkpoint::{Checkpoint, CheckpointKind, GgufWriter, MetaVal, Metadata, RawTensor};
 use flint_tokenizer::Tokenizer;
 
-/// GGUF-style metadata for a tiny BPE tokenizer: three base pieces with one
-/// merge, two control pieces and one unused piece.
 fn bpe_meta() -> Metadata {
     let tokens = ["a", "b", "ab", "<|im_start|>", "<|im_end|>", "<unused>"];
     let types = [0u32, 0, 0, 3, 3, 5];
@@ -36,12 +29,11 @@ fn bpe_meta() -> Metadata {
 fn bpe_rebuild_keeps_ids_and_honors_merges() {
     let tok = Tokenizer::from_gguf(&bpe_meta()).unwrap();
 
-    // Base pieces keep their original ids.
     assert_eq!(tok.encode("a").unwrap(), vec![0]);
     assert_eq!(tok.encode("b").unwrap(), vec![1]);
-    // The "a b" merge collapses the pair into the pre-existing "ab" piece.
+
     assert_eq!(tok.encode("ab").unwrap(), vec![2]);
-    // No merge for repeated a: two separate pieces.
+
     assert_eq!(tok.encode("aa").unwrap(), vec![0, 0]);
 }
 
@@ -65,7 +57,6 @@ fn load_prefers_tokenizer_json_over_gguf_metadata() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    // A GGUF whose embedded tokenizer would map "ab" to a single id...
     let mut w = GgufWriter::new(32);
     w.kv_str("general.architecture", "llama");
     w.kv_str("tokenizer.ggml.model", "bpe");
@@ -73,7 +64,6 @@ fn load_prefers_tokenizer_json_over_gguf_metadata() {
     w.kv_str_array("tokenizer.ggml.merges", &["a b"]);
     std::fs::write(dir.join("model.gguf"), w.finish()).unwrap();
 
-    // ...and a tokenizer.json whose vocab splits "ab" into "a" + "b".
     std::fs::write(
         dir.join("tokenizer.json"),
         r#"{
@@ -110,7 +100,6 @@ fn load_prefers_tokenizer_json_over_gguf_metadata() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A checkpoint source that carries no tokenizer metadata.
 struct NoTokenizer {
     meta: Metadata,
 }
@@ -136,8 +125,8 @@ impl Checkpoint for NoTokenizer {
     fn config_json(&self) -> flint_error::Result<Option<serde_json::Value>> {
         Ok(None)
     }
-    fn kind(&self) -> &'static str {
-        "safetensors"
+    fn kind(&self) -> CheckpointKind {
+        CheckpointKind::Safetensors
     }
 }
 
@@ -146,7 +135,7 @@ fn from_source_rejects_non_gguf_checkpoints() {
     let err = Tokenizer::from_source(&NoTokenizer::new())
         .err()
         .expect("safetensors carries no tokenizer metadata");
-    assert!(err.to_string().contains("safetensors"), "{err}");
+    assert!(err.to_string().contains("tokenizer metadata"), "{err}");
 }
 
 #[test]

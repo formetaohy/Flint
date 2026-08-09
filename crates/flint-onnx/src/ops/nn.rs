@@ -1,5 +1,3 @@
-//! Neural network operators: linear algebra, normalization and pooling.
-
 use std::collections::HashMap;
 
 use flint_error::{Error, Result};
@@ -16,7 +14,7 @@ pub(crate) fn matmul(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<(
     let rb = b.shape.len();
     let (shape, out) = match (ra, rb) {
         (1, 1) => {
-            // Dot product → scalar.
+
             if a.shape[0] != b.shape[0] {
                 return Err(Error::Model("MatMul: inner dim mismatch".into()));
             }
@@ -81,13 +79,11 @@ pub(crate) fn matmul(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<(
     Ok(())
 }
 
-/// Maps a flat index in broadcast batch space back to a source batch index
-/// (source dims are broadcast-compatible with the batch shape).
 fn broadcast_index(batch: &[usize], src: &[usize], flat: usize) -> usize {
     if src.is_empty() || src.iter().all(|&d| d == 1) {
         return 0;
     }
-    // Element strides within the source batch layout (0 for broadcast dims).
+
     let mut strides = vec![0usize; src.len()];
     let mut acc = 1usize;
     for d in (0..src.len()).rev() {
@@ -228,7 +224,7 @@ pub(crate) fn layer_norm(env: &mut HashMap<String, Tensor>, node: &Node) -> Resu
     let mut inv_out = Vec::with_capacity(outer);
     for o in 0..outer {
         let base = o * norm_dims;
-        // Mean and variance over the normalized slice (Welford-free simple pass).
+
         let mut sum = 0f64;
         for i in 0..norm_dims {
             sum += v[base + i] as f64;
@@ -295,7 +291,6 @@ pub(crate) fn batch_norm(env: &mut HashMap<String, Tensor>, node: &Node) -> Resu
     Ok(())
 }
 
-/// Generic N-D convolution (1D/2D/3D), group and dilation aware.
 pub(crate) fn conv(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let x = input(env, node, 0)?;
     let w = input(env, node, 1)?;
@@ -326,7 +321,7 @@ pub(crate) fn conv(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()>
     if bv.len() != c_out {
         return Err(Error::Model("Conv: bias length mismatch".into()));
     }
-    // Output spatial dims.
+
     let mut out_spatial = vec![0usize; spatial];
     for d in 0..spatial {
         let eff = dilations[d] * (kernel[d] - 1) + 1;
@@ -372,7 +367,7 @@ pub(crate) fn conv(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()>
                             if !in_ok {
                                 continue;
                             }
-                            // Spatial offset of the input element.
+
                             let mut x_off = (b * c_in + i_ch) * x_inner;
                             let mut inner_stride = x_inner;
                             for d in 0..spatial {
@@ -400,7 +395,6 @@ fn attr_ints(node: &Node, name: &str, default: Vec<usize>) -> Result<Vec<usize>>
     }
 }
 
-/// Generic N-D pooling for AveragePool and MaxPool.
 fn pool(
     env: &mut HashMap<String, Tensor>,
     node: &Node,
@@ -525,8 +519,6 @@ pub(crate) fn global_avg_pool(env: &mut HashMap<String, Tensor>, node: &Node) ->
     Ok(())
 }
 
-/// Gated recurrent unit (opset 14 subset: layout=0, one direction, common
-/// activations). Sequence models like encoder-decoder exports rely on it.
 pub(crate) fn gru(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let x = input(env, node, 0)?;
     let w = input(env, node, 1)?;
@@ -629,8 +621,7 @@ pub(crate) fn gru(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> 
         let mut h_next = vec![0f32; batch * hidden_size];
         for b_i in 0..batch {
             for i in 0..hidden_size {
-                // Gates (bias layout: [Wb_z, Wb_r, Wb_h, Rb_z, Rb_r, Rb_h]):
-                // z = f(X W_z + H R_z + Wb_z + Rb_z), r likewise.
+
                 let mut z = bv[i] + bv[3 * hidden_size + i];
                 let mut r = bv[hidden_size + i] + bv[4 * hidden_size + i];
                 for j in 0..input_size {
@@ -645,8 +636,7 @@ pub(crate) fn gru(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> 
                 }
                 let zt = act(z, act_gate)?;
                 let rt = act(r, act_gate)?;
-                // Candidate: h~ = g(X W_h + (r .* (H R_h + Rb_h)) + Wb_h) when
-                // linear_before_reset=0, else g(X W_h + r .* (H R_h) + Rb_h + Wb_h).
+
                 let mut c = bv[2 * hidden_size + i];
                 for j in 0..input_size {
                     let xv_ij = xv[t * batch * input_size + b_i * input_size + j];

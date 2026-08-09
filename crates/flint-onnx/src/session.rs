@@ -1,6 +1,3 @@
-//! Execution session: binds graph inputs, runs nodes in topological order
-//! and extracts the declared outputs.
-
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -10,14 +7,13 @@ use crate::graph::Graph;
 use crate::ops;
 use crate::tensor::Tensor;
 
-/// A loaded graph plus its runtime value environment.
 pub struct Session {
     graph: Graph,
     env: HashMap<String, Tensor>,
 }
 
 impl Session {
-    /// Loads a model file, decoding initializers into the environment.
+
     pub fn load(path: &Path) -> Result<Session> {
         let graph = Graph::load(path)?;
         let mut env = HashMap::with_capacity(graph.initializers.len());
@@ -31,7 +27,6 @@ impl Session {
         &self.graph
     }
 
-    /// Binds one graph input by name, failing fast on unknown names.
     pub fn set_input(&mut self, name: &str, t: Tensor) -> Result<()> {
         if !self.graph.inputs.iter().any(|i| i.name == name) {
             return Err(Error::Model(format!(
@@ -42,7 +37,6 @@ impl Session {
         Ok(())
     }
 
-    /// Executes every node and returns the declared outputs.
     pub fn run(&mut self) -> Result<HashMap<String, Tensor>> {
         for node in &self.graph.nodes {
             ops::run(node, &mut self.env)?;

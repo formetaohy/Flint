@@ -1,6 +1,3 @@
-//! Hugging Face Hub model downloads: resolve a repo file through the Hub
-//! API (following LFS redirects) and save it locally.
-
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -9,13 +6,9 @@ use flint_error::{Error, Result};
 
 const HUB_API: &str = "https://huggingface.co/api/models";
 
-/// Downloads one file from a Hub repo into `out_dir`, returning the local
-/// path. `repo_file` is the path inside the repo (e.g. `onnx/model.onnx`).
-/// Large files are served via LFS; `resolve` redirects to the CDN.
 pub fn download_file(repo: &str, repo_file: &str, out_dir: &Path) -> Result<PathBuf> {
     let mut target = out_dir.join(repo_file);
-    // Flatten the repo path into the local file name to keep single-file
-    // downloads self-contained.
+
     if let Some(name) = target.file_name() {
         target = out_dir.join(name);
     }
@@ -44,7 +37,6 @@ pub fn download_file(repo: &str, repo_file: &str, out_dir: &Path) -> Result<Path
     Ok(target)
 }
 
-/// Lists the files in a repo revision, parsed from the Hub tree API.
 pub fn list_files(repo: &str) -> Result<Vec<String>> {
     let url = format!("{HUB_API}/{repo}/tree/main?recursive=true");
     let resp = agent()
@@ -74,8 +66,6 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
-/// Finds the first `.onnx` file in a repo's file list, preferring
-/// `onnx/model.onnx`.
 pub fn default_onnx_file(repo: &str) -> Result<String> {
     let files = list_files(repo)?;
     let onnx: Vec<&String> = files

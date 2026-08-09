@@ -1,5 +1,3 @@
-//! Control-flow operators: If and Loop with subgraph execution.
-
 use std::collections::HashMap;
 
 use flint_error::{Error, Result};
@@ -8,8 +6,6 @@ use crate::graph::{Attr, Graph, Node};
 use crate::ops::{input, input_opt, output};
 use crate::tensor::{Data, Tensor};
 
-/// Executes a subgraph in a child environment: inherited bindings plus the
-/// subgraph's own initializers, returning its declared outputs.
 fn run_subgraph(sub: &Graph, env: &mut HashMap<String, Tensor>) -> Result<Vec<Tensor>> {
     for (name, t) in &sub.initializers {
         env.insert(name.clone(), t.clone());
@@ -42,7 +38,7 @@ pub(crate) fn if_op(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()
         Some(Attr::G(g)) => g,
         _ => return Err(Error::Model("If: missing else_branch".into())),
     };
-    // A subgraph inherits the parent environment; run in a scratch map.
+
     let mut sub_env = env.clone();
     let results = run_subgraph(if cond_v { sub } else { else_sub }, &mut sub_env)?;
     for (i, t) in results.into_iter().enumerate() {
@@ -125,7 +121,6 @@ pub(crate) fn loop_op(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<
         iter += 1;
     }
 
-    // Outputs: condition, carried values, concatenated scan values.
     output(env, node, 0, Tensor::bool(vec![cond], vec![]))?;
     for (i, t) in carried.iter().enumerate() {
         output(env, node, 1 + i, t.clone())?;

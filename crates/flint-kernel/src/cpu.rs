@@ -1,18 +1,11 @@
-//! CPU reference implementations of every compute kernel, in plain Rust.
-//! They define the intended semantics; the WGPU kernels are tested against
-//! them. Activations are row-major `[rows, dim]` tiles, matching the GPU.
-
 fn silu(v: f32) -> f32 {
     v / (1.0 + (-v).exp())
 }
 
-/// Round-to-bf16 (truncate the low 16 mantissa bits), modelling how the KV
-/// cache stores activations so the reference matches the GPU kernels.
 fn bf16(v: f32) -> f32 {
-    flint_num::bf16_to_f32(flint_num::f32_to_bf16(v))
+    saturn_core::num::bf16_to_f32(saturn_core::num::f32_to_bf16(v))
 }
 
-/// y[m, n] = x[m, k] @ w[n, k]^T.
 pub fn gemm(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     let mut y = vec![0f32; m * n];
     for mi in 0..m {
@@ -27,7 +20,6 @@ pub fn gemm(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     y
 }
 
-/// y[n] = x[k] @ w[n, k]^T (single activation row, the decode fast path).
 pub fn gemv(x: &[f32], w: &[f32], n: usize, k: usize) -> Vec<f32> {
     let mut y = vec![0f32; n];
     for ni in 0..n {
@@ -40,7 +32,6 @@ pub fn gemv(x: &[f32], w: &[f32], n: usize, k: usize) -> Vec<f32> {
     y
 }
 
-/// Gathers embedding rows: out[r] = scale * table[ids[r]].
 pub fn embed(ids: &[u32], table: &[f32], dim: usize, scale: f32) -> Vec<f32> {
     let mut out = vec![0f32; ids.len() * dim];
     for (r, &id) in ids.iter().enumerate() {
@@ -51,10 +42,6 @@ pub fn embed(ids: &[u32], table: &[f32], dim: usize, scale: f32) -> Vec<f32> {
     out
 }
 
-/// Normalization over `dim`. mode 0 = offset weight (1+w), 1 = gated
-/// (weight * silu(gate)), 2 = direct weight (w), 3 = layer norm
-/// ((x - mean) * inv_std * w + bias, `gate` holds the bias). `w_dim` is the
-/// weight length (may repeat across dim).
 #[allow(clippy::too_many_arguments)]
 pub fn norm(
     mode: u32,
@@ -101,14 +88,12 @@ pub fn add(a: &[f32], b: &[f32]) -> Vec<f32> {
     a.iter().zip(b).map(|(x, y)| x + y).collect()
 }
 
-/// In-place row-broadcast bias over a [rows, dim] tile.
 pub fn bias(x: &mut [f32], bias: &[f32], dim: usize) {
     for (i, v) in x.iter_mut().enumerate() {
         *v += bias[i % dim];
     }
 }
 
-/// mode 0 = silu, 1 = gelu (pytorch tanh approximation).
 pub fn swiglu(gate: &[f32], up: &[f32], mode: u32) -> Vec<f32> {
     let act = |v: f32| match mode {
         1 => 0.5 * v * (1.0 + (0.7978846 * (v + 0.044715 * v * v * v)).tanh()),
@@ -117,19 +102,16 @@ pub fn swiglu(gate: &[f32], up: &[f32], mode: u32) -> Vec<f32> {
     gate.iter().zip(up).map(|(g, u)| act(*g) * u).collect()
 }
 
-/// Logit softcapping: y[i] = cap * tanh(y[i] / cap), in place.
 pub fn softcap(x: &mut [f32], cap: f32) {
     for v in x {
         *v = cap * (*v / cap).tanh();
     }
 }
 
-/// Elementwise multiply with broadcast: y[i] = a[i] * b[i % m].
 pub fn mul(a: &[f32], b: &[f32], n: usize, m: usize) -> Vec<f32> {
     (0..n).map(|i| a[i] * b[i % m]).collect()
 }
 
-/// Copies COUNT rows of x [M_MAX, HIDDEN] selected by ids into out rows 0..COUNT.
 pub fn expert_gather(x: &[f32], ids: &[u32], rows: usize, hidden: usize) -> Vec<f32> {
     let mut out = vec![0f32; rows * hidden];
     for (r, &id) in ids.iter().enumerate() {
@@ -139,7 +121,6 @@ pub fn expert_gather(x: &[f32], ids: &[u32], rows: usize, hidden: usize) -> Vec<
     out
 }
 
-/// MoE weighted accumulation: acc[ids[i]] += weights[i] * src[i] over packed rows.
 pub fn expert_scatter(acc: &mut [f32], src: &[f32], ids: &[u32], weights: &[f32], hidden: usize) {
     for (i, &id) in ids.iter().enumerate() {
         let w = weights[i];
@@ -149,7 +130,6 @@ pub fn expert_scatter(acc: &mut [f32], src: &[f32], ids: &[u32], weights: &[f32]
     }
 }
 
-/// Zeroes the first n elements.
 pub fn zero_rows(x: &mut [f32], n: usize) {
     x[..n].fill(0.0);
 }
@@ -161,7 +141,6 @@ pub fn sigmoid_mul(a: &[f32], b: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Concatenates two [rows, d] tiles along the last dim -> [rows, 2d].
 pub fn concat(a: &[f32], b: &[f32], rows: usize, d: usize) -> Vec<f32> {
     let mut out = vec![0f32; rows * 2 * d];
     for r in 0..rows {
@@ -171,7 +150,6 @@ pub fn concat(a: &[f32], b: &[f32], rows: usize, d: usize) -> Vec<f32> {
     out
 }
 
-/// Splits interleaved [rows, heads, 2*hd] into q and gate [rows, heads, hd].
 pub fn split_qg(x: &[f32], rows: usize, heads: usize, hd: usize) -> (Vec<f32>, Vec<f32>) {
     let mut q = vec![0f32; rows * heads * hd];
     let mut g = vec![0f32; rows * heads * hd];
@@ -187,8 +165,6 @@ pub fn split_qg(x: &[f32], rows: usize, heads: usize, hd: usize) -> (Vec<f32>, V
     (q, g)
 }
 
-/// In-place multi-row RoPE. cos/sin are [max_seq, rot/2]; only the first `rot`
-/// dims of each head rotate. x is [m, heads, hd] starting at position `pos`.
 #[allow(clippy::too_many_arguments)]
 pub fn rope(
     x: &mut [f32],
@@ -219,7 +195,6 @@ pub fn rope(
     }
 }
 
-/// Writes m rows of src [m, kv_heads, hd] into cache [kv_heads, max_seq, hd] at pos.
 pub fn kv_store(
     src: &[f32],
     cache: &mut [f32],
@@ -238,9 +213,6 @@ pub fn kv_store(
     }
 }
 
-/// Multi-row causal GQA attention over a [kv_heads, max_seq, hd] KV cache.
-/// q is [m, nq, hd]; output [m, nq, hd]. `window` > 0 restricts each query to
-/// the trailing `window` keys (sliding window); 0 attends to the full prefix.
 #[allow(clippy::too_many_arguments)]
 pub fn attn(
     q: &[f32],
@@ -291,8 +263,6 @@ pub fn attn(
     out
 }
 
-/// Depthwise causal conv1d with a 3-tap ring state, per channel SiLU. One time
-/// step: out[c] = silu(w0*s0 + w1*s1 + w2*s2 + w3*x[c]); state shifts to [s1,s2,x].
 pub fn conv1d(x: &[f32], w: &[f32], state: &mut [f32]) -> Vec<f32> {
     let dim = x.len();
     let mut out = vec![0f32; dim];
@@ -310,8 +280,6 @@ pub fn conv1d(x: &[f32], w: &[f32], state: &mut [f32]) -> Vec<f32> {
     out
 }
 
-/// Expands the q/k segments of a conv tile from N_K key heads to N_V value
-/// heads (repeat_interleave), matching the layout delta_recur consumes.
 #[allow(clippy::too_many_arguments)]
 pub fn repeat_qk(
     x: &[f32],
@@ -337,7 +305,6 @@ pub fn repeat_qk(
     }
 }
 
-/// Computes per-head beta = sigmoid(b) and g = -exp(A_log) * ln(1 + exp(a + dt)).
 pub fn delta_gate(b: &[f32], a: &[f32], a_log: &[f32], dt_bias: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let heads = b.len();
     let mut beta = vec![0f32; heads];
@@ -349,9 +316,6 @@ pub fn delta_gate(b: &[f32], a: &[f32], a_log: &[f32], dt_bias: &[f32]) -> (Vec<
     (beta, g)
 }
 
-/// One Gated DeltaNet recurrence step per head. q/k are L2-normalized, q scaled
-/// by 1/sqrt(key_dim). state [heads, kd, vd] is updated in place; returns
-/// output [heads, vd].
 #[allow(clippy::too_many_arguments)]
 pub fn delta_recur(
     q: &[f32],
