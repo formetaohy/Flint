@@ -6,4 +6,4 @@ edition.workspace = true
 [dependencies]
 flint-error.workspace = true
 saturn-core = { path = "../../saturn/crates/saturn-core" }
-saturn-sat = { path = "../../saturn/crates/saturn-sat" }
+saturn-scl = { path = "../../saturn/crates/saturn-scl" }

@@ -63,14 +63,14 @@ pub fn expand(program: &Program) -> Result<Kernel> {
 }
 
 fn validate_fn_decl(f: &FnDecl) -> Result<()> {
-    if is_reserved(&f.name) || f.name.starts_with("__sat") {
+    if is_reserved(&f.name) || f.name.starts_with("__scl") {
         return Err(Diagnostic::new(
             f.span,
             format!("'{}' is a reserved name", f.name),
         ));
     }
     for param in &f.params {
-        if is_reserved(&param.name) || param.name.starts_with("__sat") {
+        if is_reserved(&param.name) || param.name.starts_with("__scl") {
             return Err(Diagnostic::new(
                 f.span,
                 format!("'{}' is a reserved name", param.name),
@@ -107,7 +107,7 @@ fn validate_fn_decl(f: &FnDecl) -> Result<()> {
 impl<'a> Expander<'a> {
     fn fresh(&mut self, base: &str) -> String {
         self.counter += 1;
-        format!("__sat_{base}_{}", self.counter)
+        format!("__scl_{base}_{}", self.counter)
     }
 
     fn expand_stmts(&mut self, stmts: &[Stmt]) -> Result<Vec<Stmt>> {

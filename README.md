@@ -25,9 +25,9 @@
 
 ### What is Saturn
 
-**Saturn** is an abstraction layer designed for cross-platform GPU computing. It adopts compute shaders as a unified computing model and supports both Vulkan and Metal backends. To abstract away platform-specific shader syntax differences, **Saturn** introduces **sat**, a cross-platform compute language. 
+**Saturn** is an abstraction layer designed for cross-platform GPU computing. It adopts compute shaders as a unified computing model and supports both Vulkan and Metal backends. To abstract away platform-specific shader syntax differences, **Saturn** introduces **SCL** (Saturn Compute Language), a cross-platform compute language. 
 
-```sat
+```scl
 kernel add [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, N_ELEM: u32) {
     if gid.x < N_ELEM {
         y[gid.x] = a[gid.x] + b[gid.x];

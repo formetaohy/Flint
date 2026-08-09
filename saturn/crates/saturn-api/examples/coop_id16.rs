@@ -45,7 +45,7 @@ fn main() {
     src.write(0, &input).expect("write src");
 
     let kernel = device
-        .create_kernel(&KernelSpec::precompiled("sat/coop_id16.sat", saturn_sat::sat!("coop_id16.sat")))
+        .create_kernel(&KernelSpec::precompiled("scl/coop_id16.scl", saturn_scl::scl!("coop_id16.scl")))
         .expect("create kernel");
     let mut encoder = device.encoder().expect("encoder");
     encoder

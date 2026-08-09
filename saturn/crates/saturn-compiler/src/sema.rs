@@ -42,7 +42,7 @@ pub fn check(kernel: &ast::Kernel, specs: &[(&str, f64)]) -> Result<ir::Kernel> 
     }
     let mut consts = HashMap::new();
     for spec in &kernel.specs {
-        if is_reserved(&spec.name) || spec.name.starts_with("__sat") {
+        if is_reserved(&spec.name) || spec.name.starts_with("__scl") {
             return Err(Diagnostic::new(
                 spec.span,
                 format!("'{}' is a reserved name", spec.name),
@@ -97,7 +97,7 @@ pub fn check(kernel: &ast::Kernel, specs: &[(&str, f64)]) -> Result<ir::Kernel> 
     let mut scalar_offset = 0u32;
     for param in kernel.params.iter() {
         let name = param.name.clone();
-        if is_reserved(&name) || name.starts_with("__sat") {
+        if is_reserved(&name) || name.starts_with("__scl") {
             return Err(Diagnostic::new(
                 kernel.span,
                 format!("'{name}' is a reserved name"),

@@ -27,7 +27,7 @@ fn main() {
         })
         .expect("create dst buffer");
     let kernel = device
-        .create_kernel(&KernelSpec::precompiled("sat/scale.sat", saturn_sat::sat!("scale.sat")))
+        .create_kernel(&KernelSpec::precompiled("scl/scale.scl", saturn_scl::scl!("scale.scl")))
         .expect("create kernel");
     let mut input = Vec::with_capacity(N * 4);
     for i in 0..N {

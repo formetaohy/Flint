@@ -3,7 +3,7 @@ use std::process::Command;
 use saturn_compiler::{Source, compile};
 
 fn main() {
-    let source = Source::new("sat/blk.sat", include_str!("sat/blk.sat"));
+    let source = Source::new("scl/blk.scl", include_str!("scl/blk.scl"));
     let kernel = compile(&source).expect("compile");
     let spirv = saturn_shader::to_spirv(&kernel).expect("spirv");
     std::fs::write("rt.spv", &spirv).expect("write");

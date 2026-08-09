@@ -1,0 +1,7 @@
+error: cannot find scl/missing_kernel.scl from $DIR/tests/ui/missing_file.rs
+ --> tests/ui/missing_file.rs:4:13
+  |
+4 |     let _ = scl!("missing_kernel.scl");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `scl` (in Nightly builds, run with -Z macro-backtrace for more info)

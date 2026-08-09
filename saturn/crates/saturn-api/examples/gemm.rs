@@ -51,7 +51,7 @@ fn main() {
     b_buf.write(0, &b_data).expect("write b");
 
     let kernel = device
-        .create_kernel(&KernelSpec::precompiled("sat/gemm.sat", saturn_sat::sat!("gemm.sat")))
+        .create_kernel(&KernelSpec::precompiled("scl/gemm.scl", saturn_scl::scl!("gemm.scl")))
         .expect("create kernel");
 
     let mut encoder = device.encoder().expect("encoder");

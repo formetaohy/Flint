@@ -1,10 +1,10 @@
 [package]
-name = "saturn-sat"
+name = "saturn-scl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Compile-time SAT kernel embedding and validation"
+description = "Compile-time SCL kernel embedding and validation"
 
 [lib]
 proc-macro = true

@@ -23,7 +23,7 @@ flint-profiler = { path = "crates/flint-profiler" }
 
 saturn-core = { path = "saturn/crates/saturn-core" }
 saturn-compiler = { path = "saturn/crates/saturn-compiler" }
-saturn-sat = { path = "saturn/crates/saturn-sat" }
+saturn-scl = { path = "saturn/crates/saturn-scl" }
 saturn-shader = { path = "saturn/crates/saturn-shader" }
 saturn-vk = { path = "saturn/crates/saturn-vk" }
 saturn-mtl = { path = "saturn/crates/saturn-mtl" }

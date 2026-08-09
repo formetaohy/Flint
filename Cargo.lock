@@ -569,7 +569,7 @@ version = "0.1.0"
 dependencies = [
  "flint-error",
  "saturn-core",
- "saturn-sat",
+ "saturn-scl",
 ]
 
 [[package]]
@@ -1390,7 +1390,7 @@ version = "0.1.0"
 dependencies = [
  "saturn-core",
  "saturn-mtl",
- "saturn-sat",
+ "saturn-scl",
  "saturn-vk",
 ]
 
@@ -1422,7 +1422,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "saturn-sat"
+name = "saturn-scl"
 version = "0.1.0"
 dependencies = [
  "saturn-compiler",

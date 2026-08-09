@@ -468,12 +468,12 @@ fn const_fold_resolves_constant_cond() {
 #[test]
 fn diagnostic_renders_source_location() {
     let source = Source::new(
-        "kern.sat",
+        "kern.scl",
         "kernel k [workgroup(1,1,1)] (a: buf<f32>) {\n    a[0] = missing;\n}",
     );
     let diags = saturn_compiler::compile(&source).expect_err("should fail");
     let rendered = source.render(&diags[0]);
-    assert!(rendered.contains("kern.sat:2:12"), "got: {rendered}");
+    assert!(rendered.contains("kern.scl:2:12"), "got: {rendered}");
     assert!(rendered.contains("^"), "got: {rendered}");
 }
 

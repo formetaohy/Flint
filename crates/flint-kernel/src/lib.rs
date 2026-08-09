@@ -35,7 +35,7 @@ pub mod name {
 use std::collections::HashMap;
 
 use saturn_core::{Device, Kernel, KernelSpec, Scalar, ScalarLayout};
-use saturn_sat::sat;
+use saturn_scl::scl;
 
 use flint_error::{Error, Result};
 
@@ -47,119 +47,119 @@ struct ShaderSpec {
 const SHADERS: &[ShaderSpec] = &[
     ShaderSpec {
         name: name::GEMM,
-        kernel: sat!("gemm.sat"),
+        kernel: scl!("gemm.scl"),
     },
     ShaderSpec {
         name: name::MERGE_GEMM,
-        kernel: sat!("merge_gemm.sat"),
+        kernel: scl!("merge_gemm.scl"),
     },
     ShaderSpec {
         name: name::GEMV,
-        kernel: sat!("gemv.sat"),
+        kernel: scl!("gemv.scl"),
     },
     ShaderSpec {
         name: name::MERGE_GEMV,
-        kernel: sat!("merge_gemv.sat"),
+        kernel: scl!("merge_gemv.scl"),
     },
     ShaderSpec {
         name: name::GEMV_QKV,
-        kernel: sat!("gemv_qkv.sat"),
+        kernel: scl!("gemv_qkv.scl"),
     },
     ShaderSpec {
         name: name::MERGE_QKV,
-        kernel: sat!("merge_qkv.sat"),
+        kernel: scl!("merge_qkv.scl"),
     },
     ShaderSpec {
         name: name::GEMV_GATEUP,
-        kernel: sat!("gemv_gateup.sat"),
+        kernel: scl!("gemv_gateup.scl"),
     },
     ShaderSpec {
         name: name::MERGE_GATEUP,
-        kernel: sat!("merge_gateup.sat"),
+        kernel: scl!("merge_gateup.scl"),
     },
     ShaderSpec {
         name: name::EMBED,
-        kernel: sat!("embed.sat"),
+        kernel: scl!("embed.scl"),
     },
     ShaderSpec {
         name: name::NORM,
-        kernel: sat!("norm.sat"),
+        kernel: scl!("norm.scl"),
     },
     ShaderSpec {
         name: name::ADD,
-        kernel: sat!("add.sat"),
+        kernel: scl!("add.scl"),
     },
     ShaderSpec {
         name: name::BIAS,
-        kernel: sat!("bias.sat"),
+        kernel: scl!("bias.scl"),
     },
     ShaderSpec {
         name: name::CONCAT,
-        kernel: sat!("concat.sat"),
+        kernel: scl!("concat.scl"),
     },
     ShaderSpec {
         name: name::SWIGLU,
-        kernel: sat!("swiglu.sat"),
+        kernel: scl!("swiglu.scl"),
     },
     ShaderSpec {
         name: name::SOFTCAP,
-        kernel: sat!("softcap.sat"),
+        kernel: scl!("softcap.scl"),
     },
     ShaderSpec {
         name: name::MUL,
-        kernel: sat!("mul.sat"),
+        kernel: scl!("mul.scl"),
     },
     ShaderSpec {
         name: name::EXPERT_GATHER,
-        kernel: sat!("expert_gather.sat"),
+        kernel: scl!("expert_gather.scl"),
     },
     ShaderSpec {
         name: name::EXPERT_SCATTER,
-        kernel: sat!("expert_scatter.sat"),
+        kernel: scl!("expert_scatter.scl"),
     },
     ShaderSpec {
         name: name::ZERO_ROWS,
-        kernel: sat!("zero_rows.sat"),
+        kernel: scl!("zero_rows.scl"),
     },
     ShaderSpec {
         name: name::SIGMOID_MUL,
-        kernel: sat!("sigmoid_mul.sat"),
+        kernel: scl!("sigmoid_mul.scl"),
     },
     ShaderSpec {
         name: name::DELTA_GATE,
-        kernel: sat!("delta_gate.sat"),
+        kernel: scl!("delta_gate.scl"),
     },
     ShaderSpec {
         name: name::CONV1D,
-        kernel: sat!("conv1d.sat"),
+        kernel: scl!("conv1d.scl"),
     },
     ShaderSpec {
         name: name::DELTA_RECUR,
-        kernel: sat!("delta_recur.sat"),
+        kernel: scl!("delta_recur.scl"),
     },
     ShaderSpec {
         name: name::REPEAT_QK,
-        kernel: sat!("repeat_qk.sat"),
+        kernel: scl!("repeat_qk.scl"),
     },
     ShaderSpec {
         name: name::ROPE,
-        kernel: sat!("rope.sat"),
+        kernel: scl!("rope.scl"),
     },
     ShaderSpec {
         name: name::ATTN,
-        kernel: sat!("attn.sat"),
+        kernel: scl!("attn.scl"),
     },
     ShaderSpec {
         name: name::MERGE_ATTN,
-        kernel: sat!("merge_attn.sat"),
+        kernel: scl!("merge_attn.scl"),
     },
     ShaderSpec {
         name: name::KV_STORE,
-        kernel: sat!("kv_store.sat"),
+        kernel: scl!("kv_store.scl"),
     },
     ShaderSpec {
         name: name::SPLIT_QG,
-        kernel: sat!("split_qg.sat"),
+        kernel: scl!("split_qg.scl"),
     },
 ];
 
@@ -172,7 +172,7 @@ impl Kernels {
         let mut kernels = HashMap::new();
         for spec in SHADERS {
             let kernel = device.create_kernel(&KernelSpec::precompiled(
-                format!("sat/{}", spec.name),
+                format!("scl/{}", spec.name),
                 spec.kernel,
             ))?;
             assert_eq!(

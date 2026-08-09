@@ -1,8 +1,0 @@
-error: sat/bad_kernel.sat is invalid:
-       $DIR/tests/ui/sat/bad_kernel.sat:3:12: type mismatch: expected f32, found u32
- --> tests/ui/bad_kernel.rs:4:13
-  |
-4 |     let _ = sat!("bad_kernel.sat");
-  |             ^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: this error originates in the macro `sat` (in Nightly builds, run with -Z macro-backtrace for more info)

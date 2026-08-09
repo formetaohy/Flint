@@ -1,8 +1,0 @@
-error: sat/bad_recursion.sat is invalid:
-       $DIR/tests/ui/sat/bad_recursion.sat:3:12: recursive call to 'f'
- --> tests/ui/bad_recursion.rs:4:13
-  |
-4 |     let _ = sat!("bad_recursion.sat");
-  |             ^^^^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: this error originates in the macro `sat` (in Nightly builds, run with -Z macro-backtrace for more info)
