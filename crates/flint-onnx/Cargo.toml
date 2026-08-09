@@ -10,7 +10,6 @@ flint-error.workspace = true
 prost.workspace = true
 saturn-core = { path = "../../saturn/crates/saturn-core" }
 serde_json.workspace = true
-ureq.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

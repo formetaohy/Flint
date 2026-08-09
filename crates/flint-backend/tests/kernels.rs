@@ -36,7 +36,7 @@ impl Ctx {
     }
 
     fn arg(&self, pos: usize, kv_len: usize) -> Tensor {
-        let segs = kv_len.div_ceil(32).clamp(1, 32);
+        let segs = kv_len.div_ceil(256).clamp(1, 32);
         let t = Tensor::new(self.backend.storage(8), vec![2], DType::U32);
         self.backend.write_u32(t.buf.as_ref(), &[pos as u32, segs as u32]);
         t
@@ -1097,7 +1097,20 @@ fn attn_case(
     window: usize,
     seed: u64,
 ) {
-    attn_case_hd(m, nq, nkv, max_seq, pos, window, seed, 64);
+    attn_case_hd(m, nq, nkv, max_seq, pos, window, seed, 64, 0.1);
+}
+
+fn attn_case_k(
+    m: usize,
+    nq: usize,
+    nkv: usize,
+    max_seq: usize,
+    pos: usize,
+    window: usize,
+    seed: u64,
+    k_scale: f32,
+) {
+    attn_case_hd(m, nq, nkv, max_seq, pos, window, seed, 64, k_scale);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1110,6 +1123,7 @@ fn attn_case_hd(
     window: usize,
     seed: u64,
     hd: usize,
+    k_scale: f32,
 ) {
     let mut ctx = Ctx::new();
     let mut rng = Rng(seed);
@@ -1117,10 +1131,12 @@ fn attn_case_hd(
     let kc = rng
         .fill(nkv * max_seq * hd)
         .iter()
-        .map(|v| v * 0.1)
+        .map(|v| v * k_scale)
         .collect::<Vec<_>>();
     let vc = rng.fill(nkv * max_seq * hd);
     let qb = ctx.f32(&q, &[m as u32, nq as u32, hd as u32]);
+    let kc = bf16_round(&kc);
+    let vc = bf16_round(&vc);
     let kb = ctx.bf16(&kc, &[nkv as u32, max_seq as u32, hd as u32]);
     let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
     let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
@@ -1291,6 +1307,138 @@ fn attn_split_short_prefix() {
 #[test]
 fn attn_split_long_prefix() {
     attn_case(16, 4, 1, 1024, 512, 0, 103);
+}
+
+#[test]
+fn attn_multi_round_boundaries() {
+    for kv_len in [65, 127, 128, 191, 192, 255, 256, 257, 511, 512] {
+        attn_case_k(8, 4, 1, 1024, kv_len, 0, 2000 + kv_len as u64, 1.0);
+    }
+}
+
+#[test]
+fn attn_multi_round_tail() {
+    for kv_len in [66, 129, 193, 258] {
+        attn_case_k(1, 2, 1, 1024, kv_len, 0, 3000 + kv_len as u64, 1.0);
+    }
+}
+
+#[test]
+fn attn_gemm_coexist() {
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(2049);
+    let (m, nq, nkv, max_seq, pos, hd) = (4usize, 4usize, 2usize, 256usize, 130usize, 64usize);
+    let q = rng.fill(m * nq * hd);
+    let kc = rng.fill(nkv * max_seq * hd);
+    let vc = rng.fill(nkv * max_seq * hd);
+    let qb = ctx.f32(&q, &[m as u32, nq as u32, hd as u32]);
+    let kb = ctx.bf16(&kc, &[nkv as u32, max_seq as u32, hd as u32]);
+    let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
+    let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
+    let scratch = ctx.zero(&[m as u32, nkv as u32, 32, 8, hd as u32 + 2]);
+    let args = ctx.arg(pos, pos + m);
+
+    let (k2, n2) = (96usize, 80usize);
+    let x = rng.fill(m * k2);
+    let w = rng.fill(n2 * k2);
+    let xb = ctx.f32(&x, &[m as u32, k2 as u32]);
+    let wb = ctx.bf16(&w, &[n2 as u32, k2 as u32]);
+    let sb = ctx.f32(&[0.0], &[1]);
+    let yg = ctx.zero(&[m as u32, n2 as u32]);
+
+    for _ in 0..24 {
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut pass = Pass::begin(enc.as_mut());
+        ctx.backend
+            .dispatch(
+                &mut pass,
+                name::ATTN,
+                &[
+                    ("N_HEADS", nq as f64),
+                    ("KV_HEADS", nkv as f64),
+                    ("HEAD_DIM", hd as f64),
+                    ("MAX_SEQ", max_seq as f64),
+                    ("SCALE", 1.0 / (hd as f64).sqrt()),
+                    ("WINDOW", 0.0),
+                    ("NQ_PER_KV", (nq / nkv) as f64),
+                    ("STRIDE", (hd as u32 + 2) as f64),
+                ],
+                &[
+                    Binding::Full(&qb),
+                    Binding::Full(&kb),
+                    Binding::Full(&vb),
+                    Binding::Full(&scratch),
+                    Binding::Full(&args),
+                ],
+                [m as u32, nkv as u32, 32],
+            )
+            .unwrap();
+        ctx.backend
+            .dispatch(
+                &mut pass,
+                name::MERGE_ATTN,
+                &[
+                    ("N_HEADS", nq as f64),
+                    ("KV_HEADS", nkv as f64),
+                    ("HEAD_DIM", hd as f64),
+                    ("STRIDE", (hd as u32 + 2) as f64),
+                ],
+                &[
+                    Binding::Full(&scratch),
+                    Binding::Full(&y),
+                    Binding::Full(&args),
+                ],
+                [m as u32, nkv as u32, 1],
+            )
+            .unwrap();
+        ctx.backend
+            .dispatch(
+                &mut pass,
+                name::GEMM,
+                &[
+                    ("N", n2 as f64),
+                    ("K", k2 as f64),
+                    ("M", m as f64),
+                    ("SEGS", 1.0),
+                    ("WDTYPE", 0.0),
+                    ("GROUP", 128.0),
+                    ("ACC", 0.0),
+                    ("Y_STRIDE", n2 as f64),
+                    ("Y_OFF", 0.0),
+                ],
+                &[
+                    Binding::Full(&xb),
+                    Binding::Full(&wb),
+                    Binding::Full(&sb),
+                    Binding::Full(&yg),
+                ],
+                [n2.div_ceil(32) as u32, m.div_ceil(32) as u32, 1],
+            )
+            .unwrap();
+    }
+        ctx.backend.submit(enc).unwrap();
+    }
+
+    agree(
+        &ctx.read(&y),
+        &cpu::attn(&q, &kc, &vc, m, nq, nkv, hd, max_seq, pos, 0),
+        2e-3,
+        1e-3,
+    );
+    agree(
+        &ctx.read(&yg),
+        &cpu::gemm(&x, &w, m, n2, k2),
+        2e-2,
+        5e-2,
+    );
+}
+
+#[test]
+fn attn_single_round_realistic() {
+    for kv_len in [1, 32, 63, 64] {
+        attn_case_k(1, 2, 1, 1024, kv_len, 0, 4000 + kv_len as u64, 1.0);
+    }
 }
 
 #[test]

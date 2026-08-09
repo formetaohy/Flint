@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="Flint" width="96" />
 </p> -->
 
-<h3 align="center"><strong>Flint</strong></h3>
+<h1 align="center"><strong>Flint</strong></h1>
 
 <p align="center">
   <strong>Fast, cross-platform LLM inference engine.</strong>

@@ -188,7 +188,7 @@ kernel attn [workgroup(512, 1, 1)]
                     segstat[hl * 2 + 1] = prev_sum * exp(prev_max - c_max) + c_sum;
                     segstat[hl * 2] = c_max;
                 } else if c_max > NEG_INF / 2.0 {
-                    segstat[hl * 2 + 1] = prev_sum + c_sum * exp(c_max - prev_max);
+                    segstat[hl * 2 + 1] = prev_sum + c_sum;
                 }
             }
             barrier();

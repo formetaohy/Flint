@@ -1,79 +1,52 @@
-use std::io::{BufRead, Write as _};
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser};
 
 use flint_architectures::chat::ChatFormat;
 use flint_backend::Backend;
 use flint_error::Result;
 use flint_generate::{Engine, Sampler, SamplingParams};
-use flint_onnx::hub;
 
 #[derive(Parser)]
 #[command(name = "flint", version, about)]
 struct Args {
-    #[command(subcommand)]
-    cmd: Option<Command>,
+    #[arg(long)]
+    model: PathBuf,
 
     #[command(flatten)]
-    chat: Option<ChatArgs>,
-}
+    onnx: OnnxArgs,
 
-#[derive(Subcommand)]
-enum Command {
-
-    Onnx(OnnxArgs),
+    #[command(flatten)]
+    chat: ChatArgs,
 }
 
 #[derive(ClapArgs)]
 struct OnnxArgs {
-    #[command(subcommand)]
-    cmd: OnnxCmd,
+    #[arg(long)]
+    inputs: Option<String>,
+
+    #[arg(long)]
+    inputs_file: Option<PathBuf>,
+
+    #[arg(long)]
+    output: Vec<String>,
+
+    #[arg(long)]
+    full: bool,
 }
 
-#[derive(Subcommand)]
-enum OnnxCmd {
-
-    Download {
-
-        repo: String,
-
-        #[arg(long)]
-        file: Option<String>,
-
-        #[arg(long, default_value = "onnx-models")]
-        out: PathBuf,
-    },
-
-    Run {
-
-        model: PathBuf,
-
-        #[arg(long)]
-        inputs: Option<String>,
-
-        #[arg(long)]
-        inputs_file: Option<PathBuf>,
-
-        #[arg(long)]
-        output: Vec<String>,
-
-        #[arg(long)]
-        full: bool,
-    },
-
-    Info {
-
-        model: PathBuf,
-    },
+impl OnnxArgs {
+    fn is_empty(&self) -> bool {
+        self.inputs.is_none()
+            && self.inputs_file.is_none()
+            && self.output.is_empty()
+            && !self.full
+    }
 }
 
 #[derive(ClapArgs)]
 struct ChatArgs {
-
-    #[arg(long)]
-    model: Option<PathBuf>,
-
     #[arg(long)]
     prompt: Option<String>,
 
@@ -111,39 +84,27 @@ struct ChatArgs {
 fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
-
-    match args.cmd {
-        Some(Command::Onnx(onnx)) => match onnx.cmd {
-            OnnxCmd::Download { repo, file, out } => {
-                let file = match file {
-                    Some(f) => f,
-                    None => hub::default_onnx_file(&repo)?,
-                };
-                let path = hub::download_file(&repo, &file, &out)?;
-                eprintln!("[flint] model saved to {}", path.display());
-                Ok(())
-            }
-            OnnxCmd::Run {
-                model,
-                inputs,
-                inputs_file,
-                output,
-                full,
-            } => onnx_run(&model, inputs, inputs_file, &output, full),
-            OnnxCmd::Info { model } => onnx_info(&model),
-        },
-        None => chat_main(args.chat.expect("chat args present without subcommand")),
+    if is_onnx(&args.model) {
+        onnx_run(&args.model, args.onnx)
+    } else {
+        if !args.onnx.is_empty() {
+            return Err(flint_error::Error::Model(
+                "onnx options --inputs/--inputs-file/--output/--full require an .onnx model"
+                    .into(),
+            ));
+        }
+        chat_main(&args.model, args.chat)
     }
 }
 
-fn onnx_run(
-    model: &std::path::Path,
-    inputs: Option<String>,
-    inputs_file: Option<std::path::PathBuf>,
-    outputs: &[String],
-    full: bool,
-) -> Result<()> {
-    let json = match (inputs, inputs_file) {
+fn is_onnx(model: &Path) -> bool {
+    model
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
+}
+
+fn onnx_run(model: &Path, args: OnnxArgs) -> Result<()> {
+    let json = match (args.inputs, args.inputs_file) {
         (Some(_), Some(_)) => {
             return Err(flint_error::Error::Model(
                 "provide either --inputs or --inputs-file, not both".into(),
@@ -154,7 +115,7 @@ fn onnx_run(
             .map_err(|e| flint_error::Error::Model(format!("cannot read {}: {e}", f.display())))?,
         (None, None) => {
             return Err(flint_error::Error::Model(
-                "onnx run requires --inputs or --inputs-file".into(),
+                "onnx model requires --inputs or --inputs-file".into(),
             ))
         }
     };
@@ -181,17 +142,17 @@ fn onnx_run(
     let out = session.run()?;
     eprintln!("[flint] ran in {:.2}s", t0.elapsed().as_secs_f64());
 
-    let mut names: Vec<String> = if outputs.is_empty() {
+    let mut names: Vec<String> = if args.output.is_empty() {
         out.keys().cloned().collect()
     } else {
-        outputs.to_vec()
+        args.output
     };
     names.sort();
     for name in names {
         let t = out.get(&name).ok_or_else(|| {
             flint_error::Error::Model(format!("output {name:?} not produced"))
         })?;
-        let limit = if full { usize::MAX } else { 8 };
+        let limit = if args.full { usize::MAX } else { 8 };
         println!("{name}: {}", t.describe(limit));
     }
     Ok(())
@@ -248,46 +209,17 @@ fn json_to_tensor(v: &serde_json::Value) -> Result<flint_onnx::Tensor> {
     }
 }
 
-fn onnx_info(model: &std::path::Path) -> Result<()> {
-    let g = flint_onnx::Graph::load(model)?;
-    println!("graph: {:?}", g.name);
-    println!(
-        "nodes: {}  initializers: {}  inputs: {}  outputs: {}",
-        g.nodes.len(),
-        g.initializers.len(),
-        g.inputs.len(),
-        g.outputs.len()
-    );
-    let mut ops: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for n in &g.nodes {
-        *ops.entry(n.op_type.as_str()).or_insert(0) += 1;
-    }
-    println!("operators:");
-    for (op, count) in &ops {
-        println!("  {op}: {count}");
-    }
-    println!("inputs:");
-    for i in &g.inputs {
-        println!("  {} dims={:?}", i.name, i.dims);
-    }
-    println!("outputs:");
-    for o in &g.outputs {
-        println!("  {}", o.name);
-    }
-    Ok(())
-}
-
-fn chat_main(args: ChatArgs) -> Result<()> {
-    let model = args
-        .model
-        .ok_or_else(|| flint_error::Error::Model("--model is required for chat mode".into()))?;
+fn chat_main(model: &Path, args: ChatArgs) -> Result<()> {
+    let prompt = args
+        .prompt
+        .ok_or_else(|| flint_error::Error::Model("chat model requires --prompt".into()))?;
     eprintln!("[flint] initializing GPU backend...");
     let backend = Backend::new()?;
     eprintln!("[flint] adapter: {}", backend.adapter_name());
 
     eprintln!("[flint] loading weights from {}...", model.display());
     let load_t = std::time::Instant::now();
-    let chat_model = flint_architectures::load(&model, args.max_seq, &backend)?;
+    let chat_model = flint_architectures::load(model, args.max_seq, &backend)?;
     eprintln!(
         "[flint] weights loaded in {:.1}s",
         load_t.elapsed().as_secs_f64()
@@ -314,51 +246,16 @@ fn chat_main(args: ChatArgs) -> Result<()> {
     );
     let chat = chat_model.chat;
 
-    match args.prompt {
-        Some(prompt) => {
-            run_turn(
-                &mut engine,
-                chat.as_ref(),
-                &args.system,
-                &[],
-                &prompt,
-                args.max_tokens,
-            )?;
-        }
-        None => interactive(&mut engine, chat.as_ref(), &args.system, args.max_tokens)?,
-    }
+    run_turn(
+        &mut engine,
+        chat.as_ref(),
+        &args.system,
+        &[],
+        &prompt,
+        args.max_tokens,
+    )?;
     if let Some(report) = engine.profile_report() {
         eprint!("{report}");
-    }
-    Ok(())
-}
-
-fn interactive(
-    engine: &mut Engine,
-    chat: &dyn ChatFormat,
-    system: &str,
-    max_tokens: usize,
-) -> Result<()> {
-    eprintln!("[flint] interactive mode. type 'exit' to quit.");
-    let mut history: Vec<(String, String)> = Vec::new();
-    let stdin = std::io::stdin();
-    loop {
-        print!("> ");
-        std::io::stdout().flush().ok();
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let user = line.trim().to_string();
-        if user.is_empty() {
-            continue;
-        }
-        if user == "exit" {
-            break;
-        }
-        let reply = run_turn(engine, chat, system, &history, &user, max_tokens)?;
-        history.push((user, reply));
     }
     Ok(())
 }

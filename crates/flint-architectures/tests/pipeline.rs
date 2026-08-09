@@ -90,6 +90,37 @@ fn prefill_equivalence(test: &str, spec: ToySpec) {
     assert!(cos > 0.98, "logit distribution diverges (cosine {cos})");
 }
 
+fn long_sequence_stability(test: &str, spec: ToySpec) {
+    let _g = gpu();
+    let (mut backend, mut cm) = load(test, spec, 1024);
+    let prompt: Vec<u32> = (10..138).collect();
+
+    let seq = sequential_logits(&mut cm.model, &mut backend, &prompt);
+    cm.model.reset(&backend);
+    let chunked = chunked_logits(&mut cm.model, &mut backend, &prompt);
+
+    assert_eq!(chunked.len(), seq.len(), "vocab mismatch");
+    let cos = cosine(&chunked, &seq);
+    assert!(cos > 0.98, "logit distribution diverges (cosine {cos})");
+
+    let out = cm.model.forward(&mut backend, &[7], &[0], &[]).unwrap();
+    let l = &out.logits[0];
+    assert!(
+        l.iter().all(|v| v.is_finite()),
+        "non-finite logits after long decode"
+    );
+    let peak = l.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b.abs()));
+    assert!(
+        peak < 1e4,
+        "logit magnitude exploded after long decode (peak {peak})"
+    );
+}
+
+#[test]
+fn long_sequence_llama() {
+    long_sequence_stability("long_llama", ToySpec::Llama);
+}
+
 #[test]
 fn prefill_llama_gguf() {
     prefill_equivalence("prefill_llama", ToySpec::Llama);

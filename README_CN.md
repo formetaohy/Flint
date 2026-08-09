@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="Flint" width="96" />
 </p> -->
 
-<h3 align="center">Flint</h3>
+<h1 align="center">Flint</h1>
 
 <p align="center">
   <strong>高性能、跨平台的 LLM 推理引擎</strong>
