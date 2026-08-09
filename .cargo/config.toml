@@ -1,4 +1,0 @@
-# A native dependency links the static MSVC CRT alongside Rust's dynamic
-# CRT; the duplicate default library is harmless to drop.
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/NODEFAULTLIB:LIBCMT"]
