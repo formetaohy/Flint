@@ -7,7 +7,10 @@ edition.workspace = true
 bytemuck.workspace = true
 flint-error.workspace = true
 flint-kernel.workspace = true
-flint-profiler.workspace = true
 flint-tensor.workspace = true
 saturn-api = { path = "../../saturn/crates/saturn-api" }
 saturn-core = { path = "../../saturn/crates/saturn-core" }
+
+[dev-dependencies]
+flint-profiler = { path = "../flint-profiler" }
+flint-tensor.workspace = true

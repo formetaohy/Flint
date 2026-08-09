@@ -532,7 +532,6 @@ impl LanguageModel for Qwen35 {
             hidden: ops::read_rows(backend, &self.s.hidden, hidden_rows, m, cfg.hidden)?,
         };
         self.pos += m;
-        backend.flush_profile()?;
         Ok(out)
     }
 
@@ -681,7 +680,6 @@ impl Speculator for Qwen35 {
 
         let logits = backend.read_f32(self.s.logits.buf.as_ref(), 0, cfg.vocab as usize)?;
         self.mtp_pos += 1;
-        backend.flush_profile()?;
         Ok(logits)
     }
 

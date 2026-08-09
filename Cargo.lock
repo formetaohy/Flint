@@ -481,6 +481,7 @@ dependencies = [
  "flint-error",
  "flint-generate",
  "flint-onnx",
+ "flint-profiler",
  "serde_json",
 ]
 
@@ -559,7 +560,6 @@ dependencies = [
  "flint-checkpoint",
  "flint-error",
  "flint-model",
- "flint-profiler",
  "flint-tokenizer",
 ]
 

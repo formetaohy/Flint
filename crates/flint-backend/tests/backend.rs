@@ -1,4 +1,5 @@
 use flint_backend::{Backend, Binding, Pass};
+use flint_profiler::GpuProfiler;
 use flint_tensor::{DType, Weight};
 
 #[test]
@@ -143,4 +144,58 @@ fn dummy_scale_is_a_single_element_tensor() {
     let d = backend.dummy_scale();
     assert_eq!(d.numel(), 1);
     assert_eq!(d.dtype, DType::F32);
+}
+
+#[test]
+fn external_profiler_records_spans() {
+    let mut backend = Backend::new().unwrap();
+    let mut prof = GpuProfiler::new(backend.device()).unwrap();
+    let span = prof.begin_span().unwrap();
+    let t = backend.zero_tensor(&[1]);
+    let mut enc = backend.encoder().unwrap();
+    let mut pass = Pass::begin(enc.as_mut());
+    let binds = [
+        Binding::Full(&t),
+        Binding::Full(&t),
+        Binding::Full(&t),
+    ];
+    backend
+        .dispatch(&mut pass, flint_kernel::name::ADD, &[("N_ELEM", 1.0)], &binds, [1, 1, 1])
+        .unwrap();
+    backend.submit(enc).unwrap();
+    prof.end_span("add", span).unwrap();
+    prof.flush().unwrap();
+    let rows = prof.report();
+    let add = rows
+        .iter()
+        .find(|r| r.label == "add")
+        .expect("add span must be reported");
+    assert_eq!(add.count, 1);
+    assert!(add.total_ns >= 0);
+}
+
+#[test]
+fn profiler_grows_beyond_initial_capacity() {
+    let backend = Backend::new().unwrap();
+    let mut prof = GpuProfiler::with_initial_capacity(backend.device(), 4).unwrap();
+    let mut spans = Vec::new();
+    for _ in 0..5 {
+        spans.push(prof.begin_span().unwrap());
+    }
+    for (i, span) in spans.into_iter().enumerate() {
+        prof.end_span("s", span).unwrap();
+        let _ = i;
+    }
+    prof.flush().unwrap();
+    let rows = prof.report();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].count, 5);
+}
+
+#[test]
+fn profiler_flush_without_spans_is_noop() {
+    let backend = Backend::new().unwrap();
+    let mut prof = GpuProfiler::new(backend.device()).unwrap();
+    prof.flush().unwrap();
+    assert!(prof.report().is_empty());
 }

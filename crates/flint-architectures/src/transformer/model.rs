@@ -722,7 +722,6 @@ impl LanguageModel for TransformerModel {
             hidden: ops::read_rows(backend, &self.s.hidden, hidden_rows, m, cfg.hidden)?,
         };
         self.pos += m;
-        backend.flush_profile()?;
         Ok(out)
     }
 

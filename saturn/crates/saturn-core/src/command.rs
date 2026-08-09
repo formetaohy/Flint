@@ -29,6 +29,14 @@ pub trait CommandEncoder: Any {
     fn write_timestamp(&mut self, _set: &dyn TimestampSet, _index: u32) -> Result<()> {
         Err(Error::TimestampUnsupported)
     }
+    fn reset_timestamps(
+        &mut self,
+        _set: &dyn TimestampSet,
+        _start: u32,
+        _count: u32,
+    ) -> Result<()> {
+        Err(Error::TimestampUnsupported)
+    }
     fn resolve_timestamps(
         &mut self,
         _set: &dyn TimestampSet,

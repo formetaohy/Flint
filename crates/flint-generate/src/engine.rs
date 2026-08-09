@@ -73,16 +73,6 @@ impl Engine {
         }
     }
 
-    pub fn profile_report(&self) -> Option<String> {
-        if !self.backend.profiling() {
-            return None;
-        }
-        let rows = self.backend.profile_report();
-        let mut out = String::from("[flint] GPU kernel time breakdown (cumulative):\n");
-        out.push_str(&flint_profiler::breakdown(&rows));
-        Some(out)
-    }
-
     pub fn reset(&mut self) {
         self.model.reset(&self.backend);
     }

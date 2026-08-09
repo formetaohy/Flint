@@ -1,9 +1,10 @@
+use std::rc::Rc;
+
 use saturn_api::{BackendKind, open as open_device};
 use saturn_core::{BindingRef, Buffer, BufferSpec, CommandEncoder, Device};
 
 use flint_error::{Error, Result};
 use flint_kernel::{Kernels, name};
-use flint_profiler::{ProfileRow, Profiler};
 use flint_tensor::{DType, Tensor, Weight};
 
 #[derive(Clone, Copy)]
@@ -44,13 +45,11 @@ impl<'a> Pass<'a> {
 }
 
 pub struct Backend {
-    device: Box<dyn Device>,
+    device: Rc<dyn Device>,
     kernels: Kernels,
     dummy_scale: Tensor,
     gemv_partial: Tensor,
     gemm_partial: Tensor,
-
-    profiler: Option<Profiler>,
 
     pending: Vec<Box<dyn saturn_core::Submission>>,
     retired: Vec<(Tensor, u32)>,
@@ -63,16 +62,12 @@ impl Backend {
         } else {
             BackendKind::Vulkan
         };
-        let device = open_device(kind)
-            .map_err(|e| Error::Gpu(format!("no suitable backend: {e}")))?;
+        let device: Rc<dyn Device> = Rc::from(
+            open_device(kind).map_err(|e| Error::Gpu(format!("no suitable backend: {e}")))?,
+        );
         let kernels = Kernels::new(device.as_ref())?;
         Self::warmup(device.as_ref(), &kernels)?;
         let dummy_scale = Tensor::new(Self::zeroed_buf(device.as_ref(), 4), vec![1], DType::F32);
-        let profiler = if std::env::var("FLINT_PROFILE").is_ok() {
-            Some(Profiler::new(device.as_ref(), 4096)?)
-        } else {
-            None
-        };
         let gemv_partial = Self::partial_buf(device.as_ref(), 8 * 65536)?;
         let gemm_partial = Self::partial_buf(device.as_ref(), 4 * 128 * 16384)?;
         Ok(Self {
@@ -81,10 +76,13 @@ impl Backend {
             dummy_scale,
             gemv_partial,
             gemm_partial,
-            profiler,
             pending: Vec::new(),
             retired: Vec::new(),
         })
+    }
+
+    pub fn device(&self) -> Rc<dyn Device> {
+        self.device.clone()
     }
 
     pub fn adapter_name(&self) -> &str {
@@ -324,10 +322,7 @@ impl Backend {
         bufs: &[Binding<'_>],
         groups: [u32; 3],
     ) -> Result<()> {
-        let span = self.prof_begin(pass)?;
-        Self::set(&self.kernels, pass, name, consts, bufs, groups)?;
-        self.prof_end(pass, name, span)?;
-        Ok(())
+        Self::set(&self.kernels, pass, name, consts, bufs, groups)
     }
 
     fn set(
@@ -427,7 +422,6 @@ impl Backend {
             1
         };
         let consts = consts.into_iter().chain([("SEGS", segs as f64)]).collect::<Vec<_>>();
-        let span = self.prof_begin(pass)?;
         let (yb, yslice) = if segs > 1 {
             self.ensure_gemm_partial(segs * rows * y_stride);
             (
@@ -468,7 +462,6 @@ impl Backend {
                 [n.div_ceil(256), 1, 1],
             )?;
         }
-        self.prof_end(pass, name::GEMM, span)?;
         Ok(())
     }
 
@@ -497,7 +490,6 @@ impl Backend {
             .into_iter()
             .find(|s| kb % *s == 0 && base * *s >= 96)
             .unwrap_or(1);
-        let span = self.prof_begin(pass)?;
         if segs > 1 {
             self.ensure_gemv_partial(n * segs);
         }
@@ -543,7 +535,6 @@ impl Backend {
                 [n.div_ceil(256), 1, 1],
             )?;
         }
-        self.prof_end(pass, name::GEMV, span)?;
         Ok(())
     }
 
@@ -573,7 +564,6 @@ impl Backend {
             .into_iter()
             .find(|s| kb % *s == 0 && base * *s >= 256)
             .unwrap_or(1);
-        let span = self.prof_begin(pass)?;
         if segs > 1 {
             self.ensure_gemv_partial(ntot * segs);
         }
@@ -636,7 +626,6 @@ impl Backend {
                 [ntot.div_ceil(256), 1, 1],
             )?;
         }
-        self.prof_end(pass, name::GEMV_QKV, span)?;
         Ok(())
     }
 
@@ -662,7 +651,6 @@ impl Backend {
             .into_iter()
             .find(|s| kb % *s == 0 && base * *s >= 192)
             .unwrap_or(1);
-        let span = self.prof_begin(pass)?;
         if segs > 1 {
             self.ensure_gemv_partial(ntot * segs);
         }
@@ -713,7 +701,6 @@ impl Backend {
                 [ntot.div_ceil(256), 1, 1],
             )?;
         }
-        self.prof_end(pass, name::GEMV_GATEUP, span)?;
         Ok(())
     }
 
@@ -725,50 +712,6 @@ impl Backend {
         }
         self.pending.push(self.device.submit(encoder)?);
         Ok(())
-    }
-
-    fn prof_begin(&mut self, pass: &mut Pass<'_>) -> Result<Option<u32>> {
-        match &mut self.profiler {
-            Some(p) => p.begin(pass.0),
-            None => Ok(None),
-        }
-    }
-
-    fn prof_end(
-        &mut self,
-        pass: &mut Pass<'_>,
-        label: &'static str,
-        span: Option<u32>,
-    ) -> Result<()> {
-        if let Some(p) = &mut self.profiler {
-            p.end(pass.0, label, span)?;
-        }
-        Ok(())
-    }
-
-    pub fn flush_profile(&mut self) -> Result<()> {
-        let Some(prof) = self.profiler.as_mut() else {
-            return Ok(());
-        };
-        if prof.pending() == 0 {
-            return Ok(());
-        }
-        let mut enc = self.device.encoder()?;
-        prof.resolve(enc.as_mut())?;
-        let sub = self.device.submit(enc)?;
-        sub.wait()?;
-        prof.accumulate()
-    }
-
-    pub fn profiling(&self) -> bool {
-        self.profiler.is_some()
-    }
-
-    pub fn profile_report(&self) -> Vec<ProfileRow> {
-        self.profiler
-            .as_ref()
-            .map(|p| p.report())
-            .unwrap_or_default()
     }
 
     pub fn read_f32(&self, src: &dyn Buffer, offset: u64, count: usize) -> Result<Vec<f32>> {

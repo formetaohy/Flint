@@ -482,6 +482,42 @@ impl CommandEncoder for VkEncoder {
         Ok(())
     }
 
+    fn reset_timestamps(
+        &mut self,
+        set: &dyn TimestampSet,
+        start: u32,
+        count: u32,
+    ) -> Result<()> {
+        if !self.active {
+            return Err(Error::EncoderInactive);
+        }
+        let set = set
+            .as_any()
+            .downcast_ref::<VkTimestampSet>()
+            .ok_or(Error::KernelTypeMismatch {
+                expected: std::any::type_name::<VkTimestampSet>(),
+                actual: std::any::type_name_of_val(set),
+            })?;
+        if !Arc::ptr_eq(&self.inner, &set.inner) {
+            return Err(Error::DeviceMismatch { kind: "timestamp set" });
+        }
+        let end = start
+            .checked_add(count)
+            .ok_or(Error::Vulkan("timestamp range overflows".to_string()))?;
+        if end > set.capacity() {
+            return Err(Error::Vulkan(format!(
+                "timestamp range {start}..{end} out of range 0..{}",
+                set.capacity()
+            )));
+        }
+        unsafe {
+            self.inner
+                .device
+                .cmd_reset_query_pool(self.cmd, set.pool, start, count);
+        }
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

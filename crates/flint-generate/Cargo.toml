@@ -7,7 +7,6 @@ edition.workspace = true
 flint-backend.workspace = true
 flint-error.workspace = true
 flint-model.workspace = true
-flint-profiler.workspace = true
 flint-tokenizer.workspace = true
 
 [dev-dependencies]

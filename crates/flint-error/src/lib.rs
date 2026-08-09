@@ -12,6 +12,8 @@ pub enum Error {
     Config(String),
     #[error("tokenizer: {0}")]
     Tokenizer(String),
+    #[error("profiler: {0}")]
+    Profiler(String),
 }
 
 impl From<serde_json::Error> for Error {

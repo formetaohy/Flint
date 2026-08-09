@@ -51,6 +51,10 @@ struct Args {
 
     #[arg(long)]
     attn_probe: bool,
+
+    #[cfg(feature = "profile")]
+    #[arg(long)]
+    profile: bool,
 }
 
 fn config(s: &BenchSpec) -> TransformerConfig {
@@ -109,6 +113,12 @@ fn main() -> Result<()> {
     eprintln!("[bench] initializing GPU backend...");
     let backend = Backend::new()?;
     eprintln!("[bench] adapter: {}", backend.adapter_name());
+    #[cfg(feature = "profile")]
+    let mut profiler = if args.profile {
+        Some(flint_profiler::GpuProfiler::new(backend.device())?)
+    } else {
+        None
+    };
 
     eprintln!("[bench] generating synthetic weights...");
     let t0 = Instant::now();
@@ -131,6 +141,11 @@ fn main() -> Result<()> {
     let warm_ids: Vec<u32> = (0..16).map(|i| i % (args.vocab - 1) + 1).collect();
     model.forward(&mut backend, &warm_ids, &[], &[])?;
     let _ = backend.read_f32(backend.dummy_scale().buf.as_ref(), 0, 1)?;
+    #[cfg(feature = "profile")]
+    let prefill_span = match &mut profiler {
+        Some(p) => Some(p.begin_span()?),
+        None => None,
+    };
     let t0 = Instant::now();
     for _ in 0..chunks {
         let ids: Vec<u32> = (t..t + flint_model::M_MAX)
@@ -142,6 +157,10 @@ fn main() -> Result<()> {
     if rem > 0 {
         let ids: Vec<u32> = (t..t + rem).map(|i| i % (args.vocab - 1) + 1).collect();
         model.forward(&mut backend, &ids, &[], &[])?;
+    }
+    #[cfg(feature = "profile")]
+    if let (Some(p), Some(span)) = (&mut profiler, prefill_span) {
+        p.end_span("prefill", span)?;
     }
 
     let _ = backend.read_f32(backend.dummy_scale().buf.as_ref(), 0, 1)?;
@@ -155,6 +174,11 @@ fn main() -> Result<()> {
 
     let mut logits: Vec<f32> = Vec::new();
     let mut per_step: Vec<f64> = Vec::new();
+    #[cfg(feature = "profile")]
+    let decode_span = match &mut profiler {
+        Some(p) => Some(p.begin_span()?),
+        None => None,
+    };
     let t0 = Instant::now();
     for (i, tok) in (0..args.decode_tokens).enumerate() {
         let ids = [tok % (args.vocab - 1) + 1];
@@ -167,6 +191,10 @@ fn main() -> Result<()> {
         logits = out.logits[0].clone();
     }
     let decode_secs = t0.elapsed().as_secs_f64();
+    #[cfg(feature = "profile")]
+    if let (Some(p), Some(span)) = (&mut profiler, decode_span) {
+        p.end_span("decode", span)?;
+    }
     eprintln!(
         "[bench] decode: {} tok in {:.2}s ({:.1} tok/s)",
         args.decode_tokens,
@@ -182,10 +210,11 @@ fn main() -> Result<()> {
         &logits[..4.min(logits.len())]
     );
 
-    if backend.profiling() {
-        let rows = backend.profile_report();
-        eprintln!("[bench] GPU kernel time breakdown (cumulative over prefill+decode):");
-        eprint!("{}", flint_profiler::breakdown(&rows));
+    #[cfg(feature = "profile")]
+    if let Some(p) = &mut profiler {
+        p.flush()?;
+        eprintln!("[bench] GPU time breakdown (cumulative over prefill+decode):");
+        eprint!("{}", flint_profiler::breakdown(&p.report()));
     }
     Ok(())
 }
@@ -358,7 +387,6 @@ fn cpu_probe() -> Result<()> {
             )?;
         }
         backend.submit(enc)?;
-        backend.flush_profile()?;
     }
 
     let kernel = backend.kernel("gemv")?;
