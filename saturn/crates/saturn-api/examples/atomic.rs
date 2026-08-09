@@ -31,10 +31,7 @@ fn main() {
     a.write(0, &input).expect("write a");
     out.write(0, &0u32.to_le_bytes()).expect("init out");
     let kernel = device
-        .create_kernel(&KernelSpec {
-            name: "sat/atomic.sat".into(),
-            source: saturn_sat::sat!("atomic.sat"),
-        })
+        .create_kernel(&KernelSpec::precompiled("sat/atomic.sat", saturn_sat::sat!("atomic.sat")))
         .expect("create kernel");
     let mut encoder = device.encoder().expect("encoder");
     encoder

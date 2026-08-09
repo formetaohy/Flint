@@ -1,15 +1,8 @@
 pub use crate::ast::{BinOp, UnOp};
-pub use saturn_core::Scalar;
+pub use saturn_core::{MatrixRole, Scalar};
 use crate::diag::Span;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MatrixRole {
-    A,
-    B,
-    Acc,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Type {
     Scalar(Scalar),
     Vec { size: u32, elem: Scalar },

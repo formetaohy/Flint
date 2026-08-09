@@ -587,7 +587,13 @@ impl Msl {
                 }
                 if matches!(
                     *name,
-                    "atomic_add" | "atomic_max" | "atomic_min" | "atomic_exchange"
+                    "atomic_add"
+                        | "atomic_max"
+                        | "atomic_min"
+                        | "atomic_exchange"
+                        | "atomic_and"
+                        | "atomic_or"
+                        | "atomic_xor"
                 ) {
                     let (base_name, space) = match &args[0] {
                         Expr::ParamRef { name, .. } => (name.as_str(), "device"),
@@ -599,6 +605,9 @@ impl Msl {
                         "atomic_add" => "atomic_fetch_add_explicit",
                         "atomic_max" => "atomic_fetch_max_explicit",
                         "atomic_min" => "atomic_fetch_min_explicit",
+                        "atomic_and" => "atomic_fetch_and_explicit",
+                        "atomic_or" => "atomic_fetch_or_explicit",
+                        "atomic_xor" => "atomic_fetch_xor_explicit",
                         _ => "atomic_exchange_explicit",
                     };
                     self.out.push_str(fn_name);

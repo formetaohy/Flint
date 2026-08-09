@@ -254,17 +254,17 @@ fn msl_shared_barrier_snapshot() {
     let kernel = compile(
         r#"
         kernel sh [workgroup(8, 1, 1)] (a: buf<f32>, s: u32) {
-            shared buf: [f32; 64];
+            shared tile: [f32; 64];
             barrier();
-            buf[gid.x] = a[gid.x] + s as f32;
+            tile[gid.x] = a[gid.x] + s as f32;
             barrier();
-            a[gid.x] = buf[gid.x];
+            a[gid.x] = tile[gid.x];
         }
         "#,
     )
     .expect("compile");
     let (msl, _) = to_msl(&kernel).expect("msl");
-    assert!(msl.contains("threadgroup float buf[64];"));
+    assert!(msl.contains("threadgroup float tile[64];"));
     assert!(msl.contains("threadgroup_barrier(mem_flags::mem_threadgroup);"));
     assert!(msl.contains("constant uint& s [[buffer(1)]]"));
 }

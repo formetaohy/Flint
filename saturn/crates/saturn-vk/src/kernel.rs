@@ -10,7 +10,7 @@ use crate::device::{VkDevice, VkDeviceInner};
 
 fn check_coop_support(
     inner: std::sync::Arc<crate::device::VkDeviceInner>,
-    kernel: &saturn_compiler::ir::Kernel,
+    kernel: &KernelMeta,
 ) -> Result<()> {
     use saturn_compiler::ir::MatrixRole;
     for (a, b, c) in &kernel.coop_triples {
@@ -57,11 +57,48 @@ pub struct VkKernel {
     shader: vk::ShaderModule,
 }
 
-impl VkKernel {
-    pub fn create(device: &VkDevice, spec: &saturn_core::KernelSpec) -> Result<Box<dyn Kernel>> {
-        let inner = device.inner.clone();
-        let source = saturn_compiler::Source::new(&spec.name, spec.source);
-        let kernel = saturn_compiler::compile(&source).map_err(|diags| {
+struct KernelMeta {
+    name: String,
+    workgroup_size: [u32; 3],
+    buffers: usize,
+    scalars: Vec<saturn_compiler::ir::ScalarParam>,
+    coop_triples: Vec<(saturn_core::Scalar, saturn_core::Scalar, saturn_core::Scalar)>,
+    coop_roles: Vec<(saturn_core::Scalar, saturn_compiler::ir::MatrixRole)>,
+    spirv: Vec<u8>,
+}
+
+fn meta_from_precompiled(pc: &saturn_core::PrecompiledKernel) -> KernelMeta {
+    KernelMeta {
+        name: pc.name.to_string(),
+        workgroup_size: pc.workgroup_size,
+        buffers: pc.buffers,
+        scalars: pc
+            .scalars
+            .iter()
+            .map(|f| saturn_compiler::ir::ScalarParam {
+                name: f.name.to_string(),
+                ty: f.ty,
+                offset: f.offset,
+            })
+            .collect(),
+        coop_triples: pc.coop_triples.to_vec(),
+        coop_roles: pc
+            .coop_roles
+            .iter()
+            .filter_map(|(elem, code)| {
+                saturn_core::MatrixRole::decode(*code)
+                    .map(|role| (*elem, role))
+            })
+            .collect(),
+        spirv: pc.spirv.to_vec(),
+    }
+}
+
+fn meta_from_compile(spec: &saturn_core::KernelSpec) -> Result<KernelMeta> {
+    let source = saturn_compiler::Source::new(&spec.name, spec.source);
+    let kernel = saturn_compiler::Driver::new()
+        .compile_with_specs(&source, spec.specs)
+        .map_err(|diags| {
             Error::Shader(
                 diags.iter()
                     .map(|d| source.render(d))
@@ -69,14 +106,33 @@ impl VkKernel {
                     .join("\n"),
             )
         })?;
-        check_coop_support(inner.clone(), &kernel)?;
-        if kernel.workgroup_size[0] > inner.max_workgroup_size[0]
-            || kernel.workgroup_size[1] > inner.max_workgroup_size[1]
-            || kernel.workgroup_size[2] > inner.max_workgroup_size[2]
+    let spirv = saturn_shader::to_spirv(&kernel).map_err(Error::Shader)?;
+    Ok(KernelMeta {
+        name: kernel.name.clone(),
+        workgroup_size: kernel.workgroup_size,
+        buffers: kernel.params.len(),
+        scalars: kernel.scalars.clone(),
+        coop_triples: kernel.coop_triples.clone(),
+        coop_roles: kernel.coop_roles.clone(),
+        spirv,
+    })
+}
+
+impl VkKernel {
+    pub fn create(device: &VkDevice, spec: &saturn_core::KernelSpec) -> Result<Box<dyn Kernel>> {
+        let inner = device.inner.clone();
+        let meta = match spec.precompiled {
+            Some(pc) => meta_from_precompiled(pc),
+            None => meta_from_compile(spec)?,
+        };
+        check_coop_support(inner.clone(), &meta)?;
+        if meta.workgroup_size[0] > inner.max_workgroup_size[0]
+            || meta.workgroup_size[1] > inner.max_workgroup_size[1]
+            || meta.workgroup_size[2] > inner.max_workgroup_size[2]
         {
             return Err(Error::WorkgroupTooLarge {
-                kernel: kernel.name.clone(),
-                size: kernel
+                kernel: meta.name.clone(),
+                size: meta
                     .workgroup_size
                     .iter()
                     .map(|&v| v as u64)
@@ -88,22 +144,22 @@ impl VkKernel {
                     .product(),
             });
         }
-        let invocations: u64 = kernel
+        let invocations: u64 = meta
             .workgroup_size
             .iter()
             .map(|&v| v as u64)
             .product();
         if invocations > inner.max_workgroup_invocations as u64 {
             return Err(Error::WorkgroupTooLarge {
-                kernel: kernel.name.clone(),
+                kernel: meta.name.clone(),
                 size: invocations,
                 max: inner.max_workgroup_invocations as u64,
             });
         }
-        let scalar_layout = if kernel.scalars.is_empty() {
+        let scalar_layout = if meta.scalars.is_empty() {
             None
         } else {
-            let total = kernel
+            let total = meta
                 .scalars
                 .iter()
                 .map(|p| p.offset + p.ty.width())
@@ -113,12 +169,12 @@ impl VkKernel {
             if size > inner.max_push_constants_size {
                 return Err(Error::Vulkan(format!(
                     "kernel {} push constants require {size} bytes, device max is {}",
-                    kernel.name, inner.max_push_constants_size
+                    meta.name, inner.max_push_constants_size
                 )));
             }
             Some(ScalarLayout {
                 size,
-                fields: kernel
+                fields: meta
                     .scalars
                     .iter()
                     .map(|p| ScalarField {
@@ -129,14 +185,14 @@ impl VkKernel {
                     .collect(),
             })
         };
-        let bytes = saturn_shader::to_spirv(&kernel).map_err(Error::Shader)?;
-        let code: Vec<u32> = bytes
+        let code: Vec<u32> = meta
+            .spirv
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
-        let name = kernel.name.clone();
-        let workgroup_size = kernel.workgroup_size;
-        let bindings: Vec<u32> = (0..kernel.params.len() as u32).collect();
+        let name = meta.name.clone();
+        let workgroup_size = meta.workgroup_size;
+        let bindings: Vec<u32> = (0..meta.buffers as u32).collect();
         let shader = unsafe {
             inner.device.create_shader_module(
                 &vk::ShaderModuleCreateInfo::default().code(&code),

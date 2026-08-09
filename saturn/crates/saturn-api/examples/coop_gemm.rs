@@ -87,10 +87,7 @@ fn main() {
     b_buf.write(0, &b_data).expect("write b");
 
     let kernel = device
-        .create_kernel(&KernelSpec {
-            name: "sat/coop_gemm.sat".into(),
-            source: saturn_sat::sat!("coop_gemm.sat"),
-        })
+        .create_kernel(&KernelSpec::precompiled("sat/coop_gemm.sat", saturn_sat::sat!("coop_gemm.sat")))
         .expect("create kernel (requires VK_KHR_cooperative_matrix)");
 
     let mut encoder = device.encoder().expect("encoder");

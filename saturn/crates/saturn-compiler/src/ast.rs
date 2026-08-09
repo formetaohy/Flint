@@ -3,9 +3,25 @@ use crate::diag::Span;
 pub use crate::ir::{Scalar, Type};
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Program {
+    pub fns: Vec<FnDecl>,
+    pub kernel: Kernel,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnDecl {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Option<Type>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
     pub ty: Type,
+    pub is_const: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,7 +29,16 @@ pub struct Kernel {
     pub name: String,
     pub workgroup_size: [u32; 3],
     pub params: Vec<Param>,
+    pub specs: Vec<SpecDecl>,
     pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpecDecl {
+    pub name: String,
+    pub ty: Scalar,
+    pub init: Expr,
     pub span: Span,
 }
 
@@ -41,6 +66,11 @@ pub enum Stmt {
         name: String,
         ty: Scalar,
         init: Expr,
+        span: Span,
+    },
+    Spec(SpecDecl),
+    Return {
+        value: Option<Expr>,
         span: Span,
     },
     Assign {

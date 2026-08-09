@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{self, BinOp, UnOp};
+use crate::consts::{self, CVal};
 use crate::diag::{Diagnostic, Result, Span};
 use crate::ir::{self, MatrixRole, Scalar, Type};
 
@@ -11,13 +12,7 @@ enum Sym {
     Local { id: u32, ty: Type, mutable: bool },
     ForVar { id: u32 },
     Shared { elem: Scalar, len: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum CVal {
-    Int(u64),
-    Float(f64),
-    Bool(bool),
+    InlineConst(CVal),
 }
 
 struct Checker {
@@ -33,7 +28,7 @@ struct Checker {
     coop_roles: Vec<(Scalar, ir::MatrixRole)>,
 }
 
-pub fn check(kernel: &ast::Kernel) -> Result<ir::Kernel> {
+pub fn check(kernel: &ast::Kernel, specs: &[(&str, f64)]) -> Result<ir::Kernel> {
     for axis in kernel.workgroup_size {
         if axis == 0 || axis > 1024 {
             return Err(Diagnostic::new(
@@ -45,12 +40,69 @@ pub fn check(kernel: &ast::Kernel) -> Result<ir::Kernel> {
             ));
         }
     }
+    let mut consts = HashMap::new();
+    for spec in &kernel.specs {
+        if is_reserved(&spec.name) || spec.name.starts_with("__sat") {
+            return Err(Diagnostic::new(
+                spec.span,
+                format!("'{}' is a reserved name", spec.name),
+            ));
+        }
+        let value = consts::const_eval(&spec.init, &consts).ok_or_else(|| {
+            Diagnostic::new(
+                spec.span,
+                format!("spec '{}' initializer must be a constant expression", spec.name),
+            )
+        })?;
+        if !consts::validate(&value, spec.ty) {
+            return Err(Diagnostic::new(
+                spec.span,
+                format!("spec '{}' initializer out of range for {:?}", spec.name, spec.ty),
+            ));
+        }
+        consts.insert(spec.name.clone(), (value, spec.ty));
+    }
+    for (name, value) in specs {
+        let Some((_, ty)) = consts.get(*name).copied() else {
+            return Err(Diagnostic::new(
+                kernel.span,
+                format!("unknown spec '{name}'"),
+            ));
+        };
+        let cval = match ty {
+            Scalar::U32 | Scalar::I32 | Scalar::U8 | Scalar::I8 => {
+                let v = *value as i64;
+                let (min, max) = match ty {
+                    Scalar::U32 => (0, u32::MAX as i64),
+                    Scalar::I32 => (i32::MIN as i64, i32::MAX as i64),
+                    Scalar::U8 => (0, u8::MAX as i64),
+                    _ => (i8::MIN as i64, i8::MAX as i64),
+                };
+                if v < min || v > max {
+                    return Err(Diagnostic::new(
+                        kernel.span,
+                        format!("spec '{name}' value {value} out of range for {ty:?}"),
+                    ));
+                }
+                CVal::Int(v as u64)
+            }
+            Scalar::F32 | Scalar::F16 | Scalar::Bf16 => CVal::Float(*value),
+            Scalar::Bool => CVal::Bool(*value != 0.0),
+        };
+        consts.insert(name.to_string(), (cval, ty));
+    }
     let mut params = Vec::new();
     let mut scalars = Vec::new();
     let mut scope = HashMap::new();
     let mut scalar_offset = 0u32;
     for param in kernel.params.iter() {
         let name = param.name.clone();
+        if is_reserved(&name) || name.starts_with("__sat") {
+            return Err(Diagnostic::new(
+                kernel.span,
+                format!("'{name}' is a reserved name"),
+            ));
+        }
         match param.ty {
             ast::Type::Buf(elem) => {
                 if elem == Scalar::Bool {
@@ -109,7 +161,7 @@ pub fn check(kernel: &ast::Kernel) -> Result<ir::Kernel> {
         scalars,
         shareds: Vec::new(),
         scopes: vec![scope],
-        consts: HashMap::new(),
+        consts,
         loop_depth: 0,
         block_depth: 0,
         next_id: 1,
@@ -142,16 +194,16 @@ impl Checker {
     }
 
     fn declare(&mut self, name: &str, sym: Sym, span: Span) -> Result<()> {
-        if is_builtin(name) {
+        if is_reserved(name) {
             return Err(Diagnostic::new(
                 span,
-                format!("'{name}' is a reserved builtin name"),
+                format!("'{name}' is a reserved name"),
             ));
         }
         if self.consts.contains_key(name) {
             return Err(Diagnostic::new(
                 span,
-                format!("'{name}' is already a const"),
+                format!("'{name}' is already a const or spec"),
             ));
         }
         if self.scope().insert(name.to_string(), sym).is_some() {
@@ -173,6 +225,10 @@ impl Checker {
 
     fn check_stmt(&mut self, stmt: &ast::Stmt) -> Result<Vec<ir::Stmt>> {
         match stmt {
+            ast::Stmt::Return { span, .. } => Err(Diagnostic::new(
+                *span,
+                "return is only allowed inside functions".to_string(),
+            )),
             ast::Stmt::Shared {
                 name,
                 elem,
@@ -185,7 +241,7 @@ impl Checker {
                         "shared must be declared at kernel top level".to_string(),
                     ));
                 }
-                let value = match const_eval(len, &self.consts) {
+                let value = match consts::const_eval(len, &self.consts) {
                     Some(CVal::Int(value)) => value,
                     _ => {
                         return Err(Diagnostic::new(
@@ -230,15 +286,25 @@ impl Checker {
                 if self.consts.contains_key(name) || self.lookup(name).is_some() {
                     return Err(Diagnostic::new(*span, format!("duplicate name '{name}'")));
                 }
-                let value = const_eval(init, &self.consts).ok_or_else(|| {
+                let value = consts::const_eval(init, &self.consts).ok_or_else(|| {
                     Diagnostic::new(
                         *span,
                         "const initializer must be a constant expression".to_string(),
                     )
                 })?;
+                if !consts::validate(&value, *ty) {
+                    return Err(Diagnostic::new(
+                        *span,
+                        format!("const initializer out of range for {ty:?}"),
+                    ));
+                }
                 self.consts.insert(name.clone(), (value, *ty));
                 Ok(Vec::new())
             }
+            ast::Stmt::Spec(spec) => Err(Diagnostic::new(
+                spec.span,
+                "spec must be declared at kernel top level".to_string(),
+            )),
             ast::Stmt::Let {
                 name,
                 ty,
@@ -276,6 +342,15 @@ impl Checker {
                             *span,
                             "local variables must be scalar, matrix or vector".to_string(),
                         ));
+                    }
+                    None if let Some(value) = consts::const_eval(init, &self.consts) => {
+                        if consts::may_negate(init) {
+                            let (init, init_ty) = self.check_expr(init, None)?;
+                            (init, init_ty)
+                        } else {
+                            self.declare(name, Sym::InlineConst(value), *span)?;
+                            return Ok(Vec::new());
+                        }
                     }
                     None => self.check_expr(init, None)?,
                 };
@@ -345,7 +420,14 @@ impl Checker {
                             "local variables must be scalar, matrix or vector".to_string(),
                         ));
                     }
-                    None => self.check_expr(init, None)?,
+                    None => {
+                        let expect = if matches!(init, ast::Expr::IntLit(..)) {
+                            Some(Type::Scalar(Scalar::U32))
+                        } else {
+                            None
+                        };
+                        self.check_expr(init, expect)?
+                    }
                 };
                 if !matches!(
                     init_ty,
@@ -431,13 +513,13 @@ impl Checker {
                 span,
             } => {
                 if *unroll {
-                    let Some(CVal::Int(start_v)) = const_eval(start, &self.consts) else {
+                    let Some(CVal::Int(start_v)) = consts::const_eval(start, &self.consts) else {
                         return Err(Diagnostic::new(
                             *span,
                             "unrolled loop bounds must be constant".to_string(),
                         ));
                     };
-                    let Some(CVal::Int(end_v)) = const_eval(end, &self.consts) else {
+                    let Some(CVal::Int(end_v)) = consts::const_eval(end, &self.consts) else {
                         return Err(Diagnostic::new(
                             *span,
                             "unrolled loop bounds must be constant".to_string(),
@@ -547,7 +629,7 @@ impl Checker {
                         ));
                     };
                     let (stride, _) = self.check_expr(&args[2], Some(Type::Scalar(Scalar::U32)))?;
-                    let layout = match const_eval(&args[3], &self.consts) {
+                    let layout = match consts::const_eval(&args[3], &self.consts) {
                         Some(CVal::Bool(row_major)) => ir::Expr::IntLit {
                             value: if row_major { 0 } else { 1 },
                             ty: Scalar::U32,
@@ -593,6 +675,10 @@ impl Checker {
                 Some(Sym::ForVar { .. }) => Err(Diagnostic::new(
                     *span,
                     format!("cannot assign to loop variable '{name}'"),
+                )),
+                Some(Sym::InlineConst(_)) => Err(Diagnostic::new(
+                    *span,
+                    format!("cannot assign to constant '{name}'"),
                 )),
                 Some(Sym::Local { mutable: false, .. }) => Err(Diagnostic::new(
                     *span,
@@ -769,7 +855,15 @@ impl Checker {
                             "integer literal in non-scalar context".to_string(),
                         ));
                     }
-                    None => Scalar::U32,
+                    None => {
+                        if *value > u32::MAX as u64 {
+                            return Err(Diagnostic::new(
+                                *span,
+                                format!("integer literal {value} out of u32 range"),
+                            ));
+                        }
+                        Scalar::U32
+                    }
                 };
                 Ok((
                     ir::Expr::IntLit {
@@ -867,6 +961,14 @@ impl Checker {
                     return Ok((const_literal(value, ty, *span), Type::Scalar(ty)));
                 }
                 match self.lookup(name) {
+                    Some(Sym::InlineConst(value)) => {
+                        let lit = match value {
+                            CVal::Int(v) => ast::Expr::IntLit(v, *span),
+                            CVal::Float(v) => ast::Expr::FloatLit(v, *span),
+                            CVal::Bool(v) => ast::Expr::BoolLit(v, *span),
+                        };
+                        return self.check_expr_inner(&lit, expect);
+                    }
                     Some(Sym::BufParam(elem)) => Ok((
                         ir::Expr::ParamRef {
                             name: name.clone(),
@@ -965,6 +1067,65 @@ impl Checker {
             }
             ast::Expr::Unary { op, expr, span } => match op {
                 UnOp::Neg => {
+                    if let ast::Expr::IntLit(value, lit_span) = &**expr {
+                        let scalar = match expect {
+                            Some(Type::Scalar(Scalar::U32 | Scalar::U8)) => {
+                                return Err(Diagnostic::new(
+                                    *span,
+                                    "cannot negate an unsigned integer literal".to_string(),
+                                ));
+                            }
+                            Some(Type::Scalar(Scalar::I32)) => Scalar::I32,
+                            Some(Type::Scalar(Scalar::I8)) => Scalar::I8,
+                            Some(Type::Scalar(Scalar::F32 | Scalar::F16)) => {
+                                let scalar = match expect {
+                                    Some(Type::Scalar(s)) => s,
+                                    _ => unreachable!(),
+                                };
+                                return Ok((
+                                    ir::Expr::FloatLit {
+                                        value: -(*value as f64),
+                                        ty: scalar,
+                                        span: *span,
+                                    },
+                                    Type::Scalar(scalar),
+                                ));
+                            }
+                            Some(Type::Scalar(Scalar::Bf16 | Scalar::Bool)) => {
+                                return Err(Diagnostic::new(
+                                    *span,
+                                    "cannot negate a bf16/bool literal".to_string(),
+                                ));
+                            }
+                            Some(Type::Matrix { .. }) | Some(Type::Vec { .. }) => {
+                                return Err(Diagnostic::new(
+                                    *span,
+                                    "cannot negate a literal in non-scalar context".to_string(),
+                                ));
+                            }
+                            _ => Scalar::I32,
+                        };
+                        let neg = (*value as i128).wrapping_neg();
+                        let (min, max) = match scalar {
+                            Scalar::I32 => (i32::MIN as i128, i32::MAX as i128),
+                            Scalar::I8 => (i8::MIN as i128, i8::MAX as i128),
+                            _ => unreachable!(),
+                        };
+                        if neg < min || neg > max {
+                            return Err(Diagnostic::new(
+                                *lit_span,
+                                format!("integer literal {} out of {scalar:?} range", *value),
+                            ));
+                        }
+                        return Ok((
+                            ir::Expr::IntLit {
+                                value: neg as u64,
+                                ty: scalar,
+                                span: *span,
+                            },
+                            Type::Scalar(scalar),
+                        ));
+                    }
                     let (expr, ty) = self.check_expr(expr, expect)?;
                     let Type::Scalar(scalar) = ty else {
                         return Err(Diagnostic::new(
@@ -1177,7 +1338,13 @@ impl Checker {
     ) -> Result<(ir::Expr, Type)> {
         if matches!(
             name,
-            "atomic_add" | "atomic_max" | "atomic_min" | "atomic_exchange"
+            "atomic_add"
+                | "atomic_max"
+                | "atomic_min"
+                | "atomic_exchange"
+                | "atomic_and"
+                | "atomic_or"
+                | "atomic_xor"
         ) {
             if args.len() != 3 {
                 return Err(Diagnostic::new(span, format!("{name} expects 3 arguments")));
@@ -1252,7 +1419,7 @@ impl Checker {
                 }
             };
             let (stride, _) = self.check_expr(&args[1], Some(Type::Scalar(Scalar::U32)))?;
-            let layout = match const_eval(&args[2], &self.consts) {
+            let layout = match consts::const_eval(&args[2], &self.consts) {
                 Some(CVal::Bool(row_major)) => ir::Expr::IntLit {
                     value: if row_major { 0 } else { 1 },
                     ty: Scalar::U32,
@@ -1379,6 +1546,49 @@ impl Checker {
                 Type::Scalar(ret),
             ));
         }
+        if matches!(name, "popcount" | "clz" | "ctz") {
+            if args.len() != 1 {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("{name} expects 1 argument"),
+                ));
+            }
+            let (arg, _) = self.check_expr(&args[0], Some(Type::Scalar(Scalar::U32)))?;
+            return Ok((
+                ir::Expr::Call {
+                    name: name_static(name),
+                    args: vec![arg],
+                    ty: Type::Scalar(Scalar::U32),
+                    span,
+                },
+                Type::Scalar(Scalar::U32),
+            ));
+        }
+        if name == "dot" {
+            if args.len() != 2 {
+                return Err(Diagnostic::new(span, "dot expects 2 arguments"));
+            }
+            let (a, a_ty) = self.check_expr(&args[0], None)?;
+            let Type::Vec { size, elem } = a_ty else {
+                return Err(Diagnostic::new(span, "dot requires vector arguments"));
+            };
+            if !elem.is_float() {
+                return Err(Diagnostic::new(
+                    span,
+                    "dot requires float vector arguments".to_string(),
+                ));
+            }
+            let (b, _) = self.check_expr(&args[1], Some(Type::Vec { size, elem }))?;
+            return Ok((
+                ir::Expr::Call {
+                    name: "dot",
+                    args: vec![a, b],
+                    ty: Type::Scalar(elem),
+                    span,
+                },
+                Type::Scalar(elem),
+            ));
+        }
         let builtin = match name {
             "min"
             | "max"
@@ -1386,6 +1596,9 @@ impl Checker {
             | "floor"
             | "ceil"
             | "round"
+            | "trunc"
+            | "sign"
+            | "fract"
             | "sqrt"
             | "rsqrt"
             | "exp"
@@ -1416,6 +1629,9 @@ impl Checker {
             | "floor"
             | "ceil"
             | "round"
+            | "trunc"
+            | "sign"
+            | "fract"
             | "sqrt"
             | "rsqrt"
             | "exp"
@@ -1757,108 +1973,6 @@ fn const_literal(value: CVal, ty: Scalar, span: Span) -> ir::Expr {
     }
 }
 
-fn const_eval(expr: &ast::Expr, consts: &HashMap<String, (CVal, Scalar)>) -> Option<CVal> {
-    match expr {
-        ast::Expr::IntLit(value, _) => Some(CVal::Int(*value)),
-        ast::Expr::FloatLit(value, _) => Some(CVal::Float(*value)),
-        ast::Expr::BoolLit(value, _) => Some(CVal::Bool(*value)),
-        ast::Expr::Name(name, _) => consts.get(name).map(|(value, _)| *value),
-        ast::Expr::Unary { op, expr, .. } => {
-            let value = const_eval(expr, consts)?;
-            match (op, value) {
-                (UnOp::Neg, CVal::Int(value)) => Some(CVal::Int(value.wrapping_neg())),
-                (UnOp::Neg, CVal::Float(value)) => Some(CVal::Float(-value)),
-                (UnOp::Not, CVal::Bool(value)) => Some(CVal::Bool(!value)),
-                _ => None,
-            }
-        }
-        ast::Expr::Binary { op, lhs, rhs, .. } => {
-            let lhs = const_eval(lhs, consts)?;
-            let rhs = const_eval(rhs, consts)?;
-            match (op, lhs, rhs) {
-                (BinOp::Add, CVal::Int(a), CVal::Int(b)) => Some(CVal::Int(a.wrapping_add(b))),
-                (BinOp::Sub, CVal::Int(a), CVal::Int(b)) => Some(CVal::Int(a.wrapping_sub(b))),
-                (BinOp::Mul, CVal::Int(a), CVal::Int(b)) => Some(CVal::Int(a.wrapping_mul(b))),
-                (BinOp::Div, CVal::Int(a), CVal::Int(b)) if b != 0 => Some(CVal::Int(a / b)),
-                (BinOp::Rem, CVal::Int(a), CVal::Int(b)) if b != 0 => Some(CVal::Int(a % b)),
-                (BinOp::And, CVal::Int(a), CVal::Int(b)) => Some(CVal::Int(a & b)),
-                (BinOp::Or, CVal::Int(a), CVal::Int(b)) => Some(CVal::Int(a | b)),
-                (BinOp::Xor, CVal::Int(a), CVal::Int(b)) => Some(CVal::Int(a ^ b)),
-                (BinOp::Shl, CVal::Int(a), CVal::Int(b)) => {
-                    Some(CVal::Int(a.wrapping_shl(b as u32)))
-                }
-                (BinOp::Shr, CVal::Int(a), CVal::Int(b)) => {
-                    Some(CVal::Int(a.wrapping_shr(b as u32)))
-                }
-                (BinOp::Add, CVal::Float(a), CVal::Float(b)) => Some(CVal::Float(a + b)),
-                (BinOp::Sub, CVal::Float(a), CVal::Float(b)) => Some(CVal::Float(a - b)),
-                (BinOp::Mul, CVal::Float(a), CVal::Float(b)) => Some(CVal::Float(a * b)),
-                (BinOp::Div, CVal::Float(a), CVal::Float(b)) => Some(CVal::Float(a / b)),
-                (BinOp::Eq, a, b) => Some(CVal::Bool(a == b)),
-                (BinOp::Ne, a, b) => Some(CVal::Bool(a != b)),
-                (BinOp::Lt, CVal::Int(a), CVal::Int(b)) => Some(CVal::Bool(a < b)),
-                (BinOp::Le, CVal::Int(a), CVal::Int(b)) => Some(CVal::Bool(a <= b)),
-                (BinOp::Gt, CVal::Int(a), CVal::Int(b)) => Some(CVal::Bool(a > b)),
-                (BinOp::Ge, CVal::Int(a), CVal::Int(b)) => Some(CVal::Bool(a >= b)),
-                (BinOp::Lt, CVal::Float(a), CVal::Float(b)) => Some(CVal::Bool(a < b)),
-                (BinOp::Le, CVal::Float(a), CVal::Float(b)) => Some(CVal::Bool(a <= b)),
-                (BinOp::Gt, CVal::Float(a), CVal::Float(b)) => Some(CVal::Bool(a > b)),
-                (BinOp::Ge, CVal::Float(a), CVal::Float(b)) => Some(CVal::Bool(a >= b)),
-                (BinOp::LAnd, CVal::Bool(a), CVal::Bool(b)) => Some(CVal::Bool(a && b)),
-                (BinOp::LOr, CVal::Bool(a), CVal::Bool(b)) => Some(CVal::Bool(a || b)),
-                _ => None,
-            }
-        }
-        ast::Expr::Cond {
-            cond, then, els, ..
-        } => match const_eval(cond, consts)? {
-            CVal::Bool(true) => const_eval(then, consts),
-            CVal::Bool(false) => const_eval(els, consts),
-            _ => None,
-        },
-        ast::Expr::Convert { ty, expr, .. } => {
-            let value = const_eval(expr, consts)?;
-            let ast::Type::Scalar(target) = ty else {
-                return None;
-            };
-            match (value, target) {
-                (CVal::Int(value), Scalar::F32 | Scalar::F16) => Some(CVal::Float(value as f64)),
-                (CVal::Float(value), Scalar::U32 | Scalar::I32) => Some(CVal::Int(value as u64)),
-                (CVal::Float(_), Scalar::F32 | Scalar::F16) => Some(value),
-                (CVal::Int(_), Scalar::U32 | Scalar::I32) => Some(value),
-                _ => None,
-            }
-        }
-        ast::Expr::Call { name, args, .. } => match name.as_str() {
-            "min" | "max" | "clamp" => {
-                let mut values = Vec::new();
-                for arg in args {
-                    values.push(const_eval(arg, consts)?);
-                }
-                match values.as_slice() {
-                    [CVal::Int(a), CVal::Int(b)] => Some(CVal::Int(match name.as_str() {
-                        "min" => (*a).min(*b),
-                        _ => (*a).max(*b),
-                    })),
-                    [CVal::Int(a), CVal::Int(b), CVal::Int(c)] => {
-                        Some(CVal::Int(match name.as_str() {
-                            "clamp" => (*a).max(*b).min(*c),
-                            _ => unreachable!(),
-                        }))
-                    }
-                    [CVal::Float(a), CVal::Float(b)] => Some(CVal::Float(match name.as_str() {
-                        "min" => (*a).min(*b),
-                        _ => (*a).max(*b),
-                    })),
-                    _ => None,
-                }
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 fn substitute_loop_var(stmt: &mut ir::Stmt, var: &str, value: u64) {
     match stmt {
         ir::Stmt::Let { init, .. } | ir::Stmt::Var { init, .. } => {
@@ -1956,10 +2070,66 @@ fn expr_span(expr: &ir::Expr) -> Span {
     }
 }
 
-fn is_builtin(name: &str) -> bool {
+pub(crate) fn is_reserved(name: &str) -> bool {
     matches!(
         name,
-        "gid" | "thread" | "block" | "block_dim" | "lane" | "subgroup_id" | "subgroup_size"
+        "kernel"
+            | "fn"
+            | "return"
+            | "spec"
+            | "let"
+            | "var"
+            | "const"
+            | "shared"
+            | "if"
+            | "else"
+            | "loop"
+            | "for"
+            | "in"
+            | "break"
+            | "continue"
+            | "as"
+            | "unroll"
+            | "workgroup"
+            | "true"
+            | "false"
+            | "buf"
+            | "vec2"
+            | "vec3"
+            | "vec4"
+            | "matrix"
+            | "gid"
+            | "thread"
+            | "block"
+            | "block_dim"
+            | "lane"
+            | "subgroup_id"
+            | "subgroup_size"
+            | "barrier"
+            | "bitcast_f32"
+            | "bitcast_u32"
+            | "atomic_add"
+            | "atomic_max"
+            | "atomic_min"
+            | "atomic_exchange"
+            | "atomic_and"
+            | "atomic_or"
+            | "atomic_xor"
+            | "subgroup_broadcast"
+            | "subgroup_shuffle"
+            | "subgroup_shuffle_down"
+            | "subgroup_shuffle_up"
+            | "subgroup_reduce_add"
+            | "subgroup_reduce_max"
+            | "subgroup_reduce_min"
+            | "subgroup_inclusive_add"
+            | "subgroup_all"
+            | "subgroup_any"
+            | "coop_zero"
+            | "coop_load_a"
+            | "coop_load_b"
+            | "coop_mul_add"
+            | "coop_store"
     )
 }
 
@@ -2000,6 +2170,9 @@ fn name_static(name: &str) -> &'static str {
         "floor" => "floor",
         "ceil" => "ceil",
         "round" => "round",
+        "trunc" => "trunc",
+        "sign" => "sign",
+        "fract" => "fract",
         "sqrt" => "sqrt",
         "rsqrt" => "rsqrt",
         "exp" => "exp",
@@ -2007,9 +2180,16 @@ fn name_static(name: &str) -> &'static str {
         "log" => "log",
         "log2" => "log2",
         "tanh" => "tanh",
+        "dot" => "dot",
+        "popcount" => "popcount",
+        "clz" => "clz",
+        "ctz" => "ctz",
         "bitcast_f32" => "bitcast_f32",
         "bitcast_u32" => "bitcast_u32",
         "pow" => "pow",
+        "atomic_and" => "atomic_and",
+        "atomic_or" => "atomic_or",
+        "atomic_xor" => "atomic_xor",
         "subgroup_broadcast" => "subgroup_broadcast",
         "subgroup_shuffle" => "subgroup_shuffle",
         "subgroup_shuffle_down" => "subgroup_shuffle_down",

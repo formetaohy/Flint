@@ -1,0 +1,5 @@
+kernel k [workgroup(64, 1, 1)] (a: buf<f32>) {
+    if thread.x < 32 {
+        barrier();
+    }
+}

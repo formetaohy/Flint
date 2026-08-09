@@ -19,16 +19,53 @@ pub struct MtlKernel {
 
 impl MtlKernel {
     pub fn create(device: &MtlDevice, spec: &saturn_core::KernelSpec) -> Result<Box<dyn Kernel>> {
-        let source = saturn_compiler::Source::new(&spec.name, spec.source);
-        let kernel = saturn_compiler::compile(&source).map_err(|diags| {
-            Error::Shader(
-                diags.iter()
-                    .map(|d| source.render(d))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
-        })?;
-        let (msl, entry) = saturn_shader::to_msl(&kernel).map_err(Error::Shader)?;
+        let (name, workgroup_size, scalars, buffer_count, msl, entry) = match spec.precompiled {
+            Some(pc) => (
+                pc.name.to_string(),
+                pc.workgroup_size,
+                pc.scalars
+                    .iter()
+                    .map(|f| ScalarField {
+                        name: f.name.to_string(),
+                        offset: f.offset,
+                        ty: f.ty,
+                    })
+                    .collect(),
+                pc.buffers,
+                pc.msl.to_string(),
+                pc.name.to_string(),
+            ),
+            None => {
+                let source = saturn_compiler::Source::new(&spec.name, spec.source);
+                let kernel = saturn_compiler::Driver::new()
+                    .compile_with_specs(&source, spec.specs)
+                    .map_err(|diags| {
+                        Error::Shader(
+                            diags.iter()
+                                .map(|d| source.render(d))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        )
+                    })?;
+                let (msl, entry) = saturn_shader::to_msl(&kernel).map_err(Error::Shader)?;
+                (
+                    kernel.name.clone(),
+                    kernel.workgroup_size,
+                    kernel
+                        .scalars
+                        .iter()
+                        .map(|p| ScalarField {
+                            name: p.name.clone(),
+                            offset: p.offset,
+                            ty: p.ty,
+                        })
+                        .collect(),
+                    kernel.params.len(),
+                    msl,
+                    entry,
+                )
+            }
+        };
         let library = compile_kernel(&device.device, &msl)?;
         let function = library
             .newFunctionWithName(&NSString::from_str(&entry))
@@ -38,31 +75,19 @@ impl MtlKernel {
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| Error::Metal(e.to_string()))?;
         let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as u64;
-        let name = kernel.name.clone();
-        let workgroup_size = kernel.workgroup_size;
-        let scalar_layout = if kernel.scalars.is_empty() {
+        let scalar_layout = if scalars.is_empty() {
             None
         } else {
-            let total = kernel
-                .scalars
+            let total = scalars
                 .iter()
-                .map(|p| p.offset + p.ty.width())
+                .map(|f| f.offset + f.ty.width())
                 .max()
                 .unwrap_or(0);
             Some(ScalarLayout {
                 size: total.div_ceil(4) * 4,
-                fields: kernel
-                    .scalars
-                    .iter()
-                    .map(|p| ScalarField {
-                        name: p.name.clone(),
-                        offset: p.offset,
-                        ty: p.ty,
-                    })
-                    .collect(),
+                fields: scalars,
             })
         };
-        let buffer_count = kernel.params.len();
         log::debug!("metal: compiled kernel {name}");
         Ok(Box::new(Self {
             name,

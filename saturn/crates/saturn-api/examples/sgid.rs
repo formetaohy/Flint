@@ -11,10 +11,7 @@ fn main() {
         })
         .expect("create");
     let kernel = device
-        .create_kernel(&KernelSpec {
-            name: "sat/sgid.sat".into(),
-            source: saturn_sat::sat!("sgid.sat"),
-        })
+        .create_kernel(&KernelSpec::precompiled("sat/sgid.sat", saturn_sat::sat!("sgid.sat")))
         .expect("create kernel");
     let mut encoder = device.encoder().expect("encoder");
     encoder

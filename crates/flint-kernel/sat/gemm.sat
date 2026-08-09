@@ -1,3 +1,30 @@
+fn load_x(x: buf<f32>, row: u32, col: u32, K: u32, M: u32) -> f32 {
+    if row < M {
+        return x[row * K + col];
+    }
+    return 0.0;
+}
+
+fn decode_w(w: buf<u32>, scales: buf<f32>, n0: u32, kk: u32, k_base: u32,
+            N: u32, K: u32, GROUP: u32, WDTYPE: u32) -> f32 {
+    if n0 >= N {
+        return 0.0;
+    }
+    if WDTYPE == 1 {
+        let kb = (k_base + kk) / 16;
+        let word = w[(kb * N + n0) * 4 + (kk % 16) / 4];
+        let byte = (word >> (((kk % 16) % 4) * 8)) & 255;
+        let sc = scales[(kb / (GROUP / 16)) * N + n0];
+        return (((byte << 24) as i32 >> 24) as f32) * sc;
+    } else {
+        let word = w[n0 * (K / 2) + (k_base + kk) / 2];
+        if kk % 2 == 0 {
+            return bitcast_f32((word & 65535) << 16);
+        }
+        return bitcast_f32((word >> 16) << 16);
+    }
+}
+
 kernel gemm [workgroup(256, 1, 1)]
     (x: buf<f32>, w: buf<u32>, scales: buf<f32>, y: buf<f32>,
      N: u32, K: u32, M: u32, SEGS: u32, WDTYPE: u32, GROUP: u32,
@@ -24,45 +51,12 @@ kernel gemm [workgroup(256, 1, 1)]
     var acc3 = 0.0;
     for i in 0..4 {
         let idx = ln + i * 256;
-        let row = idx / 32;
-        let col = idx % 32;
-        if m0 + row < M {
-            xs[row * PAD + col] = x[(m0 + row) * K + k_lo + col];
-        } else {
-            xs[row * PAD + col] = 0.0;
-        }
+        xs[(idx / 32) * PAD + idx % 32] = load_x(x, m0 + idx / 32, k_lo + idx % 32, K, M);
     }
-    if WDTYPE == 1 {
-        for i in 0..4 {
-            let idx = ln + i * 256;
-            let col = idx / 32;
-            let kk = idx % 32;
-            if n0 + col < N {
-                let kb = (k_lo + kk) / 16;
-                let word = w[(kb * N + n0 + col) * 4 + (kk % 16) / 4];
-                let byte = (word >> (((kk % 16) % 4) * 8)) & 255;
-                let sc = scales[(kb / (GROUP / 16)) * N + n0 + col];
-                wf[col * PAD + kk] = (((byte << 24) as i32 >> 24) as f32) * sc;
-            } else {
-                wf[col * PAD + kk] = 0.0;
-            }
-        }
-    } else {
-        for i in 0..4 {
-            let idx = ln + i * 256;
-            let col = idx / 32;
-            let kk = idx % 32;
-            if n0 + col < N {
-                let word = w[(n0 + col) * (K / 2) + (k_lo + kk) / 2];
-                if kk % 2 == 0 {
-                    wf[col * PAD + kk] = bitcast_f32((word & 65535) << 16);
-                } else {
-                    wf[col * PAD + kk] = bitcast_f32((word >> 16) << 16);
-                }
-            } else {
-                wf[col * PAD + kk] = 0.0;
-            }
-        }
+    for i in 0..4 {
+        let idx = ln + i * 256;
+        wf[(idx / 32) * PAD + idx % 32] =
+            decode_w(w, scales, n0 + idx / 32, idx % 32, k_lo, N, K, GROUP, WDTYPE);
     }
     barrier();
     for it in 0..steps {
@@ -96,45 +90,13 @@ kernel gemm [workgroup(256, 1, 1)]
             let k1 = k_lo + (it + 1) * BK;
             for i in 0..4 {
                 let idx = ln + i * 256;
-                let row = idx / 32;
-                let col = idx % 32;
-                if m0 + row < M {
-                    xs[p1 + row * PAD + col] = x[(m0 + row) * K + k1 + col];
-                } else {
-                    xs[p1 + row * PAD + col] = 0.0;
-                }
+                xs[p1 + (idx / 32) * PAD + idx % 32] =
+                    load_x(x, m0 + idx / 32, k1 + idx % 32, K, M);
             }
-            if WDTYPE == 1 {
-                for i in 0..4 {
-                    let idx = ln + i * 256;
-                    let col = idx / 32;
-                    let kk = idx % 32;
-                    if n0 + col < N {
-                        let kb = (k1 + kk) / 16;
-                        let word = w[(kb * N + n0 + col) * 4 + (kk % 16) / 4];
-                        let byte = (word >> (((kk % 16) % 4) * 8)) & 255;
-                        let sc = scales[(kb / (GROUP / 16)) * N + n0 + col];
-                        wf[p1 + col * PAD + kk] = (((byte << 24) as i32 >> 24) as f32) * sc;
-                    } else {
-                        wf[p1 + col * PAD + kk] = 0.0;
-                    }
-                }
-            } else {
-                for i in 0..4 {
-                    let idx = ln + i * 256;
-                    let col = idx / 32;
-                    let kk = idx % 32;
-                    if n0 + col < N {
-                        let word = w[(n0 + col) * (K / 2) + (k1 + kk) / 2];
-                        if kk % 2 == 0 {
-                            wf[p1 + col * PAD + kk] = bitcast_f32((word & 65535) << 16);
-                        } else {
-                            wf[p1 + col * PAD + kk] = bitcast_f32((word >> 16) << 16);
-                        }
-                    } else {
-                        wf[p1 + col * PAD + kk] = 0.0;
-                    }
-                }
+            for i in 0..4 {
+                let idx = ln + i * 256;
+                wf[p1 + (idx / 32) * PAD + idx % 32] =
+                    decode_w(w, scales, n0 + idx / 32, idx % 32, k1, N, K, GROUP, WDTYPE);
             }
             barrier();
         }

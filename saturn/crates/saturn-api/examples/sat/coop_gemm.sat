@@ -10,7 +10,6 @@ kernel gemm_cm [workgroup(16, 16, 1)]
     let base_col = block.x * 128 + sg * TILE;
     var acc: matrix<f32, acc> = coop_zero();
     if base_col < n {
-        barrier();
         a_tile[thread.y * 16 + thread.x] = a[(base_row + thread.y) * k + thread.x];
         let lty = thread.y - sg * 2;
         for j in 0..8 unroll {
@@ -18,7 +17,9 @@ kernel gemm_cm [workgroup(16, 16, 1)]
             b_tiles[sg * 256 + j * 32 + lty * 16 + thread.x] =
                 b[by * n + base_col + thread.x];
         }
-        barrier();
+    }
+    barrier();
+    if base_col < n {
         let am = coop_load_a(a_tile, 16, true);
         let bm = coop_load_b(b_tiles[sg * 256], 16, true);
         acc = coop_mul_add(am, bm, acc);

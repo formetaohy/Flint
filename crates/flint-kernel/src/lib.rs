@@ -41,125 +41,125 @@ use flint_error::{Error, Result};
 
 struct ShaderSpec {
     name: &'static str,
-    source: &'static str,
+    kernel: &'static saturn_core::PrecompiledKernel<'static>,
 }
 
 const SHADERS: &[ShaderSpec] = &[
     ShaderSpec {
         name: name::GEMM,
-        source: sat!("gemm.sat"),
+        kernel: sat!("gemm.sat"),
     },
     ShaderSpec {
         name: name::MERGE_GEMM,
-        source: sat!("merge_gemm.sat"),
+        kernel: sat!("merge_gemm.sat"),
     },
     ShaderSpec {
         name: name::GEMV,
-        source: sat!("gemv.sat"),
+        kernel: sat!("gemv.sat"),
     },
     ShaderSpec {
         name: name::MERGE_GEMV,
-        source: sat!("merge_gemv.sat"),
+        kernel: sat!("merge_gemv.sat"),
     },
     ShaderSpec {
         name: name::GEMV_QKV,
-        source: sat!("gemv_qkv.sat"),
+        kernel: sat!("gemv_qkv.sat"),
     },
     ShaderSpec {
         name: name::MERGE_QKV,
-        source: sat!("merge_qkv.sat"),
+        kernel: sat!("merge_qkv.sat"),
     },
     ShaderSpec {
         name: name::GEMV_GATEUP,
-        source: sat!("gemv_gateup.sat"),
+        kernel: sat!("gemv_gateup.sat"),
     },
     ShaderSpec {
         name: name::MERGE_GATEUP,
-        source: sat!("merge_gateup.sat"),
+        kernel: sat!("merge_gateup.sat"),
     },
     ShaderSpec {
         name: name::EMBED,
-        source: sat!("embed.sat"),
+        kernel: sat!("embed.sat"),
     },
     ShaderSpec {
         name: name::NORM,
-        source: sat!("norm.sat"),
+        kernel: sat!("norm.sat"),
     },
     ShaderSpec {
         name: name::ADD,
-        source: sat!("add.sat"),
+        kernel: sat!("add.sat"),
     },
     ShaderSpec {
         name: name::BIAS,
-        source: sat!("bias.sat"),
+        kernel: sat!("bias.sat"),
     },
     ShaderSpec {
         name: name::CONCAT,
-        source: sat!("concat.sat"),
+        kernel: sat!("concat.sat"),
     },
     ShaderSpec {
         name: name::SWIGLU,
-        source: sat!("swiglu.sat"),
+        kernel: sat!("swiglu.sat"),
     },
     ShaderSpec {
         name: name::SOFTCAP,
-        source: sat!("softcap.sat"),
+        kernel: sat!("softcap.sat"),
     },
     ShaderSpec {
         name: name::MUL,
-        source: sat!("mul.sat"),
+        kernel: sat!("mul.sat"),
     },
     ShaderSpec {
         name: name::EXPERT_GATHER,
-        source: sat!("expert_gather.sat"),
+        kernel: sat!("expert_gather.sat"),
     },
     ShaderSpec {
         name: name::EXPERT_SCATTER,
-        source: sat!("expert_scatter.sat"),
+        kernel: sat!("expert_scatter.sat"),
     },
     ShaderSpec {
         name: name::ZERO_ROWS,
-        source: sat!("zero_rows.sat"),
+        kernel: sat!("zero_rows.sat"),
     },
     ShaderSpec {
         name: name::SIGMOID_MUL,
-        source: sat!("sigmoid_mul.sat"),
+        kernel: sat!("sigmoid_mul.sat"),
     },
     ShaderSpec {
         name: name::DELTA_GATE,
-        source: sat!("delta_gate.sat"),
+        kernel: sat!("delta_gate.sat"),
     },
     ShaderSpec {
         name: name::CONV1D,
-        source: sat!("conv1d.sat"),
+        kernel: sat!("conv1d.sat"),
     },
     ShaderSpec {
         name: name::DELTA_RECUR,
-        source: sat!("delta_recur.sat"),
+        kernel: sat!("delta_recur.sat"),
     },
     ShaderSpec {
         name: name::REPEAT_QK,
-        source: sat!("repeat_qk.sat"),
+        kernel: sat!("repeat_qk.sat"),
     },
     ShaderSpec {
         name: name::ROPE,
-        source: sat!("rope.sat"),
+        kernel: sat!("rope.sat"),
     },
     ShaderSpec {
         name: name::ATTN,
-        source: sat!("attn.sat"),
+        kernel: sat!("attn.sat"),
     },
     ShaderSpec {
         name: name::MERGE_ATTN,
-        source: sat!("merge_attn.sat"),
+        kernel: sat!("merge_attn.sat"),
     },
     ShaderSpec {
         name: name::KV_STORE,
-        source: sat!("kv_store.sat"),
+        kernel: sat!("kv_store.sat"),
     },
     ShaderSpec {
         name: name::SPLIT_QG,
-        source: sat!("split_qg.sat"),
+        kernel: sat!("split_qg.sat"),
     },
 ];
 
@@ -171,10 +171,10 @@ impl Kernels {
     pub fn new(device: &dyn Device) -> Result<Self> {
         let mut kernels = HashMap::new();
         for spec in SHADERS {
-            let kernel = device.create_kernel(&KernelSpec {
-                name: format!("sat/{}", spec.name),
-                source: spec.source,
-            })?;
+            let kernel = device.create_kernel(&KernelSpec::precompiled(
+                format!("sat/{}", spec.name),
+                spec.kernel,
+            ))?;
             assert_eq!(
                 kernel.name(),
                 spec.name,

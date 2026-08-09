@@ -42,46 +42,118 @@ impl Pass for ConstFold {
     }
 
     fn run(&self, kernel: &mut ir::Kernel) {
-        for stmt in &mut kernel.body {
-            fold_stmt(stmt);
-        }
+        kernel.body = fold_stmts(std::mem::take(&mut kernel.body));
     }
 }
 
-fn fold_stmt(stmt: &mut ir::Stmt) {
+fn fold_stmts(stmts: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        out.extend(fold_stmt(stmt));
+    }
+    out
+}
+
+fn fold_stmt(stmt: ir::Stmt) -> Vec<ir::Stmt> {
     match stmt {
-        ir::Stmt::Let { init, .. } | ir::Stmt::Var { init, .. } => fold_expr(init),
-        ir::Stmt::Assign { target, value, .. } => {
-            fold_expr(target);
-            fold_expr(value);
+        ir::Stmt::Let {
+            id,
+            name,
+            ty,
+            mut init,
+            span,
+        } => {
+            fold_expr(&mut init);
+            vec![ir::Stmt::Let {
+                id,
+                name,
+                ty,
+                init,
+                span,
+            }]
+        }
+        ir::Stmt::Var {
+            id,
+            name,
+            ty,
+            mut init,
+            span,
+        } => {
+            fold_expr(&mut init);
+            vec![ir::Stmt::Var {
+                id,
+                name,
+                ty,
+                init,
+                span,
+            }]
+        }
+        ir::Stmt::Assign {
+            mut target,
+            mut value,
+            span,
+        } => {
+            fold_expr(&mut target);
+            fold_expr(&mut value);
+            vec![ir::Stmt::Assign { target, value, span }]
         }
         ir::Stmt::If {
-            cond, then, els, ..
+            mut cond,
+            then,
+            els,
+            span,
         } => {
-            fold_expr(cond);
-            for stmt in then {
-                fold_stmt(stmt);
-            }
-            for stmt in els {
-                fold_stmt(stmt);
+            fold_expr(&mut cond);
+            if let ir::Expr::BoolLit { value, .. } = cond {
+                let chosen = if value { then } else { els };
+                fold_stmts(chosen)
+            } else {
+                vec![ir::Stmt::If {
+                    cond,
+                    then: fold_stmts(then),
+                    els: fold_stmts(els),
+                    span,
+                }]
             }
         }
-        ir::Stmt::Loop { body, .. } => {
-            for stmt in body {
-                fold_stmt(stmt);
-            }
-        }
+        ir::Stmt::Loop { body, span } => vec![ir::Stmt::Loop {
+            body: fold_stmts(body),
+            span,
+        }],
         ir::Stmt::For {
-            start, end, body, ..
+            id,
+            var,
+            mut start,
+            mut end,
+            body,
+            span,
         } => {
-            fold_expr(start);
-            fold_expr(end);
-            for stmt in body {
-                fold_stmt(stmt);
+            fold_expr(&mut start);
+            fold_expr(&mut end);
+            let dead = match (&start, &end) {
+                (ir::Expr::IntLit { value: a, .. }, ir::Expr::IntLit { value: b, .. }) => {
+                    a >= b
+                }
+                _ => false,
+            };
+            if dead {
+                Vec::new()
+            } else {
+                vec![ir::Stmt::For {
+                    id,
+                    var,
+                    start,
+                    end,
+                    body: fold_stmts(body),
+                    span,
+                }]
             }
         }
-        ir::Stmt::ExprStmt { expr, .. } => fold_expr(expr),
-        _ => {}
+        ir::Stmt::ExprStmt { mut expr, span } => {
+            fold_expr(&mut expr);
+            vec![ir::Stmt::ExprStmt { expr, span }]
+        }
+        other => vec![other],
     }
 }
 

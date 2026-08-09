@@ -46,10 +46,7 @@ fn main() {
     a_buf.write(0, &input).expect("write a");
 
     let kernel = device
-        .create_kernel(&KernelSpec {
-            name: "sat/subgroup.sat".into(),
-            source: saturn_sat::sat!("subgroup.sat"),
-        })
+        .create_kernel(&KernelSpec::precompiled("sat/subgroup.sat", saturn_sat::sat!("subgroup.sat")))
         .expect("create kernel");
 
     let mut encoder = device.encoder().expect("encoder");

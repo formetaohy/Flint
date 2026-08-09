@@ -20,10 +20,7 @@ fn main() {
         })
         .expect("create dst");
     let kernel = device
-        .create_kernel(&KernelSpec {
-            name: "sat/scale.sat".into(),
-            source: saturn_sat::sat!("scale.sat"),
-        })
+        .create_kernel(&KernelSpec::precompiled("sat/scale.sat", saturn_sat::sat!("scale.sat")))
         .expect("create kernel");
     let mut encoder = device.encoder().expect("encoder");
     let bindings = [

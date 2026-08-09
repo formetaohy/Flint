@@ -37,10 +37,7 @@ fn main() {
     }
     src.write(0, &input).expect("write src");
     let kernel = device
-        .create_kernel(&KernelSpec {
-            name: "sat/quant.sat".into(),
-            source: saturn_sat::sat!("quant.sat"),
-        })
+        .create_kernel(&KernelSpec::precompiled("sat/quant.sat", saturn_sat::sat!("quant.sat")))
         .expect("create kernel");
     let mut encoder = device.encoder().expect("encoder");
     encoder

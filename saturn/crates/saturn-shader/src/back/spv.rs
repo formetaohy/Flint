@@ -1102,7 +1102,13 @@ impl Spv {
             Expr::Call { name, args, ty, .. } => {
                 if matches!(
                     *name,
-                    "atomic_add" | "atomic_max" | "atomic_min" | "atomic_exchange"
+                    "atomic_add"
+                        | "atomic_max"
+                        | "atomic_min"
+                        | "atomic_exchange"
+                        | "atomic_and"
+                        | "atomic_or"
+                        | "atomic_xor"
                 ) {
                     let class = match &args[0] {
                         Expr::SharedRef { .. } => StorageClass::Workgroup,
@@ -1145,6 +1151,9 @@ impl Spv {
                         ("atomic_min", Scalar::I32) => Op::AtomicSMin,
                         ("atomic_min", _) => Op::AtomicUMin,
                         ("atomic_exchange", _) => Op::AtomicExchange,
+                        ("atomic_and", _) => Op::AtomicAnd,
+                        ("atomic_or", _) => Op::AtomicOr,
+                        ("atomic_xor", _) => Op::AtomicXor,
                         _ => unreachable!(),
                     };
                     self.push_fn(inst(
@@ -1242,6 +1251,48 @@ impl Spv {
                     ));
                     return Ok(result);
                 }
+                if *name == "popcount" {
+                    let result = self.alloc();
+                    self.push_fn(inst(
+                        Op::BitCount,
+                        &[self.type_id(&T::from_scalar(scalar_ty)), result, arg_ids[0]],
+                    ));
+                    return Ok(result);
+                }
+                if *name == "clz" || *name == "ctz" {
+                    let u32_ty = self.type_id(&U32);
+                    let bool_ty = self.type_id(&BOOL);
+                    let zero = self.constant(&ConstKey::Int { ty: U32, bits: 0 });
+                    let is_zero = self.alloc();
+                    self.push_fn(inst(Op::IEqual, &[bool_ty, is_zero, arg_ids[0], zero]));
+                    let idx = self.alloc();
+                    let ext = if *name == "clz" {
+                        GlslStd450Op::FindUMsb
+                    } else {
+                        GlslStd450Op::FindILsb
+                    };
+                    self.gl_ext(ext, u32_ty, idx, &[arg_ids[0]]);
+                    let width = self.constant(&ConstKey::Int { ty: U32, bits: 32 });
+                    let val = if *name == "clz" {
+                        let thirty_one = self.constant(&ConstKey::Int { ty: U32, bits: 31 });
+                        let sub = self.alloc();
+                        self.push_fn(inst(Op::ISub, &[u32_ty, sub, thirty_one, idx]));
+                        sub
+                    } else {
+                        idx
+                    };
+                    let result = self.alloc();
+                    self.push_fn(inst(Op::Select, &[u32_ty, result, is_zero, width, val]));
+                    return Ok(result);
+                }
+                if *name == "dot" {
+                    let result = self.alloc();
+                    self.push_fn(inst(
+                        Op::Dot,
+                        &[self.type_id(&T::from_scalar(scalar_ty)), result, arg_ids[0], arg_ids[1]],
+                    ));
+                    return Ok(result);
+                }
                 match *name {
                     "min" | "max" | "clamp" => {
                         let result = self.alloc();
@@ -1270,14 +1321,17 @@ impl Spv {
                         self.gl_ext(ext, ty_id, result, &arg_ids);
                         Ok(result)
                     }
-                    "floor" | "ceil" | "round" | "sqrt" | "rsqrt" | "exp" | "exp2" | "log"
-                    | "log2" | "tanh" | "pow" | "fma" => {
+                    "floor" | "ceil" | "round" | "trunc" | "sign" | "fract" | "sqrt"
+                    | "rsqrt" | "exp" | "exp2" | "log" | "log2" | "tanh" | "pow" | "fma" => {
                         let result = self.alloc();
                         let ty_id = self.type_id(&T::from_scalar(scalar_ty));
                         let ext = match *name {
                             "floor" => GlslStd450Op::Floor,
                             "ceil" => GlslStd450Op::Ceil,
                             "round" => GlslStd450Op::Round,
+                            "trunc" => GlslStd450Op::Trunc,
+                            "sign" => GlslStd450Op::FSign,
+                            "fract" => GlslStd450Op::Fract,
                             "sqrt" => GlslStd450Op::Sqrt,
                             "rsqrt" => GlslStd450Op::InverseSqrt,
                             "exp" => GlslStd450Op::Exp,
@@ -1795,8 +1849,9 @@ fn collect_expr(collect: &mut Collect, expr: &Expr) {
             }
             if matches!(
                 *name,
-                "min" | "max" | "clamp" | "abs" | "floor" | "ceil" | "round" | "sqrt"
-                    | "rsqrt" | "exp" | "exp2" | "log" | "log2" | "tanh" | "pow" | "fma"
+                "min" | "max" | "clamp" | "abs" | "floor" | "ceil" | "round" | "trunc"
+                    | "sign" | "fract" | "sqrt" | "rsqrt" | "exp" | "exp2" | "log"
+                    | "log2" | "tanh" | "pow" | "fma" | "clz" | "ctz"
             ) {
                 collect.has_glsl_ext = true;
             }

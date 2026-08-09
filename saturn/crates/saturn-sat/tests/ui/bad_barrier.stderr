@@ -1,0 +1,8 @@
+error: sat/bad_barrier.sat is invalid:
+       $DIR/tests/ui/sat/bad_barrier.sat:3:9: barrier() inside non-uniform control flow: the enclosing condition depends on per-invocation values (gid, thread, lane, subgroup state, or buffer/shared reads with non-uniform indices)
+ --> tests/ui/bad_barrier.rs:4:13
+  |
+4 |     let _ = sat!("bad_barrier.sat");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `sat` (in Nightly builds, run with -Z macro-backtrace for more info)

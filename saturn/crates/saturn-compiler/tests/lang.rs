@@ -145,7 +145,7 @@ fn rejects_undefined_variable() {
 fn rejects_type_mismatch() {
     let err = compile(
         "kernel k [workgroup(1,1,1)] (a: buf<f32>) {
-            let x = 1;
+            var x = 1;
             a[0] = x;
         }",
     )
@@ -154,10 +154,38 @@ fn rejects_type_mismatch() {
 }
 
 #[test]
-fn rejects_negated_u32() {
-    let err = compile("kernel k [workgroup(1,1,1)] (a: buf<u32>) { a[0] = -1; }")
+fn literal_binding_adapts_to_context() {
+    let kernel = compile(
+        "kernel k [workgroup(1,1,1)] (a: buf<f32>, b: buf<u32>) {
+            let x = 1;
+            a[0] = x;
+            b[0] = x;
+        }",
+    )
+    .expect("literal binding must adapt to each use site");
+    assert_eq!(kernel.body.len(), 2);
+}
+
+#[test]
+fn rejects_negated_unsigned_literal() {
+    let err = compile("kernel k [workgroup(1,1,1)] (a: buf<u32>) { var x: u32 = -1; }")
         .expect_err("should fail");
-    assert!(diag_msg(&err).contains("cannot negate u32"));
+    assert!(diag_msg(&err).contains("cannot negate an unsigned integer literal"));
+}
+
+#[test]
+fn negative_literals_compile() {
+    let kernel = compile(
+        "kernel k [workgroup(1,1,1)] (a: buf<i32>, b: buf<f32>) {
+            let lo = -1;
+            let min = -2147483648;
+            a[0] = lo;
+            a[1] = min;
+            b[0] = -1;
+        }",
+    )
+    .expect("negative literals must compile");
+    assert_eq!(kernel.params.len(), 2);
 }
 
 #[test]
@@ -196,10 +224,16 @@ fn rejects_duplicate_parameter() {
 }
 
 #[test]
-fn rejects_builtin_name_shadowing() {
+fn rejects_reserved_name_shadowing() {
     let err = compile("kernel k [workgroup(1,1,1)] (a: buf<u32>) { let gid = 1; }")
         .expect_err("should fail");
-    assert!(diag_msg(&err).contains("reserved builtin"));
+    assert!(diag_msg(&err).contains("reserved name"));
+    let err = compile("kernel k [workgroup(1,1,1)] (a: buf<u32>) { let buf = 1; }")
+        .expect_err("should fail");
+    assert!(diag_msg(&err).contains("reserved name"));
+    let err = compile("kernel k [workgroup(1,1,1)] (let: buf<u32>) {}")
+        .expect_err("should fail");
+    assert!(diag_msg(&err).contains("reserved name"));
 }
 
 #[test]
@@ -311,11 +345,11 @@ fn shared_and_barrier_compile() {
         r#"
         kernel k [workgroup(8, 1, 1)] (a: buf<f32>) {
             const TILE: u32 = 16;
-            shared buf: [f32; TILE * TILE];
+            shared tile: [f32; TILE * TILE];
             barrier();
-            buf[gid.x] = a[gid.x];
+            tile[gid.x] = a[gid.x];
             barrier();
-            a[gid.x] = buf[gid.x];
+            a[gid.x] = tile[gid.x];
         }
         "#,
     )
@@ -404,24 +438,13 @@ fn const_fold_simplifies_int_arithmetic() {
         }",
     )
     .expect("compile");
-    let saturn_compiler::ir::Stmt::Let { init, .. } = &kernel.body[0] else {
-        panic!("expected let");
-    };
-    let saturn_compiler::ir::Expr::IntLit { value, .. } = init else {
-        panic!("expected folded literal, got {init:?}");
-    };
-    assert_eq!(*value, 9);
-    let saturn_compiler::ir::Stmt::Assign { value, .. } = &kernel.body[1] else {
+    let saturn_compiler::ir::Stmt::Assign { value, .. } = &kernel.body[0] else {
         panic!("expected assign");
     };
-    let saturn_compiler::ir::Expr::Binary { lhs, rhs, .. } = value else {
-        panic!("expected binary");
+    let saturn_compiler::ir::Expr::IntLit { value, .. } = value else {
+        panic!("expected fully folded literal, got {value:?}");
     };
-    assert!(matches!(&**lhs, saturn_compiler::ir::Expr::LocalRef { .. }));
-    let saturn_compiler::ir::Expr::IntLit { value: r, .. } = &**rhs else {
-        panic!("expected folded literal");
-    };
-    assert_eq!(*r, 4);
+    assert_eq!(*value, 13);
 }
 
 #[test]
@@ -433,11 +456,11 @@ fn const_fold_resolves_constant_cond() {
         }",
     )
     .expect("compile");
-    let saturn_compiler::ir::Stmt::Let { init, .. } = &kernel.body[0] else {
-        panic!("expected let");
+    let saturn_compiler::ir::Stmt::Assign { value, .. } = &kernel.body[0] else {
+        panic!("expected assign");
     };
-    let saturn_compiler::ir::Expr::IntLit { value, .. } = init else {
-        panic!("expected folded literal, got {init:?}");
+    let saturn_compiler::ir::Expr::IntLit { value, .. } = value else {
+        panic!("expected folded literal, got {value:?}");
     };
     assert_eq!(*value, 7);
 }
@@ -452,4 +475,320 @@ fn diagnostic_renders_source_location() {
     let rendered = source.render(&diags[0]);
     assert!(rendered.contains("kern.sat:2:12"), "got: {rendered}");
     assert!(rendered.contains("^"), "got: {rendered}");
+}
+
+#[test]
+fn functions_expand_inline() {
+    let kernel = compile(
+        r#"
+        fn lerp(a: f32, b: f32, t: f32) -> f32 {
+            return a + (b - a) * t;
+        }
+        fn double(x: u32) -> u32 {
+            return x * 2;
+        }
+        kernel k [workgroup(1,1,1)] (a: buf<f32>, b: buf<u32>) {
+            a[0] = lerp(0.0, 1.0, 0.5);
+            b[0] = double(21);
+        }
+        "#,
+    )
+    .expect("compile");
+    assert!(kernel
+        .body
+        .iter()
+        .filter(|s| matches!(s, saturn_compiler::ir::Stmt::Assign { .. }))
+        .count()
+        >= 2);
+}
+
+#[test]
+fn void_function_call_statement() {
+    let kernel = compile(
+        r#"
+        fn zero_out(dst: buf<f32>) {
+            dst[0] = 0.0;
+        }
+        kernel k [workgroup(1,1,1)] (a: buf<f32>) {
+            zero_out(a);
+        }
+        "#,
+    )
+    .expect("compile");
+    assert!(contains_assign(&kernel.body));
+}
+
+fn contains_assign(stmts: &[saturn_compiler::ir::Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        saturn_compiler::ir::Stmt::Assign { .. } => true,
+        saturn_compiler::ir::Stmt::If { then, els, .. } => {
+            contains_assign(then) || contains_assign(els)
+        }
+        saturn_compiler::ir::Stmt::Loop { body, .. }
+        | saturn_compiler::ir::Stmt::For { body, .. } => contains_assign(body),
+        _ => false,
+    })
+}
+
+#[test]
+fn rejects_recursive_function() {
+    let err = compile(
+        r#"
+        fn f(x: u32) -> u32 {
+            if x == 0 { return 1; }
+            return f(x - 1);
+        }
+        kernel k [workgroup(1,1,1)] (a: buf<u32>) {
+            a[0] = f(3);
+        }
+        "#,
+    )
+    .expect_err("should fail");
+    assert!(diag_msg(&err).contains("recursive"));
+}
+
+#[test]
+fn rejects_function_missing_return_path() {
+    let err = compile(
+        r#"
+        fn f(x: u32) -> u32 {
+            if x > 0 { return 1; }
+        }
+        kernel k [workgroup(1,1,1)] (a: buf<u32>) {
+            a[0] = f(3);
+        }
+        "#,
+    )
+    .expect_err("should fail");
+    assert!(diag_msg(&err).contains("return on all paths"));
+}
+
+#[test]
+fn const_argument_specializes() {
+    let kernel = compile(
+        r#"
+        fn decode(w: u32, const WDTYPE: u32) -> u32 {
+            if WDTYPE == 1 {
+                return w * 2;
+            }
+            return w;
+        }
+        kernel k [workgroup(1,1,1)] (a: buf<u32>) {
+            a[0] = decode(a[0], 1);
+        }
+        "#,
+    )
+    .expect("compile");
+    let last = kernel.body.last().unwrap();
+    let saturn_compiler::ir::Stmt::Assign { value, .. } = last else {
+        panic!("expected assign, got {last:?}");
+    };
+    let saturn_compiler::ir::Expr::LocalRef { .. } = value else {
+        panic!("expected local ref, got {value:?}");
+    };
+    assert!(contains_mul(&kernel.body));
+}
+
+fn contains_mul(stmts: &[saturn_compiler::ir::Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        saturn_compiler::ir::Stmt::Let { init, .. }
+        | saturn_compiler::ir::Stmt::Var { init, .. }
+        | saturn_compiler::ir::Stmt::Assign { value: init, .. }
+        | saturn_compiler::ir::Stmt::ExprStmt { expr: init, .. } => {
+            expr_has_mul(init)
+        }
+        saturn_compiler::ir::Stmt::If { then, els, .. } => {
+            contains_mul(then) || contains_mul(els)
+        }
+        saturn_compiler::ir::Stmt::Loop { body, .. }
+        | saturn_compiler::ir::Stmt::For { body, .. } => contains_mul(body),
+        _ => false,
+    })
+}
+
+fn expr_has_mul(expr: &saturn_compiler::ir::Expr) -> bool {
+    match expr {
+        saturn_compiler::ir::Expr::Binary {
+            op: saturn_compiler::ir::BinOp::Mul,
+            ..
+        } => true,
+        saturn_compiler::ir::Expr::Binary { lhs, rhs, .. } => {
+            expr_has_mul(lhs) || expr_has_mul(rhs)
+        }
+        saturn_compiler::ir::Expr::Index { base, index, .. } => {
+            expr_has_mul(base) || expr_has_mul(index)
+        }
+        saturn_compiler::ir::Expr::Unary { expr: e, .. }
+        | saturn_compiler::ir::Expr::Convert { expr: e, .. } => expr_has_mul(e),
+        saturn_compiler::ir::Expr::Cond {
+            cond, then, els, ..
+        } => expr_has_mul(cond) || expr_has_mul(then) || expr_has_mul(els),
+        saturn_compiler::ir::Expr::Call { args, .. } => args.iter().any(expr_has_mul),
+        _ => false,
+    }
+}
+
+#[test]
+fn spec_default_specializes() {
+    let kernel = compile(
+        "kernel k [workgroup(1,1,1)] (a: buf<f32>) {
+            spec MODE: u32 = 1;
+            if MODE == 1 {
+                a[0] = 1.0;
+            } else {
+                a[0] = 2.0;
+            }
+        }",
+    )
+    .expect("compile");
+    assert_eq!(kernel.body.len(), 1);
+}
+
+#[test]
+fn spec_override_specializes() {
+    let source = Source::new(
+        "<spec>",
+        "kernel k [workgroup(1,1,1)] (a: buf<f32>) {
+            spec MODE: u32 = 1;
+            if MODE == 1 {
+                a[0] = 1.0;
+            } else {
+                a[0] = 2.0;
+            }
+        }",
+    );
+    let kernel = saturn_compiler::Driver::new()
+        .compile_with_specs(&source, &[("MODE", 0.0)])
+        .expect("compile with override");
+    assert_eq!(kernel.body.len(), 1);
+    let saturn_compiler::ir::Stmt::Assign { value, .. } = &kernel.body[0] else {
+        panic!("expected assign");
+    };
+    let saturn_compiler::ir::Expr::FloatLit { value, .. } = value else {
+        panic!("expected literal, got {value:?}");
+    };
+    assert_eq!(*value, 2.0);
+}
+
+#[test]
+fn rejects_unknown_spec() {
+    let source = Source::new(
+        "<spec>",
+        "kernel k [workgroup(1,1,1)] (a: buf<f32>) {
+            spec MODE: u32 = 1;
+            a[0] = MODE as f32;
+        }",
+    );
+    let err = saturn_compiler::Driver::new()
+        .compile_with_specs(&source, &[("NOPE", 0.0)])
+        .expect_err("should fail");
+    assert!(diag_msg(&err).contains("unknown spec"));
+}
+
+#[test]
+fn rejects_spec_out_of_range() {
+    let source = Source::new(
+        "<spec>",
+        "kernel k [workgroup(1,1,1)] (a: buf<u32>) {
+            spec MODE: u32 = 1;
+            a[0] = MODE;
+        }",
+    );
+    let err = saturn_compiler::Driver::new()
+        .compile_with_specs(&source, &[("MODE", -1.0)])
+        .expect_err("should fail");
+    assert!(diag_msg(&err).contains("out of range"));
+}
+
+#[test]
+fn rejects_barrier_in_divergent_flow() {
+    let err = compile(
+        "kernel k [workgroup(64,1,1)] (a: buf<f32>) {
+            if thread.x < 32 {
+                barrier();
+            }
+        }",
+    )
+    .expect_err("should fail");
+    assert!(diag_msg(&err).contains("non-uniform"));
+}
+
+#[test]
+fn barrier_under_uniform_condition_passes() {
+    let kernel = compile(
+        "kernel k [workgroup(64,1,1)] (a: buf<f32>, n: u32) {
+            let limit = min(n, 32);
+            if block.x < limit {
+                barrier();
+            }
+        }",
+    )
+    .expect("uniform condition barrier must compile");
+    assert!(contains_barrier(&kernel.body));
+}
+
+fn contains_barrier(stmts: &[saturn_compiler::ir::Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        saturn_compiler::ir::Stmt::Barrier { .. } => true,
+        saturn_compiler::ir::Stmt::If { then, els, .. } => {
+            contains_barrier(then) || contains_barrier(els)
+        }
+        saturn_compiler::ir::Stmt::Loop { body, .. }
+        | saturn_compiler::ir::Stmt::For { body, .. } => contains_barrier(body),
+        _ => false,
+    })
+}
+
+#[test]
+fn new_builtins_compile() {
+    let kernel = compile(
+        "kernel k [workgroup(1,1,1)] (a: buf<u32>, f: buf<f32>) {
+            a[0] = popcount(a[0]) + clz(a[0]) + ctz(a[0]);
+            f[0] = trunc(f[0]) + sign(f[0]) + fract(f[0]);
+            let v = vec4<f32>(1.0, 2.0, 3.0, 4.0);
+            f[1] = dot(v, v);
+            atomic_add(a, 1, 1);
+            atomic_and(a, 2, 3);
+            atomic_or(a, 3, 1);
+            atomic_xor(a, 4, 5);
+        }",
+    )
+    .expect("new builtins must compile");
+    assert_eq!(kernel.params.len(), 2);
+}
+
+#[test]
+fn multi_error_recovery() {
+    let err = compile(
+        "kernel k [workgroup(1,1,1)] (a: buf<u32>) {
+            let x = ;
+            let y = ;
+        }",
+    )
+    .expect_err("should fail");
+    assert!(err.len() >= 2, "expected multiple diagnostics, got {err:?}");
+}
+
+#[test]
+fn return_outside_function_rejected() {
+    let err = compile("kernel k [workgroup(1,1,1)] (a: buf<u32>) { return; }")
+        .expect_err("should fail");
+    assert!(diag_msg(&err).contains("only allowed inside functions"));
+}
+
+#[test]
+fn shared_inside_function_rejected() {
+    let err = compile(
+        r#"
+        fn f(x: u32) -> u32 {
+            shared s: [u32; 4];
+            return x;
+        }
+        kernel k [workgroup(1,1,1)] (a: buf<u32>) {
+            a[0] = f(1);
+        }
+        "#,
+    )
+    .expect_err("should fail");
+    assert!(diag_msg(&err).contains("shared"));
 }

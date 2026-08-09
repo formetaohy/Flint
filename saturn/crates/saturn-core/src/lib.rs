@@ -13,4 +13,4 @@ pub use query::TimestampSet;
 pub use device::{CoopShape, Device};
 pub use error::{Error, Result};
 pub use kernel::{Kernel, Scalar, ScalarField, ScalarLayout};
-pub use spec::{BufferSpec, KernelSpec};
+pub use spec::{BufferSpec, KernelSpec, MatrixRole, PrecompiledKernel, PrecompiledScalar};
