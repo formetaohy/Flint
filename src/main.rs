@@ -53,19 +53,19 @@ struct ChatArgs {
     #[arg(long, default_value = "You are a helpful assistant.")]
     system: String,
 
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 4096)]
     max_tokens: usize,
 
-    #[arg(long, default_value_t = 0.7)]
+    #[arg(long, default_value_t = 0.8)]
     temperature: f32,
 
-    #[arg(long, default_value_t = 0.8)]
+    #[arg(long, default_value_t = 0.95)]
     top_p: f32,
 
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 40)]
     top_k: usize,
 
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.05)]
     min_p: f32,
 
     #[arg(long, default_value_t = 1.0)]
@@ -74,8 +74,8 @@ struct ChatArgs {
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    #[arg(long, default_value_t = 4096)]
-    max_seq: u32,
+    #[arg(long, default_value_t = 8192)]
+    ctx_size: u32,
 
     #[arg(long)]
     speculate: bool,
@@ -219,7 +219,7 @@ fn chat_main(model: &Path, args: ChatArgs) -> Result<()> {
 
     eprintln!("[flint] loading weights from {}...", model.display());
     let load_t = std::time::Instant::now();
-    let chat_model = flint_architectures::load(model, args.max_seq, &backend)?;
+    let chat_model = flint_architectures::load(model, args.ctx_size, &backend)?;
     eprintln!(
         "[flint] weights loaded in {:.1}s",
         load_t.elapsed().as_secs_f64()
