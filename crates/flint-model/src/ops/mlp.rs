@@ -3,7 +3,7 @@ use flint_error::Result;
 use flint_kernel::name;
 use flint_tensor::Tensor;
 
-use crate::loader::SwigluMlp;
+use crate::blocks::SwigluMlp;
 use crate::ops::{Act, gemm, gemm_acc, gemv};
 
 pub struct MlpTiles {

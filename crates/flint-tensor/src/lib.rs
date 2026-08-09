@@ -2,11 +2,7 @@ mod weight;
 
 pub use weight::Weight;
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use saturn_core::Buffer;
-
-static NEXT_TENSOR_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DType {
@@ -22,18 +18,11 @@ pub struct Tensor {
     pub buf: Box<dyn Buffer>,
     pub shape: Vec<u32>,
     pub dtype: DType,
-
-    pub id: u64,
 }
 
 impl Tensor {
     pub fn new(buf: Box<dyn Buffer>, shape: Vec<u32>, dtype: DType) -> Self {
-        Self {
-            buf,
-            shape,
-            dtype,
-            id: NEXT_TENSOR_ID.fetch_add(1, Ordering::Relaxed),
-        }
+        Self { buf, shape, dtype }
     }
 
     pub fn numel(&self) -> u64 {

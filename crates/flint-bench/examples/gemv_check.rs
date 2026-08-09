@@ -1,6 +1,6 @@
 use flint_backend::{Backend, Binding, Pass};
 use flint_error::Result;
-use flint_model::loader::quantize;
+use flint_model::quant::quantize;
 use flint_tensor::Weight;
 
 #[allow(clippy::too_many_arguments)]

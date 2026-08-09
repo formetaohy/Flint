@@ -11,7 +11,7 @@ pub struct ChatMlThink;
 
 pub struct GemmaChat;
 
-pub struct PhiChat;
+pub struct Phi3Chat;
 
 pub struct Phi4Chat;
 
@@ -44,7 +44,7 @@ impl ChatFormat for GemmaChat {
     }
 }
 
-impl ChatFormat for PhiChat {
+impl ChatFormat for Phi3Chat {
     fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
         let mut out = String::new();
         push_phi_turn(&mut out, "system", system);

@@ -79,24 +79,24 @@ impl Tensor {
     pub fn from_proto(t: &crate::onnx::TensorProto, model_dir: &Path) -> Result<Tensor> {
         let shape: Vec<usize> = t.dims.iter().map(|&d| d.max(0) as usize).collect();
         let data = match t.data_type {
-            1 => Data::F32(raw(t, model_dir, 4)?
+            1 => Data::F32(raw(t, model_dir)?
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                 .collect()),
             10 => Data::F32(
-                raw(t, model_dir, 2)?
+                raw(t, model_dir)?
                     .chunks_exact(2)
                     .map(|c| saturn_core::num::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect(),
             ),
             16 => Data::F32(
-                raw(t, model_dir, 2)?
+                raw(t, model_dir)?
                     .chunks_exact(2)
                     .map(|c| saturn_core::num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect(),
             ),
             11 => Data::F32(
-                raw(t, model_dir, 8)?
+                raw(t, model_dir)?
                     .chunks_exact(8)
                     .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
                     .collect(),
@@ -231,7 +231,7 @@ fn external_value(t: &crate::onnx::TensorProto, key: &str) -> Option<String> {
         .map(|e| e.value.clone())
 }
 
-fn raw(t: &crate::onnx::TensorProto, model_dir: &Path, elem: usize) -> Result<Vec<u8>> {
+fn raw(t: &crate::onnx::TensorProto, model_dir: &Path) -> Result<Vec<u8>> {
     if !t.raw_data.is_empty() {
         return Ok(t.raw_data.clone());
     }
@@ -242,7 +242,6 @@ fn raw(t: &crate::onnx::TensorProto, model_dir: &Path, elem: usize) -> Result<Ve
             .flat_map(|f| f.to_le_bytes())
             .collect());
     }
-    let _ = elem;
     external_bytes(t, model_dir)
 }
 

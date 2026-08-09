@@ -1,18 +1,19 @@
 use flint_backend::{Backend, Binding, Pass};
 use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
+use flint_model::blocks::MlpBlock;
 use flint_model::cache::KvCache;
-use flint_model::loader::{self, MlpBlock, Plan};
+use flint_model::loader::{self, Plan};
 use flint_model::ops::{self, M_MAX, NormMode};
 use flint_model::routing::Routing;
 use flint_model::{ChunkOut, LanguageModel};
 use flint_tensor::{Tensor, Weight};
 
-use crate::dense::config::DenseConfig;
-use crate::dense::weights::{LayerW, Scratch, alloc_scratch, take_layer};
+use crate::transformer::config::TransformerConfig;
+use crate::transformer::weights::{LayerW, Scratch, alloc_scratch, take_layer};
 
-pub struct DenseModel {
-    cfg: DenseConfig,
+pub struct TransformerModel {
+    cfg: TransformerConfig,
     max_seq: u32,
     pos: u32,
     embed: Weight,
@@ -38,10 +39,10 @@ pub struct DenseModel {
     ple_norm: Option<Tensor>,
 }
 
-impl DenseModel {
+impl TransformerModel {
     pub fn load(
         source: &dyn Checkpoint,
-        cfg: DenseConfig,
+        cfg: TransformerConfig,
         plan: &Plan,
         max_seq: u32,
         backend: &Backend,
@@ -51,7 +52,7 @@ impl DenseModel {
 
     pub fn load_extra(
         source: &dyn Checkpoint,
-        cfg: DenseConfig,
+        cfg: TransformerConfig,
         plan: &Plan,
         extra: Vec<(String, Weight)>,
         max_seq: u32,
@@ -198,7 +199,7 @@ fn residual_add(
     }
 }
 
-impl LanguageModel for DenseModel {
+impl LanguageModel for TransformerModel {
     fn forward(
         &mut self,
         backend: &mut Backend,

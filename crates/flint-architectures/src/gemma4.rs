@@ -4,11 +4,11 @@ use flint_error::{Error, Result};
 use flint_model::ops::Act;
 use serde_json::Value;
 
-use crate::dense::{DenseConfig, DenseModel, PerLayerConfig, RopeSpec, dense_plan};
+use crate::transformer::{TransformerConfig, TransformerModel, PerLayerConfig, RopeSpec, transformer_plan};
 
-pub fn parse_config(v: &Value) -> Result<DenseConfig> {
+pub fn parse_config(v: &Value) -> Result<TransformerConfig> {
     let t = v.get("text_config").unwrap_or(v);
-    let mut cfg = DenseConfig::parse(t, true)?;
+    let mut cfg = TransformerConfig::parse(t, true)?;
     cfg.embed_scale = (cfg.hidden as f32).sqrt();
     cfg.qk_norm = true;
     cfg.v_norm = true;
@@ -126,12 +126,12 @@ pub fn load(
     v: &Value,
     max_seq: u32,
     backend: &Backend,
-) -> Result<DenseModel> {
+) -> Result<TransformerModel> {
     let cfg = parse_config(v)?;
-    DenseModel::load(
+    TransformerModel::load(
         source,
         cfg,
-        &dense_plan(source.kind() == CheckpointKind::Gguf),
+        &transformer_plan(source.kind() == CheckpointKind::Gguf),
         max_seq,
         backend,
     )

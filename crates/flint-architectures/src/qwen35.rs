@@ -1,15 +1,16 @@
 use flint_backend::{Backend, Binding, Pass};
 use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::{Error, Result};
+use flint_model::blocks::{SwigluMlp, take_mlp};
 use flint_model::cache::{KvCache, RecurrentState};
 use flint_model::config::{check_gemm_dims, check_head_dim, f64_field, req, u32_field, u32_list};
-use flint_model::loader::{self, Plan, Role, SwigluMlp, WeightSet, take_mlp};
+use flint_model::loader::{self, Plan, Role, WeightSet};
 use flint_model::ops::{self, Act, M_MAX, MlpTiles, NormMode};
 use flint_model::{ChunkOut, LanguageModel, Speculator};
 use flint_tensor::{Tensor, Weight};
 use serde_json::Value;
 
-use crate::names::hf_key;
+use crate::keys::hf_key;
 
 const PLAN: Plan = Plan { key: hf_key, role };
 
@@ -303,7 +304,7 @@ fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
             cfg.kv_heads,
             ops::ATTN_SEGS,
             ops::MAX_GQA,
-            cfg.head_dim + 2,
+            cfg.head_dim + ops::ATTN_PAD,
         ]),
         qg: z(&[M_MAX, cfg.q_heads * cfg.head_dim * 2]),
         q: z(&[M_MAX, cfg.q_heads * cfg.head_dim]),
@@ -897,23 +898,23 @@ fn full_attn_block(
         m,
     )?;
 
-    ops::attn(
-        backend,
-        pass,
-        Binding::Full(&s.q2),
-        &kv.k,
-        &kv.v,
-        &s.attn_scratch,
-        Binding::Full(&s.attn_out),
-        nq,
-        nkv,
-        hd,
-        kv.max_seq,
-        args,
-        m,
-        0,
-        hd + 2,
-    )?;
+        ops::attn(
+            backend,
+            pass,
+            Binding::Full(&s.q2),
+            &kv.k,
+            &kv.v,
+            &s.attn_scratch,
+            Binding::Full(&s.attn_out),
+            nq,
+            nkv,
+            hd,
+            kv.max_seq,
+            args,
+            m,
+            0,
+            hd + ops::ATTN_PAD,
+        )?;
     ops::sigmoid_mul(
         backend,
         pass,

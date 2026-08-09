@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use flint_architectures::names::gguf_key;
+use flint_architectures::keys::gguf_key;
 use flint_checkpoint::{Checkpoint, CheckpointKind, MetaVal, Metadata, RawTensor};
 use serde_json::json;
 

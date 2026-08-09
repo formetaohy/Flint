@@ -1,4 +1,7 @@
 pub mod cpu;
+pub mod modes;
+
+pub use modes::{Act, NormMode};
 
 pub mod name {
     pub const GEMM: &str = "gemm";

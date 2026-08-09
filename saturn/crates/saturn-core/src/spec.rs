@@ -74,11 +74,6 @@ impl<'a> KernelSpec<'a> {
         self
     }
 
-    pub fn with_precompiled(mut self, precompiled: &'a PrecompiledKernel<'a>) -> Self {
-        self.precompiled = Some(precompiled);
-        self
-    }
-
     pub fn precompiled(name: impl Into<String>, pc: &'a PrecompiledKernel<'a>) -> Self {
         Self {
             name: name.into(),

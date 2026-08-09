@@ -1,3 +1,5 @@
+use crate::modes::{Act, NormMode};
+
 fn silu(v: f32) -> f32 {
     v / (1.0 + (-v).exp())
 }
@@ -44,7 +46,7 @@ pub fn embed(ids: &[u32], table: &[f32], dim: usize, scale: f32) -> Vec<f32> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn norm(
-    mode: u32,
+    mode: NormMode,
     x: &[f32],
     weight: &[f32],
     gate: &[f32],
@@ -58,11 +60,11 @@ pub fn norm(
         let row = &x[r * dim..(r + 1) * dim];
         let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
         let mean = match mode {
-            3 => row.iter().sum::<f32>() / dim as f32,
+            NormMode::Layer => row.iter().sum::<f32>() / dim as f32,
             _ => 0.0,
         };
         let inv = match mode {
-            3 => {
+            NormMode::Layer => {
                 let var = mean_sq - mean * mean;
                 (var + eps).sqrt().recip()
             }
@@ -70,14 +72,14 @@ pub fn norm(
         };
         for d in 0..dim {
             let base = match mode {
-                3 => (row[d] - mean) * inv,
+                NormMode::Layer => (row[d] - mean) * inv,
                 _ => row[d] * inv,
             };
             out[r * dim + d] = match mode {
-                0 => base * (1.0 + weight[d % w_dim]),
-                1 => base * weight[d % w_dim] * silu(gate[r * dim + d]),
-                3 => base * weight[d % w_dim] + gate[d % gate.len()],
-                _ => base * weight[d % w_dim],
+                NormMode::Offset => base * (1.0 + weight[d % w_dim]),
+                NormMode::Gated => base * weight[d % w_dim] * silu(gate[r * dim + d]),
+                NormMode::Direct => base * weight[d % w_dim],
+                NormMode::Layer => base * weight[d % w_dim] + gate[d % gate.len()],
             };
         }
     }
@@ -94,10 +96,10 @@ pub fn bias(x: &mut [f32], bias: &[f32], dim: usize) {
     }
 }
 
-pub fn swiglu(gate: &[f32], up: &[f32], mode: u32) -> Vec<f32> {
+pub fn swiglu(gate: &[f32], up: &[f32], mode: Act) -> Vec<f32> {
     let act = |v: f32| match mode {
-        1 => 0.5 * v * (1.0 + (0.7978846 * (v + 0.044715 * v * v * v)).tanh()),
-        _ => silu(v),
+        Act::GeluTanh => 0.5 * v * (1.0 + (0.7978846 * (v + 0.044715 * v * v * v)).tanh()),
+        Act::Silu => silu(v),
     };
     gate.iter().zip(up).map(|(g, u)| act(*g) * u).collect()
 }

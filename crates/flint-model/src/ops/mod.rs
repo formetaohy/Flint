@@ -10,6 +10,7 @@ pub use attn::{
 pub use gemm::{gemm, gemm_acc, gemm_qkv, gemv};
 pub use mlp::{MlpTiles, add, bias, concat, mul, sigmoid_mul, softcap, swiglu, swiglu_mlp};
 pub use moe::{MoeTiles, MoeTilesConfig, expert_gather, expert_scatter, moe_apply, zero_rows};
+pub use flint_kernel::{Act, NormMode};
 
 use flint_backend::Backend;
 use flint_error::Result;
@@ -21,23 +22,7 @@ pub const MAX_GQA: u32 = 8;
 
 pub const M_MAX: u32 = 128;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Act {
-    Silu,
-    GeluTanh,
-}
-
-#[derive(Clone, Copy)]
-pub enum NormMode {
-
-    Offset = 0,
-
-    Gated = 1,
-
-    Direct = 2,
-
-    Layer = 3,
-}
+pub const ATTN_PAD: u32 = 2;
 
 pub fn token_ids(backend: &Backend) -> Tensor {
     Tensor::new(

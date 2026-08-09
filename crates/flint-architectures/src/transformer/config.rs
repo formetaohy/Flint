@@ -19,11 +19,7 @@ pub struct RopeSpec {
 pub struct MoeConfig {
     pub experts: u32,
     pub top_k: u32,
-
-    pub scale: f32,
-
     pub shared_scale: f32,
-
     pub kind: RouteKind,
 }
 
@@ -33,7 +29,7 @@ pub struct PerLayerConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct DenseConfig {
+pub struct TransformerConfig {
     pub hidden: u32,
     pub intermediate: u32,
     pub layers: u32,
@@ -79,7 +75,7 @@ pub struct DenseConfig {
     pub per_layer: Option<PerLayerConfig>,
 }
 
-impl DenseConfig {
+impl TransformerConfig {
 
     pub fn parse(v: &Value, tied_default: bool) -> Result<Self> {
         let hidden = u32_field(v, "hidden_size")?;

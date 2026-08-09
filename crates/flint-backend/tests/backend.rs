@@ -34,7 +34,7 @@ fn copy_duplicates_contents() {
 }
 
 #[test]
-fn write_u32_lands_little_endian() {
+fn write_u32_is_little_endian() {
     let backend = Backend::new().unwrap();
     let buf = backend.storage(8);
     backend.write_u32(buf.as_ref(), &[f32::to_bits(1.0), 42]);

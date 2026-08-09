@@ -45,9 +45,9 @@ impl VkDevice {
     pub fn open(options: &Options) -> Result<Self> {
         let entry = unsafe { ash::Entry::load() }.map_err(|e| Error::Vulkan(e.to_string()))?;
         let app_info = vk::ApplicationInfo::default()
-            .application_name(c"land")
+            .application_name(c"flint")
             .application_version(0)
-            .engine_name(c"land")
+            .engine_name(c"flint")
             .engine_version(0)
             .api_version(vk::API_VERSION_1_0);
 

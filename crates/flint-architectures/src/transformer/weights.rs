@@ -1,13 +1,14 @@
 use flint_backend::Backend;
 use flint_error::Result;
-use flint_model::loader::{self, MlpBlock, Plan, Role, WeightSet, take_moe};
+use flint_model::blocks::{MlpBlock, take_moe, take_mlp};
+use flint_model::loader::{Plan, Role, WeightSet};
 use flint_model::ops::{self, MlpTiles, MoeTiles, M_MAX};
 use flint_tensor::{Tensor, Weight};
 
-use crate::dense::config::DenseConfig;
-use crate::names::{gguf_key, hf_key};
+use crate::keys::{gguf_key, hf_key};
+use crate::transformer::config::TransformerConfig;
 
-pub fn dense_role(key: &str) -> Role {
+pub fn transformer_role(key: &str) -> Role {
     if key.contains("norm") || key.ends_with(".bias") || key.ends_with("layer_scalar") {
         Role::F32
     } else if key == "embed_tokens.weight"
@@ -21,10 +22,10 @@ pub fn dense_role(key: &str) -> Role {
     }
 }
 
-pub fn dense_plan(gguf: bool) -> Plan {
+pub fn transformer_plan(gguf: bool) -> Plan {
     Plan {
         key: if gguf { gguf_key } else { hf_key },
-        role: dense_role,
+        role: transformer_role,
     }
 }
 
@@ -65,7 +66,7 @@ fn take_optional(w: &mut WeightSet, on: bool, key: &str) -> Result<Option<Tensor
     }
 }
 
-pub(crate) fn take_layer(w: &mut WeightSet, cfg: &DenseConfig, l: u32, backend: &Backend) -> Result<LayerW> {
+pub(crate) fn take_layer(w: &mut WeightSet, cfg: &TransformerConfig, l: u32, backend: &Backend) -> Result<LayerW> {
     let k = |n: &str| format!("layers.{l}.{n}");
     let hd = cfg.head_dim(l);
     let qw = cfg.q_heads * hd;
@@ -94,11 +95,10 @@ pub(crate) fn take_layer(w: &mut WeightSet, cfg: &DenseConfig, l: u32, backend: 
             &format!("layers.{l}"),
             moe.experts,
             moe.top_k,
-            moe.scale,
             moe.shared_scale,
             cfg.layernorm,
         )?)),
-        None => MlpBlock::Dense(Box::new(loader::take_mlp(w, &format!("layers.{l}"), cfg.layernorm)?)),
+        None => MlpBlock::Dense(Box::new(take_mlp(w, &format!("layers.{l}"), cfg.layernorm)?)),
     };
     let ple = cfg.has_ple();
     Ok(LayerW {
@@ -162,7 +162,7 @@ pub(crate) struct Scratch {
     pub(crate) ple_ones: Option<Tensor>,
 }
 
-pub(crate) fn alloc_scratch(cfg: &DenseConfig, backend: &Backend) -> Scratch {
+pub(crate) fn alloc_scratch(cfg: &TransformerConfig, backend: &Backend) -> Scratch {
     let max_hd = *cfg.head_dims.iter().max().unwrap();
     let mlp_w = cfg.max_mlp_width();
     let moe = cfg.moe.map(|m| {
@@ -190,9 +190,9 @@ pub(crate) fn alloc_scratch(cfg: &DenseConfig, backend: &Backend) -> Scratch {
                 cfg.kv_heads,
                 ops::ATTN_SEGS,
                 ops::MAX_GQA,
-                max_hd + 2,
+                max_hd + ops::ATTN_PAD,
             ]),
-        attn_stride: max_hd + 2,
+        attn_stride: max_hd + ops::ATTN_PAD,
         mlp: MlpTiles {
             gate_out: backend.zero_tensor(&[M_MAX, mlp_w]),
             up_out: backend.zero_tensor(&[M_MAX, mlp_w]),

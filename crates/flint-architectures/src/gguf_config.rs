@@ -6,8 +6,8 @@ use crate::Family;
 
 pub fn synthesize_config(source: &dyn Checkpoint, family: Family) -> Result<Value> {
     match family {
-        Family::Llama => dense_config(source, false),
-        Family::Gemma => dense_config(source, true),
+        Family::Llama => transformer_config(source, false),
+        Family::Gemma => transformer_config(source, true),
         Family::Gemma4 => gemma4_config(source),
         Family::Phi => phi_config(source),
         Family::Qwen35 | Family::PhiMoe => Err(Error::Config(
@@ -16,7 +16,7 @@ pub fn synthesize_config(source: &dyn Checkpoint, family: Family) -> Result<Valu
     }
 }
 
-fn dense_config(source: &dyn Checkpoint, gemma: bool) -> Result<Value> {
+fn transformer_config(source: &dyn Checkpoint, gemma: bool) -> Result<Value> {
     let m = source.metadata();
     let arch = m
         .str("general.architecture")

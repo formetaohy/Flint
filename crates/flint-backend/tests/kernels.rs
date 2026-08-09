@@ -1,5 +1,5 @@
 use flint_backend::{Backend, Binding, Pass};
-use flint_kernel::{cpu, name};
+use flint_kernel::{Act, NormMode, cpu, name};
 use flint_tensor::{DType, Tensor, Weight};
 
 struct Ctx {
@@ -407,7 +407,7 @@ fn embed_gemma_scale() {
     embed_case(3, 16, 4.0, 13);
 }
 
-fn norm_case(mode: u32, rows: usize, dim: usize, w_dim: usize, seed: u64) {
+fn norm_case(mode: NormMode, rows: usize, dim: usize, w_dim: usize, seed: u64) {
     let mut ctx = Ctx::new();
     let mut rng = Rng(seed);
     let x = rng.fill(rows * dim);
@@ -421,7 +421,7 @@ fn norm_case(mode: u32, rows: usize, dim: usize, w_dim: usize, seed: u64) {
     ctx.dispatch(
         name::NORM,
         &[
-            ("MODE", mode as f64),
+            ("MODE", mode as u32 as f64),
             ("DIM", dim as f64),
             ("W_DIM", w_dim as f64),
             ("EPS", 1e-6),
@@ -541,22 +541,22 @@ fn norm_rope_mode4_pos72_repro() {
 
 #[test]
 fn norm_layer() {
-    norm_case(3, 4, 64, 64, 29);
+    norm_case(NormMode::Layer, 4, 64, 64, 29);
 }
 
 #[test]
 fn norm_offset() {
-    norm_case(0, 3, 64, 64, 21);
+    norm_case(NormMode::Offset, 3, 64, 64, 21);
 }
 
 #[test]
 fn norm_gated_weight_repeats_across_row() {
-    norm_case(1, 4, 64, 8, 31);
+    norm_case(NormMode::Gated, 4, 64, 8, 31);
 }
 
 #[test]
 fn norm_direct() {
-    norm_case(2, 2, 32, 32, 27);
+    norm_case(NormMode::Direct, 2, 32, 32, 27);
 }
 
 #[test]
@@ -617,7 +617,7 @@ fn swiglu() {
         &[Binding::Full(&gb), Binding::Full(&ub), Binding::Full(&y)],
         [1, 1, 1],
     );
-    agree(&ctx.read(&y), &cpu::swiglu(&g, &u, 0), 1e-5, 1e-6);
+    agree(&ctx.read(&y), &cpu::swiglu(&g, &u, Act::Silu), 1e-5, 1e-6);
 }
 
 #[test]
@@ -637,7 +637,7 @@ fn swiglu_gelu_tanh() {
         &[Binding::Full(&gb), Binding::Full(&ub), Binding::Full(&y)],
         [1, 1, 1],
     );
-    agree(&ctx.read(&y), &cpu::swiglu(&g, &u, 1), 1e-5, 1e-6);
+    agree(&ctx.read(&y), &cpu::swiglu(&g, &u, Act::GeluTanh), 1e-5, 1e-6);
 }
 
 #[test]
@@ -1535,14 +1535,14 @@ fn anchor_norm_modes() {
     let inv = (2.5f32 + 1e-6).sqrt().recip(); 
     let x = [1.0f32, 2.0];
 
-    let direct = cpu::norm(2, &x, &[2.0, 3.0], &[], 1, 2, 2, 1e-6);
+    let direct = cpu::norm(NormMode::Direct, &x, &[2.0, 3.0], &[], 1, 2, 2, 1e-6);
     assert_eq!(direct, vec![inv * 2.0, inv * 6.0]);
 
-    let offset = cpu::norm(0, &x, &[0.5, -0.25], &[], 1, 2, 2, 1e-6);
+    let offset = cpu::norm(NormMode::Offset, &x, &[0.5, -0.25], &[], 1, 2, 2, 1e-6);
     assert_eq!(offset, vec![inv * 1.5, inv * 1.5]);
 
     let silu1 = 1.0 / (1.0 + (-1.0f32).exp());
-    let gated = cpu::norm(1, &x, &[2.0, 3.0], &[0.0, 1.0], 1, 2, 2, 1e-6);
+    let gated = cpu::norm(NormMode::Gated, &x, &[2.0, 3.0], &[0.0, 1.0], 1, 2, 2, 1e-6);
     assert_eq!(gated[0], 0.0, "silu(0) gates the first element to zero");
     assert!((gated[1] - inv * 6.0 * silu1).abs() < 1e-6);
 }
@@ -1556,7 +1556,7 @@ fn anchor_elementwise() {
     assert_eq!(x, [11.0, 22.0, 13.0, 24.0]);
 
     let silu1 = 1.0 / (1.0 + (-1.0f32).exp());
-    let swi = cpu::swiglu(&[0.0, 1.0], &[2.0, 3.0], 0);
+    let swi = cpu::swiglu(&[0.0, 1.0], &[2.0, 3.0], Act::Silu);
     assert_eq!(swi[0], 0.0);
     assert!((swi[1] - silu1 * 3.0).abs() < 1e-6);
 

@@ -1,4 +1,4 @@
-use flint_model::loader::{choose_group, quantize};
+use flint_model::quant::{choose_group, quantize};
 
 #[test]
 fn group_prefers_128_then_falls_back() {

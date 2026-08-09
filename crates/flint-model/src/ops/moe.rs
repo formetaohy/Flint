@@ -3,7 +3,7 @@ use flint_error::Result;
 use flint_kernel::name;
 use flint_tensor::{DType, Tensor};
 
-use crate::loader::{ExpertWeights, MoeMlp};
+use crate::blocks::{ExpertWeights, MoeMlp};
 use crate::ops::{Act, M_MAX, gemm, swiglu};
 use crate::routing::Routing;
 

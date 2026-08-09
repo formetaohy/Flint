@@ -3,10 +3,10 @@ use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::{Error, Result};
 use serde_json::Value;
 
-use crate::dense::{DenseConfig, DenseModel, dense_plan};
+use crate::transformer::{TransformerConfig, TransformerModel, transformer_plan};
 
-pub fn parse_config(v: &Value) -> Result<DenseConfig> {
-    let mut cfg = DenseConfig::parse(v, true)?;
+pub fn parse_config(v: &Value) -> Result<TransformerConfig> {
+    let mut cfg = TransformerConfig::parse(v, true)?;
     cfg.embed_scale = (cfg.hidden as f32).sqrt();
     cfg.qk_norm = true;
     cfg.sandwich = true;
@@ -40,12 +40,12 @@ pub fn load(
     v: &Value,
     max_seq: u32,
     backend: &Backend,
-) -> Result<DenseModel> {
+) -> Result<TransformerModel> {
     let cfg = parse_config(v)?;
-    DenseModel::load(
+    TransformerModel::load(
         source,
         cfg,
-        &dense_plan(source.kind() == CheckpointKind::Gguf),
+        &transformer_plan(source.kind() == CheckpointKind::Gguf),
         max_seq,
         backend,
     )

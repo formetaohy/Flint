@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use flint_architectures::dense::{DenseConfig, DenseModel, dense_plan};
+use flint_architectures::transformer::{TransformerConfig, TransformerModel, transformer_plan};
 use flint_backend::Backend;
 use flint_error::Result;
 use flint_model::LanguageModel;
@@ -53,7 +53,7 @@ struct Args {
     attn_probe: bool,
 }
 
-fn config(s: &BenchSpec) -> DenseConfig {
+fn config(s: &BenchSpec) -> TransformerConfig {
     let v = json!({
         "hidden_size": s.hidden,
         "intermediate_size": s.intermediate,
@@ -66,7 +66,7 @@ fn config(s: &BenchSpec) -> DenseConfig {
         "eos_token_id": [0],
         "tie_word_embeddings": false,
     });
-    DenseConfig::parse(&v, false).unwrap()
+    TransformerConfig::parse(&v, false).unwrap()
 }
 
 fn main() -> Result<()> {
@@ -114,9 +114,9 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let source = SynthCheckpoint::new(spec);
     let cfg = config(&spec);
-    let plan = dense_plan(false);
+    let plan = transformer_plan(false);
     let mut backend = backend;
-    let mut model = DenseModel::load(&source, cfg, &plan, args.max_seq, &backend)?;
+    let mut model = TransformerModel::load(&source, cfg, &plan, args.max_seq, &backend)?;
     eprintln!(
         "[bench] weights loaded in {:.1}s",
         t0.elapsed().as_secs_f64()
@@ -233,7 +233,7 @@ fn bandwidth_probe() -> Result<()> {
 
 fn gemv_probe() -> Result<()> {
     use flint_backend::{Binding, Pass};
-    use flint_model::loader::{choose_group, quantize};
+    use flint_model::quant::{choose_group, quantize};
 
     let mut backend = Backend::new()?;
     eprintln!("[probe] adapter: {}", backend.adapter_name());
@@ -318,7 +318,7 @@ fn gemv_probe() -> Result<()> {
 
 fn cpu_probe() -> Result<()> {
     use flint_backend::{Binding, Pass};
-    use flint_model::loader::{choose_group, quantize};
+    use flint_model::quant::{choose_group, quantize};
 
     let mut backend = Backend::new()?;
     let n = 14336u32;
@@ -422,7 +422,7 @@ fn cpu_probe() -> Result<()> {
 
 fn gemm_probe() -> Result<()> {
     use flint_backend::{Binding, Pass};
-    use flint_model::loader::{choose_group, quantize};
+    use flint_model::quant::{choose_group, quantize};
 
     let mut backend = Backend::new()?;
     eprintln!("[probe] adapter: {}", backend.adapter_name());

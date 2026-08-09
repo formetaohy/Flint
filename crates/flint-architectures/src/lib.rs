@@ -1,12 +1,12 @@
 pub mod chat;
-pub mod dense;
 pub mod gemma;
 pub mod gemma4;
 pub mod gguf_config;
+pub mod keys;
 pub mod llama;
-pub mod names;
 pub mod phi;
 pub mod qwen35;
+pub mod transformer;
 
 use std::path::Path;
 
@@ -17,7 +17,7 @@ use flint_model::LanguageModel;
 use flint_tokenizer::Tokenizer;
 use serde_json::Value;
 
-use crate::chat::{ChatFormat, ChatMl, ChatMlThink, Gemma4Chat, GemmaChat, Phi4Chat, PhiChat};
+use crate::chat::{ChatFormat, ChatMl, ChatMlThink, Gemma4Chat, GemmaChat, Phi3Chat, Phi4Chat};
 use crate::qwen35::Qwen35;
 
 pub struct ChatModel {
@@ -70,7 +70,7 @@ impl Family {
             Family::Llama => Box::new(ChatMl),
             Family::Gemma => Box::new(GemmaChat),
             Family::Phi => Box::new(Phi4Chat),
-            Family::PhiMoe => Box::new(PhiChat),
+            Family::PhiMoe => Box::new(Phi3Chat),
             Family::Gemma4 => Box::new(Gemma4Chat),
         }
     }
