@@ -475,7 +475,6 @@ dependencies = [
  "flint-backend",
  "flint-checkpoint",
  "flint-error",
- "flint-generate",
  "flint-model",
  "flint-tensor",
  "flint-tokenizer",
