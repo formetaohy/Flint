@@ -21,14 +21,6 @@
 
 At its core is **Saturn**, a cross-platform GPU compute layer unifying Vulkan and Metal. Saturn abstracts away low-level syntax differences via **SCL** (Saturn Compute Language), enabling a single compute-shader codebase for all supported platforms. 
 
-```scl
-kernel add [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, N_ELEM: u32) {
-    if gid.x < N_ELEM {
-        y[gid.x] = a[gid.x] + b[gid.x];
-    }
-}
-```
-
 ## Features
 
 - **Cross-platform** — Write once, run everywhere.

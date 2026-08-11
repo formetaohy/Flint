@@ -21,14 +21,6 @@
 
 其核心是一个专为跨平台 Compute Shader 优化的 GPU 抽象层 **Saturn**，支持 Vulkan 和 Metal 后端。**Saturn** 还引入了 **SCL**（Saturn Compute Language）以屏蔽底层语法的差异，让一套代码适配所有支持的平台。
 
-```scl
-kernel add [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, N_ELEM: u32) {
-    if gid.x < N_ELEM {
-        y[gid.x] = a[gid.x] + b[gid.x];
-    }
-}
-```
-
 ## 特性
 
 - **跨平台** —— 一次编写，随处运行。
