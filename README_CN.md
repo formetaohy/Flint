@@ -1,8 +1,4 @@
-<!-- <p align="center">
-  <img src="assets/logo.png" alt="Flint" width="96" />
-</p> -->
-
-<h1 align="center">Flint</h1>
+![LOGO](assets/logo.svg)
 
 <p align="center">
   <strong>高性能、跨平台的 LLM 推理引擎</strong>

@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 510 180" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0C0E15"/>
+      <stop offset="50%" stop-color="#08090E"/>
+      <stop offset="100%" stop-color="#040508"/>
+    </linearGradient>
+
+    <linearGradient id="textGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="50%" stop-color="#FAF8F6"/>
+      <stop offset="100%" stop-color="#E5DFD8"/>
+    </linearGradient>
+
+    <linearGradient id="fireRingGrad1" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#E5002B"/>
+      <stop offset="35%" stop-color="#FF5500"/>
+      <stop offset="70%" stop-color="#FFAA00"/>
+      <stop offset="92%" stop-color="#FFEA00"/>
+      <stop offset="100%" stop-color="#FFFFFF"/>
+    </linearGradient>
+
+    <linearGradient id="fireRingGrad2" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#B80018"/>
+      <stop offset="40%" stop-color="#E63900"/>
+      <stop offset="80%" stop-color="#FF8800"/>
+      <stop offset="100%" stop-color="#FFDD44"/>
+    </linearGradient>
+
+    <linearGradient id="fireRingGrad3" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#7A000D"/>
+      <stop offset="50%" stop-color="#BD1B00"/>
+      <stop offset="100%" stop-color="#FF5500"/>
+    </linearGradient>
+
+    <linearGradient id="fireRingGrad4" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#3D0004"/>
+      <stop offset="60%" stop-color="#800900"/>
+      <stop offset="100%" stop-color="#C42800"/>
+    </linearGradient>
+  </defs>
+
+  <style>
+    .bg-card {
+      animation: fadeInBg 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+
+    .ring {
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+
+    .ring-4 {
+      opacity: 0;
+      animation: ringPop4 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.10s forwards;
+    }
+    .ring-3 {
+      opacity: 0;
+      animation: ringPop3 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.18s forwards;
+    }
+    .ring-2 {
+      opacity: 0;
+      animation: ringPop2 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.26s forwards;
+    }
+    .ring-1 {
+      opacity: 0;
+      animation: ringPop1 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.34s forwards;
+    }
+
+    .letter {
+      opacity: 0;
+      animation: letterSlide 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+
+    .letter-F { animation-delay: 0.42s; }
+    .letter-l { animation-delay: 0.48s; }
+    .letter-i { animation-delay: 0.54s; }
+    .letter-n { animation-delay: 0.62s; }
+    .letter-t { animation-delay: 0.68s; }
+
+    .spark-dot {
+      opacity: 0;
+      animation: dotIgnite 0.6s cubic-bezier(0.22, 1, 0.36, 1) 0.58s forwards;
+    }
+
+    @keyframes fadeInBg {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    @keyframes ringPop4 {
+      0% { opacity: 0; transform: scale(0.4) rotate(-15deg); }
+      100% { opacity: 0.35; transform: scale(1) rotate(0deg); }
+    }
+    @keyframes ringPop3 {
+      0% { opacity: 0; transform: scale(0.4) rotate(-15deg); }
+      100% { opacity: 0.60; transform: scale(1) rotate(0deg); }
+    }
+    @keyframes ringPop2 {
+      0% { opacity: 0; transform: scale(0.4) rotate(-15deg); }
+      100% { opacity: 0.85; transform: scale(1) rotate(0deg); }
+    }
+    @keyframes ringPop1 {
+      0% { opacity: 0; transform: scale(0.4) rotate(-15deg); }
+      100% { opacity: 1; transform: scale(1) rotate(0deg); }
+    }
+
+    @keyframes letterSlide {
+      from {
+        opacity: 0;
+        transform: translateX(-12px);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+
+    @keyframes dotIgnite {
+      0% {
+        opacity: 0;
+        transform: translate(333px, 51px) scale(0);
+      }
+      55% {
+        opacity: 0.95;
+        transform: translate(333px, 51px) scale(1.28);
+      }
+      80% {
+        opacity: 1;
+        transform: translate(333px, 51px) scale(0.92);
+      }
+      100% {
+        opacity: 1;
+        transform: translate(333px, 51px) scale(1);
+      }
+    }
+  </style>
+
+  <rect class="bg-card" width="510" height="180" fill="url(#bgGrad)" rx="20"/>
+
+  <g transform="translate(110, 90) scale(0.3714) translate(-399, -359)">
+    <circle class="ring ring-4" cx="420" cy="380" r="136" fill="none" stroke="url(#fireRingGrad4)" stroke-width="36"/>
+    <circle class="ring ring-3" cx="406" cy="366" r="136" fill="none" stroke="url(#fireRingGrad3)" stroke-width="36"/>
+    <circle class="ring ring-2" cx="392" cy="352" r="136" fill="none" stroke="url(#fireRingGrad2)" stroke-width="36"/>
+    <circle class="ring ring-1" cx="378" cy="338" r="136" fill="none" stroke="url(#fireRingGrad1)" stroke-width="36"/>
+  </g>
+
+  <g fill="url(#textGrad)">
+    <path class="letter letter-F" d="M207,44 H269 V62 H227 V81 H261 V99 H227 V136 H207 Z" />
+    <path class="letter letter-l" d="M287,44 H307 V136 H287 Z" />
+    <path class="letter letter-i" d="M323,72 H343 V136 H323 Z" />
+    <path class="letter letter-n" d="M359,72 H379 V86 C379,77 386,72 395,72 C406,72 415,80 415,92 V136 H395 V92 C395,88 392,86 387,86 C382,86 379,88 379,92 V136 H359 Z" />
+    <path class="letter letter-t" d="M437,52 H457 V72 H467 V88 H457 V118 C457,123 459,125 464,125 H467 V136 H461 C446,136 437,127 437,112 V88 H427 V72 H437 Z" />
+  </g>
+
+  <circle class="spark-dot" cx="0" cy="0" r="10.5" fill="url(#fireRingGrad1)" />
+</svg>

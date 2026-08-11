@@ -1,8 +1,4 @@
-<!-- <p align="center">
-  <img src="assets/logo.png" alt="Flint" width="96" />
-</p> -->
-
-<h1 align="center"><strong>Flint</strong></h1>
+![LOGO](assets/logo.svg)
 
 <p align="center">
   <strong>Fast, cross-platform LLM inference engine.</strong>
