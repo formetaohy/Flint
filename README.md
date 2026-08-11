@@ -17,11 +17,9 @@
 
 ## What is Flint?
 
-**Flint** is a high-performance LLM inference engine written in Rust. At its core lies **Saturn**, a GPU compute abstraction layer purpose-built for cross-platform compute shaders, enabling Flint to run seamlessly on Windows, Linux, Android, macOS, and iOS.
+**Flint** is a high-performance Rust-based LLM inference engine, running natively on Windows, Linux, Android, macOS, and iOS.
 
-### What is Saturn?
-
-**Saturn** is an abstraction layer designed for cross-platform GPU computing. It adopts compute shaders as a unified computing model and supports both Vulkan and Metal backends. To abstract away platform-specific shader syntax differences, **Saturn** introduces **SCL** (Saturn Compute Language), a cross-platform compute language. 
+At its core is **Saturn**, a cross-platform GPU compute layer unifying Vulkan and Metal. Saturn abstracts away low-level syntax differences via **SCL** (Saturn Compute Language), enabling a single compute-shader codebase for all supported platforms. 
 
 ```scl
 kernel add [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, N_ELEM: u32) {

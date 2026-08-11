@@ -17,10 +17,9 @@
 
 ## Flint 是什么？
 
-**Flint** 是一个用 Rust 编写的高性能 LLM 推理引擎。其内置一个专为跨平台计算着色器构建的 GPU 计算抽象层 Saturn，使 **Flint** 能够在 Windows、Linux、Android、macOS 和 iOS 上无缝运行。
+**Flint** 是一款基于 Rust 的高性能 LLM 推理引擎，原生支持 Windows、Linux、Android、macOS 与 iOS。
 
-### Saturn 是什么？
-**Saturn** 是一个专为跨平台 GPU 计算设计的抽象层。它采用 compute shader 作为统一的计算模型，并支持 Vulkan 和 Metal 后端。为了屏蔽平台特定的着色器语法差异，**Saturn** 还引入了一种跨平台计算语言**SCL**（Saturn Compute Language）。
+其核心是一个专为跨平台 Compute Shader 优化的 GPU 抽象层 **Saturn**，支持 Vulkan 和 Metal 后端。**Saturn** 还引入了 **SCL**（Saturn Compute Language）以屏蔽底层语法的差异，让一套代码适配所有支持的平台。
 
 ```scl
 kernel add [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, N_ELEM: u32) {
