@@ -21,7 +21,6 @@ fn group_rejects_unquantizable_width() {
 
 #[test]
 fn quantize_matches_hand_computed() {
-
     #[rustfmt::skip]
     let data: [f32; 64] = {
         let mut d = [0.0f32; 64];
@@ -60,7 +59,6 @@ fn quantize_roundtrip_stays_within_half_a_step() {
     assert_eq!(bytes.len(), rows * cols);
     assert_eq!(scales.len(), rows * cols / group);
     for (i, &b) in bytes.iter().enumerate() {
-
         let kb = i / (rows * 16);
         let rem = i % (rows * 16);
         let (r, ii) = (rem / 16, rem % 16);

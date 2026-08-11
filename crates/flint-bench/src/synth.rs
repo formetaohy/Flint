@@ -15,15 +15,14 @@ pub struct BenchSpec {
 }
 
 impl BenchSpec {
-
     pub fn weight_bytes(&self) -> u64 {
         let h = self.hidden as u64;
         let i = self.intermediate as u64;
         let l = self.layers as u64;
         let per_layer = (4 * h * h) + (3 * i * h) + (h + h) * 4;
-        let proj_bytes = per_layer * l * 33 / 32; 
-        let embed = self.vocab as u64 * h * 2; 
-        let head = self.vocab as u64 * h * 33 / 32; 
+        let proj_bytes = per_layer * l * 33 / 32;
+        let embed = self.vocab as u64 * h * 2;
+        let head = self.vocab as u64 * h * 33 / 32;
         proj_bytes + embed + head + h * 4
     }
 }

@@ -51,13 +51,19 @@ pub fn check(kernel: &ast::Kernel, specs: &[(&str, f64)]) -> Result<ir::Kernel> 
         let value = consts::const_eval(&spec.init, &consts).ok_or_else(|| {
             Diagnostic::new(
                 spec.span,
-                format!("spec '{}' initializer must be a constant expression", spec.name),
+                format!(
+                    "spec '{}' initializer must be a constant expression",
+                    spec.name
+                ),
             )
         })?;
         if !consts::validate(&value, spec.ty) {
             return Err(Diagnostic::new(
                 spec.span,
-                format!("spec '{}' initializer out of range for {:?}", spec.name, spec.ty),
+                format!(
+                    "spec '{}' initializer out of range for {:?}",
+                    spec.name, spec.ty
+                ),
             ));
         }
         consts.insert(spec.name.clone(), (value, spec.ty));
@@ -343,16 +349,15 @@ impl Checker {
                             "local variables must be scalar, matrix or vector".to_string(),
                         ));
                     }
-                    None if let Some(value) = consts::const_eval(init, &self.consts) => {
-                        if consts::may_negate(init) {
-                            let (init, init_ty) = self.check_expr(init, None)?;
-                            (init, init_ty)
-                        } else {
+                    None => {
+                        if let Some(value) = consts::const_eval(init, &self.consts)
+                            && !consts::may_negate(init)
+                        {
                             self.declare(name, Sym::InlineConst(value), *span)?;
                             return Ok(Vec::new());
                         }
+                        self.check_expr(init, None)?
                     }
-                    None => self.check_expr(init, None)?,
                 };
                 if !matches!(
                     init_ty,
@@ -967,7 +972,7 @@ impl Checker {
                             CVal::Float(v) => ast::Expr::FloatLit(v, *span),
                             CVal::Bool(v) => ast::Expr::BoolLit(v, *span),
                         };
-                        return self.check_expr_inner(&lit, expect);
+                        self.check_expr_inner(&lit, expect)
                     }
                     Some(Sym::BufParam(elem)) => Ok((
                         ir::Expr::ParamRef {
@@ -1518,10 +1523,7 @@ impl Checker {
         }
         if name == "bitcast_f32" || name == "bitcast_u32" {
             if args.len() != 1 {
-                return Err(Diagnostic::new(
-                    span,
-                    format!("{name} expects 1 argument"),
-                ));
+                return Err(Diagnostic::new(span, format!("{name} expects 1 argument")));
             }
             let (arg, _) = self.check_expr(
                 &args[0],
@@ -1548,10 +1550,7 @@ impl Checker {
         }
         if matches!(name, "popcount" | "clz" | "ctz") {
             if args.len() != 1 {
-                return Err(Diagnostic::new(
-                    span,
-                    format!("{name} expects 1 argument"),
-                ));
+                return Err(Diagnostic::new(span, format!("{name} expects 1 argument")));
             }
             let (arg, _) = self.check_expr(&args[0], Some(Type::Scalar(Scalar::U32)))?;
             return Ok((

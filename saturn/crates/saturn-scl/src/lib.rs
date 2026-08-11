@@ -53,12 +53,10 @@ fn precompile(path: &Path) -> Result<String, String> {
             .join("\n")
     })?;
     let spirv = saturn_shader::to_spirv(&kernel).map_err(|e| format!("SPIR-V generation: {e}"))?;
-    let (msl, entry) = saturn_shader::to_msl(&kernel).map_err(|e| format!("MSL generation: {e}"))?;
+    let (msl, entry) =
+        saturn_shader::to_msl(&kernel).map_err(|e| format!("MSL generation: {e}"))?;
     if kernel.name != entry {
-        return Err(format!(
-            "kernel entry mismatch: {} vs {entry}",
-            kernel.name
-        ));
+        return Err(format!("kernel entry mismatch: {} vs {entry}", kernel.name));
     }
     let scalars = kernel
         .scalars
@@ -76,26 +74,13 @@ fn precompile(path: &Path) -> Result<String, String> {
     let triples = kernel
         .coop_triples
         .iter()
-        .map(|(a, b, c)| {
-            format!(
-                "({}, {}, {})",
-                scalar_ts(*a),
-                scalar_ts(*b),
-                scalar_ts(*c)
-            )
-        })
+        .map(|(a, b, c)| format!("({}, {}, {})", scalar_ts(*a), scalar_ts(*b), scalar_ts(*c)))
         .collect::<Vec<_>>()
         .join(", ");
     let roles = kernel
         .coop_roles
         .iter()
-        .map(|(elem, role)| {
-            format!(
-                "({}, {})",
-                scalar_ts(*elem),
-                role.encode()
-            )
-        })
+        .map(|(elem, role)| format!("({}, {})", scalar_ts(*elem), role.encode()))
         .collect::<Vec<_>>()
         .join(", ");
     let spirv_ts = spirv
@@ -122,7 +107,8 @@ fn precompile(path: &Path) -> Result<String, String> {
         wg[2],
         kernel.params.len(),
     );
-    ts.parse().map_err(|e| format!("macro output generation: {e}"))
+    ts.parse()
+        .map_err(|e| format!("macro output generation: {e}"))
 }
 
 struct SclName(String);
@@ -154,8 +140,10 @@ pub fn scl(input: TokenStream) -> TokenStream {
         Ok(path) => match precompile(&path) {
             Ok(ts) => TokenStream::from_str(ts.as_str())
                 .unwrap_or_else(|e| compile_error(format!("scl/{name} output generation: {e}"))),
-            Err(msg) => compile_error(format!("scl/{name} is invalid:
-{msg}")),
+            Err(msg) => compile_error(format!(
+                "scl/{name} is invalid:
+{msg}"
+            )),
         },
         Err(msg) => compile_error(msg),
     }

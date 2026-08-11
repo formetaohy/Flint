@@ -23,18 +23,18 @@ pub fn gemm_qkv(
     yk: Binding<'_>,
     yv: Binding<'_>,
     rows: u32,
-    nk: u32,
+    kv_width: u32,
 ) -> Result<()> {
     if rows == 1 {
         gemv(backend, pass, x, wq, yq)?;
-        if nk > 0 {
+        if kv_width > 0 {
             gemv(backend, pass, x, wk, yk)?;
             gemv(backend, pass, x, wv, yv)?;
         }
         Ok(())
     } else {
         gemm(backend, pass, x, wq, yq, rows)?;
-        if nk > 0 {
+        if kv_width > 0 {
             gemm(backend, pass, x, wk, yk, rows)?;
             gemm(backend, pass, x, wv, yv, rows)?;
         }

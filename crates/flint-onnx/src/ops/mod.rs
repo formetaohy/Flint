@@ -12,12 +12,16 @@ use crate::tensor::{Data, Tensor};
 
 pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
     match node.op_type.as_str() {
-
         "Add" => math::arith(env, node, |a, b| a + b, |a, b| a + b),
         "Sub" => math::arith(env, node, |a, b| a - b, |a, b| a - b),
         "Mul" => math::arith(env, node, |a, b| a * b, |a, b| a * b),
         "Div" => math::arith(env, node, |a, b| a / b, |a, b| a / b),
-        "Pow" => math::arith(env, node, |a, b| a.powf(b), |a, b| a.saturating_pow(b as u32)),
+        "Pow" => math::arith(
+            env,
+            node,
+            |a, b| a.powf(b),
+            |a, b| a.saturating_pow(b as u32),
+        ),
         "Mod" => math::arith(env, node, |a, b| a % b, |a, b| a % b),
         "Min" => math::arith(env, node, f32::min, i64::min),
         "Max" => math::arith(env, node, f32::max, i64::max),
@@ -124,12 +128,8 @@ pub(crate) fn input<'a>(
         .get(i)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| Error::Model(format!("{}: missing input {i}", node.op_type)))?;
-    env.get(name).ok_or_else(|| {
-        Error::Model(format!(
-            "{}: input {name:?} was not produced",
-            node.op_type
-        ))
-    })
+    env.get(name)
+        .ok_or_else(|| Error::Model(format!("{}: input {name:?} was not produced", node.op_type)))
 }
 
 pub(crate) fn input_opt<'a>(
@@ -178,7 +178,9 @@ pub(crate) fn i64s(t: &Tensor) -> Result<&[i64]> {
 pub(crate) fn norm_axis(axis: i64, rank: usize) -> Result<usize> {
     let a = if axis < 0 { axis + rank as i64 } else { axis };
     if a < 0 || a >= rank as i64 {
-        return Err(Error::Model(format!("axis {axis} out of range for rank {rank}")));
+        return Err(Error::Model(format!(
+            "axis {axis} out of range for rank {rank}"
+        )));
     }
     Ok(a as usize)
 }
@@ -200,8 +202,8 @@ pub(crate) fn erf(x: f32) -> f32 {
     let x = x.abs();
     let t = 1.0 / (1.0 + 0.3275911 * x);
     let y = 1.0
-        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
-            + 0.254829592)
+        - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
             * t
             * (-x * x).exp();
     sign * y

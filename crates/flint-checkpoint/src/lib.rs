@@ -2,34 +2,133 @@ pub mod dequant;
 pub mod gguf;
 mod safetensors;
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use flint_error::{Error, Result};
 
-pub use gguf::{Gguf, GgufWriter, MetaVal, Metadata};
+pub use gguf::Gguf;
+pub use gguf::GgufWriter;
 pub use safetensors::{Safetensors, write_tensors};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MetaVal {
+    UInt(u64),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+    Arr(Vec<MetaVal>),
+}
+
+#[derive(Default)]
+pub struct Metadata {
+    kv: HashMap<String, MetaVal>,
+}
+
+impl Metadata {
+    pub fn new(kv: HashMap<String, MetaVal>) -> Self {
+        Self { kv }
+    }
+
+    pub fn insert(&mut self, key: String, value: MetaVal) {
+        self.kv.insert(key, value);
+    }
+
+    pub fn get(&self, key: &str) -> Option<&MetaVal> {
+        self.kv.get(key)
+    }
+
+    pub fn str(&self, key: &str) -> Option<&str> {
+        match self.kv.get(key) {
+            Some(MetaVal::Str(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn u64(&self, key: &str) -> Option<u64> {
+        match self.kv.get(key) {
+            Some(MetaVal::UInt(v)) => Some(*v),
+            Some(MetaVal::Int(v)) => u64::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn u32(&self, key: &str) -> Option<u32> {
+        self.u64(key).and_then(|v| u32::try_from(v).ok())
+    }
+
+    pub fn f64(&self, key: &str) -> Option<f64> {
+        match self.kv.get(key) {
+            Some(MetaVal::Float(v)) => Some(*v),
+            Some(MetaVal::UInt(v)) => Some(*v as f64),
+            Some(MetaVal::Int(v)) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
+    pub fn str_array(&self, key: &str) -> Option<Vec<&str>> {
+        match self.kv.get(key) {
+            Some(MetaVal::Arr(items)) => items
+                .iter()
+                .map(|v| match v {
+                    MetaVal::Str(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    }
+
+    pub fn u32_array(&self, key: &str) -> Option<Vec<u32>> {
+        match self.kv.get(key) {
+            Some(MetaVal::Arr(items)) => items
+                .iter()
+                .map(|v| match v {
+                    MetaVal::UInt(n) => u32::try_from(*n).ok(),
+                    MetaVal::Int(n) => u32::try_from(*n).ok(),
+                    MetaVal::Bool(b) => Some(*b as u32),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    }
+
+    pub fn f64_array(&self, key: &str) -> Option<Vec<f64>> {
+        match self.kv.get(key) {
+            Some(MetaVal::Arr(items)) => items
+                .iter()
+                .map(|v| match v {
+                    MetaVal::Float(f) => Some(*f),
+                    MetaVal::UInt(n) => Some(*n as f64),
+                    MetaVal::Int(n) => Some(*n as f64),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    }
+}
 
 pub enum TensorData {
     F32(Vec<f32>),
 
-    Bf16(Vec<u8>),
+    Bf16Bytes(Vec<u8>),
 
-    Q8 { bytes: Vec<u8>, numel: usize },
+    Q8Blocks { bytes: Vec<u8>, numel: usize },
 }
 
 impl TensorData {
-
-    pub fn into_f32(self) -> Vec<f32> {
+    pub fn into_f32(self) -> Result<Vec<f32>> {
         match self {
-            TensorData::F32(v) => v,
-            TensorData::Bf16(b) => b
+            TensorData::F32(v) => Ok(v),
+            TensorData::Bf16Bytes(b) => Ok(b
                 .chunks_exact(2)
                 .map(|c| saturn_core::num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect(),
-            TensorData::Q8 { bytes, numel } => {
-
+                .collect()),
+            TensorData::Q8Blocks { bytes, numel } => {
                 dequant::to_f32(dequant::GgmlType::Q8_0, &bytes, numel)
-                    .expect("Q8 block stream must be valid")
             }
         }
     }

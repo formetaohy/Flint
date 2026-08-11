@@ -1,13 +1,16 @@
 kernel norm [workgroup(256, 1, 1)]
     (x: buf<f32>, w: buf<f32>, gate: buf<f32>, y: buf<f32>,
      cos_tbl: buf<f32>, sin_tbl: buf<f32>, args: buf<u32>,
-     MODE: u32, DIM: u32, W_DIM: u32, EPS: f32, HEADS: u32, ROT: u32, COS_STRIDE: u32)
+     MODE: u32, DIM: u32, W_DIM: u32, EPS: f32, HEADS: u32, ROT: u32, COS_STRIDE: u32,
+     STRIDE: u32, PLE: u32, PLE_LAYERS: u32, PLE_STRIDE: u32)
 {
     shared red: [f32; 256];
     shared mean: [f32; 256];
     shared tile: [f32; 520];
     let row = block.x;
-    let base = row * DIM;
+    let base = PLE == 1
+        ? (row / PLE_LAYERS) * PLE_STRIDE + (row % PLE_LAYERS) * DIM
+        : row * STRIDE;
     let t = thread.x;
     let vbase = base / 4;
     let vdim = DIM / 4;
@@ -88,18 +91,23 @@ kernel norm [workgroup(256, 1, 1)]
         barrier();
         let pos_m = args[0] + row / HEADS;
         let half = ROT / 2;
-        if t < DIM {
-            let cc = cos_tbl[pos_m * COS_STRIDE + t % half];
-            let ss = sin_tbl[pos_m * COS_STRIDE + t % half];
-            if t < ROT {
-                if t < half {
-                    y[base + t] = tile[t] * cc - tile[t + half] * ss;
+        var wt = t;
+        loop {
+            if wt >= DIM {
+                break;
+            }
+            let cc = cos_tbl[pos_m * COS_STRIDE + wt % half];
+            let ss = sin_tbl[pos_m * COS_STRIDE + wt % half];
+            if wt < ROT {
+                if wt < half {
+                    y[base + wt] = tile[wt] * cc - tile[wt + half] * ss;
                 } else {
-                    y[base + t] = tile[t] * cc + tile[t - half] * ss;
+                    y[base + wt] = tile[wt] * cc + tile[wt - half] * ss;
                 }
             } else {
-                y[base + t] = tile[t];
+                y[base + wt] = tile[wt];
             }
+            wt = wt + 256;
         }
     } else {
         i = t;

@@ -39,16 +39,15 @@ pub fn expand(program: &Program) -> Result<Kernel> {
             init,
             span,
         } = stmt
+            && let Some(value) = consts::const_eval(init, &expander.consts)
         {
-            if let Some(value) = consts::const_eval(init, &expander.consts) {
-                if !consts::validate(&value, *ty) {
-                    return Err(Diagnostic::new(
-                        *span,
-                        format!("const initializer out of range for {ty:?}"),
-                    ));
-                }
-                expander.consts.insert(name.clone(), (value, *ty));
+            if !consts::validate(&value, *ty) {
+                return Err(Diagnostic::new(
+                    *span,
+                    format!("const initializer out of range for {ty:?}"),
+                ));
             }
+            expander.consts.insert(name.clone(), (value, *ty));
         }
     }
     let body = expander.expand_stmts(&program.kernel.body)?;
@@ -93,13 +92,13 @@ fn validate_fn_decl(f: &FnDecl) -> Result<()> {
             ));
         }
     }
-    if let Some(ret) = &f.ret {
-        if matches!(ret, Type::Matrix { .. }) {
-            return Err(Diagnostic::new(
-                f.span,
-                format!("function '{}' cannot return a matrix", f.name),
-            ));
-        }
+    if let Some(ret) = &f.ret
+        && matches!(ret, Type::Matrix { .. })
+    {
+        return Err(Diagnostic::new(
+            f.span,
+            format!("function '{}' cannot return a matrix", f.name),
+        ));
     }
     Ok(())
 }
@@ -130,7 +129,7 @@ impl<'a> Expander<'a> {
                 out.extend(prelude);
                 out.push(Stmt::Let {
                     name: name.clone(),
-                    ty: ty.clone(),
+                    ty: *ty,
                     init,
                     span: *span,
                 });
@@ -145,7 +144,7 @@ impl<'a> Expander<'a> {
                 out.extend(prelude);
                 out.push(Stmt::Var {
                     name: name.clone(),
-                    ty: ty.clone(),
+                    ty: *ty,
                     init,
                     span: *span,
                 });
@@ -206,23 +205,21 @@ impl<'a> Expander<'a> {
                 });
             }
             Stmt::ExprStmt { expr, span } => {
-                if let Expr::Call { name, args, .. } = expr {
-                    if let Some(callee) = self.fns.get(name.as_str()).copied() {
-                        let mut prelude = Vec::new();
-                        let args = self.lift_args(args, &mut prelude)?;
-                        if callee.ret.is_some() {
-                            return Err(Diagnostic::new(
-                                *span,
-                                format!(
-                                    "call to non-void function '{name}' must be used as a value"
-                                ),
-                            ));
-                        }
-                        let (mut body, _) = self.expand_call(callee, &args, *span)?;
-                        out.extend(prelude);
-                        out.append(&mut body);
-                        return Ok(());
+                if let Expr::Call { name, args, .. } = expr
+                    && let Some(callee) = self.fns.get(name.as_str()).copied()
+                {
+                    let mut prelude = Vec::new();
+                    let args = self.lift_args(args, &mut prelude)?;
+                    if callee.ret.is_some() {
+                        return Err(Diagnostic::new(
+                            *span,
+                            format!("call to non-void function '{name}' must be used as a value"),
+                        ));
                     }
+                    let (mut body, _) = self.expand_call(callee, &args, *span)?;
+                    out.extend(prelude);
+                    out.append(&mut body);
+                    return Ok(());
                 }
                 let (prelude, expr) = self.lift_expr(expr)?;
                 out.extend(prelude);
@@ -297,12 +294,7 @@ impl<'a> Expander<'a> {
                 expr: Box::new(self.lift_inner(e, prelude)?),
                 span: *span,
             }),
-            Expr::Binary {
-                op,
-                lhs,
-                rhs,
-                span,
-            } => Ok(Expr::Binary {
+            Expr::Binary { op, lhs, rhs, span } => Ok(Expr::Binary {
                 op: *op,
                 lhs: Box::new(self.lift_inner(lhs, prelude)?),
                 rhs: Box::new(self.lift_inner(rhs, prelude)?),
@@ -320,7 +312,7 @@ impl<'a> Expander<'a> {
                 span: *span,
             }),
             Expr::Convert { ty, expr: e, span } => Ok(Expr::Convert {
-                ty: ty.clone(),
+                ty: *ty,
                 expr: Box::new(self.lift_inner(e, prelude)?),
                 span: *span,
             }),
@@ -330,7 +322,7 @@ impl<'a> Expander<'a> {
                     lifted.push(self.lift_inner(arg, prelude)?);
                 }
                 Ok(Expr::Construct {
-                    ty: ty.clone(),
+                    ty: *ty,
                     args: lifted,
                     span: *span,
                 })
@@ -415,14 +407,12 @@ impl<'a> Expander<'a> {
         self.call_stack.push(callee.name.clone());
         let ret_name = callee.ret.as_ref().map(|_| self.fresh("ret"));
         let done_name = self.fresh("done");
-        let ret_ref = ret_name
-            .as_ref()
-            .map(|name| Expr::Name(name.clone(), span));
+        let ret_ref = ret_name.as_ref().map(|name| Expr::Name(name.clone(), span));
         let mut wrapped = Vec::new();
         if let (Some(ret_name), Some(ret_ty)) = (&ret_name, &callee.ret) {
             wrapped.push(Stmt::Var {
                 name: ret_name.clone(),
-                ty: Some(ret_ty.clone()),
+                ty: Some(*ret_ty),
                 init: zero_expr(ret_ty, span),
                 span,
             });
@@ -435,7 +425,9 @@ impl<'a> Expander<'a> {
         });
         transform_returns(&mut body, ret_name.as_deref(), &done_name);
         let mut loop_body = self.expand_stmts(&body)?;
-        loop_body.push(Stmt::Break { span });
+        if callee.ret.is_none() {
+            loop_body.push(Stmt::Break { span });
+        }
         wrapped.push(Stmt::Loop {
             body: loop_body,
             span,

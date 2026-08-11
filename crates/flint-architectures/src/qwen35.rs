@@ -5,7 +5,8 @@ use flint_model::blocks::{SwigluMlp, take_mlp};
 use flint_model::cache::{KvCache, RecurrentState};
 use flint_model::config::{check_gemm_dims, check_head_dim, f64_field, req, u32_field, u32_list};
 use flint_model::loader::{self, Plan, Role, WeightSet};
-use flint_model::ops::{self, Act, M_MAX, MlpTiles, NormMode};
+use flint_model::ops::{self, Act, MlpTiles, NormMode};
+use flint_model::step::{self, MAX_M};
 use flint_model::{ChunkOut, LanguageModel, Speculator};
 use flint_tensor::{Tensor, Weight};
 use serde_json::Value;
@@ -112,11 +113,11 @@ impl Qwen35Config {
         if !t.q_heads.is_multiple_of(t.kv_heads) {
             return Err(Error::Config("q heads not divisible by kv heads".into()));
         }
-        if t.q_heads / t.kv_heads > ops::MAX_GQA {
+        if t.q_heads / t.kv_heads > step::MAX_GQA {
             return Err(Error::Config(format!(
                 "GQA ratio {} exceeds the attention shader's {} head slots",
                 t.q_heads / t.kv_heads,
-                ops::MAX_GQA
+                step::MAX_GQA
             )));
         }
         check_head_dim(t.head_dim)?;
@@ -224,7 +225,7 @@ fn take_full_layer(w: &mut WeightSet, p: &str) -> Result<Box<FullLayerW>> {
         o: w.take(&k("self_attn.o_proj.weight"))?,
         q_norm: w.take_tensor(&k("self_attn.q_norm.weight"))?,
         k_norm: w.take_tensor(&k("self_attn.k_norm.weight"))?,
-        mlp: take_mlp(w, p, false)?,
+        mlp: take_mlp(w, p, false, false)?,
     }))
 }
 
@@ -241,7 +242,7 @@ fn take_linear_layer(w: &mut WeightSet, p: &str) -> Result<Box<LinearLayerW>> {
         dt_bias: w.take_tensor(&k("dt_bias"))?,
         norm: w.take_tensor(&k("norm.weight"))?,
         out_proj: w.take(&k("out_proj.weight"))?,
-        mlp: take_mlp(w, p, false)?,
+        mlp: take_mlp(w, p, false, false)?,
     }))
 }
 
@@ -252,31 +253,31 @@ struct Scratch {
     hidden: Tensor,
     hidden2: Tensor,
     normed: Tensor,
-    qkv_raw: Tensor,
-    convd: Tensor,
+    qkv_proj: Tensor,
+    conv_out: Tensor,
 
-    qk_exp: Tensor,
+    qk_expanded: Tensor,
     z: Tensor,
     b: Tensor,
     a: Tensor,
     beta: Tensor,
     g: Tensor,
     attn_out: Tensor,
-    attn_out2: Tensor,
+    attn_gated: Tensor,
 
     attn_scratch: Tensor,
     qg: Tensor,
     q: Tensor,
-    q2: Tensor,
+    q_normed: Tensor,
     gate: Tensor,
-    k1: Tensor,
-    k2: Tensor,
-    v1: Tensor,
+    k_raw: Tensor,
+    k_normed: Tensor,
+    v_raw: Tensor,
     mlp: MlpTiles,
     logits: Tensor,
-    mtp_e: Tensor,
-    mtp_h: Tensor,
-    mtp_cat: Tensor,
+    mtp_emb: Tensor,
+    mtp_hidden: Tensor,
+    mtp_concat: Tensor,
 }
 
 fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
@@ -284,45 +285,45 @@ fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
     let i = cfg.intermediate;
     let z = |shape: &[u32]| backend.zero_tensor(shape);
     Scratch {
-        ids: ops::token_ids(backend),
-        args: ops::step_args(backend),
-        hidden: z(&[M_MAX, h]),
-        hidden2: z(&[M_MAX, h]),
-        normed: z(&[M_MAX, h]),
-        qkv_raw: z(&[M_MAX, cfg.conv_dim()]),
-        convd: z(&[M_MAX, cfg.conv_dim()]),
-        qk_exp: z(&[M_MAX, cfg.qk_exp_dim()]),
-        z: z(&[M_MAX, cfg.value_dim()]),
-        b: z(&[M_MAX, cfg.lin_val_heads]),
-        a: z(&[M_MAX, cfg.lin_val_heads]),
+        ids: step::token_ids(backend),
+        args: step::step_args(backend),
+        hidden: z(&[MAX_M, h]),
+        hidden2: z(&[MAX_M, h]),
+        normed: z(&[MAX_M, h]),
+        qkv_proj: z(&[MAX_M, cfg.conv_dim()]),
+        conv_out: z(&[MAX_M, cfg.conv_dim()]),
+        qk_expanded: z(&[MAX_M, cfg.qk_exp_dim()]),
+        z: z(&[MAX_M, cfg.value_dim()]),
+        b: z(&[MAX_M, cfg.lin_val_heads]),
+        a: z(&[MAX_M, cfg.lin_val_heads]),
         beta: z(&[cfg.lin_val_heads]),
         g: z(&[cfg.lin_val_heads]),
-        attn_out: z(&[M_MAX, cfg.value_dim()]),
-        attn_out2: z(&[M_MAX, cfg.value_dim()]),
+        attn_out: z(&[MAX_M, cfg.value_dim()]),
+        attn_gated: z(&[MAX_M, cfg.value_dim()]),
         attn_scratch: z(&[
-            M_MAX,
+            MAX_M,
             cfg.kv_heads,
-            ops::ATTN_SEGS,
-            ops::MAX_GQA,
-            cfg.head_dim + ops::ATTN_PAD,
+            step::ATTN_SEGS,
+            step::MAX_GQA,
+            cfg.head_dim + step::ATTN_PAD,
         ]),
-        qg: z(&[M_MAX, cfg.q_heads * cfg.head_dim * 2]),
-        q: z(&[M_MAX, cfg.q_heads * cfg.head_dim]),
-        q2: z(&[M_MAX, cfg.q_heads * cfg.head_dim]),
-        gate: z(&[M_MAX, cfg.q_heads * cfg.head_dim]),
-        k1: z(&[M_MAX, cfg.kv_heads * cfg.head_dim]),
-        k2: z(&[M_MAX, cfg.kv_heads * cfg.head_dim]),
-        v1: z(&[M_MAX, cfg.kv_heads * cfg.head_dim]),
+        qg: z(&[MAX_M, cfg.q_heads * cfg.head_dim * 2]),
+        q: z(&[MAX_M, cfg.q_heads * cfg.head_dim]),
+        q_normed: z(&[MAX_M, cfg.q_heads * cfg.head_dim]),
+        gate: z(&[MAX_M, cfg.q_heads * cfg.head_dim]),
+        k_raw: z(&[MAX_M, cfg.kv_heads * cfg.head_dim]),
+        k_normed: z(&[MAX_M, cfg.kv_heads * cfg.head_dim]),
+        v_raw: z(&[MAX_M, cfg.kv_heads * cfg.head_dim]),
         mlp: MlpTiles {
-            gate_out: z(&[M_MAX, i]),
-            up_out: z(&[M_MAX, i]),
-            act: z(&[M_MAX, i]),
-            down_out: z(&[M_MAX, h]),
+            gate_out: z(&[MAX_M, i]),
+            up_out: z(&[MAX_M, i]),
+            act: z(&[MAX_M, i]),
+            down_out: z(&[MAX_M, h]),
         },
-        logits: z(&[M_MAX, cfg.vocab]),
-        mtp_e: z(&[M_MAX, h]),
-        mtp_h: z(&[M_MAX, h]),
-        mtp_cat: z(&[M_MAX, 2 * h]),
+        logits: z(&[MAX_M, cfg.vocab]),
+        mtp_emb: z(&[MAX_M, h]),
+        mtp_hidden: z(&[MAX_M, h]),
+        mtp_concat: z(&[MAX_M, 2 * h]),
     }
 }
 
@@ -346,7 +347,6 @@ pub struct Qwen35 {
 }
 
 impl Qwen35 {
-
     fn logit_head(&self) -> &Weight {
         self.lm_head.as_ref().unwrap_or(&self.embed)
     }
@@ -433,6 +433,7 @@ impl Qwen35 {
             cfg.rotary_dim(),
             cfg.rope_theta,
             None,
+            None,
         );
         Ok(Self {
             cfg,
@@ -462,8 +463,8 @@ impl LanguageModel for Qwen35 {
         hidden_rows: &[u32],
     ) -> Result<ChunkOut> {
         let m = tokens.len() as u32;
-        if m == 0 || m > M_MAX {
-            return Err(Error::Model(format!("chunk size {m} outside [1, {M_MAX}]")));
+        if m == 0 || m > MAX_M {
+            return Err(Error::Model(format!("chunk size {m} outside [1, {MAX_M}]")));
         }
         if self.pos + m > self.max_seq {
             return Err(Error::Model(format!(
@@ -471,10 +472,10 @@ impl LanguageModel for Qwen35 {
                 self.max_seq
             )));
         }
-        let mut ids = vec![0u32; M_MAX as usize];
+        let mut ids = vec![0u32; MAX_M as usize];
         ids[..tokens.len()].copy_from_slice(tokens);
         backend.write_u32(self.s.ids.buf.as_ref(), &ids);
-        ops::write_step_args(backend, &self.s.args, self.pos, self.pos + m);
+        step::write_step_args(backend, &self.s.args, self.pos, self.pos + m);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder()?;
@@ -528,8 +529,8 @@ impl LanguageModel for Qwen35 {
         backend.submit(enc)?;
 
         let out = ChunkOut {
-            logits: ops::read_rows(backend, &self.s.logits, logit_rows, m, cfg.vocab)?,
-            hidden: ops::read_rows(backend, &self.s.hidden, hidden_rows, m, cfg.hidden)?,
+            logits: step::read_rows(backend, &self.s.logits, logit_rows, m, cfg.vocab)?,
+            hidden: step::read_rows(backend, &self.s.hidden, hidden_rows, m, cfg.hidden)?,
         };
         self.pos += m;
         Ok(out)
@@ -585,11 +586,11 @@ impl Speculator for Qwen35 {
             )));
         }
 
-        let mut ids = vec![0u32; M_MAX as usize];
+        let mut ids = vec![0u32; MAX_M as usize];
         ids[0] = token;
         backend.write_u32(self.s.ids.buf.as_ref(), &ids);
-        ops::write_step_args(backend, &self.s.args, self.mtp_pos, self.mtp_pos + 1);
-        backend.write_f32(self.s.mtp_h.buf.as_ref(), hidden);
+        step::write_step_args(backend, &self.s.args, self.mtp_pos, self.mtp_pos + 1);
+        backend.write_f32(self.s.mtp_hidden.buf.as_ref(), hidden);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder()?;
@@ -613,7 +614,7 @@ impl Speculator for Qwen35 {
                 Binding::Full(&s.hidden),
                 &mtp.pre_fc_norm_embedding,
                 Binding::Full(&s.hidden),
-                Binding::Full(&s.mtp_e),
+                Binding::Full(&s.mtp_emb),
                 1,
                 cfg.hidden,
                 cfg.hidden,
@@ -623,9 +624,9 @@ impl Speculator for Qwen35 {
                 backend,
                 &mut pass,
                 NormMode::Offset,
-                Binding::Full(&s.mtp_h),
+                Binding::Full(&s.mtp_hidden),
                 &mtp.pre_fc_norm_hidden,
-                Binding::Full(&s.mtp_h),
+                Binding::Full(&s.mtp_hidden),
                 Binding::Full(&s.normed),
                 1,
                 cfg.hidden,
@@ -635,16 +636,16 @@ impl Speculator for Qwen35 {
             ops::concat(
                 backend,
                 &mut pass,
-                Binding::Full(&s.mtp_e),
+                Binding::Full(&s.mtp_emb),
                 Binding::Full(&s.normed),
-                Binding::Full(&s.mtp_cat),
+                Binding::Full(&s.mtp_concat),
                 1,
                 cfg.hidden,
             )?;
             ops::gemm(
                 backend,
                 &mut pass,
-                Binding::Full(&s.mtp_cat),
+                Binding::Full(&s.mtp_concat),
                 &mtp.fc,
                 Binding::Full(&s.hidden),
                 1,
@@ -822,7 +823,7 @@ fn full_attn_block(
         Binding::Full(&s.q),
         &w.q_norm,
         Binding::Full(&s.q),
-        Binding::Full(&s.q2),
+        Binding::Full(&s.q_normed),
         m * nq,
         hd,
         hd,
@@ -833,17 +834,17 @@ fn full_attn_block(
         pass,
         Binding::Full(&s.normed),
         &w.k,
-        Binding::Full(&s.k1),
+        Binding::Full(&s.k_raw),
         m,
     )?;
     ops::norm(
         backend,
         pass,
         NormMode::Offset,
-        Binding::Full(&s.k1),
+        Binding::Full(&s.k_raw),
         &w.k_norm,
-        Binding::Full(&s.k1),
-        Binding::Full(&s.k2),
+        Binding::Full(&s.k_raw),
+        Binding::Full(&s.k_normed),
         m * nkv,
         hd,
         hd,
@@ -854,7 +855,7 @@ fn full_attn_block(
         pass,
         Binding::Full(&s.normed),
         &w.v,
-        Binding::Full(&s.v1),
+        Binding::Full(&s.v_raw),
         m,
     )?;
 
@@ -863,7 +864,7 @@ fn full_attn_block(
         pass,
         cos,
         sin,
-        Binding::Full(&s.q2),
+        Binding::Full(&s.q_normed),
         nq,
         hd,
         cfg.rotary_dim(),
@@ -875,7 +876,7 @@ fn full_attn_block(
         pass,
         cos,
         sin,
-        Binding::Full(&s.k2),
+        Binding::Full(&s.k_normed),
         nkv,
         hd,
         cfg.rotary_dim(),
@@ -885,8 +886,8 @@ fn full_attn_block(
     ops::kv_store(
         backend,
         pass,
-        Binding::Full(&s.k2),
-        Binding::Full(&s.v1),
+        Binding::Full(&s.k_normed),
+        Binding::Full(&s.v_raw),
         &kv.k,
         &kv.v,
         nkv,
@@ -896,35 +897,36 @@ fn full_attn_block(
         m,
     )?;
 
-        ops::attn(
-            backend,
-            pass,
-            Binding::Full(&s.q2),
-            &kv.k,
-            &kv.v,
-            &s.attn_scratch,
-            Binding::Full(&s.attn_out),
-            nq,
-            nkv,
-            hd,
-            kv.max_seq,
-            args,
-            m,
-            0,
-            hd + ops::ATTN_PAD,
-        )?;
+    ops::attn(
+        backend,
+        pass,
+        Binding::Full(&s.q_normed),
+        &kv.k,
+        &kv.v,
+        &s.attn_scratch,
+        Binding::Full(&s.attn_out),
+        nq,
+        nkv,
+        hd,
+        kv.max_seq,
+        args,
+        m,
+        0,
+        hd + step::ATTN_PAD,
+        (hd as f32).sqrt().recip(),
+    )?;
     ops::sigmoid_mul(
         backend,
         pass,
         Binding::Full(&s.attn_out),
         Binding::Full(&s.gate),
-        Binding::Full(&s.attn_out2),
+        Binding::Full(&s.attn_gated),
         m * nq * hd,
     )?;
     ops::gemm(
         backend,
         pass,
-        Binding::Full(&s.attn_out2),
+        Binding::Full(&s.attn_gated),
         &w.o,
         Binding::Full(&s.mlp.down_out),
         m,
@@ -948,7 +950,7 @@ fn linear_attn_block(
         pass,
         Binding::Full(&s.normed),
         &w.in_proj_qkv,
-        Binding::Full(&s.qkv_raw),
+        Binding::Full(&s.qkv_proj),
         m,
     )?;
     ops::gemm(
@@ -981,18 +983,18 @@ fn linear_attn_block(
         ops::conv1d(
             backend,
             pass,
-            Binding::Slice(&s.qkv_raw, row(t, conv_d), conv_d as u64 * 4),
+            Binding::Slice(&s.qkv_proj, row(t, conv_d), conv_d as u64 * 4),
             &w.conv1d,
             &state.conv,
-            Binding::Slice(&s.convd, row(t, conv_d), conv_d as u64 * 4),
+            Binding::Slice(&s.conv_out, row(t, conv_d), conv_d as u64 * 4),
             conv_d,
         )?;
     }
     ops::repeat_qk(
         backend,
         pass,
-        Binding::Full(&s.convd),
-        Binding::Full(&s.qk_exp),
+        Binding::Full(&s.conv_out),
+        Binding::Full(&s.qk_expanded),
         m,
         cfg.lin_key_heads,
         heads,
@@ -1003,7 +1005,6 @@ fn linear_attn_block(
 
     let qkb = exp_d as u64 * 2;
     for t in 0..m {
-
         ops::delta_gate(
             backend,
             pass,
@@ -1021,9 +1022,9 @@ fn linear_attn_block(
         ops::delta_recur(
             backend,
             pass,
-            Binding::Slice(&s.qk_exp, ed, qkb),
-            Binding::Slice(&s.qk_exp, ed + qkb, qkb),
-            Binding::Slice(&s.convd, row(t, conv_d) + kb * 2, vb),
+            Binding::Slice(&s.qk_expanded, ed, qkb),
+            Binding::Slice(&s.qk_expanded, ed + qkb, qkb),
+            Binding::Slice(&s.conv_out, row(t, conv_d) + kb * 2, vb),
             Binding::Full(&s.beta),
             Binding::Full(&s.g),
             &state.recur,
@@ -1042,7 +1043,7 @@ fn linear_attn_block(
         Binding::Slice(&s.attn_out, 0, span),
         &w.norm,
         Binding::Slice(&s.z, 0, span),
-        Binding::Slice(&s.attn_out2, 0, span),
+        Binding::Slice(&s.attn_gated, 0, span),
         m * heads,
         cfg.lin_val_dim,
         cfg.lin_val_dim,
@@ -1051,7 +1052,7 @@ fn linear_attn_block(
     ops::gemm(
         backend,
         pass,
-        Binding::Full(&s.attn_out2),
+        Binding::Full(&s.attn_gated),
         &w.out_proj,
         Binding::Full(&s.mlp.down_out),
         m,

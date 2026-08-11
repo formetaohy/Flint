@@ -8,7 +8,7 @@ use safetensors::tensor::{Dtype, SafeTensors, TensorView};
 
 use flint_error::{Error, Result};
 
-use super::gguf::Metadata;
+use super::Metadata;
 use super::{Checkpoint, CheckpointKind, RawTensor, TensorData};
 
 pub struct Safetensors {
@@ -44,7 +44,7 @@ impl Safetensors {
                 return Err(Error::Model(format!(
                     "cannot read {}: {e}",
                     index_path.display()
-                )))
+                )));
             }
         };
         Ok(Self {
@@ -78,7 +78,7 @@ impl Checkpoint for Safetensors {
         let shape: Vec<u32> = view.shape().iter().map(|d| *d as u32).collect();
         let data = match view.dtype() {
             Dtype::F32 => TensorData::F32(f32_bytes(view.data()).to_vec()),
-            Dtype::BF16 => TensorData::Bf16(view.data().to_vec()),
+            Dtype::BF16 => TensorData::Bf16Bytes(view.data().to_vec()),
             Dtype::F16 => TensorData::F32(view.data().chunks_exact(2).map(f16).collect()),
             other => {
                 return Err(Error::Model(format!(

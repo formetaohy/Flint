@@ -231,8 +231,7 @@ fn rejects_reserved_name_shadowing() {
     let err = compile("kernel k [workgroup(1,1,1)] (a: buf<u32>) { let buf = 1; }")
         .expect_err("should fail");
     assert!(diag_msg(&err).contains("reserved name"));
-    let err = compile("kernel k [workgroup(1,1,1)] (let: buf<u32>) {}")
-        .expect_err("should fail");
+    let err = compile("kernel k [workgroup(1,1,1)] (let: buf<u32>) {}").expect_err("should fail");
     assert!(diag_msg(&err).contains("reserved name"));
 }
 
@@ -265,24 +264,27 @@ fn bitcast_builtins() {
         panic!("expected call");
     };
     assert_eq!(*name, "bitcast_f32");
-    assert_eq!(*ty, saturn_compiler::ir::Type::Scalar(saturn_compiler::ir::Scalar::F32));
+    assert_eq!(
+        *ty,
+        saturn_compiler::ir::Type::Scalar(saturn_compiler::ir::Scalar::F32)
+    );
 }
 
 #[test]
 fn rejects_bitcast_wrong_arg_type() {
-    let err = compile(
-        "kernel k [workgroup(1,1,1)] (a: buf<f32>) { a[0] = bitcast_f32(a[0]); }",
-    )
-    .expect_err("should fail");
-    assert!(diag_msg(&err).contains("type mismatch"), "got: {}", diag_msg(&err));
+    let err = compile("kernel k [workgroup(1,1,1)] (a: buf<f32>) { a[0] = bitcast_f32(a[0]); }")
+        .expect_err("should fail");
+    assert!(
+        diag_msg(&err).contains("type mismatch"),
+        "got: {}",
+        diag_msg(&err)
+    );
 }
 
 #[test]
 fn tanh_builtin() {
-    let kernel = compile(
-        "kernel k [workgroup(1,1,1)] (a: buf<f32>) { a[0] = tanh(a[0]); }",
-    )
-    .expect("compile");
+    let kernel = compile("kernel k [workgroup(1,1,1)] (a: buf<f32>) { a[0] = tanh(a[0]); }")
+        .expect("compile");
     let saturn_compiler::ir::Stmt::Assign { value, .. } = &kernel.body[0] else {
         panic!("expected assign");
     };
@@ -316,8 +318,9 @@ fn rejects_bool_buf_param() {
 
 #[test]
 fn rejects_bool_scalar_param() {
-    let err = compile("kernel k [workgroup(1,1,1)] (a: buf<f32>, s: bool) { a[0] = s ? 1.0 : 0.0; }")
-        .expect_err("should fail");
+    let err =
+        compile("kernel k [workgroup(1,1,1)] (a: buf<f32>, s: bool) { a[0] = s ? 1.0 : 0.0; }")
+            .expect_err("should fail");
     assert!(diag_msg(&err).contains("cannot be bool"));
 }
 
@@ -494,12 +497,14 @@ fn functions_expand_inline() {
         "#,
     )
     .expect("compile");
-    assert!(kernel
-        .body
-        .iter()
-        .filter(|s| matches!(s, saturn_compiler::ir::Stmt::Assign { .. }))
-        .count()
-        >= 2);
+    assert!(
+        kernel
+            .body
+            .iter()
+            .filter(|s| matches!(s, saturn_compiler::ir::Stmt::Assign { .. }))
+            .count()
+            >= 2
+    );
 }
 
 #[test]
@@ -594,12 +599,8 @@ fn contains_mul(stmts: &[saturn_compiler::ir::Stmt]) -> bool {
         saturn_compiler::ir::Stmt::Let { init, .. }
         | saturn_compiler::ir::Stmt::Var { init, .. }
         | saturn_compiler::ir::Stmt::Assign { value: init, .. }
-        | saturn_compiler::ir::Stmt::ExprStmt { expr: init, .. } => {
-            expr_has_mul(init)
-        }
-        saturn_compiler::ir::Stmt::If { then, els, .. } => {
-            contains_mul(then) || contains_mul(els)
-        }
+        | saturn_compiler::ir::Stmt::ExprStmt { expr: init, .. } => expr_has_mul(init),
+        saturn_compiler::ir::Stmt::If { then, els, .. } => contains_mul(then) || contains_mul(els),
         saturn_compiler::ir::Stmt::Loop { body, .. }
         | saturn_compiler::ir::Stmt::For { body, .. } => contains_mul(body),
         _ => false,
@@ -771,8 +772,8 @@ fn multi_error_recovery() {
 
 #[test]
 fn return_outside_function_rejected() {
-    let err = compile("kernel k [workgroup(1,1,1)] (a: buf<u32>) { return; }")
-        .expect_err("should fail");
+    let err =
+        compile("kernel k [workgroup(1,1,1)] (a: buf<u32>) { return; }").expect_err("should fail");
     assert!(diag_msg(&err).contains("only allowed inside functions"));
 }
 

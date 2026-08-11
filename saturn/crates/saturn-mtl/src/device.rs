@@ -2,7 +2,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCreateSystemDefaultDevice, MTLCommandQueue, MTLCompileOptions, MTLDevice,
+    MTLCommandQueue, MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice,
     MTLLanguageVersion, MTLLibrary,
 };
 
@@ -21,8 +21,7 @@ pub struct MtlDevice {
 
 impl MtlDevice {
     pub fn open() -> Result<Self> {
-        let device =
-            MTLCreateSystemDefaultDevice().ok_or(Error::NoBackend("metal"))?;
+        let device = MTLCreateSystemDefaultDevice().ok_or(Error::NoBackend("metal"))?;
         let queue = device
             .newCommandQueue()
             .ok_or(Error::Metal("newCommandQueue failed".to_string()))?;
@@ -60,12 +59,12 @@ impl saturn_core::Device for MtlDevice {
     fn submit(&self, encoder: Box<dyn CommandEncoder>) -> Result<Box<dyn Submission>> {
         let actual = std::any::type_name_of_val(&*encoder);
         let any: Box<dyn std::any::Any> = encoder;
-        let encoder = any.downcast::<MtlEncoder>().map_err(|_| {
-            Error::EncoderTypeMismatch {
+        let encoder = any
+            .downcast::<MtlEncoder>()
+            .map_err(|_| Error::EncoderTypeMismatch {
                 expected: std::any::type_name::<MtlEncoder>(),
                 actual,
-            }
-        })?;
+            })?;
         Ok(Box::new(crate::encoder::MtlSubmission::new(*encoder)?))
     }
 }

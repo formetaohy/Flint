@@ -4,8 +4,9 @@ use flint_kernel::name;
 use flint_tensor::{DType, Tensor};
 
 use crate::blocks::{ExpertWeights, MoeMlp};
-use crate::ops::{Act, M_MAX, gemm, swiglu};
+use crate::ops::{Act, gemm, swiglu};
 use crate::routing::Routing;
+use crate::step::MAX_M;
 
 pub struct MoeTiles {
     pub logits: Tensor,
@@ -27,13 +28,13 @@ impl MoeTiles {
 
         let pairs = (cfg.experts + 2) * 64 + cfg.rows * cfg.top_k + cfg.rows;
         MoeTiles {
-            logits: z(&[M_MAX, cfg.experts]),
-            packed: (0..=cfg.experts).map(|_| z(&[M_MAX, cfg.hidden])).collect(),
-            gate: z(&[M_MAX, cfg.intermediate]),
-            up: z(&[M_MAX, cfg.intermediate]),
-            act: z(&[M_MAX, cfg.intermediate]),
-            down: z(&[M_MAX, cfg.hidden]),
-            acc: z(&[M_MAX, cfg.hidden]),
+            logits: z(&[MAX_M, cfg.experts]),
+            packed: (0..=cfg.experts).map(|_| z(&[MAX_M, cfg.hidden])).collect(),
+            gate: z(&[MAX_M, cfg.intermediate]),
+            up: z(&[MAX_M, cfg.intermediate]),
+            act: z(&[MAX_M, cfg.intermediate]),
+            down: z(&[MAX_M, cfg.hidden]),
+            acc: z(&[MAX_M, cfg.hidden]),
             rows: Tensor::new(backend.storage(pairs as u64 * 4), vec![pairs], DType::U32),
             weights: z(&[pairs]),
         }

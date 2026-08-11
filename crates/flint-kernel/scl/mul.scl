@@ -1,5 +1,9 @@
-kernel mul [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, N: u32, M: u32) {
+kernel mul [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, N: u32, M: u32, MODE: u32, STRIDE: u32, OFFSET: u32) {
     if gid.x < N {
-        y[gid.x] = a[gid.x] * b[gid.x % M];
+        if MODE == 1 {
+            y[gid.x] = a[gid.x] * b[(gid.x / M) * STRIDE + OFFSET + gid.x % M];
+        } else {
+            y[gid.x] = a[gid.x] * b[gid.x % M];
+        }
     }
 }

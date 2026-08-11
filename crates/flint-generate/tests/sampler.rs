@@ -222,7 +222,6 @@ fn greedy_verify_accepts_only_argmax() {
 
 #[test]
 fn verify_accepts_whenever_target_covers_draft() {
-
     let mut s = Sampler::new(params(), 3);
     let target = transformed(&s, &[5.0f32, 0.0, 0.0]);
     let draft = transformed(&s, &[1.0f32, 0.0, 0.0]);
@@ -237,7 +236,6 @@ fn verify_accepts_whenever_target_covers_draft() {
 
 #[test]
 fn verify_rejects_zero_target_mass_and_resamples_the_residual() {
-
     let mut s = Sampler::new(params(), 4);
     let target = transformed(&s, &[0.0f32, -1000.0, 0.0]);
     let draft = transformed(&s, &[0.0f32, 0.0, 0.0]);

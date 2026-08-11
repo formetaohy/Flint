@@ -9,7 +9,6 @@ description = "ONNX model parsing and graph execution for Flint"
 flint-error.workspace = true
 prost.workspace = true
 saturn-core = { path = "../../saturn/crates/saturn-core" }
-serde_json.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

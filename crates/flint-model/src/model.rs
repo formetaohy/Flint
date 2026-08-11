@@ -28,7 +28,6 @@ pub trait LanguageModel {
 }
 
 pub trait Speculator {
-
     fn draft(&mut self, backend: &mut Backend, token: u32, hidden: &[f32]) -> Result<Vec<f32>>;
 
     fn prime(&mut self);

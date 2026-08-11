@@ -1,3 +1,4 @@
+pub mod dtype;
 pub mod graph;
 pub mod graph_ops;
 pub mod ops;

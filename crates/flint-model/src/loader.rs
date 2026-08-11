@@ -39,6 +39,14 @@ impl WeightSet {
         }
     }
 
+    pub fn take_if(&mut self, key: &str) -> Result<Option<Tensor>> {
+        if self.weights.contains_key(key) {
+            self.take_tensor(key).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn has(&self, key: &str) -> bool {
         self.weights.contains_key(key)
     }
@@ -151,7 +159,7 @@ fn upload_experts(
             "{prefix}.experts: fused gate+up width {n} is odd"
         )));
     }
-    let data = raw.data.into_f32();
+    let data = raw.data.into_f32()?;
     let mut out = Vec::with_capacity(e_count as usize * parts.len());
     for e in 0..e_count {
         for (i, part) in parts.iter().enumerate() {
@@ -197,19 +205,19 @@ pub fn upload(backend: &Backend, key: &str, raw: RawTensor, role: Role) -> Resul
     let shape = raw.shape;
     match role {
         Role::F32 => {
-            let data = raw.data.into_f32();
+            let data = raw.data.into_f32()?;
             Ok(Weight::plain(backend.tensor_f32(&data, shape)))
         }
         Role::Bf16 => {
             let bytes = match raw.data {
-                TensorData::Bf16(b) => b,
+                TensorData::Bf16Bytes(b) => b,
                 TensorData::F32(f) => f
                     .iter()
                     .flat_map(|v| f32_to_bf16(*v).to_le_bytes())
                     .collect(),
-                TensorData::Q8 { .. } => raw
+                TensorData::Q8Blocks { .. } => raw
                     .data
-                    .into_f32()
+                    .into_f32()?
                     .iter()
                     .flat_map(|v| f32_to_bf16(*v).to_le_bytes())
                     .collect(),
@@ -224,7 +232,7 @@ pub fn upload(backend: &Backend, key: &str, raw: RawTensor, role: Role) -> Resul
             }
             let (n, k) = (shape[0], shape[1]);
             match raw.data {
-                TensorData::Q8 { bytes, numel } => {
+                TensorData::Q8Blocks { bytes, numel } => {
                     if numel != (n * k) as usize {
                         return Err(Error::Model(format!(
                             "{key}: Q8_0 numel {numel} does not match shape {shape:?}"
@@ -239,7 +247,7 @@ pub fn upload(backend: &Backend, key: &str, raw: RawTensor, role: Role) -> Resul
                 }
                 other => {
                     let group = choose_group(k)?;
-                    let data = other.into_f32();
+                    let data = other.into_f32()?;
                     let (bytes, scales) = quantize(&data, n as usize, k as usize, group as usize);
                     let (n, groups) = (n, k / group);
                     Ok(Weight::quant(

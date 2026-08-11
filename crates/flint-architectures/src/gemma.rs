@@ -8,7 +8,7 @@ use crate::transformer::{TransformerConfig, TransformerModel, transformer_plan};
 pub fn parse_config(v: &Value) -> Result<TransformerConfig> {
     let mut cfg = TransformerConfig::parse(v, true)?;
     cfg.embed_scale = (cfg.hidden as f32).sqrt();
-    cfg.qk_norm = true;
+    cfg.qk_norm = v.get("qk_norm").and_then(Value::as_bool).unwrap_or(true);
     cfg.sandwich = true;
     let size = v.get("sliding_window").and_then(Value::as_u64).unwrap_or(0) as u32;
     if size > 0 {
@@ -41,7 +41,8 @@ pub fn load(
     max_seq: u32,
     backend: &Backend,
 ) -> Result<TransformerModel> {
-    let cfg = parse_config(v)?;
+    let mut cfg = parse_config(v)?;
+    cfg.hf_names = source.kind() == CheckpointKind::Safetensors;
     TransformerModel::load(
         source,
         cfg,

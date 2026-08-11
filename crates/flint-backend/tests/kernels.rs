@@ -22,9 +22,7 @@ impl Ctx {
             .iter()
             .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
             .collect();
-        self.backend
-            .tensor_bf16(&bytes, shape.to_vec())
-            .unwrap()
+        self.backend.tensor_bf16(&bytes, shape.to_vec()).unwrap()
     }
 
     fn zero(&self, shape: &[u32]) -> Tensor {
@@ -38,7 +36,8 @@ impl Ctx {
     fn arg(&self, pos: usize, kv_len: usize) -> Tensor {
         let segs = kv_len.div_ceil(256).clamp(1, 32);
         let t = Tensor::new(self.backend.storage(8), vec![2], DType::U32);
-        self.backend.write_u32(t.buf.as_ref(), &[pos as u32, segs as u32]);
+        self.backend
+            .write_u32(t.buf.as_ref(), &[pos as u32, segs as u32]);
         t
     }
 
@@ -158,7 +157,7 @@ fn dequant(bytes: &[u8], scales: &[f32], rows: usize, cols: usize, group: usize)
 
 enum WType {
     Bf16,
-    I8(usize), 
+    I8(usize),
 }
 
 fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
@@ -208,8 +207,6 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
     agree(&ctx.read(&y), &cpu::gemm(&x, &cpu_w, m, n, k), rel, abs);
 }
 
-
-
 #[test]
 fn gemm_bf16() {
     gemm_case(WType::Bf16, 16, 64, 128, 7);
@@ -227,7 +224,6 @@ fn gemm_i8_group128() {
 
 #[test]
 fn gemm_i8_group64() {
-
     gemm_case(WType::I8(64), 16, 64, 960, 19);
 }
 
@@ -285,7 +281,7 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
     );
     if segs > 1 {
         ctx.dispatch(
-        name::MERGE_GEMV,
+            name::MERGE_GEMV,
             &[("N", n as f64), ("SEGS", segs as f64), ("ACC", 0.0)],
             &[
                 Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64),
@@ -309,7 +305,6 @@ fn gemv_i8_group128() {
 
 #[test]
 fn gemv_i8_partial_chunk() {
-
     gemv_case(WType::I8(32), 32, 192, 41, 1);
 }
 
@@ -379,10 +374,13 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
             ("SCALE", scale as f64),
             ("WDTYPE", 0.0),
             ("GROUP", 128.0),
+            ("SPLIT", u32::MAX as f64),
+            ("ROWS", vocab as f64),
         ],
         &[
             Binding::Full(&ib),
             Binding::Full(w.tensor()),
+            Binding::Full(&fallback),
             Binding::Full(&fallback),
             Binding::Full(&y),
         ],
@@ -428,8 +426,11 @@ fn norm_case(mode: NormMode, rows: usize, dim: usize, w_dim: usize, seed: u64) {
             ("HEADS", 1.0),
             ("ROT", 2.0),
             ("COS_STRIDE", 1.0),
+            ("STRIDE", dim as f64),
+            ("PLE", 0.0),
+            ("PLE_LAYERS", 0.0),
+            ("PLE_STRIDE", 0.0),
         ],
-
         &[
             Binding::Full(&xb),
             Binding::Full(&wb),
@@ -519,6 +520,10 @@ fn norm_rope_mode4_pos72_repro() {
             ("HEADS", heads as f64),
             ("ROT", rot as f64),
             ("COS_STRIDE", half as f64),
+            ("STRIDE", dim as f64),
+            ("PLE", 0.0),
+            ("PLE_LAYERS", 0.0),
+            ("PLE_STRIDE", 0.0),
         ],
         &[
             Binding::Full(&xb),
@@ -537,7 +542,6 @@ fn norm_rope_mode4_pos72_repro() {
     eprintln!("nan in gpu: {}", got.iter().filter(|v| v.is_nan()).count());
     eprintln!("nan in cpu: {}", want.iter().filter(|v| v.is_nan()).count());
 }
-
 
 #[test]
 fn norm_layer() {
@@ -562,7 +566,7 @@ fn norm_direct() {
 #[test]
 fn add() {
     let mut ctx = Ctx::new();
-    let n = 100usize; 
+    let n = 100usize;
     let mut rng = Rng(33);
     let a = rng.fill(n);
     let b = rng.fill(n);
@@ -637,7 +641,12 @@ fn swiglu_gelu_tanh() {
         &[Binding::Full(&gb), Binding::Full(&ub), Binding::Full(&y)],
         [1, 1, 1],
     );
-    agree(&ctx.read(&y), &cpu::swiglu(&g, &u, Act::GeluTanh), 1e-5, 1e-6);
+    agree(
+        &ctx.read(&y),
+        &cpu::swiglu(&g, &u, Act::GeluTanh),
+        1e-5,
+        1e-6,
+    );
 }
 
 #[test]
@@ -647,7 +656,7 @@ fn softcap() {
     let mut rng = Rng(53);
     let mut x = rng.fill(n);
     for v in x.iter_mut() {
-        *v *= 40.0; 
+        *v *= 40.0;
     }
     let xb = ctx.f32(&x, &[n as u32]);
     ctx.dispatch(
@@ -673,7 +682,13 @@ fn mul_broadcast() {
 
     ctx.dispatch(
         name::MUL,
-        &[("N", n as f64), ("M", 4.0)],
+        &[
+            ("N", n as f64),
+            ("M", 4.0),
+            ("MODE", 0.0),
+            ("STRIDE", 0.0),
+            ("OFFSET", 0.0),
+        ],
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
     );
@@ -849,7 +864,7 @@ fn conv1d_rolls_state_across_steps() {
     for x in &steps {
         ctx.backend.write_f32(xb.buf.as_ref(), x);
         ctx.dispatch(
-        name::CONV1D,
+            name::CONV1D,
             &[("DIM", dim as f64)],
             &[
                 Binding::Full(&xb),
@@ -880,7 +895,7 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
     let wb = ctx.f32(&w, &[conv_dim as u32, 4]);
     let st = ctx.f32(&state, &[conv_dim as u32, 3]);
     let xb = ctx.zero(&[rows as u32, conv_dim as u32]);
-    let convd = ctx.zero(&[rows as u32, conv_dim as u32]);
+    let conv_out = ctx.zero(&[rows as u32, conv_dim as u32]);
     let y = ctx.zero(&[rows as u32, (2 * n_v * kd) as u32]);
 
     let flat: Vec<f32> = x.iter().flatten().copied().collect();
@@ -894,13 +909,13 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
             ctx.backend
                 .dispatch(
                     &mut pass,
-        name::CONV1D,
+                    name::CONV1D,
                     &[("DIM", conv_dim as f64)],
                     &[
                         Binding::Slice(&xb, row(t), conv_dim as u64 * 4),
                         Binding::Full(&wb),
                         Binding::Full(&st),
-                        Binding::Slice(&convd, row(t), conv_dim as u64 * 4),
+                        Binding::Slice(&conv_out, row(t), conv_dim as u64 * 4),
                     ],
                     [1, 1, 1],
                 )
@@ -915,7 +930,7 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
         ctx.backend
             .dispatch(
                 &mut pass,
-        name::REPEAT_QK,
+                name::REPEAT_QK,
                 &[
                     ("ROWS", rows as f64),
                     ("N_K", n_k as f64),
@@ -925,7 +940,7 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
                     ("CONV_DIM", conv_dim as f64),
                 ],
                 &[
-                    Binding::Slice(&convd, 0, (rows * conv_dim * 4) as u64),
+                    Binding::Slice(&conv_out, 0, (rows * conv_dim * 4) as u64),
                     Binding::Full(&y),
                 ],
                 [rows as u32, 1, 1],
@@ -989,7 +1004,6 @@ fn repeat_qk_expands_key_heads() {
 
 #[test]
 fn anchor_repeat_qk() {
-
     let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
     let mut y = vec![0f32; 8];
     cpu::repeat_qk(&x, &mut y, 1, 1, 2, 2, 3);
@@ -1014,7 +1028,7 @@ fn delta_gate_selects_chunk_rows() {
 
     for row in [0usize, 2] {
         ctx.dispatch(
-        name::DELTA_GATE,
+            name::DELTA_GATE,
             &[("HEADS", heads as f64), ("ROW_T", row as f64)],
             &[
                 Binding::Full(&bb),
@@ -1187,8 +1201,6 @@ fn attn_case_hd(
     );
 }
 
-
-
 #[test]
 fn kv_store_attn_hd128_gqa2_pos71() {
     let (m, nq, nkv, hd, max_seq, pos) = (2usize, 16usize, 8usize, 128usize, 4096usize, 71usize);
@@ -1276,7 +1288,6 @@ fn kv_store_attn_hd128_gqa2_pos71() {
     eprintln!("nan in gpu: {}", got.iter().filter(|v| v.is_nan()).count());
 }
 
-
 #[test]
 fn attn_gqa_multi_row() {
     attn_case(3, 2, 1, 16, 5, 0, 91);
@@ -1284,7 +1295,6 @@ fn attn_gqa_multi_row() {
 
 #[test]
 fn attn_sliding_window() {
-
     attn_case(3, 2, 1, 16, 5, 3, 93);
 }
 
@@ -1300,7 +1310,6 @@ fn attn_gqa_4x_multi_chunk() {
 
 #[test]
 fn attn_split_short_prefix() {
-
     attn_case(1, 2, 1, 16, 2, 0, 101);
 }
 
@@ -1347,76 +1356,76 @@ fn attn_gemm_coexist() {
     let yg = ctx.zero(&[m as u32, n2 as u32]);
 
     for _ in 0..24 {
-    let mut enc = ctx.backend.encoder().unwrap();
-    {
-        let mut pass = Pass::begin(enc.as_mut());
-        ctx.backend
-            .dispatch(
-                &mut pass,
-                name::ATTN,
-                &[
-                    ("N_HEADS", nq as f64),
-                    ("KV_HEADS", nkv as f64),
-                    ("HEAD_DIM", hd as f64),
-                    ("MAX_SEQ", max_seq as f64),
-                    ("SCALE", 1.0 / (hd as f64).sqrt()),
-                    ("WINDOW", 0.0),
-                    ("NQ_PER_KV", (nq / nkv) as f64),
-                    ("STRIDE", (hd as u32 + 2) as f64),
-                ],
-                &[
-                    Binding::Full(&qb),
-                    Binding::Full(&kb),
-                    Binding::Full(&vb),
-                    Binding::Full(&scratch),
-                    Binding::Full(&args),
-                ],
-                [m as u32, nkv as u32, 32],
-            )
-            .unwrap();
-        ctx.backend
-            .dispatch(
-                &mut pass,
-                name::MERGE_ATTN,
-                &[
-                    ("N_HEADS", nq as f64),
-                    ("KV_HEADS", nkv as f64),
-                    ("HEAD_DIM", hd as f64),
-                    ("STRIDE", (hd as u32 + 2) as f64),
-                ],
-                &[
-                    Binding::Full(&scratch),
-                    Binding::Full(&y),
-                    Binding::Full(&args),
-                ],
-                [m as u32, nkv as u32, 1],
-            )
-            .unwrap();
-        ctx.backend
-            .dispatch(
-                &mut pass,
-                name::GEMM,
-                &[
-                    ("N", n2 as f64),
-                    ("K", k2 as f64),
-                    ("M", m as f64),
-                    ("SEGS", 1.0),
-                    ("WDTYPE", 0.0),
-                    ("GROUP", 128.0),
-                    ("ACC", 0.0),
-                    ("Y_STRIDE", n2 as f64),
-                    ("Y_OFF", 0.0),
-                ],
-                &[
-                    Binding::Full(&xb),
-                    Binding::Full(&wb),
-                    Binding::Full(&sb),
-                    Binding::Full(&yg),
-                ],
-                [n2.div_ceil(32) as u32, m.div_ceil(32) as u32, 1],
-            )
-            .unwrap();
-    }
+        let mut enc = ctx.backend.encoder().unwrap();
+        {
+            let mut pass = Pass::begin(enc.as_mut());
+            ctx.backend
+                .dispatch(
+                    &mut pass,
+                    name::ATTN,
+                    &[
+                        ("N_HEADS", nq as f64),
+                        ("KV_HEADS", nkv as f64),
+                        ("HEAD_DIM", hd as f64),
+                        ("MAX_SEQ", max_seq as f64),
+                        ("SCALE", 1.0 / (hd as f64).sqrt()),
+                        ("WINDOW", 0.0),
+                        ("NQ_PER_KV", (nq / nkv) as f64),
+                        ("STRIDE", (hd as u32 + 2) as f64),
+                    ],
+                    &[
+                        Binding::Full(&qb),
+                        Binding::Full(&kb),
+                        Binding::Full(&vb),
+                        Binding::Full(&scratch),
+                        Binding::Full(&args),
+                    ],
+                    [m as u32, nkv as u32, 32],
+                )
+                .unwrap();
+            ctx.backend
+                .dispatch(
+                    &mut pass,
+                    name::MERGE_ATTN,
+                    &[
+                        ("N_HEADS", nq as f64),
+                        ("KV_HEADS", nkv as f64),
+                        ("HEAD_DIM", hd as f64),
+                        ("STRIDE", (hd as u32 + 2) as f64),
+                    ],
+                    &[
+                        Binding::Full(&scratch),
+                        Binding::Full(&y),
+                        Binding::Full(&args),
+                    ],
+                    [m as u32, nkv as u32, 1],
+                )
+                .unwrap();
+            ctx.backend
+                .dispatch(
+                    &mut pass,
+                    name::GEMM,
+                    &[
+                        ("N", n2 as f64),
+                        ("K", k2 as f64),
+                        ("M", m as f64),
+                        ("SEGS", 1.0),
+                        ("WDTYPE", 0.0),
+                        ("GROUP", 128.0),
+                        ("ACC", 0.0),
+                        ("Y_STRIDE", n2 as f64),
+                        ("Y_OFF", 0.0),
+                    ],
+                    &[
+                        Binding::Full(&xb),
+                        Binding::Full(&wb),
+                        Binding::Full(&sb),
+                        Binding::Full(&yg),
+                    ],
+                    [n2.div_ceil(32) as u32, m.div_ceil(32) as u32, 1],
+                )
+                .unwrap();
+        }
         ctx.backend.submit(enc).unwrap();
     }
 
@@ -1426,12 +1435,7 @@ fn attn_gemm_coexist() {
         2e-3,
         1e-3,
     );
-    agree(
-        &ctx.read(&yg),
-        &cpu::gemm(&x, &w, m, n2, k2),
-        2e-2,
-        5e-2,
-    );
+    agree(&ctx.read(&yg), &cpu::gemm(&x, &w, m, n2, k2), 2e-2, 5e-2);
 }
 
 #[test]
@@ -1532,7 +1536,7 @@ fn anchor_embed() {
 
 #[test]
 fn anchor_norm_modes() {
-    let inv = (2.5f32 + 1e-6).sqrt().recip(); 
+    let inv = (2.5f32 + 1e-6).sqrt().recip();
     let x = [1.0f32, 2.0];
 
     let direct = cpu::norm(NormMode::Direct, &x, &[2.0, 3.0], &[], 1, 2, 2, 1e-6);
@@ -1584,7 +1588,6 @@ fn anchor_layout_ops() {
 
 #[test]
 fn anchor_rope() {
-
     let inv1 = 1.0 / 10000f64.powf(2.0 / 4.0);
     let (c0, s0) = (1.0f64.cos() as f32, 1.0f64.sin() as f32);
     let (c1, s1) = (inv1.cos() as f32, inv1.sin() as f32);
@@ -1612,7 +1615,7 @@ fn anchor_rope() {
 
 #[test]
 fn anchor_attn_causal_and_window() {
-    let k = [1.0, 0.0, 0.0, 1.0]; 
+    let k = [1.0, 0.0, 0.0, 1.0];
     let v = [1.0, 2.0, 3.0, 4.0];
     let q = [1.0, 1.0];
 
@@ -1694,4 +1697,3 @@ fn gemv_bf16_wide() {
 fn gemm_i8_9728() {
     gemm_case(WType::I8(128), 16, 2560, 9728, 77);
 }
-

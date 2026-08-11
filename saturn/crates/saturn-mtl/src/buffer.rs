@@ -2,8 +2,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
-use saturn_core::error::{Error, Result};
 use saturn_core::Buffer;
+use saturn_core::error::{Error, Result};
 
 use crate::device::MtlDevice;
 
@@ -64,7 +64,11 @@ impl Buffer for MtlBuffer {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
-                self.raw.contents().as_ptr().add(offset as usize).cast::<u8>(),
+                self.raw
+                    .contents()
+                    .as_ptr()
+                    .add(offset as usize)
+                    .cast::<u8>(),
                 data.len(),
             );
         }
@@ -78,7 +82,11 @@ impl Buffer for MtlBuffer {
         self.check_range(offset, out.len())?;
         unsafe {
             std::ptr::copy_nonoverlapping(
-                self.raw.contents().as_ptr().add(offset as usize).cast::<u8>(),
+                self.raw
+                    .contents()
+                    .as_ptr()
+                    .add(offset as usize)
+                    .cast::<u8>(),
                 out.as_mut_ptr(),
                 out.len(),
             );

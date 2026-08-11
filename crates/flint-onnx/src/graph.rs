@@ -28,9 +28,8 @@ impl Node {
     }
 
     pub fn need(&self, name: &str) -> Result<&Attr> {
-        self.attr(name).ok_or_else(|| {
-            Error::Model(format!("node {} missing attribute {name}", self.op_type))
-        })
+        self.attr(name)
+            .ok_or_else(|| Error::Model(format!("node {} missing attribute {name}", self.op_type)))
     }
 }
 
@@ -52,35 +51,45 @@ impl Attr {
     pub fn i(&self) -> Result<i64> {
         match self {
             Attr::I(v) => Ok(*v),
-            other => Err(Error::Model(format!("expected int attribute, got {other:?}"))),
+            other => Err(Error::Model(format!(
+                "expected int attribute, got {other:?}"
+            ))),
         }
     }
 
     pub fn f(&self) -> Result<f32> {
         match self {
             Attr::F(v) => Ok(*v),
-            other => Err(Error::Model(format!("expected float attribute, got {other:?}"))),
+            other => Err(Error::Model(format!(
+                "expected float attribute, got {other:?}"
+            ))),
         }
     }
 
     pub fn s(&self) -> Result<&[u8]> {
         match self {
             Attr::S(v) => Ok(v),
-            other => Err(Error::Model(format!("expected string attribute, got {other:?}"))),
+            other => Err(Error::Model(format!(
+                "expected string attribute, got {other:?}"
+            ))),
         }
     }
 
     pub fn ints(&self) -> Result<&[i64]> {
         match self {
             Attr::Ints(v) => Ok(v),
-            other => Err(Error::Model(format!("expected ints attribute, got {other:?}"))),
+            other => Err(Error::Model(format!(
+                "expected ints attribute, got {other:?}"
+            ))),
         }
     }
 
     pub fn strings(&self) -> Result<&[Vec<u8>]> {
         match self {
             Attr::Strings(v) => Ok(v),
-            other => Err(Error::Model(format!("expected strings attribute, got {other:?}"))),
+            other => Err(Error::Model(format!(
+                "expected strings attribute, got {other:?}"
+            ))),
         }
     }
 }
@@ -104,7 +113,6 @@ pub struct Graph {
 }
 
 impl Graph {
-
     pub fn load(path: &Path) -> Result<Graph> {
         let bytes = std::fs::read(path)
             .map_err(|e| Error::Model(format!("cannot read {}: {e}", path.display())))?;
@@ -148,19 +156,21 @@ impl Graph {
                     elem_type: 0,
                     dims: vec![],
                 };
-                if let Some(t) = v.r#type.as_ref().and_then(|t| t.value.as_ref()) {
-                    if let crate::onnx::type_proto::Value::TensorType(tensor) = t {
-                        vi.elem_type = tensor.elem_type;
-                        if let Some(shape) = tensor.shape.as_ref() {
-                            vi.dims = shape
-                                .dim
-                                .iter()
-                                .map(|d| match d.value {
-                                    Some(crate::onnx::tensor_shape_proto::dimension::Value::DimValue(x)) => x,
-                                    _ => 0,
-                                })
-                                .collect();
-                        }
+                if let Some(t) = v.r#type.as_ref().and_then(|t| t.value.as_ref())
+                    && let crate::onnx::type_proto::Value::TensorType(tensor) = t
+                {
+                    vi.elem_type = tensor.elem_type;
+                    if let Some(shape) = tensor.shape.as_ref() {
+                        vi.dims = shape
+                            .dim
+                            .iter()
+                            .map(|d| match d.value {
+                                Some(
+                                    crate::onnx::tensor_shape_proto::dimension::Value::DimValue(x),
+                                ) => x,
+                                _ => 0,
+                            })
+                            .collect();
                     }
                 }
                 vi
@@ -193,23 +203,25 @@ impl Graph {
                 crate::onnx::attribute_proto::AttributeType::Int => Attr::I(a.i),
                 crate::onnx::attribute_proto::AttributeType::String => Attr::S(a.s.clone()),
                 crate::onnx::attribute_proto::AttributeType::Tensor => Attr::T(
-                    a.t
-                        .as_ref()
+                    a.t.as_ref()
                         .map(|t| Tensor::from_proto(t, dir))
                         .transpose()?
                         .ok_or_else(|| Error::Model("empty tensor attribute".into()))?,
                 ),
-                crate::onnx::attribute_proto::AttributeType::Graph => Attr::G(Box::new(
-                    Self::from_proto(
-                        a.g
-                            .as_ref()
+                crate::onnx::attribute_proto::AttributeType::Graph => {
+                    Attr::G(Box::new(Self::from_proto(
+                        a.g.as_ref()
                             .ok_or_else(|| Error::Model("empty graph attribute".into()))?,
                         dir,
-                    )?,
-                )),
-                crate::onnx::attribute_proto::AttributeType::Floats => Attr::Floats(a.floats.clone()),
+                    )?))
+                }
+                crate::onnx::attribute_proto::AttributeType::Floats => {
+                    Attr::Floats(a.floats.clone())
+                }
                 crate::onnx::attribute_proto::AttributeType::Ints => Attr::Ints(a.ints.clone()),
-                crate::onnx::attribute_proto::AttributeType::Strings => Attr::Strings(a.strings.clone()),
+                crate::onnx::attribute_proto::AttributeType::Strings => {
+                    Attr::Strings(a.strings.clone())
+                }
                 crate::onnx::attribute_proto::AttributeType::Tensors => Attr::Tensors(
                     a.tensors
                         .iter()
@@ -226,7 +238,7 @@ impl Graph {
                     return Err(Error::Model(format!(
                         "unsupported attribute type {other:?} on {}",
                         n.op_type
-                    )))
+                    )));
                 }
             };
             attrs.insert(a.name.clone(), attr);

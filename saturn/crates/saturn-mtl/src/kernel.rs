@@ -6,7 +6,7 @@ use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary};
 use saturn_core::error::{Error, Result};
 use saturn_core::{Kernel, ScalarField, ScalarLayout};
 
-use crate::device::{compile_kernel, MtlDevice};
+use crate::device::{MtlDevice, compile_kernel};
 
 pub struct MtlKernel {
     name: String,
@@ -41,7 +41,8 @@ impl MtlKernel {
                     .compile_with_specs(&source, spec.specs)
                     .map_err(|diags| {
                         Error::Shader(
-                            diags.iter()
+                            diags
+                                .iter()
                                 .map(|d| source.render(d))
                                 .collect::<Vec<_>>()
                                 .join("\n"),

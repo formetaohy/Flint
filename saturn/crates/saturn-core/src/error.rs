@@ -17,11 +17,20 @@ pub enum Error {
     #[error("buffer is not host visible")]
     BufferNotHostVisible,
     #[error("buffer type mismatch: expected {expected}, got {actual}")]
-    BufferTypeMismatch { expected: &'static str, actual: &'static str },
+    BufferTypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
     #[error("kernel type mismatch: expected {expected}, got {actual}")]
-    KernelTypeMismatch { expected: &'static str, actual: &'static str },
+    KernelTypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
     #[error("encoder type mismatch: expected {expected}, got {actual}")]
-    EncoderTypeMismatch { expected: &'static str, actual: &'static str },
+    EncoderTypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
     #[error("encoder was already submitted")]
     EncoderInactive,
     #[error("{kind} belongs to a different device")]
@@ -33,11 +42,7 @@ pub enum Error {
     #[error("offset {offset} is not aligned to {alignment}")]
     MisalignedOffset { offset: u64, alignment: u64 },
     #[error("kernel {kernel} workgroup size {size} exceeds device maximum {max}")]
-    WorkgroupTooLarge {
-        kernel: String,
-        size: u64,
-        max: u64,
-    },
+    WorkgroupTooLarge { kernel: String, size: u64, max: u64 },
     #[error("kernel function {0} not found in library")]
     FunctionNotFound(String),
     #[error("dispatch before bind")]

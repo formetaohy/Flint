@@ -38,10 +38,7 @@ struct OnnxArgs {
 
 impl OnnxArgs {
     fn is_empty(&self) -> bool {
-        self.inputs.is_none()
-            && self.inputs_file.is_none()
-            && self.output.is_empty()
-            && !self.full
+        self.inputs.is_none() && self.inputs_file.is_none() && self.output.is_empty() && !self.full
     }
 }
 
@@ -89,8 +86,7 @@ fn main() -> Result<()> {
     } else {
         if !args.onnx.is_empty() {
             return Err(flint_error::Error::Model(
-                "onnx options --inputs/--inputs-file/--output/--full require an .onnx model"
-                    .into(),
+                "onnx options --inputs/--inputs-file/--output/--full require an .onnx model".into(),
             ));
         }
         chat_main(&args.model, args.chat)
@@ -108,7 +104,7 @@ fn onnx_run(model: &Path, args: OnnxArgs) -> Result<()> {
         (Some(_), Some(_)) => {
             return Err(flint_error::Error::Model(
                 "provide either --inputs or --inputs-file, not both".into(),
-            ))
+            ));
         }
         (Some(s), None) => s,
         (None, Some(f)) => std::fs::read_to_string(&f)
@@ -116,7 +112,7 @@ fn onnx_run(model: &Path, args: OnnxArgs) -> Result<()> {
         (None, None) => {
             return Err(flint_error::Error::Model(
                 "onnx model requires --inputs or --inputs-file".into(),
-            ))
+            ));
         }
     };
     let inputs: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json)
@@ -149,9 +145,9 @@ fn onnx_run(model: &Path, args: OnnxArgs) -> Result<()> {
     };
     names.sort();
     for name in names {
-        let t = out.get(&name).ok_or_else(|| {
-            flint_error::Error::Model(format!("output {name:?} not produced"))
-        })?;
+        let t = out
+            .get(&name)
+            .ok_or_else(|| flint_error::Error::Model(format!("output {name:?} not produced")))?;
         let limit = if args.full { usize::MAX } else { 8 };
         println!("{name}: {}", t.describe(limit));
     }
@@ -159,7 +155,12 @@ fn onnx_run(model: &Path, args: OnnxArgs) -> Result<()> {
 }
 
 fn json_to_tensor(v: &serde_json::Value) -> Result<flint_onnx::Tensor> {
-    fn flatten(v: &serde_json::Value, f32s: &mut Vec<f32>, i64s: &mut Vec<i64>, bools: &mut Vec<bool>) -> Result<()> {
+    fn flatten(
+        v: &serde_json::Value,
+        f32s: &mut Vec<f32>,
+        i64s: &mut Vec<i64>,
+        bools: &mut Vec<bool>,
+    ) -> Result<()> {
         match v {
             serde_json::Value::Array(a) => {
                 for x in a {
@@ -179,7 +180,7 @@ fn json_to_tensor(v: &serde_json::Value) -> Result<flint_onnx::Tensor> {
             other => {
                 return Err(flint_error::Error::Model(format!(
                     "unsupported input value {other:?}"
-                )))
+                )));
             }
         }
         Ok(())
@@ -198,7 +199,11 @@ fn json_to_tensor(v: &serde_json::Value) -> Result<flint_onnx::Tensor> {
     let mut bools = vec![];
     flatten(v, &mut f32s, &mut i64s, &mut bools)?;
     let shape = shape_of(v);
-    let kinds = [(!f32s.is_empty()) as u8, (!i64s.is_empty()) as u8, (!bools.is_empty()) as u8];
+    let kinds = [
+        (!f32s.is_empty()) as u8,
+        (!i64s.is_empty()) as u8,
+        (!bools.is_empty()) as u8,
+    ];
     match kinds {
         [1, 0, 0] => Ok(flint_onnx::Tensor::f32(f32s, shape)),
         [0, 1, 0] => Ok(flint_onnx::Tensor::i64(i64s, shape)),
@@ -264,17 +269,15 @@ fn run_turn(
     history: &[(String, String)],
     user: &str,
     max_tokens: usize,
-) -> Result<String> {
+) -> Result<()> {
     let text = chat.render(system, history, user);
     let mut stream = engine.stream(&text, max_tokens)?;
-    let mut reply = String::new();
     for piece in stream.by_ref() {
         let piece = piece?;
         print!("{}", piece.text);
         std::io::stdout().flush().ok();
-        reply.push_str(&piece.text);
     }
     println!();
     eprintln!("{}", stream.stats().summary());
-    Ok(reply)
+    Ok(())
 }

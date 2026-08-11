@@ -6,7 +6,12 @@ use crate::graph::Node;
 use crate::ops::{axes_attr, f32s, input, input_opt, norm_axis, output};
 use crate::tensor::{Data, Tensor, broadcast_shape, broadcast_to};
 
-pub(crate) fn arith<FF, IF>(env: &mut HashMap<String, Tensor>, node: &Node, ff: FF, fi: IF) -> Result<()>
+pub(crate) fn arith<FF, IF>(
+    env: &mut HashMap<String, Tensor>,
+    node: &Node,
+    ff: FF,
+    fi: IF,
+) -> Result<()>
 where
     FF: Fn(f32, f32) -> f32,
     IF: Fn(i64, i64) -> i64,
@@ -18,18 +23,28 @@ where
         (Data::F32(x), Data::F32(y)) => {
             let x = broadcast_to(x, &a.shape, &shape)?;
             let y = broadcast_to(y, &b.shape, &shape)?;
-            output(env, node, 0, Tensor::f32(x.iter().zip(&y).map(|(&x, &y)| ff(x, y)).collect(), shape))?;
+            output(
+                env,
+                node,
+                0,
+                Tensor::f32(x.iter().zip(&y).map(|(&x, &y)| ff(x, y)).collect(), shape),
+            )?;
         }
         (Data::I64(x), Data::I64(y)) => {
             let x = broadcast_to(x, &a.shape, &shape)?;
             let y = broadcast_to(y, &b.shape, &shape)?;
-            output(env, node, 0, Tensor::i64(x.iter().zip(&y).map(|(&x, &y)| fi(x, y)).collect(), shape))?;
+            output(
+                env,
+                node,
+                0,
+                Tensor::i64(x.iter().zip(&y).map(|(&x, &y)| fi(x, y)).collect(), shape),
+            )?;
         }
         (x, y) => {
             return Err(Error::Model(format!(
                 "{}: mixed or unsupported dtypes {:?} / {:?}",
                 node.op_type, x, y
-            )))
+            )));
         }
     }
     Ok(())
@@ -58,10 +73,7 @@ where
         } else {
             shape = broadcast_shape(&shape, &t.shape)?;
             if f32_mode != is_f32 {
-                return Err(Error::Model(format!(
-                    "{}: mixed dtypes",
-                    node.op_type
-                )));
+                return Err(Error::Model(format!("{}: mixed dtypes", node.op_type)));
             }
         }
     }
@@ -83,12 +95,7 @@ where
                     *a = fi(*a, b);
                 }
             }
-            _ => {
-                return Err(Error::Model(format!(
-                    "{}: unsupported dtype",
-                    node.op_type
-                )))
-            }
+            _ => return Err(Error::Model(format!("{}: unsupported dtype", node.op_type))),
         }
     }
     if node.op_type == "Mean" {
@@ -118,7 +125,10 @@ where
     let b = input(env, node, 1)?;
     let shape = broadcast_shape(&a.shape, &b.shape)?;
     let (Data::Bool(x), Data::Bool(y)) = (&a.data, &b.data) else {
-        return Err(Error::Model(format!("{}: expected bool inputs", node.op_type)));
+        return Err(Error::Model(format!(
+            "{}: expected bool inputs",
+            node.op_type
+        )));
     };
     let x = broadcast_to(x, &a.shape, &shape)?;
     let y = broadcast_to(y, &b.shape, &shape)?;
@@ -145,7 +155,12 @@ pub(crate) fn not(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> 
     Ok(())
 }
 
-pub(crate) fn cmp<FF, IF>(env: &mut HashMap<String, Tensor>, node: &Node, ff: FF, fi: IF) -> Result<()>
+pub(crate) fn cmp<FF, IF>(
+    env: &mut HashMap<String, Tensor>,
+    node: &Node,
+    ff: FF,
+    fi: IF,
+) -> Result<()>
 where
     FF: Fn(f32, f32) -> bool,
     IF: Fn(i64, i64) -> bool,
@@ -168,7 +183,7 @@ where
             return Err(Error::Model(format!(
                 "{}: mixed dtypes {:?} / {:?}",
                 node.op_type, x, y
-            )))
+            )));
         }
     };
     output(env, node, 0, Tensor::bool(out, shape))?;
@@ -222,31 +237,42 @@ pub(crate) fn where3(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<(
             return Err(Error::Model(format!(
                 "Where: mixed dtypes {:?} / {:?}",
                 x, y
-            )))
+            )));
         }
     };
     output(env, node, 0, Tensor { data: out, shape })?;
     Ok(())
 }
 
-pub(crate) fn unary_arith<FF, IF>(env: &mut HashMap<String, Tensor>, node: &Node, ff: FF, fi: IF) -> Result<()>
+pub(crate) fn unary_arith<FF, IF>(
+    env: &mut HashMap<String, Tensor>,
+    node: &Node,
+    ff: FF,
+    fi: IF,
+) -> Result<()>
 where
     FF: Fn(f32) -> f32,
     IF: Fn(i64) -> i64,
 {
     let a = input(env, node, 0)?;
     match &a.data {
-        Data::F32(v) => {
-            output(env, node, 0, Tensor::f32(v.iter().map(|&x| ff(x)).collect(), a.shape.clone()))?
-        }
-        Data::I64(v) => {
-            output(env, node, 0, Tensor::i64(v.iter().map(|&x| fi(x)).collect(), a.shape.clone()))?
-        }
+        Data::F32(v) => output(
+            env,
+            node,
+            0,
+            Tensor::f32(v.iter().map(|&x| ff(x)).collect(), a.shape.clone()),
+        )?,
+        Data::I64(v) => output(
+            env,
+            node,
+            0,
+            Tensor::i64(v.iter().map(|&x| fi(x)).collect(), a.shape.clone()),
+        )?,
         other => {
             return Err(Error::Model(format!(
                 "{}: unsupported dtype {other:?}",
                 node.op_type
-            )))
+            )));
         }
     }
     Ok(())
@@ -258,12 +284,21 @@ where
 {
     let a = input(env, node, 0)?;
     let v = f32s(a)?;
-    output(env, node, 0, Tensor::f32(v.iter().map(|&x| f(x)).collect(), a.shape.clone()))?;
+    output(
+        env,
+        node,
+        0,
+        Tensor::f32(v.iter().map(|&x| f(x)).collect(), a.shape.clone()),
+    )?;
     Ok(())
 }
 
 pub(crate) fn leaky_relu(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
-    let alpha = node.attr("alpha").map(|a| a.f()).transpose()?.unwrap_or(0.01);
+    let alpha = node
+        .attr("alpha")
+        .map(|a| a.f())
+        .transpose()?
+        .unwrap_or(0.01);
     unary_f32(env, node, |x| if x >= 0.0 { x } else { alpha * x })
 }
 
@@ -289,7 +324,11 @@ pub(crate) fn clip(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()>
 }
 
 pub(crate) fn hard_sigmoid(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
-    let alpha = node.attr("alpha").map(|a| a.f()).transpose()?.unwrap_or(0.2);
+    let alpha = node
+        .attr("alpha")
+        .map(|a| a.f())
+        .transpose()?
+        .unwrap_or(0.2);
     let beta = node.attr("beta").map(|a| a.f()).transpose()?.unwrap_or(0.5);
     unary_f32(env, node, |x| (alpha * x + beta).clamp(0.0, 1.0))
 }
@@ -306,7 +345,10 @@ pub(crate) fn prelu(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()
         node,
         0,
         Tensor::f32(
-            v.iter().zip(&s).map(|(&x, &a)| if x >= 0.0 { x } else { a * x }).collect(),
+            v.iter()
+                .zip(&s)
+                .map(|(&x, &a)| if x >= 0.0 { x } else { a * x })
+                .collect(),
             shape,
         ),
     )?;
@@ -314,8 +356,16 @@ pub(crate) fn prelu(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()
 }
 
 pub(crate) fn selu(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
-    let alpha = node.attr("alpha").map(|a| a.f()).transpose()?.unwrap_or(1.6732632423543772);
-    let gamma = node.attr("gamma").map(|a| a.f()).transpose()?.unwrap_or(1.0507009873554805);
+    let alpha = node
+        .attr("alpha")
+        .map(|a| a.f())
+        .transpose()?
+        .unwrap_or(1.673_263_2);
+    let gamma = node
+        .attr("gamma")
+        .map(|a| a.f())
+        .transpose()?
+        .unwrap_or(1.050_701);
     unary_f32(env, node, |x| {
         if x > 0.0 {
             gamma * x
@@ -388,7 +438,6 @@ where
     C: Fn(f32, f32) -> f32,
     F: Fn(usize, f32) -> f32,
 {
-
     let mut order: Vec<usize> = (0..shape.len()).filter(|d| !axes.contains(d)).collect();
     for a in axes {
         order.push(*a);
@@ -452,7 +501,11 @@ pub(crate) fn argmax(env: &mut HashMap<String, Tensor>, node: &Node, largest: bo
     for o in 0..outer {
         for i in 0..inner {
             let mut best = 0usize;
-            let mut best_v = if largest { f64::NEG_INFINITY } else { f64::INFINITY };
+            let mut best_v = if largest {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            };
             for d in 0..dim {
                 let val = v[o * dim * inner + d * inner + i];
                 let better = if largest { val > best_v } else { val < best_v };

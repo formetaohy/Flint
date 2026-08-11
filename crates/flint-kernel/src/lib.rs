@@ -178,11 +178,7 @@ impl Kernels {
                 format!("scl/{}", spec.name),
                 spec.kernel,
             ))?;
-            assert_eq!(
-                kernel.name(),
-                spec.name,
-                "kernel entry point mismatch"
-            );
+            assert_eq!(kernel.name(), spec.name, "kernel entry point mismatch");
             kernels.insert(spec.name, kernel);
         }
         Ok(Self { kernels })
@@ -196,18 +192,14 @@ impl Kernels {
             .as_ref())
     }
 
-    pub fn scalar_layout(&self, name: &str) -> Result<&ScalarLayout> {
+    fn scalar_layout(&self, name: &str) -> Result<&ScalarLayout> {
         let kernel = self.get(name)?;
-        kernel.scalar_layout().ok_or_else(|| {
-            Error::Gpu(format!("shader {name} has no scalar parameters"))
-        })
+        kernel
+            .scalar_layout()
+            .ok_or_else(|| Error::Gpu(format!("shader {name} has no scalar parameters")))
     }
 
-    pub fn pack_scalars(
-        &self,
-        name: &str,
-        consts: &[(&'static str, f64)],
-    ) -> Result<Vec<u8>> {
+    pub fn pack_scalars(&self, name: &str, consts: &[(&'static str, f64)]) -> Result<Vec<u8>> {
         let layout = self.scalar_layout(name)?;
         if consts.len() != layout.fields.len() {
             return Err(Error::Gpu(format!(

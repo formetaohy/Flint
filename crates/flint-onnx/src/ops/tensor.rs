@@ -70,7 +70,11 @@ pub(crate) fn transpose(env: &mut HashMap<String, Tensor>, node: &Node) -> Resul
     let x = input(env, node, 0)?;
     let rank = x.shape.len();
     let perm: Vec<usize> = match node.attr("perm") {
-        Some(a) => a.ints()?.iter().map(|&p| norm_axis(p, rank)).collect::<Result<_>>()?,
+        Some(a) => a
+            .ints()?
+            .iter()
+            .map(|&p| norm_axis(p, rank))
+            .collect::<Result<_>>()?,
         None => (0..rank).rev().collect(),
     };
     if perm.len() != rank {
@@ -123,9 +127,6 @@ pub(crate) fn concat(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<(
     let mut datas: Vec<(Data, Vec<usize>)> = Vec::with_capacity(node.inputs.len());
     for i in 0..node.inputs.len() {
         let t = input(env, node, i)?;
-        if t.shape.len() != rank || t.shape[axis] == 0 {
-
-        }
         if t.shape.len() != rank {
             return Err(Error::Model(format!(
                 "Concat: input {i} rank {} != {rank}",
@@ -191,7 +192,10 @@ pub(crate) fn split(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()
     let data = x.data.clone();
     let shape = x.shape.clone();
     let rank = shape.len();
-    let axis = norm_axis(node.attr("axis").map(|a| a.i()).transpose()?.unwrap_or(0), rank)?;
+    let axis = norm_axis(
+        node.attr("axis").map(|a| a.i()).transpose()?.unwrap_or(0),
+        rank,
+    )?;
     let num_outputs = node.outputs.len();
     let splits: Vec<usize> = match node.attr("split") {
         Some(a) => a.ints()?.iter().map(|&s| s as usize).collect(),
@@ -249,14 +253,16 @@ pub(crate) fn slice(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()
             .iter()
             .map(|&a| norm_axis(a, rank))
             .collect::<Result<_>>()?,
-        None => (0..starts.len()).map(|i| i).collect(),
+        None => (0..starts.len()).collect(),
     };
     let steps: Vec<i64> = match input_opt(env, node, 4)? {
         Some(t) => i64s(t)?.to_vec(),
         None => vec![1; starts.len()],
     };
     if starts.len() != ends.len() || starts.len() != axes.len() || starts.len() != steps.len() {
-        return Err(Error::Model("Slice: starts/ends/axes/steps length mismatch".into()));
+        return Err(Error::Model(
+            "Slice: starts/ends/axes/steps length mismatch".into(),
+        ));
     }
 
     let mut slices: Vec<(usize, usize, i64)> = (0..rank).map(|d| (0, x.shape[d], 1)).collect();
@@ -270,7 +276,10 @@ pub(crate) fn slice(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()
         let (s, e) = if step > 0 {
             (norm(starts[i]).clamp(0, dim), norm(ends[i]).clamp(0, dim))
         } else {
-            (norm(starts[i]).clamp(0, dim - 1), norm(ends[i]).clamp(-1, dim - 1))
+            (
+                norm(starts[i]).clamp(0, dim - 1),
+                norm(ends[i]).clamp(-1, dim - 1),
+            )
         };
         slices[ax] = (s as usize, e as usize, step);
     }
@@ -313,7 +322,11 @@ fn slice_data<T: Copy>(v: &[T], shape: &[usize], slices: &[(usize, usize, i64)])
         let mut flat = 0usize;
         for d in 0..shape.len() {
             let (s, _, step) = slices[d];
-            let i = if step > 0 { s + idx[d] * step as usize } else { s - idx[d] * (-step) as usize };
+            let i = if step > 0 {
+                s + idx[d] * step as usize
+            } else {
+                s - idx[d] * (-step) as usize
+            };
             flat = flat * shape[d] + i;
         }
         out.push(v[flat]);
@@ -332,7 +345,10 @@ fn slice_data<T: Copy>(v: &[T], shape: &[usize], slices: &[(usize, usize, i64)])
 pub(crate) fn gather(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let x = input(env, node, 0)?;
     let rank = x.shape.len();
-    let axis = norm_axis(node.attr("axis").map(|a| a.i()).transpose()?.unwrap_or(0), rank)?;
+    let axis = norm_axis(
+        node.attr("axis").map(|a| a.i()).transpose()?.unwrap_or(0),
+        rank,
+    )?;
     let idx = input(env, node, 1)?;
     let indices: Vec<usize> = i64s(idx)?
         .iter()
@@ -348,7 +364,7 @@ pub(crate) fn gather(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<(
 
     let mut shape: Vec<usize> = x.shape[..axis].to_vec();
     shape.extend_from_slice(&idx_shape);
-    shape.extend_from_slice(&x.shape[axis + 1..].to_vec());
+    shape.extend_from_slice(&x.shape[axis + 1..]);
     let outer: usize = x.shape[..axis].iter().product();
     let inner: usize = x.shape[axis + 1..].iter().product();
     let dim = x.shape[axis];
@@ -391,17 +407,24 @@ pub(crate) fn gather(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<(
 pub(crate) fn gather_elements(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let x = input(env, node, 0)?;
     let rank = x.shape.len();
-    let axis = norm_axis(node.attr("axis").map(|a| a.i()).transpose()?.unwrap_or(0), rank)?;
+    let axis = norm_axis(
+        node.attr("axis").map(|a| a.i()).transpose()?.unwrap_or(0),
+        rank,
+    )?;
     let idx = input(env, node, 1)?;
     if idx.shape != x.shape {
-        return Err(Error::Model("GatherElements: index shape != data shape".into()));
+        return Err(Error::Model(
+            "GatherElements: index shape != data shape".into(),
+        ));
     }
     let indices: Vec<usize> = i64s(idx)?
         .iter()
         .map(|&i| {
             let i = if i < 0 { i + x.shape[axis] as i64 } else { i };
             if i < 0 || i >= x.shape[axis] as i64 {
-                return Err(Error::Model(format!("GatherElements: index {i} out of range")));
+                return Err(Error::Model(format!(
+                    "GatherElements: index {i} out of range"
+                )));
             }
             Ok(i as usize)
         })
@@ -438,7 +461,15 @@ pub(crate) fn gather_elements(env: &mut HashMap<String, Tensor>, node: &Node) ->
             Data::Bool(out)
         }
     };
-    output(env, node, 0, Tensor { data, shape: x.shape.clone() })?;
+    output(
+        env,
+        node,
+        0,
+        Tensor {
+            data,
+            shape: x.shape.clone(),
+        },
+    )?;
     Ok(())
 }
 
@@ -451,7 +482,7 @@ pub(crate) fn gather_nd(env: &mut HashMap<String, Tensor>, node: &Node) -> Resul
         .transpose()?
         .unwrap_or(0) as usize;
     let k = *idx.shape.last().unwrap_or(&0);
-    if idx.shape.len() < 1 || k < batch_dims {
+    if idx.shape.is_empty() || k < batch_dims {
         return Err(Error::Model("GatherND: bad index rank".into()));
     }
     if batch_dims > 0 {
@@ -526,9 +557,16 @@ pub(crate) fn squeeze(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<
     let x = input(env, node, 0)?;
     let rank = x.shape.len();
     let axes: Vec<usize> = match node.attr("axes") {
-        Some(a) => a.ints()?.iter().map(|&a| norm_axis(a, rank)).collect::<Result<_>>()?,
+        Some(a) => a
+            .ints()?
+            .iter()
+            .map(|&a| norm_axis(a, rank))
+            .collect::<Result<_>>()?,
         None => match input_opt(env, node, 1)? {
-            Some(t) => i64s(t)?.iter().map(|&a| norm_axis(a, rank)).collect::<Result<_>>()?,
+            Some(t) => i64s(t)?
+                .iter()
+                .map(|&a| norm_axis(a, rank))
+                .collect::<Result<_>>()?,
             None => (0..rank).filter(|&d| x.shape[d] == 1).collect(),
         },
     };
@@ -547,7 +585,15 @@ pub(crate) fn squeeze(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<
         .filter(|(i, _)| !axes.contains(i))
         .map(|(_, d)| *d)
         .collect();
-    output(env, node, 0, Tensor { data: x.data.clone(), shape })?;
+    output(
+        env,
+        node,
+        0,
+        Tensor {
+            data: x.data.clone(),
+            shape,
+        },
+    )?;
     Ok(())
 }
 
@@ -581,18 +627,37 @@ pub(crate) fn unsqueeze(env: &mut HashMap<String, Tensor>, node: &Node) -> Resul
             src += 1;
         }
     }
-    output(env, node, 0, Tensor { data: x.data.clone(), shape })?;
+    output(
+        env,
+        node,
+        0,
+        Tensor {
+            data: x.data.clone(),
+            shape,
+        },
+    )?;
     Ok(())
 }
 
 pub(crate) fn flatten(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let x = input(env, node, 0)?;
     let rank = x.shape.len();
-    let axis = norm_axis(node.attr("axis").map(|a| a.i()).transpose()?.unwrap_or(1), rank)?;
+    let axis = norm_axis(
+        node.attr("axis").map(|a| a.i()).transpose()?.unwrap_or(1),
+        rank,
+    )?;
     let d0: usize = x.shape[..axis].iter().product();
     let d1: usize = x.shape[axis..].iter().product();
     let shape = vec![d0, d1];
-    output(env, node, 0, Tensor { data: x.data.clone(), shape })?;
+    output(
+        env,
+        node,
+        0,
+        Tensor {
+            data: x.data.clone(),
+            shape,
+        },
+    )?;
     Ok(())
 }
 
@@ -666,7 +731,7 @@ pub(crate) fn constant_of_shape(env: &mut HashMap<String, Tensor>, node: &Node) 
         Some(other) => {
             return Err(Error::Model(format!(
                 "ConstantOfShape: value must be a tensor, got {other:?}"
-            )))
+            )));
         }
     };
     output(env, node, 0, t)?;
@@ -722,12 +787,12 @@ pub(crate) fn constant(env: &mut HashMap<String, Tensor>, node: &Node) -> Result
         Some(crate::graph::Attr::Floats(v)) => Tensor::f32(v.clone(), vec![v.len()]),
         Some(crate::graph::Attr::Ints(v)) => Tensor::i64(v.clone(), vec![v.len()]),
         Some(crate::graph::Attr::S(_)) => {
-            return Err(Error::Model("Constant: string values unsupported".into()))
+            return Err(Error::Model("Constant: string values unsupported".into()));
         }
         Some(other) => {
             return Err(Error::Model(format!(
                 "Constant: unsupported attribute {other:?}"
-            )))
+            )));
         }
         None => return Err(Error::Model("Constant: no value attribute".into())),
     };
@@ -737,20 +802,39 @@ pub(crate) fn constant(env: &mut HashMap<String, Tensor>, node: &Node) -> Result
 
 pub(crate) fn cast(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let x = input(env, node, 0)?;
-    let to = node.need("to")?.i()?;
+    let to = node.need("to")?.i()? as i32;
     let data = match to {
-        1 | 10 | 11 | 16 => Data::F32(x.data.as_f32()),
-        2 | 3 | 4 | 5 | 6 | 7 | 12 | 13 => Data::I64(x.data.as_i64()),
-        9 => Data::Bool(match &x.data {
+        crate::dtype::F32 | crate::dtype::F16 | crate::dtype::F64 | crate::dtype::BF16 => {
+            Data::F32(x.data.as_f32())
+        }
+        crate::dtype::U8
+        | crate::dtype::I8
+        | crate::dtype::U16
+        | crate::dtype::I16
+        | crate::dtype::I32
+        | crate::dtype::I64
+        | crate::dtype::U32
+        | crate::dtype::U64 => Data::I64(x.data.as_i64()),
+        crate::dtype::BOOL => Data::Bool(match &x.data {
             Data::Bool(v) => v.clone(),
             Data::F32(v) => v.iter().map(|&x| x != 0.0).collect(),
             Data::I64(v) => v.iter().map(|&x| x != 0).collect(),
         }),
         other => {
-            return Err(Error::Model(format!("Cast: unsupported target type {other}")))
+            return Err(Error::Model(format!(
+                "Cast: unsupported target type {other}"
+            )));
         }
     };
-    output(env, node, 0, Tensor { data, shape: x.shape.clone() })?;
+    output(
+        env,
+        node,
+        0,
+        Tensor {
+            data,
+            shape: x.shape.clone(),
+        },
+    )?;
     Ok(())
 }
 
@@ -766,7 +850,15 @@ pub(crate) fn cast_like(env: &mut HashMap<String, Tensor>, node: &Node) -> Resul
             Data::I64(v) => v.iter().map(|&x| x != 0).collect(),
         }),
     };
-    output(env, node, 0, Tensor { data, shape: x.shape.clone() })?;
+    output(
+        env,
+        node,
+        0,
+        Tensor {
+            data,
+            shape: x.shape.clone(),
+        },
+    )?;
     Ok(())
 }
 
@@ -813,8 +905,22 @@ pub(crate) fn pad(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> 
     }
     let data = match &x.data {
         Data::F32(v) => Data::F32(pad_data(v, &x.shape, &shape, &begins, mode.as_str(), value)),
-        Data::I64(v) => Data::I64(pad_data(v, &x.shape, &shape, &begins, mode.as_str(), value as i64)),
-        Data::Bool(v) => Data::Bool(pad_data(v, &x.shape, &shape, &begins, mode.as_str(), value != 0.0)),
+        Data::I64(v) => Data::I64(pad_data(
+            v,
+            &x.shape,
+            &shape,
+            &begins,
+            mode.as_str(),
+            value as i64,
+        )),
+        Data::Bool(v) => Data::Bool(pad_data(
+            v,
+            &x.shape,
+            &shape,
+            &begins,
+            mode.as_str(),
+            value != 0.0,
+        )),
     };
     output(env, node, 0, Tensor { data, shape })?;
     Ok(())
@@ -847,7 +953,6 @@ fn pad_data<T: Copy>(
         if src_ok {
             match mode {
                 "reflect" | "edge" => {
-
                     let mut flat = 0usize;
                     for d in 0..rank {
                         let b = begins[d] as usize;
@@ -890,7 +995,12 @@ pub(crate) fn topk(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()>
         rank,
     )?;
     let k = i64s(input(env, node, 1)?)?[0] as usize;
-    let largest = node.attr("largest").map(|a| a.i()).transpose()?.unwrap_or(1) != 0;
+    let largest = node
+        .attr("largest")
+        .map(|a| a.i())
+        .transpose()?
+        .unwrap_or(1)
+        != 0;
     let sorted = node.attr("sorted").map(|a| a.i()).transpose()?.unwrap_or(1) != 0;
     let v = f32s(x)?;
     let outer: usize = x.shape[..axis].iter().product();
@@ -911,7 +1021,6 @@ pub(crate) fn topk(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()>
                 }
             });
             if !sorted {
-
                 let mut selected = pairs[..k].to_vec();
                 selected.sort_by_key(|p| p.1);
                 pairs = selected;
@@ -1032,7 +1141,15 @@ pub(crate) fn scatter_nd(env: &mut HashMap<String, Tensor>, node: &Node) -> Resu
             _ => return Err(Error::Model("ScatterND: dtype mismatch".into())),
         }
     }
-    output(env, node, 0, Tensor { data: out, shape: data.shape.clone() })?;
+    output(
+        env,
+        node,
+        0,
+        Tensor {
+            data: out,
+            shape: data.shape.clone(),
+        },
+    )?;
     Ok(())
 }
 
@@ -1041,7 +1158,10 @@ pub(crate) fn scatter_elements(env: &mut HashMap<String, Tensor>, node: &Node) -
     let idx = input(env, node, 1)?;
     let updates = input(env, node, 2)?;
     let rank = data.shape.len();
-    let axis = norm_axis(node.attr("axis").map(|a| a.i()).transpose()?.unwrap_or(0), rank)?;
+    let axis = norm_axis(
+        node.attr("axis").map(|a| a.i()).transpose()?.unwrap_or(0),
+        rank,
+    )?;
     let reduction = node
         .attr("reduction")
         .map(|a| a.s())
@@ -1051,9 +1171,15 @@ pub(crate) fn scatter_elements(env: &mut HashMap<String, Tensor>, node: &Node) -
     let indices: Vec<usize> = i64s(idx)?
         .iter()
         .map(|&i| {
-            let i = if i < 0 { i + data.shape[axis] as i64 } else { i };
+            let i = if i < 0 {
+                i + data.shape[axis] as i64
+            } else {
+                i
+            };
             if i < 0 || i >= data.shape[axis] as i64 {
-                return Err(Error::Model(format!("ScatterElements: index {i} out of range")));
+                return Err(Error::Model(format!(
+                    "ScatterElements: index {i} out of range"
+                )));
             }
             Ok(i as usize)
         })
@@ -1084,6 +1210,14 @@ pub(crate) fn scatter_elements(env: &mut HashMap<String, Tensor>, node: &Node) -
             _ => return Err(Error::Model("ScatterElements: dtype mismatch".into())),
         }
     }
-    output(env, node, 0, Tensor { data: out, shape: data.shape.clone() })?;
+    output(
+        env,
+        node,
+        0,
+        Tensor {
+            data: out,
+            shape: data.shape.clone(),
+        },
+    )?;
     Ok(())
 }

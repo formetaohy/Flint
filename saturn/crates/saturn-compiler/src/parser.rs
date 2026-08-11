@@ -286,7 +286,8 @@ impl Parser {
         self.expect_ident_span("fn")?;
         let (name, _) = self.expect_ident()?;
         let params = self.parse_params()?;
-        let ret = if matches!(self.peek(), Some(Tok::Minus)) && matches!(self.peek_at(1), Some(Tok::Gt))
+        let ret = if matches!(self.peek(), Some(Tok::Minus))
+            && matches!(self.peek_at(1), Some(Tok::Gt))
         {
             self.bump();
             self.bump();
@@ -336,8 +337,9 @@ impl Parser {
             params = self.parse_params()?;
         }
         let body = self.parse_block()?;
-        let (specs, body): (Vec<Stmt>, Vec<Stmt>) =
-            body.into_iter().partition(|stmt| matches!(stmt, Stmt::Spec(_)));
+        let (specs, body): (Vec<Stmt>, Vec<Stmt>) = body
+            .into_iter()
+            .partition(|stmt| matches!(stmt, Stmt::Spec(_)));
         let specs = specs
             .into_iter()
             .map(|stmt| match stmt {
@@ -380,7 +382,10 @@ impl Parser {
         loop {
             match self.peek() {
                 None => {
-                    return Err(Diagnostic::new(self.span(), "unterminated block".to_string()));
+                    return Err(Diagnostic::new(
+                        self.span(),
+                        "unterminated block".to_string(),
+                    ));
                 }
                 Some(Tok::RBrace) => {
                     self.bump();

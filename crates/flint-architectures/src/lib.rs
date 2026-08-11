@@ -2,6 +2,7 @@ pub mod chat;
 pub mod gemma;
 pub mod gemma4;
 pub mod gguf_config;
+pub mod gguf_tokenizer;
 pub mod keys;
 pub mod llama;
 pub mod phi;
@@ -17,7 +18,10 @@ use flint_model::LanguageModel;
 use flint_tokenizer::Tokenizer;
 use serde_json::Value;
 
-use crate::chat::{ChatFormat, ChatMl, ChatMlThink, Gemma4Chat, GemmaChat, Phi3Chat, Phi4Chat};
+use crate::chat::{
+    ChatFormat, ChatMl, ChatMlThink, Gemma4Chat, GemmaChat, Llama2Chat, Llama3Chat, Phi3Chat,
+    Phi4Chat,
+};
 use crate::qwen35::Qwen35;
 
 pub struct ChatModel {
@@ -38,7 +42,6 @@ pub enum Family {
 }
 
 impl Family {
-
     fn from_model_type(t: Option<&str>) -> Result<Self> {
         match t {
             Some("qwen3_5") => Ok(Family::Qwen35),
@@ -64,15 +67,23 @@ impl Family {
         }
     }
 
-    fn chat_format(self) -> Box<dyn ChatFormat> {
+    fn chat_format(self, config: &serde_json::Value) -> Box<dyn ChatFormat> {
         match self {
             Family::Qwen35 => Box::new(ChatMlThink),
-            Family::Llama => Box::new(ChatMl),
+            Family::Llama => llama_chat(config),
             Family::Gemma => Box::new(GemmaChat),
             Family::Phi => Box::new(Phi4Chat),
             Family::PhiMoe => Box::new(Phi3Chat),
             Family::Gemma4 => Box::new(Gemma4Chat),
         }
+    }
+}
+
+fn llama_chat(config: &serde_json::Value) -> Box<dyn ChatFormat> {
+    match config.get("vocab_size").and_then(serde_json::Value::as_u64) {
+        Some(128256) => Box::new(Llama3Chat),
+        Some(32000) => Box::new(Llama2Chat),
+        _ => Box::new(ChatMl),
     }
 }
 
@@ -88,8 +99,8 @@ pub fn load(model_dir: &Path, max_seq: u32, backend: &Backend) -> Result<ChatMod
         Family::PhiMoe => Box::new(phi::load_moe(source.as_ref(), &config, max_seq, backend)?),
         Family::Gemma4 => Box::new(gemma4::load(source.as_ref(), &config, max_seq, backend)?),
     };
-    let tokenizer = Tokenizer::load(model_dir, source.as_ref())?;
-    let chat = family.chat_format();
+    let tokenizer = crate::gguf_tokenizer::load(model_dir, source.as_ref())?;
+    let chat = family.chat_format(&config);
     let stop = stop_tokens(model.eos(), &tokenizer, chat.stop_literals());
     Ok(ChatModel {
         model,

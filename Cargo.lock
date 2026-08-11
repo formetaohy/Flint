@@ -508,7 +508,6 @@ dependencies = [
  "flint-kernel",
  "flint-model",
  "flint-profiler",
- "flint-tensor",
  "saturn-core",
  "serde_json",
 ]
@@ -576,7 +575,6 @@ dependencies = [
  "prost-build",
  "protox",
  "saturn-core",
- "serde_json",
 ]
 
 [[package]]
@@ -598,10 +596,7 @@ dependencies = [
 name = "flint-tokenizer"
 version = "0.1.0"
 dependencies = [
- "ahash",
- "flint-checkpoint",
  "flint-error",
- "serde_json",
  "tokenizers",
 ]
 

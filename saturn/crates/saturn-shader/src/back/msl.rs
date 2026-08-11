@@ -72,11 +72,9 @@ impl Msl {
                 _ => unreachable!(),
             };
             if matches!(*builtin, "lane" | "subgroup_id" | "subgroup_size") {
-                self.out
-                    .push_str(&format!("uint {builtin} [[{attr}]]"));
+                self.out.push_str(&format!("uint {builtin} [[{attr}]]"));
             } else {
-                self.out
-                    .push_str(&format!("uint3 {builtin} [[{attr}]]"));
+                self.out.push_str(&format!("uint3 {builtin} [[{attr}]]"));
             }
         }
         self.out.push_str(") {\n");
@@ -85,15 +83,20 @@ impl Msl {
             self.out.push_str(msl_scalar(shared.elem));
             self.out.push(' ');
             self.out.push_str(&shared.name);
-            self.out.push_str(&format!("[{}];
-", shared.len));
+            self.out.push_str(&format!(
+                "[{}];
+",
+                shared.len
+            ));
         }
         if !kernel.shareds.is_empty() {
             self.out.push('\n');
         }
         self.emit_stmts(&kernel.body, 1)?;
-        self.out.push_str("}
-");
+        self.out.push_str(
+            "}
+",
+        );
         Ok(())
     }
 
@@ -118,7 +121,8 @@ impl Msl {
                 "metal::{ty} NagaCooperativeLoad(const {space} {name}* ptr, ulong stride, bool is_row_major) {{\n"
             ));
             self.out.push_str(&format!("    metal::{ty} m;\n"));
-            self.out.push_str("    simdgroup_load(m, ptr, stride, 0, is_row_major);\n");
+            self.out
+                .push_str("    simdgroup_load(m, ptr, stride, 0, is_row_major);\n");
             self.out.push_str("    return m;\n}\n\n");
         }
         let mut mul_adds: Vec<Wrapped> = self
@@ -141,7 +145,8 @@ impl Msl {
                 "metal::{c_ty} NagaCooperativeMultiplyAdd(const metal::{ab_ty}& a, const metal::{ab_ty}& b, const metal::{c_ty}& c) {{\n"
             ));
             self.out.push_str(&format!("    metal::{c_ty} d;\n"));
-            self.out.push_str("    simdgroup_multiply_accumulate(d, a, b, c);\n");
+            self.out
+                .push_str("    simdgroup_multiply_accumulate(d, a, b, c);\n");
             self.out.push_str("    return d;\n}\n\n");
         }
         let mut stores: Vec<Wrapped> = self
@@ -163,7 +168,8 @@ impl Msl {
             self.out.push_str(&format!(
                 "void NagaCooperativeStore({space} {name}* ptr, metal::{ty} m, ulong stride, bool is_row_major) {{\n"
             ));
-            self.out.push_str("    simdgroup_store(m, ptr, stride, 0, is_row_major);\n}\n\n");
+            self.out
+                .push_str("    simdgroup_store(m, ptr, stride, 0, is_row_major);\n}\n\n");
         }
     }
 
@@ -297,10 +303,7 @@ impl Msl {
                 self.out.push_str(";\n");
             }
             Stmt::If {
-                cond,
-                then,
-                els,
-                ..
+                cond, then, els, ..
             } => {
                 self.out.push_str(&pad);
                 self.out.push_str("if (");
@@ -354,8 +357,10 @@ impl Msl {
             }
             Stmt::Barrier { .. } => {
                 self.out.push_str(&pad);
-                self.out.push_str("threadgroup_barrier(mem_flags::mem_threadgroup);
-");
+                self.out.push_str(
+                    "threadgroup_barrier(mem_flags::mem_threadgroup);
+",
+                );
             }
             Stmt::Continue { .. } => {
                 self.out.push_str(&pad);
@@ -447,11 +452,7 @@ impl Msl {
                 self.out.push(')');
             }
             Expr::Binary {
-                op,
-                lhs,
-                rhs,
-                ty,
-                ..
+                op, lhs, rhs, ty, ..
             } => {
                 self.out.push('(');
                 self.emit_expr(lhs)?;
@@ -477,7 +478,10 @@ impl Msl {
                 };
                 self.out.push_str(text);
                 if scalar_of(ty) == Scalar::F16
-                    && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem)
+                    && matches!(
+                        op,
+                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+                    )
                 {
                     self.out.push_str("(half)");
                 }
@@ -485,10 +489,7 @@ impl Msl {
                 self.out.push(')');
             }
             Expr::Cond {
-                cond,
-                then,
-                els,
-                ..
+                cond, then, els, ..
             } => {
                 self.out.push('(');
                 self.emit_expr(cond)?;
@@ -716,7 +717,7 @@ impl Msl {
 
 fn emit_lvalue(out: &mut String, expr: &Expr) -> Result<()> {
     match expr {
-Expr::LocalRef { name, .. }
+        Expr::LocalRef { name, .. }
         | Expr::ParamRef { name, .. }
         | Expr::ScalarRef { name, .. }
         | Expr::SharedRef { name, .. } => out.push_str(name),

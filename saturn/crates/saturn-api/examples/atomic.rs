@@ -31,7 +31,10 @@ fn main() {
     a.write(0, &input).expect("write a");
     out.write(0, &0u32.to_le_bytes()).expect("init out");
     let kernel = device
-        .create_kernel(&KernelSpec::precompiled("scl/atomic.scl", saturn_scl::scl!("atomic.scl")))
+        .create_kernel(&KernelSpec::precompiled(
+            "scl/atomic.scl",
+            saturn_scl::scl!("atomic.scl"),
+        ))
         .expect("create kernel");
     let mut encoder = device.encoder().expect("encoder");
     encoder

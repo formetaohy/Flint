@@ -40,10 +40,13 @@ fn single_shard_roundtrip_without_index() {
 
     let a = st.read("a").unwrap();
     assert_eq!(a.shape, vec![2, 3]);
-    assert_eq!(a.data.into_f32(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(
+        a.data.into_f32().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    );
 
     let b = st.read("b").unwrap();
-    assert_eq!(b.data.into_f32(), vec![-1.0, 0.0, 2.5, 1e30]);
+    assert_eq!(b.data.into_f32().unwrap(), vec![-1.0, 0.0, 2.5, 1e30]);
 
     let cfg = st.config_json().unwrap().unwrap();
     assert_eq!(cfg["model_type"], "llama");
@@ -88,10 +91,10 @@ fn bf16_and_f16_decode_to_f32() {
 
     let st = Safetensors::open(&dir).unwrap();
     let b = st.read("b").unwrap();
-    assert_eq!(b.data.into_f32(), vec![1.0, -2.0, 0.5]);
+    assert_eq!(b.data.into_f32().unwrap(), vec![1.0, -2.0, 0.5]);
 
     let f = st.read("f").unwrap();
-    assert_eq!(f.data.into_f32(), vec![1.0, -2.0, 2.5]);
+    assert_eq!(f.data.into_f32().unwrap(), vec![1.0, -2.0, 2.5]);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -123,9 +126,9 @@ fn sharded_index_dispatches_across_files() {
     assert_eq!(st.names().len(), 2);
     let q = st.read("layers.0.q.weight").unwrap();
     assert_eq!(q.shape, vec![16, 64]);
-    assert_eq!(q.data.into_f32()[0], 1.0);
+    assert_eq!(q.data.into_f32().unwrap()[0], 1.0);
     let n = st.read("norm.weight").unwrap();
-    assert_eq!(n.data.into_f32()[63], 2.0);
+    assert_eq!(n.data.into_f32().unwrap()[63], 2.0);
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -68,7 +68,9 @@ pub(crate) fn dequantize_linear(env: &mut HashMap<String, Tensor>, node: &Node) 
         )));
     }
     if zv.as_ref().is_some_and(|z| z.len() != 1 && z.len() != dim) {
-        return Err(Error::Model("DequantizeLinear: bad zero point shape".into()));
+        return Err(Error::Model(
+            "DequantizeLinear: bad zero point shape".into(),
+        ));
     }
     let inner: usize = x.shape[axis + 1..].iter().product();
     let outer: usize = x.shape[..axis].iter().product();
@@ -113,10 +115,14 @@ pub(crate) fn matmul_integer(env: &mut HashMap<String, Tensor>, node: &Node) -> 
     let mut out = vec![0i64; batch_n * m * n];
 
     let a_z = |r: usize| -> i64 {
-        a_zpv.as_ref().map_or(0, |z| if z.len() == 1 { z[0] } else { z[r] })
+        a_zpv
+            .as_ref()
+            .map_or(0, |z| if z.len() == 1 { z[0] } else { z[r] })
     };
     let b_z = |c: usize| -> i64 {
-        b_zpv.as_ref().map_or(0, |z| if z.len() == 1 { z[0] } else { z[c] })
+        b_zpv
+            .as_ref()
+            .map_or(0, |z| if z.len() == 1 { z[0] } else { z[c] })
     };
     for bt in 0..batch_n {
         let a_base = bt * m * k;

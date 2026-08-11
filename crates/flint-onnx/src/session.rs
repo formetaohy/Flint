@@ -13,7 +13,6 @@ pub struct Session {
 }
 
 impl Session {
-
     pub fn load(path: &Path) -> Result<Session> {
         let graph = Graph::load(path)?;
         let mut env = HashMap::with_capacity(graph.initializers.len());
@@ -29,9 +28,7 @@ impl Session {
 
     pub fn set_input(&mut self, name: &str, t: Tensor) -> Result<()> {
         if !self.graph.inputs.iter().any(|i| i.name == name) {
-            return Err(Error::Model(format!(
-                "graph has no input named {name:?}"
-            )));
+            return Err(Error::Model(format!("graph has no input named {name:?}")));
         }
         self.env.insert(name.to_string(), t);
         Ok(())

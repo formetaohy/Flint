@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use saturn_core::error::{Error, Result};
 use saturn_core::TimestampSet;
+use saturn_core::error::{Error, Result};
 
 use crate::device::{VkDevice, VkDeviceInner};
 

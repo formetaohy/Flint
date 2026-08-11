@@ -14,7 +14,6 @@ pub(crate) fn matmul(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<(
     let rb = b.shape.len();
     let (shape, out) = match (ra, rb) {
         (1, 1) => {
-
             if a.shape[0] != b.shape[0] {
                 return Err(Error::Model("MatMul: inner dim mismatch".into()));
             }
@@ -106,7 +105,11 @@ fn broadcast_index(batch: &[usize], src: &[usize], flat: usize) -> usize {
 pub(crate) fn gemm(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> {
     let a = input(env, node, 0)?;
     let b = input(env, node, 1)?;
-    let alpha = node.attr("alpha").map(|x| x.f()).transpose()?.unwrap_or(1.0);
+    let alpha = node
+        .attr("alpha")
+        .map(|x| x.f())
+        .transpose()?
+        .unwrap_or(1.0);
     let beta = node.attr("beta").map(|x| x.f()).transpose()?.unwrap_or(1.0);
     let trans_a = node.attr("transA").map(|x| x.i()).transpose()?.unwrap_or(0) != 0;
     let trans_b = node.attr("transB").map(|x| x.i()).transpose()?.unwrap_or(0) != 0;
@@ -130,8 +133,16 @@ pub(crate) fn gemm(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()>
         for j in 0..n {
             let mut acc = 0f32;
             for p in 0..k {
-                let a_v = if trans_a { av[p * m + i] } else { av[i * k + p] };
-                let b_v = if trans_b { bv[j * k + p] } else { bv[p * n + j] };
+                let a_v = if trans_a {
+                    av[p * m + i]
+                } else {
+                    av[i * k + p]
+                };
+                let b_v = if trans_b {
+                    bv[j * k + p]
+                } else {
+                    bv[p * n + j]
+                };
                 acc += a_v * b_v;
             }
             out[i * n + j] = alpha * acc;
@@ -272,7 +283,9 @@ pub(crate) fn batch_norm(env: &mut HashMap<String, Tensor>, node: &Node) -> Resu
     let (sv, bv, mv, vv) = (f32s(scale)?, f32s(bias)?, f32s(mean)?, f32s(var)?);
     let c = x.shape[1];
     if sv.len() != c || bv.len() != c || mv.len() != c || vv.len() != c {
-        return Err(Error::Model("BatchNormalization: channel count mismatch".into()));
+        return Err(Error::Model(
+            "BatchNormalization: channel count mismatch".into(),
+        ));
     }
     let outer: usize = x.shape[..1].iter().product();
     let inner: usize = x.shape[2..].iter().product();
@@ -395,24 +408,25 @@ fn attr_ints(node: &Node, name: &str, default: Vec<usize>) -> Result<Vec<usize>>
     }
 }
 
-fn pool(
-    env: &mut HashMap<String, Tensor>,
-    node: &Node,
-    avg: bool,
-) -> Result<()> {
+fn pool(env: &mut HashMap<String, Tensor>, node: &Node, avg: bool) -> Result<()> {
     let x = input(env, node, 0)?;
     let v = f32s(x)?;
     let spatial = x.shape.len() - 2;
-    let kernel: Vec<usize> = attr_ints(node, "kernel_shape", vec![])?
-        .into_iter()
-        .map(|k| k)
-        .collect();
+    let kernel: Vec<usize> = attr_ints(node, "kernel_shape", vec![])?;
     if kernel.len() != spatial {
-        return Err(Error::Model(format!("{}: kernel_shape mismatch", node.op_type)));
+        return Err(Error::Model(format!(
+            "{}: kernel_shape mismatch",
+            node.op_type
+        )));
     }
     let strides: Vec<usize> = attr_ints(node, "strides", kernel.clone())?;
     let pads: Vec<usize> = attr_ints(node, "pads", vec![0; 2 * spatial])?;
-    let ceil_mode = node.attr("ceil_mode").map(|a| a.i()).transpose()?.unwrap_or(0) != 0;
+    let ceil_mode = node
+        .attr("ceil_mode")
+        .map(|a| a.i())
+        .transpose()?
+        .unwrap_or(0)
+        != 0;
     let count_include_pad = node
         .attr("count_include_pad")
         .map(|a| a.i())
@@ -467,11 +481,7 @@ fn pool(
                     }
                     if in_ok {
                         let val = v[x_off];
-                        acc = if avg {
-                            acc + val
-                        } else {
-                            acc.max(val)
-                        };
+                        acc = if avg { acc + val } else { acc.max(val) };
                         count += 1;
                     }
                 }
@@ -514,7 +524,7 @@ pub(crate) fn global_avg_pool(env: &mut HashMap<String, Tensor>, node: &Node) ->
         out[i] = sum / inner as f32;
     }
     let mut shape = vec![n, c];
-    shape.extend(std::iter::repeat(1).take(spatial));
+    shape.extend(std::iter::repeat_n(1, spatial));
     output(env, node, 0, Tensor::f32(out, shape))?;
     Ok(())
 }
@@ -599,7 +609,7 @@ pub(crate) fn gru(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> 
             other => {
                 return Err(Error::Model(format!(
                     "GRU: unsupported activation {other:?}"
-                )))
+                )));
             }
         })
     };
@@ -621,7 +631,6 @@ pub(crate) fn gru(env: &mut HashMap<String, Tensor>, node: &Node) -> Result<()> 
         let mut h_next = vec![0f32; batch * hidden_size];
         for b_i in 0..batch {
             for i in 0..hidden_size {
-
                 let mut z = bv[i] + bv[3 * hidden_size + i];
                 let mut r = bv[hidden_size + i] + bv[4 * hidden_size + i];
                 for j in 0..input_size {

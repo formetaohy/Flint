@@ -137,7 +137,40 @@ pub fn mul(
     backend.dispatch(
         pass,
         name::MUL,
-        &[("N", n as f64), ("M", m as f64)],
+        &[
+            ("N", n as f64),
+            ("M", m as f64),
+            ("MODE", 0.0),
+            ("STRIDE", 0.0),
+            ("OFFSET", 0.0),
+        ],
+        &[a, b, y],
+        [n.div_ceil(256), 1, 1],
+    )
+}
+
+pub fn row_mul(
+    backend: &mut Backend,
+    pass: &mut Pass<'_>,
+    a: Binding<'_>,
+    b: Binding<'_>,
+    y: Binding<'_>,
+    rows: u32,
+    cols: u32,
+    stride: u32,
+    offset: u32,
+) -> Result<()> {
+    let n = rows * cols;
+    backend.dispatch(
+        pass,
+        name::MUL,
+        &[
+            ("N", n as f64),
+            ("M", cols as f64),
+            ("MODE", 1.0),
+            ("STRIDE", stride as f64),
+            ("OFFSET", offset as f64),
+        ],
         &[a, b, y],
         [n.div_ceil(256), 1, 1],
     )

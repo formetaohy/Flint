@@ -96,7 +96,8 @@ impl GpuProfiler {
             .map(|g| g.capacity)
             .sum::<u32>()
             .max(INITIAL_CAPACITY);
-        self.generations.push(Generation::new(self.device.as_ref(), capacity)?);
+        self.generations
+            .push(Generation::new(self.device.as_ref(), capacity)?);
         Ok(())
     }
 
@@ -132,11 +133,17 @@ impl GpuProfiler {
             }
             self.needs_reset = false;
         }
-        let last = self.generations.last().expect("profiler always has a generation");
+        let last = self
+            .generations
+            .last()
+            .expect("profiler always has a generation");
         if last.next + 2 > last.capacity {
             self.grow()?;
         }
-        let generation = self.generations.last_mut().expect("profiler always has a generation");
+        let generation = self
+            .generations
+            .last_mut()
+            .expect("profiler always has a generation");
         let start = generation.next;
         generation.next += 1;
         encoder.write_timestamp(generation.set.as_ref(), start)?;
@@ -149,7 +156,10 @@ impl GpuProfiler {
         label: &'static str,
         span: u32,
     ) -> Result<()> {
-        let generation = self.generations.last_mut().expect("profiler always has a generation");
+        let generation = self
+            .generations
+            .last_mut()
+            .expect("profiler always has a generation");
         let end = generation.next;
         generation.next += 1;
         encoder.write_timestamp(generation.set.as_ref(), end)?;

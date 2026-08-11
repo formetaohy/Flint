@@ -7,7 +7,6 @@ use serde_json::json;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ToySpec {
-
     Llama,
 
     LlamaQkvBias,
@@ -32,7 +31,6 @@ pub enum ToySpec {
 }
 
 impl ToySpec {
-
     pub fn write(self, dir: &Path) -> Result<()> {
         match self {
             ToySpec::Qwen35 => write_qwen35(dir, 16, 16, true),
@@ -82,7 +80,6 @@ struct Canon {
 
 #[derive(Clone, Copy)]
 enum Role {
-
     F32,
 
     Bf16,
@@ -527,6 +524,8 @@ fn write_phi_layernorm(dir: &Path) -> Result<()> {
             format!("{p}.post_attention_layernorm.weight"),
             &[HIDDEN],
         ));
+        all.push(f32w(format!("{p}.post_attention_norm.weight"), &[HIDDEN]));
+        all.push(f32w(format!("{p}.post_ffw_norm.weight"), &[HIDDEN]));
         all.push(f32w(
             format!("{p}.post_attention_layernorm.bias"),
             &[HIDDEN],
@@ -625,6 +624,8 @@ fn write_phimoe(dir: &Path) -> Result<()> {
             format!("{p}.post_attention_layernorm.weight"),
             &[HIDDEN],
         ));
+        all.push(f32w(format!("{p}.post_attention_norm.weight"), &[HIDDEN]));
+        all.push(f32w(format!("{p}.post_ffw_norm.weight"), &[HIDDEN]));
         all.push(f32w(
             format!("{p}.post_attention_layernorm.bias"),
             &[HIDDEN],
@@ -815,6 +816,8 @@ fn write_gemma4(dir: &Path) -> Result<()> {
             format!("{p}.post_attention_layernorm.weight"),
             &[HIDDEN],
         ));
+        all.push(f32w(format!("{p}.post_attention_norm.weight"), &[HIDDEN]));
+        all.push(f32w(format!("{p}.post_ffw_norm.weight"), &[HIDDEN]));
         all.push(proj(format!("{p}.mlp.gate_proj.weight"), &[ffl, HIDDEN]));
         all.push(proj(format!("{p}.mlp.up_proj.weight"), &[ffl, HIDDEN]));
         all.push(proj(format!("{p}.mlp.down_proj.weight"), &[HIDDEN, ffl]));

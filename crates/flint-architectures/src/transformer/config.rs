@@ -6,12 +6,12 @@ use serde_json::Value;
 
 #[derive(Clone, Debug)]
 pub struct RopeSpec {
-
     pub dim: u32,
 
     pub freq_dim: u32,
     pub theta: f64,
 
+    pub partial: Option<u32>,
     pub scaling: Option<RopeScaling>,
 }
 
@@ -51,6 +51,8 @@ pub struct TransformerConfig {
 
     pub sandwich: bool,
 
+    pub hf_names: bool,
+
     pub windows: Vec<u32>,
 
     pub norm_eps: f32,
@@ -68,6 +70,8 @@ pub struct TransformerConfig {
 
     pub kv_shared: u32,
 
+    pub attn_scale: Option<f32>,
+
     pub softcap: Option<f32>,
 
     pub moe: Option<MoeConfig>,
@@ -76,7 +80,6 @@ pub struct TransformerConfig {
 }
 
 impl TransformerConfig {
-
     pub fn parse(v: &Value, tied_default: bool) -> Result<Self> {
         let hidden = u32_field(v, "hidden_size")?;
         let q_heads = u32_field(v, "num_attention_heads")?;
@@ -93,6 +96,21 @@ impl TransformerConfig {
         };
         let layers = u32_field(v, "num_hidden_layers")?;
         let rope_theta = f64_field(v, "rope_theta")?;
+        let rope_freqs = v
+            .get("rope_freqs")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_f64)
+                    .map(|f| f as f32)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|f| !f.is_empty());
+        let scaling = rope_freqs.map(|f| RopeScaling {
+            short: f.clone(),
+            long: f,
+            original_max: 0,
+        });
         Ok(Self {
             hidden,
             intermediate: u32_field(v, "intermediate_size")?,
@@ -111,6 +129,7 @@ impl TransformerConfig {
             qk_norm: false,
             v_norm: false,
             sandwich: false,
+            hf_names: false,
             windows: vec![0; layers as usize],
             norm_eps: 1e-6,
             layernorm: false,
@@ -121,10 +140,12 @@ impl TransformerConfig {
                 dim: head_dim,
                 freq_dim: head_dim,
                 theta: rope_theta,
-                scaling: None,
+                partial: None,
+                scaling: scaling.clone(),
             }],
             layer_rope: vec![0; layers as usize],
             kv_shared: 0,
+            attn_scale: None,
             softcap: None,
             moe: None,
             per_layer: None,
@@ -136,11 +157,11 @@ impl TransformerConfig {
         if !t.q_heads.is_multiple_of(t.kv_heads) {
             return Err(Error::Config("q heads not divisible by kv heads".into()));
         }
-        if t.q_heads / t.kv_heads > flint_model::ops::MAX_GQA {
+        if t.q_heads / t.kv_heads > flint_model::step::MAX_GQA {
             return Err(Error::Config(format!(
                 "GQA ratio {} exceeds the attention shader's {} head slots",
                 t.q_heads / t.kv_heads,
-                flint_model::ops::MAX_GQA
+                flint_model::step::MAX_GQA
             )));
         }
         if t.head_dims.len() != t.layers as usize {

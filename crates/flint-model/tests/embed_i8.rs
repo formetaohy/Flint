@@ -1,5 +1,6 @@
 use flint_backend::{Backend, Binding, Pass};
 use flint_model::ops;
+use flint_model::quant::quantize;
 use flint_tensor::{DType, Tensor, Weight};
 
 #[test]
@@ -11,24 +12,10 @@ fn embed_i8_matches_cpu_dequant() {
     let table: Vec<f32> = (0..rows * dim)
         .map(|i| (i % 17) as f32 * 0.1 - 0.8)
         .collect();
-    let groups = dim / group;
-    let mut bytes = Vec::with_capacity((rows * dim) as usize);
-    let mut scales = Vec::with_capacity((rows * groups) as usize);
-    for r in 0..rows {
-        for g in 0..groups {
-            let block =
-                &table[(r * dim + g * group) as usize..(r * dim + (g + 1) * group) as usize];
-            let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
-            let scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
-            scales.push(scale);
-            for v in block {
-                bytes.push(((v / scale).round().clamp(-127.0, 127.0) as i8) as u8);
-            }
-        }
-    }
+    let (bytes, scales) = quantize(&table, rows as usize, dim as usize, group as usize);
     let w = Weight::quant(
         backend.tensor_i8(&bytes, vec![rows, dim]),
-        backend.tensor_f32(&scales, vec![rows, groups]),
+        backend.tensor_f32(&scales, vec![rows, dim / group]),
         group,
     );
     let ids_t = Tensor::new(backend.storage(16), vec![4], DType::U32);
@@ -52,20 +39,18 @@ fn embed_i8_matches_cpu_dequant() {
         }
         backend.submit(enc).unwrap();
     }
-    let got = backend.read_f32(y.buf.as_ref(), 0, (4 * dim) as usize).unwrap();
+    let got = backend
+        .read_f32(y.buf.as_ref(), 0, (4 * dim) as usize)
+        .unwrap();
     let ids = [3u32, 1, 0, 2];
     for r in 0..rows {
         let src = ids[r as usize];
-        let row = &table[(src * dim) as usize..((src + 1) * dim) as usize];
         let mut expect = vec![0f32; dim as usize];
-        for g in 0..groups {
-            let block = &row[g as usize * group as usize..(g as usize + 1) * group as usize];
-            let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
-            let s = if amax == 0.0 { 1.0 } else { amax / 127.0 };
-            for k in 0..group {
-                let v = row[g as usize * group as usize + k as usize];
-                expect[g as usize * group as usize + k as usize] =
-                    (v / s).round().clamp(-127.0, 127.0) * s;
+        for kb in 0..dim / 16 {
+            for i in 0..16 {
+                let d = (kb * 16 + i) as usize;
+                let q = bytes[(kb as usize * rows as usize + src as usize) * 16 + i as usize] as i8;
+                expect[d] = q as f32 * scales[kb as usize / 2 * rows as usize + src as usize];
             }
         }
         let worst = (0..dim as usize)

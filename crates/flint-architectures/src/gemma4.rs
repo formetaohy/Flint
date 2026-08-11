@@ -2,16 +2,31 @@ use flint_backend::Backend;
 use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::{Error, Result};
 use flint_model::ops::Act;
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::transformer::{TransformerConfig, TransformerModel, PerLayerConfig, RopeSpec, transformer_plan};
+use crate::transformer::{
+    PerLayerConfig, RopeSpec, TransformerConfig, TransformerModel, transformer_plan,
+};
 
 pub fn parse_config(v: &Value) -> Result<TransformerConfig> {
-    let t = v.get("text_config").unwrap_or(v);
-    let mut cfg = TransformerConfig::parse(t, true)?;
+    let base = v.get("text_config").unwrap_or(v);
+    let t = if base.get("rope_theta").is_some() {
+        base.clone()
+    } else {
+        let mut owned = base.clone();
+        owned["rope_theta"] = base
+            .get("rope_parameters")
+            .and_then(|r| r.get("sliding_attention"))
+            .and_then(|r| r.get("rope_theta"))
+            .cloned()
+            .unwrap_or_else(|| json!(10000.0));
+        owned
+    };
+    let mut cfg = TransformerConfig::parse(&t, true)?;
     cfg.embed_scale = (cfg.hidden as f32).sqrt();
     cfg.qk_norm = true;
     cfg.v_norm = true;
+    cfg.sandwich = true;
     cfg.act = match t.get("hidden_activation").and_then(Value::as_str) {
         Some("gelu_pytorch_tanh") => Act::GeluTanh,
         other => {
@@ -77,12 +92,14 @@ pub fn parse_config(v: &Value) -> Result<TransformerConfig> {
             dim: sliding_hd,
             freq_dim: sliding_hd,
             theta: theta("sliding_attention")?,
+            partial: None,
             scaling: None,
         },
         RopeSpec {
-            dim: (global_hd as f64 * rot) as u32,
+            dim: global_hd,
             freq_dim: global_hd,
             theta: theta("full_attention")?,
+            partial: Some(((global_hd as f64 * rot) as u32) / 2),
             scaling: None,
         },
     ];
@@ -117,6 +134,7 @@ pub fn parse_config(v: &Value) -> Result<TransformerConfig> {
             "Gemma 4 enable_moe_block (26B-A4B) is not supported".into(),
         ));
     }
+    cfg.attn_scale = Some(1.0);
     cfg.validate()?;
     Ok(cfg)
 }
@@ -127,7 +145,8 @@ pub fn load(
     max_seq: u32,
     backend: &Backend,
 ) -> Result<TransformerModel> {
-    let cfg = parse_config(v)?;
+    let mut cfg = parse_config(v)?;
+    cfg.hf_names = source.kind() == CheckpointKind::Safetensors;
     TransformerModel::load(
         source,
         cfg,

@@ -1,7 +1,6 @@
 use crate::{DType, Tensor};
 
 pub enum Weight {
-
     Plain(Tensor),
 
     Quantized {
@@ -14,7 +13,7 @@ pub enum Weight {
 impl Weight {
     pub fn plain(t: Tensor) -> Self {
         assert!(
-            t.dtype == DType::F32 || t.dtype == DType::Bf16Packed,
+            t.dtype == DType::F32 || t.dtype == DType::Bf16,
             "plain weight must be f32 or bf16"
         );
         Self::Plain(t)

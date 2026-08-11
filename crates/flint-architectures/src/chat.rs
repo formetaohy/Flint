@@ -1,5 +1,4 @@
 pub trait ChatFormat {
-
     fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String;
 
     fn stop_literals(&self) -> &'static [&'static str];
@@ -23,6 +22,92 @@ impl ChatFormat for ChatMl {
     }
     fn stop_literals(&self) -> &'static [&'static str] {
         &["im_end"]
+    }
+}
+
+pub struct Llama3Chat;
+
+pub struct Llama2Chat;
+
+impl ChatFormat for Llama3Chat {
+    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
+        let mut out = String::new();
+        out.push_str(
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+",
+        );
+        out.push_str(
+            "Cutting Knowledge Date: December 2023
+",
+        );
+        out.push_str(system);
+        out.push_str("<|eot_id|>");
+        for (u, a) in history {
+            out.push_str(
+                "<|start_header_id|>user<|end_header_id|>
+
+",
+            );
+            out.push_str(u);
+            out.push_str("<|eot_id|>");
+            out.push_str(
+                "<|start_header_id|>assistant<|end_header_id|>
+
+",
+            );
+            out.push_str(a);
+            out.push_str("<|eot_id|>");
+        }
+        out.push_str(
+            "<|start_header_id|>user<|end_header_id|>
+
+",
+        );
+        out.push_str(user);
+        out.push_str("<|eot_id|>");
+        out.push_str(
+            "<|start_header_id|>assistant<|end_header_id|>
+
+",
+        );
+        out
+    }
+    fn stop_literals(&self) -> &'static [&'static str] {
+        &["eot_id"]
+    }
+}
+
+impl ChatFormat for Llama2Chat {
+    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
+        let mut out = String::new();
+        out.push_str("<s>");
+        out.push_str("[INST] ");
+        if !system.is_empty() {
+            out.push_str(
+                "<<SYS>>
+",
+            );
+            out.push_str(system);
+            out.push_str(
+                "
+<</SYS>>
+
+",
+            );
+        }
+        for (u, a) in history {
+            out.push_str(u);
+            out.push_str(" [/INST] ");
+            out.push_str(a);
+            out.push_str(" </s><s>[INST] ");
+        }
+        out.push_str(user);
+        out.push_str(" [/INST]");
+        out
+    }
+    fn stop_literals(&self) -> &'static [&'static str] {
+        &["[INST]"]
     }
 }
 

@@ -46,8 +46,8 @@ pub fn f32_to_f16(value: f32) -> u16 {
         let shift = (14 - half_exp) as u32;
         let shifted = m >> shift;
         let rem = m & ((1u32 << shift) - 1);
-        let round = rem > (1u32 << (shift - 1))
-            || (rem == (1u32 << (shift - 1)) && (shifted & 1) == 1);
+        let round =
+            rem > (1u32 << (shift - 1)) || (rem == (1u32 << (shift - 1)) && (shifted & 1) == 1);
         return sign | (shifted as u16).wrapping_add(round as u16);
     }
     let frac = (mant >> 13) as u16;

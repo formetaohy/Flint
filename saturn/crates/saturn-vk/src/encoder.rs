@@ -7,7 +7,7 @@ use saturn_core::error::{Error, Result};
 use saturn_core::{BindingRef, Buffer, CommandEncoder, Kernel, Submission, TimestampSet};
 
 use crate::buffer::VkBuffer;
-use crate::device::{check, VkDeviceInner};
+use crate::device::{VkDeviceInner, check};
 use crate::kernel::VkKernel;
 use crate::query::VkTimestampSet;
 
@@ -46,7 +46,11 @@ impl VkEncoder {
 
     fn allocate_set(&mut self, layout: vk::DescriptorSetLayout) -> Result<vk::DescriptorSet> {
         if std::env::var("TRACE_SET").is_ok() {
-            eprintln!("[set] pool={} sets={}", self.pools.len(), self.sets_allocated);
+            eprintln!(
+                "[set] pool={} sets={}",
+                self.pools.len(),
+                self.sets_allocated
+            );
         }
         if self.sets_allocated >= MAX_SETS_PER_POOL {
             self.grow_pool()?;
@@ -59,9 +63,7 @@ impl VkEncoder {
                 self.sets_allocated += 1;
                 Ok(sets[0])
             }
-            Err(
-                vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
-            ) => {
+            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => {
                 self.grow_pool()?;
                 self.allocate_set(layout)
             }
@@ -94,17 +96,16 @@ impl CommandEncoder for VkEncoder {
         if !self.active {
             return Err(Error::EncoderInactive);
         }
-        let kernel = kernel
-            .as_any()
-            .downcast_ref::<VkKernel>()
-            .ok_or(Error::KernelTypeMismatch {
-                expected: std::any::type_name::<VkKernel>(),
-                actual: std::any::type_name_of_val(kernel),
-            })?;
+        let kernel =
+            kernel
+                .as_any()
+                .downcast_ref::<VkKernel>()
+                .ok_or(Error::KernelTypeMismatch {
+                    expected: std::any::type_name::<VkKernel>(),
+                    actual: std::any::type_name_of_val(kernel),
+                })?;
         if !Arc::ptr_eq(&self.inner, &kernel.inner) {
-            return Err(Error::DeviceMismatch {
-                kind: "kernel",
-            });
+            return Err(Error::DeviceMismatch { kind: "kernel" });
         }
         if bindings.len() != kernel.bindings.len() {
             return Err(Error::Vulkan(format!(
@@ -123,24 +124,23 @@ impl CommandEncoder for VkEncoder {
             }
         }
         for (i, binding) in bindings.iter().enumerate() {
-            if bindings[..i].iter().any(|other| other.index == binding.index) {
+            if bindings[..i]
+                .iter()
+                .any(|other| other.index == binding.index)
+            {
                 return Err(Error::Vulkan(format!(
                     "binding index {} bound twice",
                     binding.index
                 )));
             }
-            let buffer = binding
-                .buffer
-                .as_any()
-                .downcast_ref::<VkBuffer>()
-                .ok_or(Error::BufferTypeMismatch {
+            let buffer = binding.buffer.as_any().downcast_ref::<VkBuffer>().ok_or(
+                Error::BufferTypeMismatch {
                     expected: std::any::type_name::<VkBuffer>(),
                     actual: std::any::type_name_of_val(binding.buffer),
-                })?;
+                },
+            )?;
             if !Arc::ptr_eq(&self.inner, &buffer.inner) {
-                return Err(Error::DeviceMismatch {
-                    kind: "buffer",
-                });
+                return Err(Error::DeviceMismatch { kind: "buffer" });
             }
             if binding.offset % self.inner.offset_alignment != 0 {
                 return Err(Error::MisalignedOffset {
@@ -181,9 +181,11 @@ impl CommandEncoder for VkEncoder {
             .collect();
         unsafe {
             self.inner.device.update_descriptor_sets(&writes, &[]);
-            self.inner
-                .device
-                .cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
+            self.inner.device.cmd_bind_pipeline(
+                self.cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                kernel.pipeline,
+            );
             self.inner.device.cmd_bind_descriptor_sets(
                 self.cmd,
                 vk::PipelineBindPoint::COMPUTE,
@@ -206,13 +208,14 @@ impl CommandEncoder for VkEncoder {
         if !self.active {
             return Err(Error::EncoderInactive);
         }
-        let kernel = kernel
-            .as_any()
-            .downcast_ref::<VkKernel>()
-            .ok_or(Error::KernelTypeMismatch {
-                expected: std::any::type_name::<VkKernel>(),
-                actual: std::any::type_name_of_val(kernel),
-            })?;
+        let kernel =
+            kernel
+                .as_any()
+                .downcast_ref::<VkKernel>()
+                .ok_or(Error::KernelTypeMismatch {
+                    expected: std::any::type_name::<VkKernel>(),
+                    actual: std::any::type_name_of_val(kernel),
+                })?;
         let bound = self.bound.as_ref().ok_or(Error::UnboundDispatch)?;
         let Some(layout) = &kernel.scalar_layout else {
             return Err(Error::Vulkan(format!(
@@ -293,9 +296,7 @@ impl CommandEncoder for VkEncoder {
                 actual: std::any::type_name_of_val(dst),
             })?;
         if !Arc::ptr_eq(&self.inner, &src.inner) || !Arc::ptr_eq(&self.inner, &dst.inner) {
-            return Err(Error::DeviceMismatch {
-                kind: "buffer",
-            });
+            return Err(Error::DeviceMismatch { kind: "buffer" });
         }
         let src_end = src_offset
             .checked_add(size)
@@ -335,9 +336,7 @@ impl CommandEncoder for VkEncoder {
             return Err(Error::EncoderInactive);
         }
         let barrier = vk::MemoryBarrier::default()
-            .src_access_mask(
-                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-            )
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(
                 vk::AccessFlags::SHADER_READ
                     | vk::AccessFlags::SHADER_WRITE
@@ -377,13 +376,11 @@ impl CommandEncoder for VkEncoder {
         if !Arc::ptr_eq(&self.inner, &dst.inner) {
             return Err(Error::DeviceMismatch { kind: "buffer" });
         }
-        let end = offset
-            .checked_add(size)
-            .ok_or(Error::RangeOutOfBounds {
-                offset,
-                end: u64::MAX,
-                size: dst.size,
-            })?;
+        let end = offset.checked_add(size).ok_or(Error::RangeOutOfBounds {
+            offset,
+            end: u64::MAX,
+            size: dst.size,
+        })?;
         if end > dst.size {
             return Err(Error::RangeOutOfBounds {
                 offset,
@@ -403,15 +400,17 @@ impl CommandEncoder for VkEncoder {
         if !self.active {
             return Err(Error::EncoderInactive);
         }
-        let set = set
-            .as_any()
-            .downcast_ref::<VkTimestampSet>()
-            .ok_or(Error::KernelTypeMismatch {
-                expected: std::any::type_name::<VkTimestampSet>(),
-                actual: std::any::type_name_of_val(set),
-            })?;
+        let set =
+            set.as_any()
+                .downcast_ref::<VkTimestampSet>()
+                .ok_or(Error::KernelTypeMismatch {
+                    expected: std::any::type_name::<VkTimestampSet>(),
+                    actual: std::any::type_name_of_val(set),
+                })?;
         if !Arc::ptr_eq(&self.inner, &set.inner) {
-            return Err(Error::DeviceMismatch { kind: "timestamp set" });
+            return Err(Error::DeviceMismatch {
+                kind: "timestamp set",
+            });
         }
         if index >= set.capacity() {
             return Err(Error::Vulkan(format!(
@@ -441,13 +440,13 @@ impl CommandEncoder for VkEncoder {
         if !self.active {
             return Err(Error::EncoderInactive);
         }
-        let set = set
-            .as_any()
-            .downcast_ref::<VkTimestampSet>()
-            .ok_or(Error::KernelTypeMismatch {
-                expected: std::any::type_name::<VkTimestampSet>(),
-                actual: std::any::type_name_of_val(set),
-            })?;
+        let set =
+            set.as_any()
+                .downcast_ref::<VkTimestampSet>()
+                .ok_or(Error::KernelTypeMismatch {
+                    expected: std::any::type_name::<VkTimestampSet>(),
+                    actual: std::any::type_name_of_val(set),
+                })?;
         let dst = dst
             .as_any()
             .downcast_ref::<VkBuffer>()
@@ -482,24 +481,21 @@ impl CommandEncoder for VkEncoder {
         Ok(())
     }
 
-    fn reset_timestamps(
-        &mut self,
-        set: &dyn TimestampSet,
-        start: u32,
-        count: u32,
-    ) -> Result<()> {
+    fn reset_timestamps(&mut self, set: &dyn TimestampSet, start: u32, count: u32) -> Result<()> {
         if !self.active {
             return Err(Error::EncoderInactive);
         }
-        let set = set
-            .as_any()
-            .downcast_ref::<VkTimestampSet>()
-            .ok_or(Error::KernelTypeMismatch {
-                expected: std::any::type_name::<VkTimestampSet>(),
-                actual: std::any::type_name_of_val(set),
-            })?;
+        let set =
+            set.as_any()
+                .downcast_ref::<VkTimestampSet>()
+                .ok_or(Error::KernelTypeMismatch {
+                    expected: std::any::type_name::<VkTimestampSet>(),
+                    actual: std::any::type_name_of_val(set),
+                })?;
         if !Arc::ptr_eq(&self.inner, &set.inner) {
-            return Err(Error::DeviceMismatch { kind: "timestamp set" });
+            return Err(Error::DeviceMismatch {
+                kind: "timestamp set",
+            });
         }
         let end = start
             .checked_add(count)

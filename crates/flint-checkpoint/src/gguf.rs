@@ -8,106 +8,9 @@ use flint_error::{Error, Result};
 use saturn_core::num::{f32_to_bf16, f32_to_f16};
 
 use super::dequant::{self, GgmlType};
-use super::{Checkpoint, CheckpointKind, RawTensor, TensorData};
+use super::{Checkpoint, CheckpointKind, MetaVal, Metadata, RawTensor, TensorData};
 
-const MAGIC: u32 = 0x4655_4747; 
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum MetaVal {
-    UInt(u64),
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-    Str(String),
-    Arr(Vec<MetaVal>),
-}
-
-#[derive(Default)]
-pub struct Metadata {
-    kv: HashMap<String, MetaVal>,
-}
-
-impl Metadata {
-
-    pub fn new(kv: HashMap<String, MetaVal>) -> Self {
-        Self { kv }
-    }
-
-    pub fn get(&self, key: &str) -> Option<&MetaVal> {
-        self.kv.get(key)
-    }
-
-    pub fn str(&self, key: &str) -> Option<&str> {
-        match self.kv.get(key) {
-            Some(MetaVal::Str(s)) => Some(s),
-            _ => None,
-        }
-    }
-
-    pub fn u64(&self, key: &str) -> Option<u64> {
-        match self.kv.get(key) {
-            Some(MetaVal::UInt(v)) => Some(*v),
-            Some(MetaVal::Int(v)) => u64::try_from(*v).ok(),
-            _ => None,
-        }
-    }
-
-    pub fn u32(&self, key: &str) -> Option<u32> {
-        self.u64(key).and_then(|v| u32::try_from(v).ok())
-    }
-
-    pub fn f64(&self, key: &str) -> Option<f64> {
-        match self.kv.get(key) {
-            Some(MetaVal::Float(v)) => Some(*v),
-            Some(MetaVal::UInt(v)) => Some(*v as f64),
-            Some(MetaVal::Int(v)) => Some(*v as f64),
-            _ => None,
-        }
-    }
-
-    pub fn str_array(&self, key: &str) -> Option<Vec<&str>> {
-        match self.kv.get(key) {
-            Some(MetaVal::Arr(items)) => items
-                .iter()
-                .map(|v| match v {
-                    MetaVal::Str(s) => Some(s.as_str()),
-                    _ => None,
-                })
-                .collect(),
-            _ => None,
-        }
-    }
-
-    pub fn u32_array(&self, key: &str) -> Option<Vec<u32>> {
-        match self.kv.get(key) {
-            Some(MetaVal::Arr(items)) => items
-                .iter()
-                .map(|v| match v {
-                    MetaVal::UInt(n) => u32::try_from(*n).ok(),
-                    MetaVal::Int(n) => u32::try_from(*n).ok(),
-                    MetaVal::Bool(b) => Some(*b as u32),
-                    _ => None,
-                })
-                .collect(),
-            _ => None,
-        }
-    }
-
-    pub fn f64_array(&self, key: &str) -> Option<Vec<f64>> {
-        match self.kv.get(key) {
-            Some(MetaVal::Arr(items)) => items
-                .iter()
-                .map(|v| match v {
-                    MetaVal::Float(f) => Some(*f),
-                    MetaVal::UInt(n) => Some(*n as f64),
-                    MetaVal::Int(n) => Some(*n as f64),
-                    _ => None,
-                })
-                .collect(),
-            _ => None,
-        }
-    }
-}
+const MAGIC: u32 = 0x4655_4747;
 
 struct TensorInfo {
     ty: GgmlType,
@@ -149,7 +52,7 @@ impl Gguf {
         for _ in 0..kv_count {
             let key = r.string()?;
             let val = r.value()?;
-            meta.kv.insert(key, val);
+            meta.insert(key, val);
         }
 
         let alignment = meta.u64("general.alignment").unwrap_or(32) as usize;
@@ -185,11 +88,92 @@ impl Gguf {
                 },
             );
         }
+        if let Some(info) = tensors
+            .get("rope_freqs.weight")
+            .or_else(|| tensors.get("rope_freqs"))
+            && info.ty == GgmlType::F32
+        {
+            let need = info.numel * 4;
+            let start = info.offset;
+            let end = start + need;
+            if end <= mmap.len() {
+                let vals = mmap[start..end]
+                    .chunks_exact(4)
+                    .map(|b| MetaVal::Float(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64))
+                    .collect();
+                meta.insert("rope_freqs".into(), MetaVal::Arr(vals));
+            }
+        }
         Ok(Self {
             mmap,
             meta,
             tensors,
         })
+    }
+}
+
+impl Gguf {
+    fn head_dim(&self) -> Option<u32> {
+        let arch = self.meta.str("general.architecture")?;
+        self.meta.u32(&format!("{arch}.attention.key_length"))
+    }
+
+    fn qk_permuted(&self) -> bool {
+        self.meta.str("general.architecture") == Some("llama")
+    }
+}
+
+fn deinterleave_rows_f32(v: &mut [f32], rows: u32, cols: u32, hd: u32) {
+    let (cols, hd) = (cols as usize, hd as usize);
+    let half = hd / 2;
+    let mut buf = vec![0f32; rows as usize * cols];
+    buf.copy_from_slice(v);
+    for h in 0..rows as usize / hd {
+        for i in 0..half {
+            let (dst, src) = (h * hd + i, h * hd + 2 * i);
+            v[dst * cols..(dst + 1) * cols].copy_from_slice(&buf[src * cols..(src + 1) * cols]);
+            let (dst, src) = (h * hd + half + i, h * hd + 2 * i + 1);
+            v[dst * cols..(dst + 1) * cols].copy_from_slice(&buf[src * cols..(src + 1) * cols]);
+        }
+    }
+}
+
+fn deinterleave_rows_bf16(v: &mut [u8], rows: u32, cols: u32, hd: u32) {
+    let words = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u16, v.len() / 2) };
+    let (cols, hd) = (cols as usize, hd as usize);
+    let half = hd / 2;
+    let mut buf = vec![0u16; rows as usize * cols];
+    buf.copy_from_slice(words);
+    for h in 0..rows as usize / hd {
+        for i in 0..half {
+            let (dst, src) = (h * hd + i, h * hd + 2 * i);
+            words[dst * cols..(dst + 1) * cols].copy_from_slice(&buf[src * cols..(src + 1) * cols]);
+            let (dst, src) = (h * hd + half + i, h * hd + 2 * i + 1);
+            words[dst * cols..(dst + 1) * cols].copy_from_slice(&buf[src * cols..(src + 1) * cols]);
+        }
+    }
+}
+
+fn deinterleave_rows_q8(v: &mut [u8], rows: u32, cols: u32, hd: u32) {
+    const BLOCK: usize = 32;
+    let (cols, hd) = (cols as usize, hd as usize);
+    assert!(
+        cols.is_multiple_of(BLOCK),
+        "Q8_0 deinterleave requires cols to be a multiple of 32, got {cols}"
+    );
+    let half = hd / 2;
+    let row_bytes = (cols / BLOCK) * 34;
+    let mut buf = vec![0u8; rows as usize * row_bytes];
+    buf.copy_from_slice(v);
+    for h in 0..rows as usize / hd {
+        for i in 0..half {
+            let (dst, src) = (h * hd + i, h * hd + 2 * i);
+            v[dst * row_bytes..(dst + 1) * row_bytes]
+                .copy_from_slice(&buf[src * row_bytes..(src + 1) * row_bytes]);
+            let (dst, src) = (h * hd + half + i, h * hd + 2 * i + 1);
+            v[dst * row_bytes..(dst + 1) * row_bytes]
+                .copy_from_slice(&buf[src * row_bytes..(src + 1) * row_bytes]);
+        }
     }
 }
 
@@ -217,13 +201,44 @@ impl Checkpoint for Gguf {
 
         let shape: Vec<u32> = info.shape.iter().rev().cloned().collect();
 
+        let hd = self.head_dim().unwrap_or(0);
+        let interleaved = self.qk_permuted() && hd > 0 && hd.is_multiple_of(2) && {
+            let is_qk = name.ends_with("attn_q.weight")
+                || name.ends_with("attn_k.weight")
+                || name.ends_with("attn_q.bias")
+                || name.ends_with("attn_k.bias");
+            is_qk && shape[0].is_multiple_of(hd)
+        };
+        let (rows, cols) = match shape.len() {
+            2 => (shape[0], shape[1]),
+            _ => (shape[0], 1),
+        };
+
         let data = match info.ty {
-            GgmlType::Bf16 => TensorData::Bf16(bytes.to_vec()),
-            GgmlType::Q8_0 => TensorData::Q8 {
-                bytes: bytes.to_vec(),
-                numel: info.numel,
-            },
-            _ => TensorData::F32(dequant::to_f32(info.ty, bytes, info.numel)?),
+            GgmlType::Bf16 => {
+                let mut d = bytes.to_vec();
+                if interleaved {
+                    deinterleave_rows_bf16(&mut d, rows, cols, hd);
+                }
+                TensorData::Bf16Bytes(d)
+            }
+            GgmlType::Q8_0 => {
+                let mut d = bytes.to_vec();
+                if interleaved {
+                    deinterleave_rows_q8(&mut d, rows, cols, hd);
+                }
+                TensorData::Q8Blocks {
+                    bytes: d,
+                    numel: info.numel,
+                }
+            }
+            _ => {
+                let mut v = dequant::to_f32(info.ty, bytes, info.numel)?;
+                if interleaved {
+                    deinterleave_rows_f32(&mut v, rows, cols, hd);
+                }
+                TensorData::F32(v)
+            }
         };
         Ok(RawTensor { shape, data })
     }
@@ -445,7 +460,7 @@ impl GgufWriter {
     pub fn finish(self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC.to_le_bytes());
-        out.extend_from_slice(&3u32.to_le_bytes()); 
+        out.extend_from_slice(&3u32.to_le_bytes());
         out.extend_from_slice(&(self.tensors.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.kvs.len() as u64).to_le_bytes());
 

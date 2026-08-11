@@ -9,7 +9,7 @@ pub enum DType {
     F32,
     U32,
 
-    Bf16Packed,
+    Bf16,
 
     I8,
 }
@@ -32,7 +32,7 @@ impl Tensor {
     pub fn byte_len(&self) -> u64 {
         match self.dtype {
             DType::F32 | DType::U32 => self.numel() * 4,
-            DType::Bf16Packed => self.numel() * 2,
+            DType::Bf16 => self.numel() * 2,
             DType::I8 => self.numel(),
         }
     }

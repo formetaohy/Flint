@@ -24,8 +24,7 @@ fn to_f16_bits(value: f32) -> [u8; 2] {
 }
 
 fn main() {
-    let device: Box<dyn saturn_core::Device> =
-        open(BackendKind::Vulkan).expect("open vulkan");
+    let device: Box<dyn saturn_core::Device> = open(BackendKind::Vulkan).expect("open vulkan");
     let src = device
         .create_buffer(&BufferSpec {
             size: (T * T * 2) as u64,
@@ -45,7 +44,10 @@ fn main() {
     src.write(0, &input).expect("write src");
 
     let kernel = device
-        .create_kernel(&KernelSpec::precompiled("scl/coop_id16.scl", saturn_scl::scl!("coop_id16.scl")))
+        .create_kernel(&KernelSpec::precompiled(
+            "scl/coop_id16.scl",
+            saturn_scl::scl!("coop_id16.scl"),
+        ))
         .expect("create kernel");
     let mut encoder = device.encoder().expect("encoder");
     encoder

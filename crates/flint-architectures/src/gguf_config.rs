@@ -55,11 +55,21 @@ fn transformer_config(source: &dyn Checkpoint, gemma: bool) -> Result<Value> {
         "tie_word_embeddings": tied,
     });
 
+    if let Some(freqs) = m.f64_array("rope_freqs") {
+        cfg["rope_freqs"] = json!(freqs);
+    }
+
     if gemma {
         let sliding_window = m.u32(&key("attention.sliding_window")).unwrap_or(0);
         let sliding_window_pattern = m.u32(&key("attention.sliding_window_pattern")).unwrap_or(6);
         cfg["sliding_window"] = json!(sliding_window);
         cfg["sliding_window_pattern"] = json!(sliding_window_pattern);
+        cfg["qk_norm"] = json!(
+            source
+                .names()
+                .iter()
+                .any(|n| n == "blk.0.attn_q_norm.weight")
+        );
 
         if let Some(id) = m.str_array("tokenizer.ggml.tokens").and_then(|t| {
             t.iter()
@@ -70,7 +80,6 @@ fn transformer_config(source: &dyn Checkpoint, gemma: bool) -> Result<Value> {
             cfg["eos_token_id"] = json!([eos.as_slice(), &[id]].concat());
         }
     } else {
-
         let bias = source.names().iter().any(|n| n == "blk.0.attn_q.bias");
 
         let qk_norm = source
@@ -121,8 +130,8 @@ fn phi_config(source: &dyn Checkpoint) -> Result<Value> {
         source.read("rope_factors_short.weight"),
         source.read("rope_factors_long.weight"),
     ) {
-        let short = sf.data.into_f32();
-        let long = lf.data.into_f32();
+        let short = sf.data.into_f32()?;
+        let long = lf.data.into_f32()?;
         if !short.is_empty() && short.len() == long.len() {
             cfg["rope_scaling"] = json!({
                 "type": "longrope",
@@ -156,7 +165,6 @@ fn gemma4_config(source: &dyn Checkpoint) -> Result<Value> {
     let sliding = m
         .u32_array(&key("attention.sliding_window_pattern"))
         .or_else(|| {
-
             m.u32(&key("attention.sliding_window_pattern")).map(|p| {
                 (0..layers)
                     .map(|l| (l + 1) % p != 0)
@@ -188,7 +196,7 @@ fn gemma4_config(source: &dyn Checkpoint) -> Result<Value> {
         .ok_or_else(|| Error::Config("gemma4 missing feed_forward_length".into()))?;
     let mut rot_full = hd_full;
     if let Ok(raw) = source.read("rope_freqs.weight") {
-        let freqs = raw.data.into_f32();
+        let freqs = raw.data.into_f32()?;
         let real = freqs.iter().take_while(|v| v.abs() < 1e10).count();
         if real > 0 {
             rot_full = (real as u32 * 2).min(hd_full);

@@ -1,8 +1,9 @@
 use flint_backend::Backend;
 use flint_error::Result;
-use flint_model::blocks::{MlpBlock, take_moe, take_mlp};
+use flint_model::blocks::{MlpBlock, take_mlp, take_moe};
 use flint_model::loader::{Plan, Role, WeightSet};
-use flint_model::ops::{self, MlpTiles, MoeTiles, M_MAX};
+use flint_model::ops::{self, MlpTiles, MoeTiles};
+use flint_model::step::{self, MAX_M};
 use flint_tensor::{Tensor, Weight};
 
 use crate::keys::{gguf_key, hf_key};
@@ -14,8 +15,8 @@ pub fn transformer_role(key: &str) -> Role {
     } else if key == "embed_tokens.weight"
         || key == "embed_tokens_per_layer.weight"
         || key.contains("router")
+        || std::env::var("FLINT_NO_QUANT").is_ok()
     {
-
         Role::Bf16
     } else {
         Role::I8
@@ -36,6 +37,7 @@ pub(crate) struct LayerW {
     pub(crate) k: Option<Weight>,
     pub(crate) v: Option<Weight>,
     pub(crate) o: Weight,
+    pub(crate) o_bias: Option<Tensor>,
     pub(crate) q_bias: Option<Tensor>,
     pub(crate) k_bias: Option<Tensor>,
     pub(crate) v_bias: Option<Tensor>,
@@ -44,13 +46,13 @@ pub(crate) struct LayerW {
     pub(crate) post_attn_norm: Option<Tensor>,
     pub(crate) mlp: MlpBlock,
     pub(crate) post_ffn_norm: Option<Tensor>,
-    pub(crate) per_layer_gate: Option<Weight>, 
+    pub(crate) per_layer_gate: Option<Weight>,
     pub(crate) per_layer_proj: Option<Weight>,
     pub(crate) per_layer_norm: Option<Tensor>,
     pub(crate) out_scale: Option<Tensor>,
-    pub(crate) q_t: Tensor, 
-    pub(crate) k_t: Tensor,
-    pub(crate) v_t: Tensor,
+    pub(crate) q_out: Tensor,
+    pub(crate) k_out: Tensor,
+    pub(crate) v_out: Tensor,
     pub(crate) q_normed: Tensor,
     pub(crate) k_normed: Tensor,
 
@@ -66,7 +68,12 @@ fn take_optional(w: &mut WeightSet, on: bool, key: &str) -> Result<Option<Tensor
     }
 }
 
-pub(crate) fn take_layer(w: &mut WeightSet, cfg: &TransformerConfig, l: u32, backend: &Backend) -> Result<LayerW> {
+pub(crate) fn take_layer(
+    w: &mut WeightSet,
+    cfg: &TransformerConfig,
+    l: u32,
+    backend: &Backend,
+) -> Result<LayerW> {
     let k = |n: &str| format!("layers.{l}.{n}");
     let hd = cfg.head_dim(l);
     let qw = cfg.q_heads * hd;
@@ -98,9 +105,24 @@ pub(crate) fn take_layer(w: &mut WeightSet, cfg: &TransformerConfig, l: u32, bac
             moe.shared_scale,
             cfg.layernorm,
         )?)),
-        None => MlpBlock::Dense(Box::new(take_mlp(w, &format!("layers.{l}"), cfg.layernorm)?)),
+        None => MlpBlock::Dense(Box::new(take_mlp(
+            w,
+            &format!("layers.{l}"),
+            cfg.layernorm,
+            cfg.hf_names,
+        )?)),
     };
-    let ple = cfg.has_ple();
+    let per_layer = cfg.has_ple();
+    let post_attn_key = if cfg.hf_names {
+        "post_attention_layernorm.weight"
+    } else {
+        "post_attention_norm.weight"
+    };
+    let post_ffn_key = if cfg.hf_names {
+        "post_feedforward_layernorm.weight"
+    } else {
+        "post_ffw_norm.weight"
+    };
     Ok(LayerW {
         attn_norm: w.take_tensor(&k("input_layernorm.weight"))?,
         attn_norm_bias: take_optional(w, cfg.layernorm, &k("input_layernorm.bias"))?,
@@ -108,33 +130,34 @@ pub(crate) fn take_layer(w: &mut WeightSet, cfg: &TransformerConfig, l: u32, bac
         k: k_w,
         v: v_w,
         o: w.take(&k("self_attn.o_proj.weight"))?,
+        o_bias: w.take_if(&k("self_attn.o_proj.bias"))?,
         q_bias: take_optional(w, cfg.qkv_bias, &k("self_attn.q_proj.bias"))?,
         k_bias: k_b,
         v_bias: v_b,
         q_norm: take_optional(w, cfg.qk_norm, &k("self_attn.q_norm.weight"))?,
         k_norm: take_optional(w, cfg.qk_norm && has_kv, &k("self_attn.k_norm.weight"))?,
-        post_attn_norm: take_optional(w, cfg.sandwich, &k("post_attention_norm.weight"))?,
+        post_attn_norm: take_optional(w, cfg.sandwich, &k(post_attn_key))?,
         mlp,
-        post_ffn_norm: take_optional(w, cfg.sandwich, &k("post_ffw_norm.weight"))?,
-        per_layer_gate: if ple {
+        post_ffn_norm: take_optional(w, cfg.sandwich, &k(post_ffn_key))?,
+        per_layer_gate: if per_layer {
             Some(w.take(&k("per_layer_input_gate.weight"))?)
         } else {
             None
         },
-        per_layer_proj: if ple {
+        per_layer_proj: if per_layer {
             Some(w.take(&k("per_layer_projection.weight"))?)
         } else {
             None
         },
-        per_layer_norm: take_optional(w, ple, &k("post_per_layer_input_norm.weight"))?,
-        out_scale: take_optional(w, ple, &k("layer_scalar"))?,
-        q_t: backend.zero_tensor(&[M_MAX, qw]),
-        k_t: backend.zero_tensor(&[M_MAX, kvw]),
-        v_t: backend.zero_tensor(&[M_MAX, kvw]),
-        q_normed: backend.zero_tensor(&[M_MAX, qw]),
-        k_normed: backend.zero_tensor(&[M_MAX, kvw]),
-        v_normed: backend.zero_tensor(&[M_MAX, kvw]),
-        attn_out: backend.zero_tensor(&[M_MAX, qw]),
+        per_layer_norm: take_optional(w, per_layer, &k("post_per_layer_input_norm.weight"))?,
+        out_scale: take_optional(w, per_layer, &k("layer_scalar"))?,
+        q_out: backend.zero_tensor(&[MAX_M, qw]),
+        k_out: backend.zero_tensor(&[MAX_M, kvw]),
+        v_out: backend.zero_tensor(&[MAX_M, kvw]),
+        q_normed: backend.zero_tensor(&[MAX_M, qw]),
+        k_normed: backend.zero_tensor(&[MAX_M, kvw]),
+        v_normed: backend.zero_tensor(&[MAX_M, kvw]),
+        attn_out: backend.zero_tensor(&[MAX_M, qw]),
     })
 }
 
@@ -154,12 +177,12 @@ pub(crate) struct Scratch {
     pub(crate) moe: Option<MoeTiles>,
     pub(crate) logits: Tensor,
 
-    pub(crate) ple_tok: Option<Tensor>,
-    pub(crate) ple_ctx: Option<Tensor>,
-    pub(crate) ple_out: Option<Tensor>,
-    pub(crate) ple_gate: Option<Tensor>,
+    pub(crate) per_layer_tok: Option<Tensor>,
+    pub(crate) per_layer_ctx: Option<Tensor>,
+    pub(crate) per_layer_out: Option<Tensor>,
+    pub(crate) per_layer_gate: Option<Tensor>,
 
-    pub(crate) ple_ones: Option<Tensor>,
+    pub(crate) per_layer_ones: Option<Tensor>,
 }
 
 pub(crate) fn alloc_scratch(cfg: &TransformerConfig, backend: &Backend) -> Scratch {
@@ -169,7 +192,7 @@ pub(crate) fn alloc_scratch(cfg: &TransformerConfig, backend: &Backend) -> Scrat
         ops::MoeTiles::new(
             &ops::MoeTilesConfig {
                 experts: m.experts,
-                rows: M_MAX,
+                rows: MAX_M,
                 top_k: m.top_k,
                 hidden: cfg.hidden,
                 intermediate: cfg.intermediate,
@@ -177,36 +200,36 @@ pub(crate) fn alloc_scratch(cfg: &TransformerConfig, backend: &Backend) -> Scrat
             backend,
         )
     });
-    let ple_dim = cfg.per_layer.map(|p| p.dim * cfg.layers);
-    let ple = |shape: &[u32]| ple_dim.map(|_| backend.zero_tensor(shape));
+    let per_layer_dim = cfg.per_layer.map(|p| p.dim * cfg.layers);
+    let alloc = |shape: &[u32]| per_layer_dim.map(|_| backend.zero_tensor(shape));
     Scratch {
-        ids: ops::token_ids(backend),
-        args: ops::step_args(backend),
-        hidden: backend.zero_tensor(&[M_MAX, cfg.hidden]),
-        hidden2: backend.zero_tensor(&[M_MAX, cfg.hidden]),
-        normed: backend.zero_tensor(&[M_MAX, cfg.hidden]),
+        ids: step::token_ids(backend),
+        args: step::step_args(backend),
+        hidden: backend.zero_tensor(&[MAX_M, cfg.hidden]),
+        hidden2: backend.zero_tensor(&[MAX_M, cfg.hidden]),
+        normed: backend.zero_tensor(&[MAX_M, cfg.hidden]),
         attn_scratch: backend.zero_tensor(&[
-                M_MAX,
-                cfg.kv_heads,
-                ops::ATTN_SEGS,
-                ops::MAX_GQA,
-                max_hd + ops::ATTN_PAD,
-            ]),
-        attn_stride: max_hd + ops::ATTN_PAD,
+            MAX_M,
+            cfg.kv_heads,
+            step::ATTN_SEGS,
+            step::MAX_GQA,
+            max_hd + step::ATTN_PAD,
+        ]),
+        attn_stride: max_hd + step::ATTN_PAD,
         mlp: MlpTiles {
-            gate_out: backend.zero_tensor(&[M_MAX, mlp_w]),
-            up_out: backend.zero_tensor(&[M_MAX, mlp_w]),
-            act: backend.zero_tensor(&[M_MAX, mlp_w]),
-            down_out: backend.zero_tensor(&[M_MAX, cfg.hidden]),
+            gate_out: backend.zero_tensor(&[MAX_M, mlp_w]),
+            up_out: backend.zero_tensor(&[MAX_M, mlp_w]),
+            act: backend.zero_tensor(&[MAX_M, mlp_w]),
+            down_out: backend.zero_tensor(&[MAX_M, cfg.hidden]),
         },
         moe,
-        logits: backend.zero_tensor(&[M_MAX, cfg.vocab]),
-        ple_tok: ple(&[M_MAX, ple_dim.unwrap_or(0)]),
-        ple_ctx: ple(&[M_MAX, ple_dim.unwrap_or(0)]),
-        ple_out: ple(&[M_MAX, ple_dim.unwrap_or(0)]),
-        ple_gate: ple(&[M_MAX, cfg.per_layer.map_or(0, |p| p.dim)]),
-        ple_ones: cfg.per_layer.map(|p| {
-            backend.tensor_f32(&vec![1.0; (M_MAX * p.dim) as usize], vec![M_MAX, p.dim])
-        }),
+        logits: backend.zero_tensor(&[MAX_M, cfg.vocab]),
+        per_layer_tok: alloc(&[MAX_M, per_layer_dim.unwrap_or(0)]),
+        per_layer_ctx: alloc(&[MAX_M, per_layer_dim.unwrap_or(0)]),
+        per_layer_out: alloc(&[MAX_M, per_layer_dim.unwrap_or(0)]),
+        per_layer_gate: alloc(&[MAX_M, cfg.per_layer.map_or(0, |p| p.dim)]),
+        per_layer_ones: cfg
+            .per_layer
+            .map(|p| backend.tensor_f32(&vec![1.0; (MAX_M * p.dim) as usize], vec![MAX_M, p.dim])),
     }
 }

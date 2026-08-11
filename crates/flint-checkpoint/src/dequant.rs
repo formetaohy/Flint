@@ -316,7 +316,6 @@ fn q5k(b: &[u8], y: &mut [f32]) {
         let m2 = min * m as f32;
         let base = j * 32;
         for l in 0..32 {
-
             let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
             y[o] = d1 * ((ql[base + l] & 0xf) + hi) as f32 - m1;
             o += 1;

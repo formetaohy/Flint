@@ -59,24 +59,23 @@ impl MtlEncoder {
 
 impl CommandEncoder for MtlEncoder {
     fn bind(&mut self, kernel: &dyn Kernel, bindings: &[BindingRef]) -> Result<()> {
-        let kernel = kernel
-            .as_any()
-            .downcast_ref::<MtlKernel>()
-            .ok_or(Error::KernelTypeMismatch {
-                expected: std::any::type_name::<MtlKernel>(),
-                actual: std::any::type_name_of_val(kernel),
-            })?;
+        let kernel =
+            kernel
+                .as_any()
+                .downcast_ref::<MtlKernel>()
+                .ok_or(Error::KernelTypeMismatch {
+                    expected: std::any::type_name::<MtlKernel>(),
+                    actual: std::any::type_name_of_val(kernel),
+                })?;
         let encoder = self.compute()?;
         encoder.setComputePipelineState(&kernel.pipeline);
         for binding in bindings {
-            let buffer = binding
-                .buffer
-                .as_any()
-                .downcast_ref::<MtlBuffer>()
-                .ok_or(Error::BufferTypeMismatch {
+            let buffer = binding.buffer.as_any().downcast_ref::<MtlBuffer>().ok_or(
+                Error::BufferTypeMismatch {
                     expected: std::any::type_name::<MtlBuffer>(),
                     actual: std::any::type_name_of_val(binding.buffer),
-                })?;
+                },
+            )?;
             unsafe {
                 encoder.setBuffer_offset_atIndex(
                     Some(&buffer.raw),
@@ -96,13 +95,14 @@ impl CommandEncoder for MtlEncoder {
     }
 
     fn set_scalars(&mut self, kernel: &dyn Kernel, bytes: &[u8]) -> Result<()> {
-        let kernel = kernel
-            .as_any()
-            .downcast_ref::<MtlKernel>()
-            .ok_or(Error::KernelTypeMismatch {
-                expected: std::any::type_name::<MtlKernel>(),
-                actual: std::any::type_name_of_val(kernel),
-            })?;
+        let kernel =
+            kernel
+                .as_any()
+                .downcast_ref::<MtlKernel>()
+                .ok_or(Error::KernelTypeMismatch {
+                    expected: std::any::type_name::<MtlKernel>(),
+                    actual: std::any::type_name_of_val(kernel),
+                })?;
         let Some(layout) = &kernel.scalar_layout else {
             return Err(Error::Metal(format!(
                 "kernel {} has no scalar parameters",
@@ -152,10 +152,7 @@ impl CommandEncoder for MtlEncoder {
         if groups[0] == 0 || groups[1] == 0 || groups[2] == 0 {
             return Ok(());
         }
-        let bound = self
-            .bound
-            .as_ref()
-            .ok_or(Error::UnboundDispatch)?;
+        let bound = self.bound.as_ref().ok_or(Error::UnboundDispatch)?;
         if bound.scalar_layout.is_some() && !bound.scalars_set {
             return Err(Error::UnboundScalars(bound.name.clone()));
         }
@@ -239,7 +236,8 @@ impl CommandEncoder for MtlEncoder {
     }
 
     fn barrier(&mut self) -> Result<()> {
-        self.compute()?.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+        self.compute()?
+            .memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
         Ok(())
     }
 
@@ -251,10 +249,7 @@ impl CommandEncoder for MtlEncoder {
                 expected: std::any::type_name::<MtlBuffer>(),
                 actual: std::any::type_name_of_val(dst),
             })?;
-        if offset
-            .checked_add(size)
-            .is_none_or(|end| end > dst.size())
-        {
+        if offset.checked_add(size).is_none_or(|end| end > dst.size()) {
             return Err(Error::RangeOutOfBounds {
                 offset,
                 end: offset.saturating_add(size),

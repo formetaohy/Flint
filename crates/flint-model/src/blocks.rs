@@ -11,10 +11,20 @@ pub struct SwigluMlp {
     pub down: Weight,
 }
 
-pub fn take_mlp(w: &mut WeightSet, prefix: &str, layernorm: bool) -> Result<SwigluMlp> {
+pub fn take_mlp(
+    w: &mut WeightSet,
+    prefix: &str,
+    layernorm: bool,
+    hf_names: bool,
+) -> Result<SwigluMlp> {
     let k = |n: &str| format!("{prefix}.{n}");
+    let norm_key = if hf_names {
+        "pre_feedforward_layernorm.weight"
+    } else {
+        "post_attention_layernorm.weight"
+    };
     Ok(SwigluMlp {
-        norm: w.take_tensor(&k("post_attention_layernorm.weight"))?,
+        norm: w.take_tensor(&k(norm_key))?,
         norm_bias: if layernorm {
             Some(w.take_tensor(&k("post_attention_layernorm.bias"))?)
         } else {

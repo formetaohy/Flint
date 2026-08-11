@@ -12,9 +12,9 @@ fn f16_covers_the_ieee754_cases() {
         (0x4100, 2.5),
         (0x7C00, f32::INFINITY),
         (0xFC00, f32::NEG_INFINITY),
-        (0x0001, 2.0f32.powi(-24)), 
-        (0x03FF, 2.0f32.powi(-14) * (1023.0 / 1024.0)), 
-        (0x3555, 1.0 / 3.0),        
+        (0x0001, 2.0f32.powi(-24)),
+        (0x03FF, 2.0f32.powi(-14) * (1023.0 / 1024.0)),
+        (0x3555, 1.0 / 3.0),
     ];
     for &(bits, want) in cases {
         let got = f16_to_f32(bits);
@@ -76,7 +76,6 @@ impl Bytes {
 }
 
 fn half_bits(v: f32) -> [u8; 2] {
-
     let b = v.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
     let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
@@ -169,14 +168,17 @@ fn truncated_input_fails_fast() {
 
 #[test]
 fn tensor_data_materializes_f32() {
-    assert_eq!(TensorData::F32(vec![1.0, -2.0]).into_f32(), vec![1.0, -2.0]);
+    assert_eq!(
+        TensorData::F32(vec![1.0, -2.0]).into_f32().unwrap(),
+        vec![1.0, -2.0]
+    );
     let bf16_of_one = (1.0f32.to_bits() >> 16) as u16;
     let bf16_of_pi = (std::f32::consts::PI.to_bits() >> 16) as u16;
     let bytes: Vec<u8> = [bf16_of_one, bf16_of_pi]
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
-    let got = TensorData::Bf16(bytes).into_f32();
+    let got = TensorData::Bf16Bytes(bytes).into_f32().unwrap();
     assert_eq!(got[0], 1.0);
     assert!(
         (got[1] - 3.140625).abs() < 1e-6,
@@ -240,7 +242,7 @@ fn ref_q2k(b: &[u8], y: &mut [f32]) {
     let (d, dmin) = (half(b, 68), half(b, 70));
     let (scales, qs) = (&b[0..16], &b[16..80]);
     for (v, out) in y.iter_mut().enumerate() {
-        let (n, r) = ((v / 128) * 32, v % 128); 
+        let (n, r) = ((v / 128) * 32, v % 128);
         let (j, l) = (r / 32, r % 32);
         let g = (n / 32) * 8 + 2 * j + l / 16;
         let q = (qs[n + l % 16 + 16 * (l / 16)] >> (2 * j)) & 3;
@@ -264,8 +266,8 @@ fn ref_q3k(b: &[u8], y: &mut [f32]) {
     for (v, out) in y.iter_mut().enumerate() {
         let (n, r) = ((v / 128) * 32, v % 128);
         let (j, l) = (r / 32, r % 32);
-        let qb = n + l % 16 + 16 * (l / 16); 
-        let hb = l % 16 + 16 * (l / 16); 
+        let qb = n + l % 16 + 16 * (l / 16);
+        let hb = l % 16 + 16 * (l / 16);
         let g = (n / 32) * 8 + 2 * j + l / 16;
         let low = (qs[qb] >> (2 * j)) & 3;
 

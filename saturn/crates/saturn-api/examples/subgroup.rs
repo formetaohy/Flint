@@ -46,7 +46,10 @@ fn main() {
     a_buf.write(0, &input).expect("write a");
 
     let kernel = device
-        .create_kernel(&KernelSpec::precompiled("scl/subgroup.scl", saturn_scl::scl!("subgroup.scl")))
+        .create_kernel(&KernelSpec::precompiled(
+            "scl/subgroup.scl",
+            saturn_scl::scl!("subgroup.scl"),
+        ))
         .expect("create kernel");
 
     let mut encoder = device.encoder().expect("encoder");

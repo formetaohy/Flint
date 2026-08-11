@@ -55,9 +55,23 @@ pub fn norm(
     w_dim: usize,
     eps: f32,
 ) -> Vec<f32> {
+    norm_strided(mode, x, weight, gate, rows, dim, w_dim, eps, dim)
+}
+
+pub fn norm_strided(
+    mode: NormMode,
+    x: &[f32],
+    weight: &[f32],
+    gate: &[f32],
+    rows: usize,
+    dim: usize,
+    w_dim: usize,
+    eps: f32,
+    stride: usize,
+) -> Vec<f32> {
     let mut out = vec![0f32; rows * dim];
     for r in 0..rows {
-        let row = &x[r * dim..(r + 1) * dim];
+        let row = &x[r * stride..r * stride + dim];
         let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
         let mean = match mode {
             NormMode::Layer => row.iter().sum::<f32>() / dim as f32,

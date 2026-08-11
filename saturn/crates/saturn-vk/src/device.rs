@@ -49,7 +49,7 @@ impl VkDevice {
             .application_version(0)
             .engine_name(c"flint")
             .engine_version(0)
-            .api_version(vk::API_VERSION_1_0);
+            .api_version(vk::API_VERSION_1_3);
 
         let layer_names = if options.validation {
             let layers = unsafe { entry.enumerate_instance_layer_properties() }
@@ -119,7 +119,8 @@ impl VkDevice {
         let mut best: Option<(u32, u32, vk::PhysicalDevice)> = None;
         for &physical in &physical_devices {
             let props = unsafe { instance.get_physical_device_properties(physical) };
-            let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
+            let families =
+                unsafe { instance.get_physical_device_queue_family_properties(physical) };
             if let Some((family, _)) = families
                 .iter()
                 .enumerate()
@@ -136,8 +137,7 @@ impl VkDevice {
                 }
             }
         }
-        let (_, queue_family, physical) =
-            best.ok_or(Error::NoBackend("vulkan"))?;
+        let (_, queue_family, physical) = best.ok_or(Error::NoBackend("vulkan"))?;
         let name = unsafe { instance.get_physical_device_properties(physical) }
             .device_name
             .iter()
@@ -156,17 +156,15 @@ impl VkDevice {
                 .map_err(|e| Error::Vulkan(e.to_string()))?
         };
         let has = |name: &str| {
-            available_extensions
-                .iter()
-                .any(|ext| {
-                    let bytes: Vec<u8> = ext
-                        .extension_name
-                        .iter()
-                        .take_while(|&&c| c != 0)
-                        .map(|&c| c as u8)
-                        .collect();
-                    bytes == name.as_bytes()
-                })
+            available_extensions.iter().any(|ext| {
+                let bytes: Vec<u8> = ext
+                    .extension_name
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| c as u8)
+                    .collect();
+                bytes == name.as_bytes()
+            })
         };
         let coop_matrix = has("VK_KHR_cooperative_matrix");
         let vulkan_memory_model = has("VK_KHR_vulkan_memory_model");
@@ -181,10 +179,7 @@ impl VkDevice {
             .iter()
             .map(|name| std::ffi::CString::new(*name).expect("extension name"))
             .collect();
-        let enabled_ptrs: Vec<*const i8> = enabled_refs
-            .iter()
-            .map(|name| name.as_ptr())
-            .collect();
+        let enabled_ptrs: Vec<*const i8> = enabled_refs.iter().map(|name| name.as_ptr()).collect();
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_ref)
             .enabled_extension_names(&enabled_ptrs);
@@ -207,7 +202,8 @@ impl VkDevice {
                 memory_props.memory_types.iter().position(|t| {
                     let f = t.property_flags;
                     f.contains(
-                        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
                     )
                 })
             })
@@ -286,11 +282,17 @@ impl saturn_core::Device for VkDevice {
         self.inner.offset_alignment
     }
 
-    fn create_buffer(&self, spec: &saturn_core::BufferSpec) -> Result<Box<dyn saturn_core::Buffer>> {
+    fn create_buffer(
+        &self,
+        spec: &saturn_core::BufferSpec,
+    ) -> Result<Box<dyn saturn_core::Buffer>> {
         crate::buffer::VkBuffer::create(self, spec)
     }
 
-    fn create_kernel(&self, spec: &saturn_core::KernelSpec) -> Result<Box<dyn saturn_core::Kernel>> {
+    fn create_kernel(
+        &self,
+        spec: &saturn_core::KernelSpec,
+    ) -> Result<Box<dyn saturn_core::Kernel>> {
         crate::kernel::VkKernel::create(self, spec)
     }
 
@@ -346,7 +348,10 @@ impl saturn_core::Device for VkDevice {
         self.inner.timestamp_period
     }
 
-    fn submit(&self, encoder: Box<dyn saturn_core::CommandEncoder>) -> Result<Box<dyn saturn_core::Submission>> {
+    fn submit(
+        &self,
+        encoder: Box<dyn saturn_core::CommandEncoder>,
+    ) -> Result<Box<dyn saturn_core::Submission>> {
         let any: Box<dyn std::any::Any> = encoder;
         let mut encoder = any.downcast::<crate::encoder::VkEncoder>().map_err(|_| {
             Error::EncoderTypeMismatch {
@@ -356,11 +361,19 @@ impl saturn_core::Device for VkDevice {
         })?;
         let inner = self.inner.clone();
         check(unsafe { inner.device.end_command_buffer(encoder.cmd) })?;
-        let fence = unsafe { inner.device.create_fence(&vk::FenceCreateInfo::default(), None) }
-            .map_err(|e| Error::Vulkan(e.to_string()))?;
+        let fence = unsafe {
+            inner
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }
+        .map_err(|e| Error::Vulkan(e.to_string()))?;
         let cmd_ref = [encoder.cmd];
         let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_ref);
-        check(unsafe { inner.device.queue_submit(inner.queue, &[submit_info], fence) })?;
+        check(unsafe {
+            inner
+                .device
+                .queue_submit(inner.queue, &[submit_info], fence)
+        })?;
         let cmd = encoder.take_cmd();
         let pools = encoder.take_pools();
         Ok(Box::new(crate::encoder::VkSubmission {

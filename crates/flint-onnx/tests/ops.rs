@@ -83,9 +83,13 @@ fn init_i64(name: &str, dims: &[i64], data: &[i64]) -> onnx::TensorProto {
     t
 }
 
-fn run_bytes(bytes: &[u8], inputs: &[(&str, Tensor)]) -> (Session, std::collections::HashMap<String, Tensor>) {
+fn run_bytes(
+    bytes: &[u8],
+    inputs: &[(&str, Tensor)],
+) -> (Session, std::collections::HashMap<String, Tensor>) {
     let n = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("flint_onnx_test_{}_{}.onnx", std::process::id(), n));
+    let path =
+        std::env::temp_dir().join(format!("flint_onnx_test_{}_{}.onnx", std::process::id(), n));
     std::fs::write(&path, bytes).unwrap();
     let mut s = Session::load(&path).unwrap();
     for (n, t) in inputs {
@@ -104,14 +108,7 @@ fn f32s(t: &Tensor) -> &[f32] {
 
 #[test]
 fn add_broadcast() {
-    let bytes = one_op(
-        "Add",
-        &["a", "b"],
-        &["y"],
-        vec![],
-        vec![],
-        &["a", "b"],
-    );
+    let bytes = one_op("Add", &["a", "b"], &["y"], vec![], vec![], &["a", "b"]);
     let (_, out) = run_bytes(
         &bytes,
         &[
@@ -124,13 +121,18 @@ fn add_broadcast() {
 
 #[test]
 fn matmul_2d_and_batched() {
-
     let bytes = one_op("MatMul", &["a", "b"], &["y"], vec![], vec![], &["a", "b"]);
     let (_, out) = run_bytes(
         &bytes,
         &[
-            ("a", Tensor::f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3])),
-            ("b", Tensor::f32(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2])),
+            (
+                "a",
+                Tensor::f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
+            ),
+            (
+                "b",
+                Tensor::f32(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]),
+            ),
         ],
     );
 
@@ -139,8 +141,14 @@ fn matmul_2d_and_batched() {
     let (_, out) = run_bytes(
         &bytes,
         &[
-            ("a", Tensor::f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 1, 3])),
-            ("b", Tensor::f32(vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0], vec![2, 3, 1])),
+            (
+                "a",
+                Tensor::f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 1, 3]),
+            ),
+            (
+                "b",
+                Tensor::f32(vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0], vec![2, 3, 1]),
+            ),
         ],
     );
     assert_eq!(f32s(&out["y"]), &[6.0, 30.0]);
@@ -194,7 +202,10 @@ fn softmax_axis() {
         &["x"],
     );
 
-    let (_, out) = run_bytes(&bytes, &[("x", Tensor::f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]))]);
+    let (_, out) = run_bytes(
+        &bytes,
+        &[("x", Tensor::f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]))],
+    );
     let y = f32s(&out["y"]);
     let e = |v: f32| v.exp();
     let s0 = e(1.0) + e(2.0);
@@ -207,7 +218,6 @@ fn softmax_axis() {
 
 #[test]
 fn layernorm_decomposition() {
-
     let inits = vec![
         init_f32("w", &[3], &[1.0, 2.0, 3.0]),
         init_f32("b", &[3], &[0.1, 0.2, 0.3]),
@@ -256,12 +266,14 @@ fn layernorm_decomposition() {
     let mut g = onnx::GraphProto::default();
     g.node = vec![n1, n2, n3, n4, n5, n6, n7, n8, n9];
     g.initializer = inits;
-    for name in ["x"] {
+    {
+        let name = "x";
         let mut v = onnx::ValueInfoProto::default();
         v.name = name.into();
         g.input.push(v);
     }
-    for name in ["y"] {
+    {
+        let name = "y";
         let mut v = onnx::ValueInfoProto::default();
         v.name = name.into();
         g.output.push(v);
@@ -283,7 +295,10 @@ fn layernorm_decomposition() {
     let (w, b) = ([1.0, 2.0, 3.0], [0.1, 0.2, 0.3]);
     for row in 0..2 {
         let m = (xv[row * 3] + xv[row * 3 + 1] + xv[row * 3 + 2]) / 3.0;
-        let v = ((xv[row * 3] - m).powi(2) + (xv[row * 3 + 1] - m).powi(2) + (xv[row * 3 + 2] - m).powi(2)) / 3.0;
+        let v = ((xv[row * 3] - m).powi(2)
+            + (xv[row * 3 + 1] - m).powi(2)
+            + (xv[row * 3 + 2] - m).powi(2))
+            / 3.0;
         for j in 0..3 {
             let want = (xv[row * 3 + j] - m) / (v + 1e-5).sqrt() * w[j] + b[j];
             assert!((y[row * 3 + j] - want).abs() < 1e-5, "row {row} j {j}");
@@ -293,7 +308,6 @@ fn layernorm_decomposition() {
 
 #[test]
 fn gather_negative_and_reshape() {
-
     let mut g1 = onnx::NodeProto::default();
     g1.op_type = "Gather".into();
     g1.input = vec!["data".into(), "idx".into()];
@@ -311,7 +325,8 @@ fn gather_negative_and_reshape() {
         v.name = name.into();
         g.input.push(v);
     }
-    for name in ["y"] {
+    {
+        let name = "y";
         let mut v = onnx::ValueInfoProto::default();
         v.name = name.into();
         g.output.push(v);
@@ -349,7 +364,10 @@ fn slice_negative_step() {
     let (_, out) = run_bytes(
         &bytes,
         &[
-            ("x", Tensor::f32(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0], vec![6])),
+            (
+                "x",
+                Tensor::f32(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0], vec![6]),
+            ),
             ("starts", Tensor::i64(vec![5], vec![1])),
             ("ends", Tensor::i64(vec![0], vec![1])),
             ("axes", Tensor::i64(vec![0], vec![1])),
@@ -362,7 +380,10 @@ fn slice_negative_step() {
 #[test]
 fn erf_accuracy() {
     let bytes = one_op("Erf", &["x"], &["y"], vec![], vec![], &["x"]);
-    let (_, out) = run_bytes(&bytes, &[("x", Tensor::f32(vec![0.0, 0.5, 1.0, 2.0, -1.5], vec![5]))]);
+    let (_, out) = run_bytes(
+        &bytes,
+        &[("x", Tensor::f32(vec![0.0, 0.5, 1.0, 2.0, -1.5], vec![5]))],
+    );
     let y = f32s(&out["y"]);
     let want = [0.0, 0.5204999, 0.8427008, 0.9953223, -0.9661051];
     for (a, b) in y.iter().zip(want) {
@@ -372,7 +393,6 @@ fn erf_accuracy() {
 
 #[test]
 fn if_control_flow() {
-
     let mut then_g = onnx::GraphProto::default();
     let mut add = onnx::NodeProto::default();
     add.op_type = "Add".into();

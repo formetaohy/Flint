@@ -15,7 +15,3 @@ clap.workspace = true
 serde_json.workspace = true
 saturn-core.workspace = true
 
-[dev-dependencies]
-flint-tensor.workspace = true
-saturn-core.workspace = true
-

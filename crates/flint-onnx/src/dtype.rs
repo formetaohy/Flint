@@ -1,0 +1,13 @@
+pub const F32: i32 = 1;
+pub const U8: i32 = 2;
+pub const I8: i32 = 3;
+pub const U16: i32 = 4;
+pub const I16: i32 = 5;
+pub const I32: i32 = 6;
+pub const I64: i32 = 7;
+pub const BOOL: i32 = 9;
+pub const F16: i32 = 10;
+pub const F64: i32 = 11;
+pub const U32: i32 = 12;
+pub const U64: i32 = 13;
+pub const BF16: i32 = 16;

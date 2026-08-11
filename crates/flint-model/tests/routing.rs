@@ -15,7 +15,6 @@ fn softmax_topk_weights_sum_lt_one() {
 
 #[test]
 fn sparsemixer_masks_distant_experts() {
-
     let logits: Vec<f32> = vec![
         10.0, 9.9, 5.0, -5.0, 9.95, 9.98, 0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0, 9.0, 9.99,
     ];

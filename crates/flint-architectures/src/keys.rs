@@ -3,7 +3,11 @@ use flint_model::loader::MoEPart;
 pub fn hf_key(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("model.language_model.") {
         Some(rest.to_string())
-    } else if let Some(rest) = name.strip_prefix("model.") {
+    } else if let Some(rest) = name.strip_prefix("model.")
+        && !rest.starts_with("audio_tower.")
+        && !rest.starts_with("vision_tower.")
+        && !rest.starts_with("visual.")
+    {
         Some(rest.to_string())
     } else if name.starts_with("lm_head.") || name.starts_with("mtp.") {
         Some(name.to_string())

@@ -11,10 +11,7 @@ pub enum CVal {
     Bool(bool),
 }
 
-pub fn const_eval(
-    expr: &ast::Expr,
-    consts: &HashMap<String, (CVal, Scalar)>,
-) -> Option<CVal> {
+pub fn const_eval(expr: &ast::Expr, consts: &HashMap<String, (CVal, Scalar)>) -> Option<CVal> {
     match expr {
         ast::Expr::IntLit(value, _) => Some(CVal::Int(*value)),
         ast::Expr::FloatLit(value, _) => Some(CVal::Float(*value)),

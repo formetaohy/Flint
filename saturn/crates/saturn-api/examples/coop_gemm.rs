@@ -87,7 +87,10 @@ fn main() {
     b_buf.write(0, &b_data).expect("write b");
 
     let kernel = device
-        .create_kernel(&KernelSpec::precompiled("scl/coop_gemm.scl", saturn_scl::scl!("coop_gemm.scl")))
+        .create_kernel(&KernelSpec::precompiled(
+            "scl/coop_gemm.scl",
+            saturn_scl::scl!("coop_gemm.scl"),
+        ))
         .expect("create kernel (requires VK_KHR_cooperative_matrix)");
 
     let mut encoder = device.encoder().expect("encoder");

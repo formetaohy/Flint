@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use flint_backend::Backend;
 use flint_error::{Error, Result};
-use flint_model::{LanguageModel, M_MAX};
-use flint_tokenizer::{Decoder, Tokenizer};
+use flint_model::{LanguageModel, MAX_M};
+use flint_tokenizer::{StreamDecoder, Tokenizer};
 
 use crate::sampler::{Dist, Sampler};
 
@@ -22,7 +22,6 @@ pub struct GenStats {
 }
 
 impl GenStats {
-
     pub fn summary(&self) -> String {
         let pp = if self.prefill_secs > 0.0 {
             self.prefill_tokens as f64 / self.prefill_secs
@@ -98,7 +97,7 @@ impl Engine {
             sampler: &mut self.sampler,
             stop: self.stop.clone(),
             speculate,
-            decoder: self.tokenizer.decoder(),
+            decoder: self.tokenizer.stream_decoder(),
             context: prompt_ids.clone(),
             prompt_ids,
             max_tokens,
@@ -140,7 +139,7 @@ pub struct Stream<'a> {
     sampler: &'a mut Sampler,
     stop: Vec<u32>,
     speculate: bool,
-    decoder: Decoder,
+    decoder: StreamDecoder,
     prompt_ids: Vec<u32>,
 
     context: Vec<u32>,
@@ -211,7 +210,7 @@ impl Stream<'_> {
 
     fn step_prefill(&mut self, done: usize) -> Result<()> {
         let total = self.prompt_ids.len();
-        let end = (done + M_MAX as usize).min(total);
+        let end = (done + MAX_M as usize).min(total);
         let chunk = &self.prompt_ids[done..end];
         let m = chunk.len() as u32;
         let last = end == total;

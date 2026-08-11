@@ -10,8 +10,14 @@ fn model_path() -> Option<std::path::PathBuf> {
 }
 
 const REF_FIRST: [f32; 8] = [
-    0.05258789, -0.07846259, 0.25362775, -0.19136892, -0.59708065, -0.06743392, 0.06855663,
-    -0.19574150,
+    0.05258789,
+    -0.07846259,
+    0.25362775,
+    -0.19136892,
+    -0.59708065,
+    -0.06743392,
+    0.06855663,
+    -0.195_741_5,
 ];
 
 #[test]
@@ -22,9 +28,12 @@ fn minilm_end_to_end() {
     };
     let mut s = Session::load(&path).unwrap();
     let ids: Vec<i64> = vec![101, 7592, 2087, 2023, 2003, 1037, 3710, 102];
-    s.set_input("input_ids", Tensor::i64(ids, vec![1, 8])).unwrap();
-    s.set_input("attention_mask", Tensor::i64(vec![1; 8], vec![1, 8])).unwrap();
-    s.set_input("token_type_ids", Tensor::i64(vec![0; 8], vec![1, 8])).unwrap();
+    s.set_input("input_ids", Tensor::i64(ids, vec![1, 8]))
+        .unwrap();
+    s.set_input("attention_mask", Tensor::i64(vec![1; 8], vec![1, 8]))
+        .unwrap();
+    s.set_input("token_type_ids", Tensor::i64(vec![0; 8], vec![1, 8]))
+        .unwrap();
     let out = s.run().unwrap();
     let t = &out["last_hidden_state"];
     assert_eq!(t.shape, vec![1, 8, 384]);
@@ -45,21 +54,20 @@ fn minilm_end_to_end() {
 
 #[test]
 fn minilm_matches_fp16_and_int8_variants() {
-
     let Some(base) = model_path() else {
         eprintln!("skipping: model not found");
         return;
     };
     let dir = base.parent().unwrap();
-    let variants = [
-        ("model_fp16.onnx", 5e-2),
-        ("model_quantized.onnx", 5e-1),
-    ];
+    let variants = [("model_fp16.onnx", 5e-2), ("model_quantized.onnx", 5e-1)];
     let mut s = Session::load(&base).unwrap();
     let ids: Vec<i64> = vec![101, 7592, 2087, 2023, 2003, 1037, 3710, 102];
-    s.set_input("input_ids", Tensor::i64(ids.clone(), vec![1, 8])).unwrap();
-    s.set_input("attention_mask", Tensor::i64(vec![1; 8], vec![1, 8])).unwrap();
-    s.set_input("token_type_ids", Tensor::i64(vec![0; 8], vec![1, 8])).unwrap();
+    s.set_input("input_ids", Tensor::i64(ids.clone(), vec![1, 8]))
+        .unwrap();
+    s.set_input("attention_mask", Tensor::i64(vec![1; 8], vec![1, 8]))
+        .unwrap();
+    s.set_input("token_type_ids", Tensor::i64(vec![0; 8], vec![1, 8]))
+        .unwrap();
     let base_out = s.run().unwrap();
     let Data::F32(base_v) = &base_out["last_hidden_state"].data else {
         panic!("output not f32");
@@ -71,9 +79,12 @@ fn minilm_matches_fp16_and_int8_variants() {
             continue;
         }
         let mut s = Session::load(&p).unwrap();
-        s.set_input("input_ids", Tensor::i64(ids.clone(), vec![1, 8])).unwrap();
-        s.set_input("attention_mask", Tensor::i64(vec![1; 8], vec![1, 8])).unwrap();
-        s.set_input("token_type_ids", Tensor::i64(vec![0; 8], vec![1, 8])).unwrap();
+        s.set_input("input_ids", Tensor::i64(ids.clone(), vec![1, 8]))
+            .unwrap();
+        s.set_input("attention_mask", Tensor::i64(vec![1; 8], vec![1, 8]))
+            .unwrap();
+        s.set_input("token_type_ids", Tensor::i64(vec![0; 8], vec![1, 8]))
+            .unwrap();
         let out = s.run().unwrap();
         let Data::F32(v) = &out["last_hidden_state"].data else {
             panic!("{file} output not f32");

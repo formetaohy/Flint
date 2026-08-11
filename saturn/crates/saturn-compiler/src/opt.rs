@@ -95,7 +95,11 @@ fn fold_stmt(stmt: ir::Stmt) -> Vec<ir::Stmt> {
         } => {
             fold_expr(&mut target);
             fold_expr(&mut value);
-            vec![ir::Stmt::Assign { target, value, span }]
+            vec![ir::Stmt::Assign {
+                target,
+                value,
+                span,
+            }]
         }
         ir::Stmt::If {
             mut cond,
@@ -131,9 +135,7 @@ fn fold_stmt(stmt: ir::Stmt) -> Vec<ir::Stmt> {
             fold_expr(&mut start);
             fold_expr(&mut end);
             let dead = match (&start, &end) {
-                (ir::Expr::IntLit { value: a, .. }, ir::Expr::IntLit { value: b, .. }) => {
-                    a >= b
-                }
+                (ir::Expr::IntLit { value: a, .. }, ir::Expr::IntLit { value: b, .. }) => a >= b,
                 _ => false,
             };
             if dead {

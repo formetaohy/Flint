@@ -3,7 +3,10 @@ use flint_error::Result;
 use flint_kernel::name;
 use flint_tensor::{Tensor, Weight};
 
-use crate::ops::{ATTN_SEGS, MAX_GQA, NormMode};
+use crate::ops::NormMode;
+use crate::step::{ATTN_SEGS, MAX_GQA};
+
+const NORM_ROPE_MODE: u32 = 4;
 
 pub fn norm(
     backend: &mut Backend,
@@ -18,6 +21,78 @@ pub fn norm(
     w_dim: u32,
     eps: f32,
 ) -> Result<()> {
+    norm_strided(
+        backend, pass, mode, x, weight, gate, y, rows, dim, w_dim, eps, dim,
+    )
+}
+
+pub fn norm_strided(
+    backend: &mut Backend,
+    pass: &mut Pass<'_>,
+    mode: NormMode,
+    x: Binding<'_>,
+    weight: &Tensor,
+    gate: Binding<'_>,
+    y: Binding<'_>,
+    rows: u32,
+    dim: u32,
+    w_dim: u32,
+    eps: f32,
+    stride: u32,
+) -> Result<()> {
+    norm_impl(
+        backend, pass, mode, x, weight, gate, y, rows, dim, w_dim, eps, stride, 0, 0, 0,
+    )
+}
+
+pub fn norm_per_layer(
+    backend: &mut Backend,
+    pass: &mut Pass<'_>,
+    x: Binding<'_>,
+    weight: &Tensor,
+    y: Binding<'_>,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+    layers: u32,
+    stride: u32,
+) -> Result<()> {
+    norm_impl(
+        backend,
+        pass,
+        NormMode::Direct,
+        x,
+        weight,
+        x,
+        y,
+        rows,
+        dim,
+        dim,
+        eps,
+        stride,
+        1,
+        layers,
+        stride,
+    )
+}
+
+fn norm_impl(
+    backend: &mut Backend,
+    pass: &mut Pass<'_>,
+    mode: NormMode,
+    x: Binding<'_>,
+    weight: &Tensor,
+    gate: Binding<'_>,
+    y: Binding<'_>,
+    rows: u32,
+    dim: u32,
+    w_dim: u32,
+    eps: f32,
+    stride: u32,
+    ple: u32,
+    ple_layers: u32,
+    ple_stride: u32,
+) -> Result<()> {
     backend.dispatch(
         pass,
         name::NORM,
@@ -29,8 +104,11 @@ pub fn norm(
             ("HEADS", 1.0),
             ("ROT", 2.0),
             ("COS_STRIDE", 1.0),
+            ("STRIDE", stride as f64),
+            ("PLE", ple as f64),
+            ("PLE_LAYERS", ple_layers as f64),
+            ("PLE_STRIDE", ple_stride as f64),
         ],
-
         &[x, Binding::Full(weight), gate, y, gate, gate, gate],
         [rows, 1, 1],
     )
@@ -54,13 +132,17 @@ pub fn norm_rope(
         pass,
         name::NORM,
         &[
-            ("MODE", 4.0),
+            ("MODE", NORM_ROPE_MODE as f64),
             ("DIM", dim as f64),
             ("W_DIM", dim as f64),
             ("EPS", eps as f64),
             ("HEADS", heads as f64),
             ("ROT", rot as f64),
             ("COS_STRIDE", (rot / 2) as f64),
+            ("STRIDE", dim as f64),
+            ("PLE", 0.0),
+            ("PLE_LAYERS", 0.0),
+            ("PLE_STRIDE", 0.0),
         ],
         &[
             x,
@@ -84,7 +166,6 @@ pub fn embed(
     dim: u32,
     scale: f32,
 ) -> Result<()> {
-
     let (wdt, wd, group, scales) = match table {
         Weight::Plain(t) => (0.0, Binding::Full(t), 128.0, Binding::Full(t)),
         Weight::Quantized {
@@ -93,6 +174,82 @@ pub fn embed(
             group: g,
         } => (1.0, Binding::Full(t), *g as f64, Binding::Full(s)),
     };
+    embed_dispatch(
+        backend,
+        pass,
+        ids,
+        wd,
+        wd,
+        scales,
+        y,
+        rows,
+        dim,
+        scale,
+        wdt,
+        group,
+        u32::MAX as f64,
+        table.tensor().shape[0],
+    )
+}
+
+pub fn embed_split(
+    backend: &mut Backend,
+    pass: &mut Pass<'_>,
+    ids: &Tensor,
+    table: &Weight,
+    split: u32,
+    y: Binding<'_>,
+    rows: u32,
+    dim: u32,
+    scale: f32,
+) -> Result<()> {
+    let t = match table {
+        Weight::Plain(t) => t,
+        Weight::Quantized { tensor: t, .. } => t,
+    };
+    let (wdt, group, scales) = match table {
+        Weight::Plain(_) => (0.0, 128.0, Binding::Slice(t, 0, t.byte_len())),
+        Weight::Quantized {
+            scale: s, group: g, ..
+        } => (1.0, *g as f64, Binding::Full(s)),
+    };
+    let half = split as u64 * dim as u64 * 2;
+    let t0 = Binding::Slice(t, 0, half);
+    let t1 = Binding::Slice(t, half, t.byte_len() - half);
+    embed_dispatch(
+        backend,
+        pass,
+        ids,
+        t0,
+        t1,
+        scales,
+        y,
+        rows,
+        dim,
+        scale,
+        wdt,
+        group,
+        split as f64,
+        t.shape[0],
+    )
+}
+
+fn embed_dispatch(
+    backend: &mut Backend,
+    pass: &mut Pass<'_>,
+    ids: &Tensor,
+    w0: Binding<'_>,
+    w1: Binding<'_>,
+    scales: Binding<'_>,
+    y: Binding<'_>,
+    rows: u32,
+    dim: u32,
+    scale: f32,
+    wdt: f64,
+    group: f64,
+    split: f64,
+    table_rows: u32,
+) -> Result<()> {
     backend.dispatch(
         pass,
         name::EMBED,
@@ -102,8 +259,10 @@ pub fn embed(
             ("SCALE", scale as f64),
             ("WDTYPE", wdt),
             ("GROUP", group),
+            ("SPLIT", split),
+            ("ROWS", table_rows as f64),
         ],
-        &[Binding::Full(ids), wd, scales, y],
+        &[Binding::Full(ids), w0, w1, scales, y],
         [(rows * dim).div_ceil(256), 1, 1],
     )
 }
@@ -184,6 +343,7 @@ pub fn attn(
     m: u32,
     window: u32,
     stride: u32,
+    scale: f32,
 ) -> Result<()> {
     assert!(
         q_heads / kv_heads <= MAX_GQA,
@@ -199,7 +359,7 @@ pub fn attn(
             ("KV_HEADS", kv_heads as f64),
             ("HEAD_DIM", head_dim as f64),
             ("MAX_SEQ", max_seq as f64),
-            ("SCALE", 1.0 / (head_dim as f64).sqrt()),
+            ("SCALE", scale as f64),
             ("WINDOW", window as f64),
             ("NQ_PER_KV", (q_heads / kv_heads) as f64),
             ("STRIDE", stride as f64),
@@ -345,6 +505,7 @@ pub fn rope_tables(
     rotary_dim: u32,
     freq_dim: u32,
     theta: f64,
+    partial: Option<u32>,
     scaling: Option<&RopeScaling>,
 ) -> (Tensor, Tensor) {
     let half = rotary_dim / 2;
@@ -352,7 +513,11 @@ pub fn rope_tables(
     let mut sin = Vec::with_capacity((max_seq * half) as usize);
     for pos in 0..max_seq {
         for i in 0..half {
-            let inv = 1.0 / theta.powf((2 * i) as f64 / freq_dim as f64);
+            let inv = if partial.is_some_and(|p| i >= p) {
+                0.0
+            } else {
+                1.0 / theta.powf((2 * i) as f64 / freq_dim as f64)
+            };
             let factor = scaling.and_then(|s| {
                 (pos < s.original_max)
                     .then(|| s.short.get(i as usize))

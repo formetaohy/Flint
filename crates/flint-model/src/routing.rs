@@ -1,6 +1,5 @@
 #[derive(Clone, Copy, Debug)]
 pub enum RouteKind {
-
     Softmax,
 
     SparseMixer { jitter: f32 },
@@ -8,7 +7,6 @@ pub enum RouteKind {
 
 #[derive(Debug)]
 pub struct Routing {
-
     pub starts: Vec<u32>,
 
     pub counts: Vec<u32>,
@@ -19,7 +17,6 @@ pub struct Routing {
 }
 
 impl Routing {
-
     pub fn new(
         logits: &[f32],
         m: u32,
@@ -53,7 +50,6 @@ impl Routing {
         }
         let mut starts = vec![0u32; experts + 2];
         for e in 0..=experts {
-
             starts[e + 1] = align64(starts[e] + counts[e].max(1));
         }
         let mut slots = starts[..experts + 1].to_vec();
@@ -133,7 +129,6 @@ fn sparse_mixer(scores: &[f32], top_k: usize, jitter: f32) -> Vec<(usize, f32)> 
     let p1 = softmax_topk(&masked, 1)[0];
     let mut sel = vec![p1];
     if top_k > 1 {
-
         let mut masked_scores = masked;
         masked_scores[p1.0] = f32::NEG_INFINITY;
         let second_max = masked_scores
@@ -143,7 +138,6 @@ fn sparse_mixer(scores: &[f32], top_k: usize, jitter: f32) -> Vec<(usize, f32)> 
         let rest: Vec<f32> = (0..scores.len())
             .map(|i| {
                 if i != p1.0 && keep(scores, second_max, i) {
-
                     scores[i]
                 } else {
                     f32::NEG_INFINITY

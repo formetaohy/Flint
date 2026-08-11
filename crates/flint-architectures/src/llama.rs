@@ -22,7 +22,21 @@ pub fn load(
     max_seq: u32,
     backend: &Backend,
 ) -> Result<TransformerModel> {
-    let cfg = parse_config(v)?;
+    let mut cfg = parse_config(v)?;
+    if source
+        .names()
+        .iter()
+        .any(|n| n.ends_with("self_attn.q_proj.bias"))
+    {
+        cfg.qkv_bias = true;
+    }
+    if source
+        .names()
+        .iter()
+        .any(|n| n.ends_with("self_attn.q_norm.weight"))
+    {
+        cfg.qk_norm = true;
+    }
     TransformerModel::load(
         source,
         cfg,

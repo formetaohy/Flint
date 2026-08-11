@@ -6,6 +6,7 @@ pub mod model;
 pub mod ops;
 pub mod quant;
 pub mod routing;
+pub mod step;
 
 pub use model::{ChunkOut, LanguageModel, Speculator};
-pub use ops::M_MAX;
+pub use step::MAX_M;

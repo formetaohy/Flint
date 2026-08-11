@@ -310,7 +310,7 @@ fn verify_chunk_row0_matches_single_forward() {
     let prompt: Vec<u32> = (10..40).collect();
     let mut done = 0usize;
     while done < prompt.len() {
-        let end = (done + flint_model::M_MAX as usize).min(prompt.len());
+        let end = (done + flint_model::MAX_M as usize).min(prompt.len());
         cm.model
             .forward(&mut backend, &prompt[done..end], &[], &[])
             .unwrap();
@@ -355,7 +355,7 @@ fn tokenizer_markers_and_streaming_roundtrip() {
         );
 
         let ids = tok.encode("hello world").unwrap();
-        let mut state = tok.decoder();
+        let mut state = tok.stream_decoder();
         let mut text = String::new();
         for id in ids {
             text.push_str(&tok.step_decode(&mut state, id).unwrap().unwrap_or_default());
@@ -378,7 +378,7 @@ fn engine_and_model_fail_fast() {
         cm.model
             .forward(&mut backend, &[1u32; 129], &[0], &[])
             .is_err(),
-        "chunk above M_MAX"
+        "chunk above MAX_M"
     );
     for _ in 0..4 {
         cm.model

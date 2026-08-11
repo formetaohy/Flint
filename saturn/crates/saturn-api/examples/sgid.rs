@@ -2,8 +2,7 @@ use saturn_api::{BackendKind, open};
 use saturn_core::{BindingRef, BufferSpec, KernelSpec};
 
 fn main() {
-    let device: Box<dyn saturn_core::Device> =
-        open(BackendKind::Vulkan).expect("open vulkan");
+    let device: Box<dyn saturn_core::Device> = open(BackendKind::Vulkan).expect("open vulkan");
     let buf = device
         .create_buffer(&BufferSpec {
             size: 128 * 4,
@@ -11,7 +10,10 @@ fn main() {
         })
         .expect("create");
     let kernel = device
-        .create_kernel(&KernelSpec::precompiled("scl/sgid.scl", saturn_scl::scl!("sgid.scl")))
+        .create_kernel(&KernelSpec::precompiled(
+            "scl/sgid.scl",
+            saturn_scl::scl!("sgid.scl"),
+        ))
         .expect("create kernel");
     let mut encoder = device.encoder().expect("encoder");
     encoder

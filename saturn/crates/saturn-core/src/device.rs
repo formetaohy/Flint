@@ -1,10 +1,10 @@
+use crate::Scalar;
 use crate::buffer::Buffer;
 use crate::command::{CommandEncoder, Submission};
 use crate::error::Result;
 use crate::kernel::Kernel;
 use crate::query::TimestampSet;
 use crate::spec::{BufferSpec, KernelSpec};
-use crate::Scalar;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CoopShape {

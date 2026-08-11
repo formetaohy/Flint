@@ -4,10 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ahash.workspace = true
-flint-checkpoint.workspace = true
 flint-error.workspace = true
 tokenizers.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true

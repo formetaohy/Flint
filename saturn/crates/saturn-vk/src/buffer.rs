@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use saturn_core::error::{Error, Result};
 use saturn_core::Buffer;
+use saturn_core::error::{Error, Result};
 
-use crate::device::{check, VkDevice, VkDeviceInner};
+use crate::device::{VkDevice, VkDeviceInner, check};
 
 pub struct VkBuffer {
     pub(crate) inner: Arc<VkDeviceInner>,
@@ -87,9 +87,7 @@ impl Buffer for VkBuffer {
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
-        let ptr = self
-            .mapped
-            .ok_or(Error::BufferNotHostVisible)?;
+        let ptr = self.mapped.ok_or(Error::BufferNotHostVisible)?;
         self.check_range(offset, data.len())?;
         unsafe {
             std::ptr::copy_nonoverlapping(

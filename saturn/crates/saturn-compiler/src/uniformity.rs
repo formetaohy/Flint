@@ -67,10 +67,7 @@ fn check_stmts(stmts: &[Stmt], ctx: &mut Ctx, uniform: bool) -> Result<()> {
                 }
             }
             Stmt::If {
-                cond,
-                then,
-                els,
-                ..
+                cond, then, els, ..
             } => {
                 let u = uniform && uniform_expr(cond, ctx);
                 let before = ctx.locals.clone();
@@ -93,7 +90,11 @@ fn check_stmts(stmts: &[Stmt], ctx: &mut Ctx, uniform: bool) -> Result<()> {
                 ctx.locals = merge_back(&before, &body_ctx.locals);
             }
             Stmt::For {
-                id, start, end, body, ..
+                id,
+                start,
+                end,
+                body,
+                ..
             } => {
                 let u = uniform && uniform_expr(start, ctx) && uniform_expr(end, ctx);
                 let before = ctx.locals.clone();
@@ -136,10 +137,10 @@ fn merge_branches(
         }
     }
     for (id, u2) in els {
-        if !then.contains_key(id) {
-            if let Some(prev) = merged.get(id) {
-                merged.insert(*id, *prev && *u2);
-            }
+        if !then.contains_key(id)
+            && let Some(prev) = merged.get(id)
+        {
+            merged.insert(*id, *prev && *u2);
         }
     }
     merged

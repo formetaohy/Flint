@@ -8,7 +8,9 @@ use flint_tensor::Weight;
 use serde_json::Value;
 
 use crate::keys::{gguf_key, gguf_moe_key, hf_key};
-use crate::transformer::{MoeConfig, RopeSpec, TransformerConfig, TransformerModel, transformer_role};
+use crate::transformer::{
+    MoeConfig, RopeSpec, TransformerConfig, TransformerModel, transformer_role,
+};
 
 fn moe_key(name: &str) -> Option<(String, MoEPart)> {
     let rest = name.strip_prefix("model.layers.")?;
@@ -55,6 +57,7 @@ fn parse_transformer(v: &Value) -> Result<TransformerConfig> {
 
         freq_dim: dim,
         theta: cfg.rope[0].theta,
+        partial: None,
         scaling: None,
     };
     if let Some(rs) = v.get("rope_scaling") {
@@ -155,9 +158,63 @@ pub fn load(
     let extra = if gguf {
         gguf_split_qkv(backend, source, &cfg, role)?
     } else {
-        Vec::new()
+        hf_split_fused(backend, source, &cfg, role)?
     };
     TransformerModel::load_extra(source, cfg, &plan(gguf), extra, max_seq, backend)
+}
+
+fn hf_split_fused(
+    backend: &Backend,
+    source: &dyn Checkpoint,
+    cfg: &TransformerConfig,
+    role: fn(&str) -> Role,
+) -> Result<Vec<(String, Weight)>> {
+    let hd = cfg.head_dims[0];
+    let qw = cfg.q_heads * hd;
+    let kvw = cfg.kv_heads * hd;
+    let mut out = Vec::new();
+    let names = source.names();
+    for l in 0..cfg.layers {
+        let qkv = format!("model.layers.{l}.self_attn.qkv_proj.weight");
+        if names.contains(&qkv) {
+            let raw = source.read(&qkv)?;
+            if raw.shape.len() != 2 || raw.shape[0] != qw + 2 * kvw {
+                return Err(Error::Model(format!(
+                    "{qkv}: unexpected fused QKV shape {:?} (q {qw}, kv {kvw})",
+                    raw.shape
+                )));
+            }
+            split_rows(
+                backend,
+                raw,
+                &mut out,
+                role,
+                |part| format!("layers.{l}.self_attn.{part}.weight"),
+                &[
+                    ("q_proj", 0, qw),
+                    ("k_proj", qw, qw + kvw),
+                    ("v_proj", qw + kvw, qw + 2 * kvw),
+                ],
+            )?;
+        }
+        let fused_mlp = format!("model.layers.{l}.mlp.gate_up_proj.weight");
+        if names.contains(&fused_mlp) {
+            let raw = source.read(&fused_mlp)?;
+            if raw.shape.len() != 2 || raw.shape[0] != 2 * cfg.intermediate {
+                continue;
+            }
+            let half = raw.shape[0] / 2;
+            split_rows(
+                backend,
+                raw,
+                &mut out,
+                role,
+                |part| format!("layers.{l}.mlp.{part}.weight"),
+                &[("gate_proj", 0, half), ("up_proj", half, 2 * half)],
+            )?;
+        }
+    }
+    Ok(out)
 }
 
 fn hf_key_moe(name: &str) -> Option<String> {
@@ -278,7 +335,7 @@ fn split_rows(
     parts: &[(&str, u32, u32)],
 ) -> Result<()> {
     let k = raw.shape[1];
-    let data = raw.data.into_f32();
+    let data = raw.data.into_f32()?;
     for &(part, lo, hi) in parts {
         let key = key_for(part);
         let slice: Vec<f32> = data[(lo as usize * k as usize)..(hi as usize * k as usize)].to_vec();

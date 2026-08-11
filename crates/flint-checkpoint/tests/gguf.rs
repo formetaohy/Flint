@@ -33,10 +33,10 @@ fn f16_bytes(v: f32) -> [u8; 2] {
 
 fn synth_gguf() -> Vec<u8> {
     let mut h = Vec::new();
-    w_u32(&mut h, 0x4655_4747); 
+    w_u32(&mut h, 0x4655_4747);
     w_u32(&mut h, 3);
-    w_u64(&mut h, 2); 
-    w_u64(&mut h, 8); 
+    w_u64(&mut h, 2);
+    w_u64(&mut h, 8);
 
     w_kv_str(&mut h, "general.architecture", "llama");
     w_kv_u32(&mut h, "general.alignment", 64);
@@ -66,16 +66,16 @@ fn synth_gguf() -> Vec<u8> {
 
     w_str(&mut h, "t_f32");
     w_u32(&mut h, 2);
-    w_u64(&mut h, 3); 
+    w_u64(&mut h, 3);
     w_u64(&mut h, 2);
-    w_u32(&mut h, 0); 
+    w_u32(&mut h, 0);
     w_u64(&mut h, 0);
 
     w_str(&mut h, "t_q8");
     w_u32(&mut h, 1);
     w_u64(&mut h, 32);
-    w_u32(&mut h, 8); 
-    w_u64(&mut h, 64); 
+    w_u32(&mut h, 8);
+    w_u64(&mut h, 64);
 
     while h.len() % 64 != 0 {
         h.push(0);
@@ -86,8 +86,8 @@ fn synth_gguf() -> Vec<u8> {
     while h.len() % 64 != 0 {
         h.push(0);
     }
-    h.extend_from_slice(&f16_bytes(2.0)); 
-    h.extend((0i8..32).map(|q| q as u8)); 
+    h.extend_from_slice(&f16_bytes(2.0));
+    h.extend((0i8..32).map(|q| q as u8));
 
     h
 }
@@ -139,11 +139,14 @@ fn reads_metadata_and_tensors() {
 
     let f = gguf.read("t_f32").unwrap();
     assert_eq!(f.shape, vec![2, 3], "dims reverse to [N, K]");
-    assert_eq!(f.data.into_f32(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(
+        f.data.into_f32().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    );
 
     let q = gguf.read("t_q8").unwrap();
     assert_eq!(q.shape, vec![32]);
-    let vals = q.data.into_f32();
+    let vals = q.data.into_f32().unwrap();
     let want: Vec<f32> = (0..32).map(|i| i as f32 * 2.0).collect();
     assert_eq!(vals, want);
 
@@ -168,10 +171,12 @@ fn rejects_bad_magic_and_truncation() {
 
 #[test]
 fn open_dispatches_on_directory_contents() {
-
     let dir = tmp_dir("open");
     std::fs::write(dir.join("m.gguf"), synth_gguf()).unwrap();
-    assert_eq!(flint_checkpoint::open(&dir).unwrap().kind(), CheckpointKind::Gguf);
+    assert_eq!(
+        flint_checkpoint::open(&dir).unwrap().kind(),
+        CheckpointKind::Gguf
+    );
 
     std::fs::write(dir.join("m-00001.gguf"), synth_gguf()).unwrap();
     assert!(
@@ -191,8 +196,8 @@ fn synth_full_types() -> Vec<u8> {
     let mut h = Vec::new();
     w_u32(&mut h, 0x4655_4747);
     w_u32(&mut h, 3);
-    w_u64(&mut h, 0); 
-    w_u64(&mut h, 9); 
+    w_u64(&mut h, 0);
+    w_u64(&mut h, 9);
 
     let kv = |out: &mut Vec<u8>, key: &str, ty: u32, body: &[u8]| {
         w_str(out, key);
@@ -254,7 +259,7 @@ fn rejects_unknown_value_types_and_versions() {
     let dir = tmp_dir("bad-ty");
 
     let mut bad = synth_full_types();
-    let tag_off = 8 + 8 + 8 + 8 + 4; 
+    let tag_off = 8 + 8 + 8 + 8 + 4;
     bad[tag_off] = 13;
     let p = dir.join("bad.gguf");
     std::fs::write(&p, &bad).unwrap();
@@ -324,13 +329,14 @@ fn writer_roundtrips_through_reader() {
 
     let f32 = g.read("t_f32").unwrap();
     assert_eq!(f32.shape, vec![2, 16]);
-    assert_eq!(f32.data.into_f32(), f32_data);
+    assert_eq!(f32.data.into_f32().unwrap(), f32_data);
 
     let bf16 = g.read("t_bf16").unwrap();
     assert_eq!(bf16.shape, vec![2, 32]);
     let got: Vec<f32> = bf16
         .data
         .into_f32()
+        .unwrap()
         .iter()
         .zip(&bf16_data)
         .map(|(a, b)| (a - b).abs())
@@ -343,10 +349,107 @@ fn writer_roundtrips_through_reader() {
 
     let q8 = g.read("t_q8").unwrap();
     assert_eq!(q8.shape, vec![2, 32]);
-    let got = q8.data.into_f32();
+    let got = q8.data.into_f32().unwrap();
     for (a, b) in got.iter().zip(&q8_data) {
-
         assert!((a - b).abs() < 0.5, "{a} vs {b}");
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+fn synth_qk_gguf(arch: &str, interleaved: bool) -> Vec<u8> {
+    const HD: u32 = 4;
+    const HEADS: u32 = 2;
+    const ROWS: u32 = HEADS * HD;
+    const COLS: u32 = 6;
+    let mut h = Vec::new();
+    w_u32(&mut h, 0x4655_4747);
+    w_u32(&mut h, 3);
+    w_u64(&mut h, 2);
+    w_u64(&mut h, 4);
+    w_kv_str(&mut h, "general.architecture", arch);
+    w_kv_u32(&mut h, "general.alignment", 64);
+    w_kv_u32(&mut h, "llama.block_count", 1);
+    w_kv_u32(&mut h, "llama.attention.key_length", HD);
+    w_str(&mut h, "blk.0.attn_q.weight");
+    w_u32(&mut h, 2);
+    w_u64(&mut h, COLS as u64);
+    w_u64(&mut h, ROWS as u64);
+    w_u32(&mut h, 0);
+    w_u64(&mut h, 0);
+    w_str(&mut h, "blk.0.attn_q.bias");
+    w_u32(&mut h, 1);
+    w_u64(&mut h, ROWS as u64);
+    w_u32(&mut h, 0);
+    w_u64(&mut h, ROWS as u64 * COLS as u64 * 4);
+    while h.len() % 64 != 0 {
+        h.push(0);
+    }
+    let mut rows = (0..ROWS).collect::<Vec<_>>();
+    if interleaved {
+        for hd_i in 0..HEADS {
+            let base = hd_i * HD;
+            let r = &mut rows[base as usize..(base + HD) as usize];
+            let mut p = vec![0u32; HD as usize];
+            for i in 0..HD as usize / 2 {
+                p[i] = r[2 * i];
+                p[HD as usize / 2 + i] = r[2 * i + 1];
+            }
+            r.copy_from_slice(&p);
+        }
+    }
+    for &r in &rows {
+        for c in 0..COLS {
+            h.extend_from_slice(&((r * 1000 + c) as f32).to_le_bytes());
+        }
+    }
+    for &r in &rows {
+        h.extend_from_slice(&((r + 1000) as f32).to_le_bytes());
+    }
+    h
+}
+
+fn open_bytes(tag: &str, b: &[u8]) -> Gguf {
+    let dir = tmp_dir(&format!("qk-{tag}"));
+    let path = dir.join("qk.gguf");
+    std::fs::write(&path, b).unwrap();
+    let g = Gguf::open(&path).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    g
+}
+
+#[test]
+fn deinterleaves_llama_qk_rows() {
+    let g = open_bytes("llama", &synth_qk_gguf("llama", true));
+    let w = g.read("blk.0.attn_q.weight").unwrap();
+    let expect: Vec<f32> = (0..8u32)
+        .flat_map(|r| (0..6u32).map(move |c| (r * 1000 + c) as f32))
+        .collect();
+    assert_eq!(
+        w.data.into_f32().unwrap(),
+        expect,
+        "llama q weight restored to plain order"
+    );
+    let b = g.read("blk.0.attn_q.bias").unwrap();
+    let expect_bias: Vec<f32> = (0..8u32).map(|r| (r + 1000) as f32).collect();
+    assert_eq!(
+        b.data.into_f32().unwrap(),
+        expect_bias,
+        "llama q bias restored to plain order"
+    );
+}
+
+#[test]
+fn leaves_non_llama_qk_rows_untouched() {
+    for arch in ["qwen2", "gemma3", "llama4"] {
+        let g = open_bytes(arch, &synth_qk_gguf(arch, true));
+        let w = g.read("blk.0.attn_q.weight").unwrap();
+        let got = w.data.into_f32().unwrap();
+        assert_ne!(
+            got,
+            (0..8u32)
+                .flat_map(|r| (0..6u32).map(move |c| (r * 1000 + c) as f32))
+                .collect::<Vec<_>>(),
+            "{arch} q must not be deinterleaved"
+        );
+    }
 }

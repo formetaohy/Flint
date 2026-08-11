@@ -1,6 +1,6 @@
 use saturn_api::{BackendKind, open};
-use saturn_core::{BindingRef, BufferSpec, KernelSpec};
 use saturn_core::num::f32_to_f16;
+use saturn_core::{BindingRef, BufferSpec, KernelSpec};
 
 const M: usize = 256;
 const N: usize = 256;
@@ -51,7 +51,10 @@ fn main() {
     b_buf.write(0, &b_data).expect("write b");
 
     let kernel = device
-        .create_kernel(&KernelSpec::precompiled("scl/gemm.scl", saturn_scl::scl!("gemm.scl")))
+        .create_kernel(&KernelSpec::precompiled(
+            "scl/gemm.scl",
+            saturn_scl::scl!("gemm.scl"),
+        ))
         .expect("create kernel");
 
     let mut encoder = device.encoder().expect("encoder");

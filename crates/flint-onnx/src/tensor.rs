@@ -73,39 +73,49 @@ impl Tensor {
 
     pub fn broadcast_to_f32(&self, shape: &[usize]) -> Result<Vec<f32>> {
         let src = self.data.as_f32();
-        Ok(broadcast_to(&src, &self.shape, shape)?)
+        broadcast_to(&src, &self.shape, shape)
     }
 
     pub fn from_proto(t: &crate::onnx::TensorProto, model_dir: &Path) -> Result<Tensor> {
         let shape: Vec<usize> = t.dims.iter().map(|&d| d.max(0) as usize).collect();
         let data = match t.data_type {
-            1 => Data::F32(raw(t, model_dir)?
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect()),
-            10 => Data::F32(
+            crate::dtype::F32 => Data::F32(
+                raw(t, model_dir)?
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+            ),
+            crate::dtype::F16 => Data::F32(
                 raw(t, model_dir)?
                     .chunks_exact(2)
                     .map(|c| saturn_core::num::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect(),
             ),
-            16 => Data::F32(
+            crate::dtype::BF16 => Data::F32(
                 raw(t, model_dir)?
                     .chunks_exact(2)
                     .map(|c| saturn_core::num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect(),
             ),
-            11 => Data::F32(
+            crate::dtype::F64 => Data::F32(
                 raw(t, model_dir)?
                     .chunks_exact(8)
                     .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
                     .collect(),
             ),
-            2 | 3 | 4 | 5 | 6 | 7 | 9 | 12 | 13 => Data::I64(int_data(t, model_dir)?),
+            crate::dtype::U8
+            | crate::dtype::I8
+            | crate::dtype::U16
+            | crate::dtype::I16
+            | crate::dtype::I32
+            | crate::dtype::I64
+            | crate::dtype::BOOL
+            | crate::dtype::U32
+            | crate::dtype::U64 => Data::I64(int_data(t, model_dir)?),
             other => {
                 return Err(Error::Model(format!(
                     "unsupported tensor data_type {other}"
-                )))
+                )));
             }
         };
         let tensor = Tensor { data, shape };
@@ -165,9 +175,7 @@ pub fn broadcast_to<T: Copy>(data: &[T], src: &[usize], dst: &[usize]) -> Result
     let off = dst.len() - src.len();
     for (i, d) in src.iter().enumerate() {
         if *d != 1 && *d != dst[off + i] {
-            return Err(Error::Model(format!(
-                "cannot broadcast {src:?} to {dst:?}"
-            )));
+            return Err(Error::Model(format!("cannot broadcast {src:?} to {dst:?}")));
         }
     }
 
@@ -216,9 +224,7 @@ pub fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
         } else if db == 1 {
             da
         } else {
-            return Err(Error::Model(format!(
-                "broadcast mismatch: {a:?} vs {b:?}"
-            )));
+            return Err(Error::Model(format!("broadcast mismatch: {a:?} vs {b:?}")));
         };
     }
     Ok(out)
@@ -236,11 +242,7 @@ fn raw(t: &crate::onnx::TensorProto, model_dir: &Path) -> Result<Vec<u8>> {
         return Ok(t.raw_data.clone());
     }
     if !t.float_data.is_empty() {
-        return Ok(t
-            .float_data
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect());
+        return Ok(t.float_data.iter().flat_map(|f| f.to_le_bytes()).collect());
     }
     external_bytes(t, model_dir)
 }
@@ -256,12 +258,10 @@ fn external_bytes(t: &crate::onnx::TensorProto, model_dir: &Path) -> Result<Vec<
     let offset: u64 = external_value(t, "offset")
         .map(|s| s.parse().unwrap_or(0))
         .unwrap_or(0);
-    let length: Option<u64> = external_value(t, "length").map(|s| s.parse().ok()).flatten();
+    let length: Option<u64> = external_value(t, "length").and_then(|s| s.parse().ok());
     let bytes = std::fs::read(&path)
         .map_err(|e| Error::Model(format!("external data {}: {e}", path.display())))?;
-    let end = length
-        .map(|l| offset + l)
-        .unwrap_or(bytes.len() as u64);
+    let end = length.map(|l| offset + l).unwrap_or(bytes.len() as u64);
     if end > bytes.len() as u64 {
         return Err(Error::Model(format!(
             "external data {}: requested range {offset}..{end} exceeds file",
@@ -274,38 +274,33 @@ fn external_bytes(t: &crate::onnx::TensorProto, model_dir: &Path) -> Result<Vec<
 fn int_data(t: &crate::onnx::TensorProto, model_dir: &Path) -> Result<Vec<i64>> {
     if !t.raw_data.is_empty() {
         return Ok(match t.data_type {
-            2 | 9 => t.raw_data.iter().map(|&b| b as i64).collect(),        
-            3 => t.raw_data.iter().map(|&b| (b as i8) as i64).collect(),    
-            4 => t
+            crate::dtype::U8 | crate::dtype::BOOL => t.raw_data.iter().map(|&b| b as i64).collect(),
+            crate::dtype::I8 => t.raw_data.iter().map(|&b| (b as i8) as i64).collect(),
+            crate::dtype::U16 => t
                 .raw_data
                 .chunks_exact(2)
                 .map(|c| i64::from(u16::from_le_bytes([c[0], c[1]])))
-                .collect(),                                                  
-            5 => t
+                .collect(),
+            crate::dtype::I16 => t
                 .raw_data
                 .chunks_exact(2)
                 .map(|c| i64::from(i16::from_le_bytes([c[0], c[1]])))
-                .collect(),                                                  
-            6 => t
+                .collect(),
+            crate::dtype::I32 => t
                 .raw_data
                 .chunks_exact(4)
                 .map(|c| i64::from(i32::from_le_bytes(c.try_into().unwrap())))
-                .collect(),                                                  
-            12 => t
+                .collect(),
+            crate::dtype::U32 => t
                 .raw_data
                 .chunks_exact(4)
                 .map(|c| i64::from(u32::from_le_bytes(c.try_into().unwrap())))
-                .collect(),                                                  
-            7 => t
+                .collect(),
+            crate::dtype::I64 | crate::dtype::U64 => t
                 .raw_data
                 .chunks_exact(8)
                 .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-                .collect(),                                                  
-            13 => t
-                .raw_data
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-                .collect(),                                                  
+                .collect(),
             _ => return Err(Error::Model("unsupported integer type".into())),
         });
     }

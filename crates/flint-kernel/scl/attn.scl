@@ -36,6 +36,10 @@ kernel attn [workgroup(512, 1, 1)]
         var o1 = 0.0;
         var o2 = 0.0;
         var o3 = 0.0;
+        var o4 = 0.0;
+        var o5 = 0.0;
+        var o6 = 0.0;
+        var o7 = 0.0;
         var c0 = seg_lo;
         loop {
             if c0 >= seg_hi {
@@ -117,6 +121,10 @@ kernel attn [workgroup(512, 1, 1)]
                         o1 = o1 * r;
                         o2 = o2 * r;
                         o3 = o3 * r;
+                        o4 = o4 * r;
+                        o5 = o5 * r;
+                        o6 = o6 * r;
+                        o7 = o7 * r;
                     } else {
                         align = exp(c_max - prev_max);
                     }
@@ -166,6 +174,14 @@ kernel attn [workgroup(512, 1, 1)]
                             o2 = o2 + w * bitcast_f32((v_cache[vk + CHUNK + slot / 2] & 65535) << 16);
                             o3 = o3 + w * bitcast_f32((v_cache[vk + CHUNK + CHUNK / 2 + slot / 2] & 65535) << 16);
                         }
+                        if slot + 4 * CHUNK < HEAD_DIM {
+                            o4 = o4 + w * bitcast_f32((v_cache[vk + 2 * CHUNK + slot / 2] & 65535) << 16);
+                            o5 = o5 + w * bitcast_f32((v_cache[vk + 2 * CHUNK + CHUNK / 2 + slot / 2] & 65535) << 16);
+                        }
+                        if slot + 6 * CHUNK < HEAD_DIM {
+                            o6 = o6 + w * bitcast_f32((v_cache[vk + 3 * CHUNK + slot / 2] & 65535) << 16);
+                            o7 = o7 + w * bitcast_f32((v_cache[vk + 3 * CHUNK + CHUNK / 2 + slot / 2] & 65535) << 16);
+                        }
                     } else {
                         o0 = o0 + w * bitcast_f32((v_cache[vk + slot / 2] >> 16) << 16);
                         if slot + CHUNK < HEAD_DIM {
@@ -174,6 +190,14 @@ kernel attn [workgroup(512, 1, 1)]
                         if slot + 2 * CHUNK < HEAD_DIM {
                             o2 = o2 + w * bitcast_f32((v_cache[vk + CHUNK + slot / 2] >> 16) << 16);
                             o3 = o3 + w * bitcast_f32((v_cache[vk + CHUNK + CHUNK / 2 + slot / 2] >> 16) << 16);
+                        }
+                        if slot + 4 * CHUNK < HEAD_DIM {
+                            o4 = o4 + w * bitcast_f32((v_cache[vk + 2 * CHUNK + slot / 2] >> 16) << 16);
+                            o5 = o5 + w * bitcast_f32((v_cache[vk + 2 * CHUNK + CHUNK / 2 + slot / 2] >> 16) << 16);
+                        }
+                        if slot + 6 * CHUNK < HEAD_DIM {
+                            o6 = o6 + w * bitcast_f32((v_cache[vk + 3 * CHUNK + slot / 2] >> 16) << 16);
+                            o7 = o7 + w * bitcast_f32((v_cache[vk + 3 * CHUNK + CHUNK / 2 + slot / 2] >> 16) << 16);
                         }
                     }
                 }
@@ -205,6 +229,14 @@ kernel attn [workgroup(512, 1, 1)]
             if slot + 2 * CHUNK < HEAD_DIM {
                 scratch[sbase + hl * STRIDE + slot + 2 * CHUNK] = o2;
                 scratch[sbase + hl * STRIDE + slot + 3 * CHUNK] = o3;
+            }
+            if slot + 4 * CHUNK < HEAD_DIM {
+                scratch[sbase + hl * STRIDE + slot + 4 * CHUNK] = o4;
+                scratch[sbase + hl * STRIDE + slot + 5 * CHUNK] = o5;
+            }
+            if slot + 6 * CHUNK < HEAD_DIM {
+                scratch[sbase + hl * STRIDE + slot + 6 * CHUNK] = o6;
+                scratch[sbase + hl * STRIDE + slot + 7 * CHUNK] = o7;
             }
             if slot == 0 {
                 scratch[sbase + hl * STRIDE + HEAD_DIM] = segstat[hl * 2];

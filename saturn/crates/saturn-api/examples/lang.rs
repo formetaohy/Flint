@@ -82,7 +82,9 @@ kernel lf [workgroup(64, 1, 1)]
         })
         .expect("create acc");
     src_buf.write(0, &encode_f32(&src_data)).expect("write src");
-    bits_buf.write(0, &encode_u32(&bits_data)).expect("write bits");
+    bits_buf
+        .write(0, &encode_u32(&bits_data))
+        .expect("write bits");
     acc_buf.write(0, &[0u8; 16]).expect("write acc");
 
     let mut encoder = device.encoder().expect("encoder");
@@ -117,9 +119,7 @@ kernel lf [workgroup(64, 1, 1)]
             ],
         )
         .expect("bind");
-    encoder
-        .dispatch([1, 1, 1])
-        .expect("dispatch");
+    encoder.dispatch([1, 1, 1]).expect("dispatch");
     let submission = device.submit(encoder).expect("submit");
     submission.wait().expect("wait");
 
@@ -153,10 +153,7 @@ kernel lf [workgroup(64, 1, 1)]
     assert_eq!(acc[1], 0, "atomic_and mismatch");
     assert_eq!(acc[2], 1, "atomic_or mismatch");
     assert_eq!(acc[3], pop_xor, "atomic_xor mismatch");
-    assert!(
-        max_err < 1e-3,
-        "kernel output mismatch, max_err={max_err}"
-    );
+    assert!(max_err < 1e-3, "kernel output mismatch, max_err={max_err}");
     println!(
         "lang ok on {} (spec MODE=1, fn+dot+bitops+atomics, max_err {max_err})",
         device.name()
@@ -164,15 +161,11 @@ kernel lf [workgroup(64, 1, 1)]
 }
 
 fn encode_f32(data: &[f32]) -> Vec<u8> {
-    data.iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect()
+    data.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
 fn encode_u32(data: &[u32]) -> Vec<u8> {
-    data.iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect()
+    data.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
 fn decode_f32(data: &[u8]) -> Vec<f32> {

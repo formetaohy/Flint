@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use saturn_compiler::ir::{BinOp, Expr, Kernel, MatrixRole, Scalar, Stmt, Type, UnOp};
 use spirv::{
-    AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel,
-    GlslStd450Op, MemoryModel, Op, StorageClass,
+    AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel, GlslStd450Op,
+    MemoryModel, Op, StorageClass,
 };
 
 type Result<T> = std::result::Result<T, String>;
@@ -12,15 +12,32 @@ type Result<T> = std::result::Result<T, String>;
 enum T {
     Void,
     Bool,
-    Int { width: u32, signed: bool },
-    Float { width: u32 },
-    Vec { size: u32, elem: Box<T> },
+    Int {
+        width: u32,
+        signed: bool,
+    },
+    Float {
+        width: u32,
+    },
+    Vec {
+        size: u32,
+        elem: Box<T>,
+    },
     RtArray(Box<T>),
-    Array { elem: Box<T>, len: u64 },
+    Array {
+        elem: Box<T>,
+        len: u64,
+    },
     Struct(Box<T>),
     PushStruct(Vec<Scalar>),
-    CoopMat { elem: Scalar, role: MatrixRole },
-    Ptr { class: StorageClass, pointee: Box<T> },
+    CoopMat {
+        elem: Scalar,
+        role: MatrixRole,
+    },
+    Ptr {
+        class: StorageClass,
+        pointee: Box<T>,
+    },
     Function,
 }
 
@@ -116,7 +133,7 @@ struct Spv {
     loop_stack: Vec<LoopCtx>,
     block_dim_const: Option<u32>,
     coop_zero_ids: HashMap<(Scalar, MatrixRole), u32>,
-    last_opcode: Option<u32>,
+    block_terminated: bool,
 }
 
 struct LoopCtx {
@@ -131,7 +148,6 @@ const U32: T = T::Int {
 const BOOL: T = T::Bool;
 
 pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
-
     let mut collect = Collect {
         types: HashSet::new(),
         builtins: HashSet::new(),
@@ -191,7 +207,7 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         loop_stack: Vec::new(),
         block_dim_const: None,
         coop_zero_ids: HashMap::new(),
-        last_opcode: None,
+        block_terminated: false,
     };
 
     spv.caps.push(Capability::Shader as u32);
@@ -236,8 +252,10 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         let rt = spv.ensure_type(&rt_key);
         let struct_ty = spv.ensure_type(&T::Struct(Box::new(T::RtArray(Box::new(elem.clone())))));
         if decorated.insert(rt_key) {
-            spv.modes
-                .extend(inst(Op::Decorate, &[rt, Decoration::ArrayStride as u32, elem.width() / 8]));
+            spv.modes.extend(inst(
+                Op::Decorate,
+                &[rt, Decoration::ArrayStride as u32, elem.width() / 8],
+            ));
             spv.modes
                 .extend(inst(Op::Decorate, &[struct_ty, Decoration::Block as u32]));
             spv.modes.extend(inst(
@@ -256,10 +274,14 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
             Op::Variable,
             &[ptr, var_id, StorageClass::StorageBuffer as u32],
         ));
-        spv.modes
-            .extend(inst(Op::Decorate, &[var_id, Decoration::DescriptorSet as u32, 0]));
-        spv.modes
-            .extend(inst(Op::Decorate, &[var_id, Decoration::Binding as u32, index as u32]));
+        spv.modes.extend(inst(
+            Op::Decorate,
+            &[var_id, Decoration::DescriptorSet as u32, 0],
+        ));
+        spv.modes.extend(inst(
+            Op::Decorate,
+            &[var_id, Decoration::Binding as u32, index as u32],
+        ));
     }
 
     let push_var = if !kernel.scalars.is_empty() {
@@ -271,14 +293,17 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         for (index, scalar) in kernel.scalars.iter().enumerate() {
             spv.modes.extend(inst(
                 Op::MemberDecorate,
-                &[struct_ty, index as u32, Decoration::Offset as u32, scalar.offset],
+                &[
+                    struct_ty,
+                    index as u32,
+                    Decoration::Offset as u32,
+                    scalar.offset,
+                ],
             ));
         }
         let ptr_ty = spv.ensure_type(&T::Ptr {
             class: StorageClass::PushConstant,
-            pointee: Box::new(T::PushStruct(
-                kernel.scalars.iter().map(|p| p.ty).collect(),
-            )),
+            pointee: Box::new(T::PushStruct(kernel.scalars.iter().map(|p| p.ty).collect())),
         });
         let var_id = spv.alloc();
         spv.types.extend(inst(
@@ -321,8 +346,10 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
             Op::Variable,
             &[ptr_ty, var_id, StorageClass::Input as u32],
         ));
-        spv.modes
-            .extend(inst(Op::Decorate, &[var_id, Decoration::BuiltIn as u32, builtin_kind as u32]));
+        spv.modes.extend(inst(
+            Op::Decorate,
+            &[var_id, Decoration::BuiltIn as u32, builtin_kind as u32],
+        ));
     }
 
     for shared in &kernel.shareds {
@@ -386,13 +413,17 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         });
         let id = spv.alloc();
         spv.block_dim_const = Some(id);
-        spv.types.extend(inst(Op::ConstantComposite, &[vec_ty, id, x, y, z]));
+        spv.types
+            .extend(inst(Op::ConstantComposite, &[vec_ty, id, x, y, z]));
     }
     let fn_ty = spv.ensure_type(&T::Function);
     for ty in &collect.types {
         spv.ensure_type(ty);
     }
-    spv.fns.extend(inst(Op::Function, &[spv.type_id(&T::Void), entry_id, 0, fn_ty]));
+    spv.fns.extend(inst(
+        Op::Function,
+        &[spv.type_id(&T::Void), entry_id, 0, fn_ty],
+    ));
     let entry_label = spv.alloc();
     spv.fns.extend(inst(Op::Label, &[entry_label]));
     let mut local_vars = Vec::new();
@@ -404,8 +435,10 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         });
         let var_id = spv.alloc();
         spv.locals.insert(id, var_id);
-        spv.fns
-            .extend(inst(Op::Variable, &[ptr_ty, var_id, StorageClass::Function as u32]));
+        spv.fns.extend(inst(
+            Op::Variable,
+            &[ptr_ty, var_id, StorageClass::Function as u32],
+        ));
     }
     spv.emit_stmts(&kernel.body)?;
     spv.fns.extend(inst(Op::Return, &[]));
@@ -416,14 +449,17 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
     words.extend(&spv.caps);
     words.extend(&spv.extensions);
     words.extend(&spv.import_words);
-    words.extend(inst(Op::MemoryModel, &[
-        AddressingModel::Logical as u32,
-        if collect.has_coop {
-            MemoryModel::Vulkan as u32
-        } else {
-            MemoryModel::GLSL450 as u32
-        },
-    ]));
+    words.extend(inst(
+        Op::MemoryModel,
+        &[
+            AddressingModel::Logical as u32,
+            if collect.has_coop {
+                MemoryModel::Vulkan as u32
+            } else {
+                MemoryModel::GLSL450 as u32
+            },
+        ],
+    ));
     words.extend(&spv.entry);
     words.extend(&spv.exec);
     words.extend(&spv.modes);
@@ -473,7 +509,10 @@ impl Spv {
             }
             T::Array { elem, len } => {
                 let elem_id = self.ensure_type(elem);
-                let len_id = self.constant(&ConstKey::Int { ty: U32, bits: *len as u32 });
+                let len_id = self.constant(&ConstKey::Int {
+                    ty: U32,
+                    bits: *len as u32,
+                });
                 inst(Op::TypeArray, &[id, elem_id, len_id])
             }
             T::CoopMat { elem, role } => {
@@ -530,7 +569,11 @@ impl Spv {
             ConstKey::Bool(value) => {
                 let ty_id = self.ensure_type(&BOOL);
                 inst(
-                    if *value { Op::ConstantTrue } else { Op::ConstantFalse },
+                    if *value {
+                        Op::ConstantTrue
+                    } else {
+                        Op::ConstantFalse
+                    },
                     &[ty_id, id],
                 )
             }
@@ -540,17 +583,18 @@ impl Spv {
     }
 
     fn push_fn(&mut self, words: Vec<u32>) {
-        self.last_opcode = words.first().map(|word| word & 0xFFFF);
+        let op = words.first().map(|word| word & 0xFFFF);
+        if op == Some(Op::Label as u32) {
+            self.block_terminated = false;
+        } else if op.is_some_and(|op| matches!(op, 249..=255)) {
+            self.block_terminated = true;
+        }
         self.fns.extend(words);
     }
 
     fn end_block(&mut self, target: u32) {
-        let terminates = self
-            .last_opcode
-            .is_some_and(|op| matches!(op, 249..=255));
-        if !terminates {
+        if !self.block_terminated {
             self.push_fn(inst(Op::Branch, &[target]));
-            self.last_opcode = Some(Op::Branch as u32);
         }
     }
 
@@ -574,18 +618,17 @@ impl Spv {
                 self.push_fn(inst(Op::Store, &[ptr_id, value_id]));
             }
             Stmt::If {
-                cond,
-                then,
-                els,
-                ..
+                cond, then, els, ..
             } => {
                 let cond_id = self.emit_expr(cond)?;
                 let then_label = self.alloc();
                 let els_label = self.alloc();
                 let merge = self.alloc();
                 self.push_fn(inst(Op::SelectionMerge, &[merge, 0]));
-                self.fns
-                    .extend(inst(Op::BranchConditional, &[cond_id, then_label, els_label]));
+                self.push_fn(inst(
+                    Op::BranchConditional,
+                    &[cond_id, then_label, els_label],
+                ));
                 self.push_fn(inst(Op::Label, &[then_label]));
                 self.emit_stmts(then)?;
                 self.end_block(merge);
@@ -840,17 +883,15 @@ impl Spv {
                 UnOp::Not => {
                     let operand = self.emit_expr(expr)?;
                     let result = self.alloc();
-                    self.fns
-                        .extend(inst(Op::LogicalNot, &[self.type_id(&BOOL), result, operand]));
+                    self.fns.extend(inst(
+                        Op::LogicalNot,
+                        &[self.type_id(&BOOL), result, operand],
+                    ));
                     Ok(result)
                 }
             },
             Expr::Binary {
-                op,
-                lhs,
-                rhs,
-                ty,
-                ..
+                op, lhs, rhs, ty, ..
             } => {
                 let lhs_id = self.emit_expr(lhs)?;
                 let rhs_id = self.emit_expr(rhs)?;
@@ -997,42 +1038,39 @@ impl Spv {
                         let bitcast = self.alloc();
                         let shift = self.alloc();
                         let result_ty = self.type_id(&target);
-                        self.push_fn(inst(
-                            Op::Bitcast,
-                            &[u32_ty, bitcast, chain[0]],
-                        ));
+                        self.push_fn(inst(Op::Bitcast, &[u32_ty, bitcast, chain[0]]));
                         let sixteen = self.constant(&ConstKey::Int { ty: U32, bits: 16 });
                         self.push_fn(inst(
                             Op::ShiftRightLogical,
                             &[u32_ty, shift, bitcast, sixteen],
                         ));
-                        self.push_fn(inst(
-                            Op::UConvert,
-                            &[u16_ty, result, shift],
-                        ));
+                        self.push_fn(inst(Op::UConvert, &[u16_ty, result, shift]));
                         let _ = result_ty;
                         return Ok(result);
                     }
-                    (T::Int { width: 16, signed: false }, Scalar::F32) => {
+                    (
+                        T::Int {
+                            width: 16,
+                            signed: false,
+                        },
+                        Scalar::F32,
+                    ) => {
                         let u32_ty = self.type_id(&U32);
                         let widen = self.alloc();
                         let shift = self.alloc();
-                        self.push_fn(inst(
-                            Op::UConvert,
-                            &[u32_ty, widen, chain[0]],
-                        ));
+                        self.push_fn(inst(Op::UConvert, &[u32_ty, widen, chain[0]]));
                         let sixteen = self.constant(&ConstKey::Int { ty: U32, bits: 16 });
-                        self.push_fn(inst(
-                            Op::ShiftLeftLogical,
-                            &[u32_ty, shift, widen, sixteen],
-                        ));
-                        self.push_fn(inst(
-                            Op::Bitcast,
-                            &[self.type_id(&target), result, shift],
-                        ));
+                        self.push_fn(inst(Op::ShiftLeftLogical, &[u32_ty, shift, widen, sixteen]));
+                        self.push_fn(inst(Op::Bitcast, &[self.type_id(&target), result, shift]));
                         return Ok(result);
                     }
-                    (T::Int { width: 8, signed: s8 }, Scalar::F32) => {
+                    (
+                        T::Int {
+                            width: 8,
+                            signed: s8,
+                        },
+                        Scalar::F32,
+                    ) => {
                         let mid = if *s8 {
                             T::Int {
                                 width: 32,
@@ -1060,13 +1098,29 @@ impl Spv {
                         };
                         let trunc_ty = self.type_id(&mid);
                         let trunc = self.alloc();
-                        let trunc_op = if signed { Op::ConvertFToS } else { Op::ConvertFToU };
+                        let trunc_op = if signed {
+                            Op::ConvertFToS
+                        } else {
+                            Op::ConvertFToU
+                        };
                         self.push_fn(inst(trunc_op, &[trunc_ty, trunc, chain[0]]));
                         chain.push(trunc);
                         final_ty = mid;
                     }
-                    (T::Int { width: 8, signed: s1 }, Scalar::I32 | Scalar::U32)
-                    | (T::Int { width: 32, signed: s1 }, Scalar::I8 | Scalar::U8) => {
+                    (
+                        T::Int {
+                            width: 8,
+                            signed: s1,
+                        },
+                        Scalar::I32 | Scalar::U32,
+                    )
+                    | (
+                        T::Int {
+                            width: 32,
+                            signed: s1,
+                        },
+                        Scalar::I8 | Scalar::U8,
+                    ) => {
                         let s2 = matches!(*ty, Scalar::I32 | Scalar::I8);
                         let mid = if s2 {
                             T::Int {
@@ -1118,7 +1172,10 @@ impl Spv {
                         StorageClass::Workgroup => 2,
                         _ => 1,
                     };
-                    let scope = self.constant(&ConstKey::Int { ty: U32, bits: scope_bits });
+                    let scope = self.constant(&ConstKey::Int {
+                        ty: U32,
+                        bits: scope_bits,
+                    });
                     let relaxed = self.constant(&ConstKey::Int { ty: U32, bits: 0 });
                     let var_id = match &args[0] {
                         Expr::ParamRef { name, .. } => self.param_vars[self.param_index[name]],
@@ -1232,10 +1289,7 @@ impl Spv {
                     let mat_id = self.emit_expr(&args[1])?;
                     let stride_id = self.emit_expr(&args[2])?;
                     let layout_id = self.emit_expr(&args[3])?;
-                    self.push_fn(inst_raw(
-                        4458,
-                        &[ptr_id, mat_id, layout_id, stride_id, 32],
-                    ));
+                    self.push_fn(inst_raw(4458, &[ptr_id, mat_id, layout_id, stride_id, 32]));
                     return Ok(0);
                 }
                 let mut arg_ids = Vec::new();
@@ -1289,7 +1343,12 @@ impl Spv {
                     let result = self.alloc();
                     self.push_fn(inst(
                         Op::Dot,
-                        &[self.type_id(&T::from_scalar(scalar_ty)), result, arg_ids[0], arg_ids[1]],
+                        &[
+                            self.type_id(&T::from_scalar(scalar_ty)),
+                            result,
+                            arg_ids[0],
+                            arg_ids[1],
+                        ],
                     ));
                     return Ok(result);
                 }
@@ -1321,8 +1380,8 @@ impl Spv {
                         self.gl_ext(ext, ty_id, result, &arg_ids);
                         Ok(result)
                     }
-                    "floor" | "ceil" | "round" | "trunc" | "sign" | "fract" | "sqrt"
-                    | "rsqrt" | "exp" | "exp2" | "log" | "log2" | "tanh" | "pow" | "fma" => {
+                    "floor" | "ceil" | "round" | "trunc" | "sign" | "fract" | "sqrt" | "rsqrt"
+                    | "exp" | "exp2" | "log" | "log2" | "tanh" | "pow" | "fma" => {
                         let result = self.alloc();
                         let ty_id = self.type_id(&T::from_scalar(scalar_ty));
                         let ext = match *name {
@@ -1360,7 +1419,9 @@ impl Spv {
                         ));
                         Ok(result)
                     }
-                    "subgroup_broadcast" | "subgroup_shuffle" | "subgroup_shuffle_down"
+                    "subgroup_broadcast"
+                    | "subgroup_shuffle"
+                    | "subgroup_shuffle_down"
                     | "subgroup_shuffle_up" => {
                         let scope = self.constant(&ConstKey::Int { ty: U32, bits: 3 });
                         let result = self.alloc();
@@ -1378,7 +1439,9 @@ impl Spv {
                         ));
                         Ok(result)
                     }
-                    "subgroup_reduce_add" | "subgroup_reduce_max" | "subgroup_reduce_min"
+                    "subgroup_reduce_add"
+                    | "subgroup_reduce_max"
+                    | "subgroup_reduce_min"
                     | "subgroup_inclusive_add" => {
                         let scope = self.constant(&ConstKey::Int { ty: U32, bits: 3 });
                         let group_op = if *name == "subgroup_inclusive_add" {
@@ -1393,8 +1456,9 @@ impl Spv {
                             | ("subgroup_inclusive_add", Scalar::F32 | Scalar::F16) => {
                                 Op::GroupNonUniformFAdd
                             }
-                            ("subgroup_reduce_add", _)
-                            | ("subgroup_inclusive_add", _) => Op::GroupNonUniformIAdd,
+                            ("subgroup_reduce_add", _) | ("subgroup_inclusive_add", _) => {
+                                Op::GroupNonUniformIAdd
+                            }
                             ("subgroup_reduce_max", Scalar::I32) => Op::GroupNonUniformSMax,
                             ("subgroup_reduce_max", Scalar::F32 | Scalar::F16) => {
                                 Op::GroupNonUniformFMax
@@ -1407,10 +1471,7 @@ impl Spv {
                             ("subgroup_reduce_min", _) => Op::GroupNonUniformUMin,
                             _ => unreachable!(),
                         };
-                        self.push_fn(inst(
-                            op,
-                            &[ty_id, result, scope, group_op, arg_ids[0]],
-                        ));
+                        self.push_fn(inst(op, &[ty_id, result, scope, group_op, arg_ids[0]]));
                         Ok(result)
                     }
                     "subgroup_all" | "subgroup_any" => {
@@ -1434,7 +1495,9 @@ impl Spv {
 
     fn emit_coop_ptr(&mut self, expr: &Expr) -> Result<u32> {
         match expr {
-            Expr::Index { base, index, ty, .. } => {
+            Expr::Index {
+                base, index, ty, ..
+            } => {
                 let index_id = self.emit_expr(index)?;
                 match &**base {
                     Expr::SharedRef { name, .. } => {
@@ -1578,10 +1641,26 @@ fn convert_op(target: &T, source: &T) -> Op {
         (T::Float { .. }, T::Int { signed: false, .. }) => Op::ConvertFToU,
         (T::Int { signed: true, .. }, T::Float { .. }) => Op::ConvertSToF,
         (T::Int { signed: false, .. }, T::Float { .. }) => Op::ConvertUToF,
-        (T::Int { width: 32, signed: true }, T::Int { width: 32, signed: false })
-        | (T::Int { width: 32, signed: false }, T::Int { width: 32, signed: true }) => {
-            Op::Bitcast
-        }
+        (
+            T::Int {
+                width: 32,
+                signed: true,
+            },
+            T::Int {
+                width: 32,
+                signed: false,
+            },
+        )
+        | (
+            T::Int {
+                width: 32,
+                signed: false,
+            },
+            T::Int {
+                width: 32,
+                signed: true,
+            },
+        ) => Op::Bitcast,
         (T::Int { signed: true, .. }, T::Int { .. }) => Op::SConvert,
         (T::Int { signed: false, .. }, T::Int { .. }) => Op::UConvert,
         _ => unreachable!("no conversion"),
@@ -1822,7 +1901,11 @@ fn collect_expr(collect: &mut Collect, expr: &Expr) {
             }
         }
         Expr::Cond {
-            cond, then, els, ty, ..
+            cond,
+            then,
+            els,
+            ty,
+            ..
         } => {
             collect_expr(collect, cond);
             collect_expr(collect, then);
@@ -1849,21 +1932,47 @@ fn collect_expr(collect: &mut Collect, expr: &Expr) {
             }
             if matches!(
                 *name,
-                "min" | "max" | "clamp" | "abs" | "floor" | "ceil" | "round" | "trunc"
-                    | "sign" | "fract" | "sqrt" | "rsqrt" | "exp" | "exp2" | "log"
-                    | "log2" | "tanh" | "pow" | "fma" | "clz" | "ctz"
+                "min"
+                    | "max"
+                    | "clamp"
+                    | "abs"
+                    | "floor"
+                    | "ceil"
+                    | "round"
+                    | "trunc"
+                    | "sign"
+                    | "fract"
+                    | "sqrt"
+                    | "rsqrt"
+                    | "exp"
+                    | "exp2"
+                    | "log"
+                    | "log2"
+                    | "tanh"
+                    | "pow"
+                    | "fma"
+                    | "clz"
+                    | "ctz"
             ) {
                 collect.has_glsl_ext = true;
             }
-            if matches!(*name, "coop_zero" | "coop_load_a" | "coop_load_b" | "coop_mul_add" | "coop_store")
-            {
+            if matches!(
+                *name,
+                "coop_zero" | "coop_load_a" | "coop_load_b" | "coop_mul_add" | "coop_store"
+            ) {
                 collect.has_coop = true;
             }
             if matches!(
                 *name,
-                "subgroup_broadcast" | "subgroup_shuffle" | "subgroup_shuffle_down"
-                    | "subgroup_shuffle_up" | "subgroup_reduce_add" | "subgroup_reduce_max"
-                    | "subgroup_reduce_min" | "subgroup_inclusive_add" | "subgroup_all"
+                "subgroup_broadcast"
+                    | "subgroup_shuffle"
+                    | "subgroup_shuffle_down"
+                    | "subgroup_shuffle_up"
+                    | "subgroup_reduce_add"
+                    | "subgroup_reduce_max"
+                    | "subgroup_reduce_min"
+                    | "subgroup_inclusive_add"
+                    | "subgroup_all"
                     | "subgroup_any"
             ) {
                 let cap = match *name {
@@ -1872,7 +1981,9 @@ fn collect_expr(collect: &mut Collect, expr: &Expr) {
                     "subgroup_shuffle_down" | "subgroup_shuffle_up" => {
                         Capability::GroupNonUniformShuffleRelative as u32
                     }
-                    "subgroup_reduce_add" | "subgroup_reduce_max" | "subgroup_reduce_min"
+                    "subgroup_reduce_add"
+                    | "subgroup_reduce_max"
+                    | "subgroup_reduce_min"
                     | "subgroup_inclusive_add" => Capability::GroupNonUniformArithmetic as u32,
                     "subgroup_all" | "subgroup_any" => Capability::GroupNonUniformVote as u32,
                     _ => unreachable!(),

@@ -49,29 +49,22 @@ pub fn quantize(data: &[f32], rows: usize, cols: usize, group: usize) -> (Vec<u8
         "quantized K must be a multiple of 16 (vec4 blocks)"
     );
     let groups = cols / group;
-    let mut bytes = Vec::with_capacity(rows * cols);
+    let mut bytes = vec![0u8; rows * cols];
     let mut scales = vec![0f32; rows * groups];
     for r in 0..rows {
         for g in 0..groups {
             let block = &data[r * cols + g * group..r * cols + (g + 1) * group];
             let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
-
             let scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
             scales[g * rows + r] = scale;
-            for v in block {
-                let q = (v / scale).round().clamp(-127.0, 127.0) as i8;
-                bytes.push(q as u8);
+            for kb in 0..group / 16 {
+                for i in 0..16 {
+                    let v = block[kb * 16 + i];
+                    let q = (v / scale).round().clamp(-127.0, 127.0) as i8;
+                    bytes[(((g * group / 16) + kb) * rows + r) * 16 + i] = q as u8;
+                }
             }
         }
     }
-
-    let mut out = vec![0u8; rows * cols];
-    for kb in 0..cols / 16 {
-        for r in 0..rows {
-            for i in 0..16 {
-                out[(kb * rows + r) * 16 + i] = bytes[r * cols + kb * 16 + i];
-            }
-        }
-    }
-    (out, scales)
+    (bytes, scales)
 }

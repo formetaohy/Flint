@@ -1,6 +1,5 @@
 #[derive(Clone, Debug, PartialEq)]
 pub enum Dist {
-
     Greedy(u32),
 
     Probs(Vec<f32>),
@@ -8,7 +7,6 @@ pub enum Dist {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SamplingParams {
-
     pub temperature: f32,
 
     pub top_k: usize,

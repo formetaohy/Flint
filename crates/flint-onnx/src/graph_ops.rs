@@ -15,9 +15,9 @@ fn run_subgraph(sub: &Graph, env: &mut HashMap<String, Tensor>) -> Result<Vec<Te
     }
     let mut out = Vec::with_capacity(sub.outputs.len());
     for v in &sub.outputs {
-        let t = env.get(&v.name).ok_or_else(|| {
-            Error::Model(format!("subgraph output {:?} not produced", v.name))
-        })?;
+        let t = env
+            .get(&v.name)
+            .ok_or_else(|| Error::Model(format!("subgraph output {:?} not produced", v.name)))?;
         out.push(t.clone());
     }
     Ok(out)

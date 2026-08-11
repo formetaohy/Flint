@@ -1,4 +1,4 @@
-use flint_architectures::chat::{ChatFormat, ChatMl, ChatMlThink, GemmaChat};
+use flint_architectures::chat::{ChatFormat, ChatMl, ChatMlThink, GemmaChat, Llama3Chat};
 
 fn im(start: bool) -> String {
     format!("<|im_{}|>", if start { "start" } else { "end" })
@@ -42,6 +42,33 @@ fn chatml_think_opens_an_empty_think_block() {
     let block = "<think>\n\n</think>\n\n".to_string();
     assert!(!plain.contains(&block), "plain ChatML has no think block");
     assert!(think.ends_with(&format!("{}assistant\n{block}", im(true))));
+}
+
+#[test]
+fn llama3_renders_meta_system_header() {
+    let got = Llama3Chat.render("sys", &[], "hi");
+    let want = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n\
+         Cutting Knowledge Date: December 2023\n\
+         sys<|eot_id|>\
+         <|start_header_id|>user<|end_header_id|>\n\n\
+         hi<|eot_id|>\
+         <|start_header_id|>assistant<|end_header_id|>\n\n"
+        .to_string();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn llama3_interleaves_history() {
+    let got = Llama3Chat.render("", &[("u1".to_string(), "a1".to_string())], "u2");
+    let want = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n\
+         Cutting Knowledge Date: December 2023\n\
+         <|eot_id|>\
+         <|start_header_id|>user<|end_header_id|>\n\nu1<|eot_id|>\
+         <|start_header_id|>assistant<|end_header_id|>\n\na1<|eot_id|>\
+         <|start_header_id|>user<|end_header_id|>\n\nu2<|eot_id|>\
+         <|start_header_id|>assistant<|end_header_id|>\n\n"
+        .to_string();
+    assert_eq!(got, want);
 }
 
 #[test]

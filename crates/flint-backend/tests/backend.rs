@@ -14,7 +14,10 @@ fn f32_roundtrip() {
 fn read_f32_honors_byte_offset() {
     let backend = Backend::new().unwrap();
     let t = backend.tensor_f32(&[1.0, 2.0, 3.0, 4.0], vec![4]);
-    assert_eq!(backend.read_f32(t.buf.as_ref(), 8, 2).unwrap(), vec![3.0, 4.0]);
+    assert_eq!(
+        backend.read_f32(t.buf.as_ref(), 8, 2).unwrap(),
+        vec![3.0, 4.0]
+    );
 }
 
 #[test]
@@ -22,7 +25,10 @@ fn zero_fill_resets_a_written_tensor() {
     let backend = Backend::new().unwrap();
     let t = backend.tensor_f32(&[9.0; 4], vec![4]);
     backend.zero_fill(&t);
-    assert_eq!(backend.read_f32(t.buf.as_ref(), 0, 4).unwrap(), vec![0.0; 4]);
+    assert_eq!(
+        backend.read_f32(t.buf.as_ref(), 0, 4).unwrap(),
+        vec![0.0; 4]
+    );
 }
 
 #[test]
@@ -31,7 +37,10 @@ fn copy_duplicates_contents() {
     let src = backend.tensor_f32(&[5.0, 6.0], vec![2]);
     let dst = backend.zero_tensor(&[2]);
     backend.copy(&src, &dst);
-    assert_eq!(backend.read_f32(dst.buf.as_ref(), 0, 2).unwrap(), vec![5.0, 6.0]);
+    assert_eq!(
+        backend.read_f32(dst.buf.as_ref(), 0, 2).unwrap(),
+        vec![5.0, 6.0]
+    );
 }
 
 #[test]
@@ -52,7 +61,7 @@ fn tensor_geometry_per_dtype() {
     assert_eq!(f.byte_len(), 24);
 
     let b = backend.tensor_bf16(&[0u8; 12], vec![2, 3]).unwrap();
-    assert_eq!(b.dtype, DType::Bf16Packed);
+    assert_eq!(b.dtype, DType::Bf16);
     assert_eq!(b.byte_len(), 12);
 
     let i = backend.tensor_i8(&[0u8; 8], vec![2, 4]);
@@ -154,13 +163,15 @@ fn external_profiler_records_spans() {
     let t = backend.zero_tensor(&[1]);
     let mut enc = backend.encoder().unwrap();
     let mut pass = Pass::begin(enc.as_mut());
-    let binds = [
-        Binding::Full(&t),
-        Binding::Full(&t),
-        Binding::Full(&t),
-    ];
+    let binds = [Binding::Full(&t), Binding::Full(&t), Binding::Full(&t)];
     backend
-        .dispatch(&mut pass, flint_kernel::name::ADD, &[("N_ELEM", 1.0)], &binds, [1, 1, 1])
+        .dispatch(
+            &mut pass,
+            flint_kernel::name::ADD,
+            &[("N_ELEM", 1.0)],
+            &binds,
+            [1, 1, 1],
+        )
         .unwrap();
     backend.submit(enc).unwrap();
     prof.end_span("add", span).unwrap();
@@ -171,7 +182,7 @@ fn external_profiler_records_spans() {
         .find(|r| r.label == "add")
         .expect("add span must be reported");
     assert_eq!(add.count, 1);
-    assert!(add.total_ns >= 0);
+    assert!(add.total_ns > 0);
 }
 
 #[test]

@@ -1,6 +1,6 @@
 pub use crate::ast::{BinOp, UnOp};
-pub use saturn_core::{MatrixRole, Scalar};
 use crate::diag::Span;
+pub use saturn_core::{MatrixRole, Scalar};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {

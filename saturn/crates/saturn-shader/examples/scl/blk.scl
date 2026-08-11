@@ -1,3 +1,0 @@
-kernel blk [workgroup(4, 4, 1)] (out: buf<u32>) {
-    out[gid.y * 128 + gid.x] = block.y * 16 + block.x;
-}

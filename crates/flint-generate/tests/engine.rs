@@ -1,15 +1,13 @@
-use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
 use flint_backend::Backend;
-use flint_checkpoint::{MetaVal, Metadata};
 use flint_error::Result;
 use flint_generate::{Engine, GenStats, Sampler};
-use flint_model::{ChunkOut, LanguageModel, M_MAX};
+use flint_model::{ChunkOut, LanguageModel, MAX_M};
 use flint_tokenizer::Tokenizer;
 
 const VOCAB: u32 = 32;
-const EOS: u32 = 31; 
+const EOS: u32 = 31;
 const MAX_SEQ: u32 = 512;
 
 static GPU: Mutex<()> = Mutex::new(());
@@ -52,7 +50,7 @@ impl LanguageModel for FakeModel {
         hidden_rows: &[u32],
     ) -> Result<ChunkOut> {
         let m = tokens.len() as u32;
-        assert!(m > 0 && m <= M_MAX, "chunk size {m} outside [1, {M_MAX}]");
+        assert!(m > 0 && m <= MAX_M, "chunk size {m} outside [1, {MAX_M}]");
         assert!(self.pos + m <= MAX_SEQ, "context overflow");
         let base = self.pos;
         let logits = logit_rows
@@ -85,20 +83,35 @@ impl LanguageModel for FakeModel {
 }
 
 fn tokenizer() -> Tokenizer {
-    let tokens: Vec<String> = (0..VOCAB).map(|i| format!("t{i}")).collect();
-    let scores: Vec<f64> = (0..VOCAB).map(|i| -(i as f64) - 1.0).collect();
-    let mut kv = HashMap::new();
-    kv.insert("tokenizer.ggml.model".into(), MetaVal::Str("llama".into()));
-    kv.insert(
-        "tokenizer.ggml.tokens".into(),
-        MetaVal::Arr(tokens.iter().map(|t| MetaVal::Str(t.clone())).collect()),
+    let dir = std::env::temp_dir().join(format!("flint-gen-tok-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let vocab: Vec<String> = (0..VOCAB)
+        .map(|i| format!("[\"t{i}\", -{}]", i as f64 + 1.0))
+        .collect();
+    let json = format!(
+        r#"{{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {{"type": "Whitespace"}},
+            "post_processor": null,
+            "decoder": null,
+            "model": {{
+                "type": "Unigram",
+                "unk_id": 0,
+                "vocab": [{}]
+            }}
+        }}"#,
+        vocab.join(",")
     );
-    kv.insert(
-        "tokenizer.ggml.scores".into(),
-        MetaVal::Arr(scores.iter().map(|s| MetaVal::Float(*s)).collect()),
-    );
-    kv.insert("tokenizer.ggml.unknown_token_id".into(), MetaVal::UInt(0));
-    Tokenizer::from_gguf(&Metadata::new(kv)).unwrap()
+    let path = dir.join("tokenizer.json");
+    std::fs::write(&path, json).unwrap();
+    let tok = Tokenizer::from_file(&path).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    tok
 }
 
 fn run(prompt: &str, max_tokens: usize, eos_after: Option<u32>) -> (Vec<u32>, GenStats, u32) {
@@ -135,7 +148,6 @@ fn run(prompt: &str, max_tokens: usize, eos_after: Option<u32>) -> (Vec<u32>, Ge
 
 #[test]
 fn eos_terminates_generation_without_emitting_it() {
-
     let (tokens, stats, n) = run("t0 t1 t2", 64, Some(2));
     let want = [((n - 1) * 7 + 3) % (VOCAB - 1), (n * 7 + 3) % (VOCAB - 1)];
     assert_eq!(tokens, want, "eos must not be emitted");
@@ -188,13 +200,12 @@ fn multi_turn_reset_reproduces_output() {
 
 #[test]
 fn stats_account_prefill_and_decode() {
-
     let prompt = (0..200)
         .map(|i| format!("t{}", i % 31))
         .collect::<Vec<_>>()
         .join(" ");
     let n = tokenizer().encode(&prompt).unwrap().len();
-    assert!(n > M_MAX as usize, "prompt must span prefill chunks");
+    assert!(n > MAX_M as usize, "prompt must span prefill chunks");
     let (tokens, stats, _) = run(&prompt, 8, None);
     assert_eq!(stats.prefill_tokens, n, "all prompt tokens counted");
     assert_eq!(stats.decode_tokens, 8);

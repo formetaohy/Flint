@@ -62,7 +62,11 @@ struct KernelMeta {
     workgroup_size: [u32; 3],
     buffers: usize,
     scalars: Vec<saturn_compiler::ir::ScalarParam>,
-    coop_triples: Vec<(saturn_core::Scalar, saturn_core::Scalar, saturn_core::Scalar)>,
+    coop_triples: Vec<(
+        saturn_core::Scalar,
+        saturn_core::Scalar,
+        saturn_core::Scalar,
+    )>,
     coop_roles: Vec<(saturn_core::Scalar, saturn_compiler::ir::MatrixRole)>,
     spirv: Vec<u8>,
 }
@@ -86,8 +90,7 @@ fn meta_from_precompiled(pc: &saturn_core::PrecompiledKernel) -> KernelMeta {
             .coop_roles
             .iter()
             .filter_map(|(elem, code)| {
-                saturn_core::MatrixRole::decode(*code)
-                    .map(|role| (*elem, role))
+                saturn_core::MatrixRole::decode(*code).map(|role| (*elem, role))
             })
             .collect(),
         spirv: pc.spirv.to_vec(),
@@ -100,7 +103,8 @@ fn meta_from_compile(spec: &saturn_core::KernelSpec) -> Result<KernelMeta> {
         .compile_with_specs(&source, spec.specs)
         .map_err(|diags| {
             Error::Shader(
-                diags.iter()
+                diags
+                    .iter()
                     .map(|d| source.render(d))
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -132,23 +136,11 @@ impl VkKernel {
         {
             return Err(Error::WorkgroupTooLarge {
                 kernel: meta.name.clone(),
-                size: meta
-                    .workgroup_size
-                    .iter()
-                    .map(|&v| v as u64)
-                    .product(),
-                max: inner
-                    .max_workgroup_size
-                    .iter()
-                    .map(|&v| v as u64)
-                    .product(),
+                size: meta.workgroup_size.iter().map(|&v| v as u64).product(),
+                max: inner.max_workgroup_size.iter().map(|&v| v as u64).product(),
             });
         }
-        let invocations: u64 = meta
-            .workgroup_size
-            .iter()
-            .map(|&v| v as u64)
-            .product();
+        let invocations: u64 = meta.workgroup_size.iter().map(|&v| v as u64).product();
         if invocations > inner.max_workgroup_invocations as u64 {
             return Err(Error::WorkgroupTooLarge {
                 kernel: meta.name.clone(),
@@ -194,10 +186,9 @@ impl VkKernel {
         let workgroup_size = meta.workgroup_size;
         let bindings: Vec<u32> = (0..meta.buffers as u32).collect();
         let shader = unsafe {
-            inner.device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&code),
-                None,
-            )
+            inner
+                .device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
         }
         .map_err(|e| Error::Vulkan(e.to_string()))?;
 
@@ -220,10 +211,12 @@ impl VkKernel {
         .map_err(|e| Error::Vulkan(e.to_string()))?;
 
         let push_ranges = scalar_layout.as_ref().map(|layout| {
-            vec![vk::PushConstantRange::default()
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                .offset(0)
-                .size(layout.size)]
+            vec![
+                vk::PushConstantRange::default()
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    .offset(0)
+                    .size(layout.size),
+            ]
         });
         let layout_refs = [layout];
         let pipeline_layout = unsafe {
@@ -241,8 +234,9 @@ impl VkKernel {
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader)
             .name(&entry);
-        let pipeline_info =
-            vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout);
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(pipeline_layout);
         let pipeline = unsafe {
             inner
                 .device
