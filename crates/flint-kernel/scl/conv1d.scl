@@ -1,6 +1,7 @@
-kernel conv1d [workgroup(256, 1, 1)] (x: buf<f32>, weight: buf<f32>, state: buf<f32>, y: buf<f32>, DIM: u32) {
-    if gid.x < DIM {
-        let c = gid.x;
+@workgroup_size(256, 1, 1)
+kernel conv1d (@binding(0) x: buf<f32>, @binding(1) weight: buf<f32>, @binding(2) state: buf<f32>, @binding(3) y: buf<f32>, DIM: u32) {
+    if global_id().x < DIM {
+        let c = global_id().x;
         let s0 = state[c * 3];
         let s1 = state[c * 3 + 1];
         let s2 = state[c * 3 + 2];

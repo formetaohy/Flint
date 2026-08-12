@@ -1,9 +1,10 @@
-kernel mul [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, N: u32, M: u32, MODE: u32, STRIDE: u32, OFFSET: u32) {
-    if gid.x < N {
+@workgroup_size(256, 1, 1)
+kernel mul (@binding(0) a: buf<f32>, @binding(1) b: buf<f32>, @binding(2) y: buf<f32>, N: u32, M: u32, MODE: u32, STRIDE: u32, OFFSET: u32) {
+    if global_id().x < N {
         if MODE == 1 {
-            y[gid.x] = a[gid.x] * b[(gid.x / M) * STRIDE + OFFSET + gid.x % M];
+            y[global_id().x] = a[global_id().x] * b[(global_id().x / M) * STRIDE + OFFSET + global_id().x % M];
         } else {
-            y[gid.x] = a[gid.x] * b[gid.x % M];
+            y[global_id().x] = a[global_id().x] * b[global_id().x % M];
         }
     }
 }

@@ -1,13 +1,22 @@
 use std::collections::HashMap;
 
+use crate::builtin;
 use crate::diag::{Diagnostic, Result, Span};
 use crate::ir::{self, Expr, Stmt};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Term {
+    Fallthrough,
+    Break,
+    Continue,
+}
 
 pub fn check(kernel: &ir::Kernel) -> Result<()> {
     let mut ctx = Ctx {
         locals: HashMap::new(),
     };
-    check_stmts(&kernel.body, &mut ctx, true)
+    check_stmts(&kernel.body, &mut ctx, true)?;
+    Ok(())
 }
 
 struct Ctx {
@@ -17,103 +26,140 @@ struct Ctx {
 fn uniform_expr(expr: &Expr, ctx: &Ctx) -> bool {
     match expr {
         Expr::IntLit { .. } | Expr::FloatLit { .. } | Expr::BoolLit { .. } => true,
-        Expr::ParamRef { .. } | Expr::SharedRef { .. } => false,
-        Expr::ScalarRef { .. } => true,
+        Expr::ParamRef { .. } => false,
         Expr::LocalRef { id, .. } => ctx.locals.get(id).copied().unwrap_or(false),
-        Expr::Builtin { name, .. } => matches!(*name, "block" | "block_dim"),
+        Expr::ScalarRef { .. } => true,
         Expr::Index { index, .. } => uniform_expr(index, ctx),
-        Expr::Member { base, .. } => uniform_expr(base, ctx),
+        Expr::Field { base, .. } => uniform_expr(base, ctx),
         Expr::Unary { expr: e, .. } => uniform_expr(e, ctx),
         Expr::Binary { lhs, rhs, .. } => uniform_expr(lhs, ctx) && uniform_expr(rhs, ctx),
         Expr::Cond {
             cond, then, els, ..
         } => uniform_expr(cond, ctx) && uniform_expr(then, ctx) && uniform_expr(els, ctx),
         Expr::Convert { expr: e, .. } => uniform_expr(e, ctx),
-        Expr::Call { name, args, .. } => match *name {
-            "coop_zero" => true,
-            "barrier" => true,
-            "subgroup_broadcast"
-            | "subgroup_shuffle"
-            | "subgroup_shuffle_down"
-            | "subgroup_shuffle_up"
-            | "subgroup_reduce_add"
-            | "subgroup_reduce_max"
-            | "subgroup_reduce_min"
-            | "subgroup_inclusive_add"
-            | "subgroup_all"
-            | "subgroup_any"
-            | "coop_load_a"
-            | "coop_load_b"
-            | "coop_mul_add"
-            | "coop_store" => false,
-            "atomic_add" | "atomic_max" | "atomic_min" | "atomic_exchange" | "atomic_and"
-            | "atomic_or" | "atomic_xor" => false,
-            _ => args.iter().all(|arg| uniform_expr(arg, ctx)),
+        Expr::OrderLit { .. } => true,
+        Expr::ConstructStruct { fields, .. } => {
+            fields.iter().all(|(_, e)| uniform_expr(e, ctx))
+        }
+        Expr::Call { name, args, .. } => match builtin::lookup(name) {
+            Some(sig) => {
+                if args.is_empty() {
+                    sig.uniform
+                } else if sig.uniform {
+                    true
+                } else {
+                    args.iter().all(|arg| uniform_expr(arg, ctx))
+                }
+            }
+            None => args.iter().all(|arg| uniform_expr(arg, ctx)),
         },
     }
 }
 
-fn check_stmts(stmts: &[Stmt], ctx: &mut Ctx, uniform: bool) -> Result<()> {
+fn check_stmts(stmts: &[Stmt], ctx: &mut Ctx, uniform: bool) -> Result<Term> {
     for stmt in stmts {
-        match stmt {
-            Stmt::Let { id, init, .. } | Stmt::Var { id, init, .. } => {
-                let u = uniform && uniform_expr(init, ctx);
-                ctx.locals.insert(*id, u);
-            }
-            Stmt::Assign { target, value, .. } => {
-                if let Expr::LocalRef { id, .. } = target {
-                    let u = uniform && uniform_expr(value, ctx);
-                    ctx.locals.insert(*id, u);
-                }
-            }
-            Stmt::If {
-                cond, then, els, ..
-            } => {
-                let u = uniform && uniform_expr(cond, ctx);
-                let before = ctx.locals.clone();
-                let mut then_ctx = Ctx {
-                    locals: before.clone(),
-                };
-                let mut els_ctx = Ctx {
-                    locals: before.clone(),
-                };
-                check_stmts(then, &mut then_ctx, u)?;
-                check_stmts(els, &mut els_ctx, u)?;
-                ctx.locals = merge_branches(&before, &then_ctx.locals, &els_ctx.locals);
-            }
-            Stmt::Loop { body, .. } => {
-                let before = ctx.locals.clone();
-                let mut body_ctx = Ctx {
-                    locals: before.clone(),
-                };
-                check_stmts(body, &mut body_ctx, uniform)?;
-                ctx.locals = merge_back(&before, &body_ctx.locals);
-            }
-            Stmt::For {
-                id,
-                start,
-                end,
-                body,
-                ..
-            } => {
-                let u = uniform && uniform_expr(start, ctx) && uniform_expr(end, ctx);
-                let before = ctx.locals.clone();
-                let mut body_ctx = Ctx {
-                    locals: before.clone(),
-                };
-                body_ctx.locals.insert(*id, u);
-                check_stmts(body, &mut body_ctx, u)?;
-                ctx.locals = merge_back(&before, &body_ctx.locals);
-            }
-            Stmt::Barrier { span } => {
-                if !uniform {
-                    return Err(barrier_error(*span));
-                }
-            }
-            Stmt::ExprStmt { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        let term = check_stmt(stmt, ctx, uniform)?;
+        if !matches!(term, Term::Fallthrough) {
+            return Ok(term);
         }
     }
-    Ok(())
+    Ok(Term::Fallthrough)
+}
+
+fn check_stmt(stmt: &Stmt, ctx: &mut Ctx, uniform: bool) -> Result<Term> {
+    match stmt {
+        Stmt::Let { id, init, .. } | Stmt::Var { id, init: Some(init), .. } => {
+            let u = uniform && uniform_expr(init, ctx);
+            ctx.locals.insert(*id, u);
+            Ok(Term::Fallthrough)
+        }
+        Stmt::Var { id, init: None, .. } => {
+            ctx.locals.insert(*id, uniform);
+            Ok(Term::Fallthrough)
+        }
+        Stmt::Assign { target, value, .. } => {
+            let u = uniform && uniform_expr(value, ctx);
+            match target {
+                Expr::LocalRef { id, .. } => {
+                    ctx.locals.insert(*id, u);
+                }
+                Expr::Field { base, .. } => {
+                    if let Expr::LocalRef { id, .. } = &**base {
+                        ctx.locals.insert(*id, u);
+                    }
+                }
+                _ => {}
+            }
+            Ok(Term::Fallthrough)
+        }
+        Stmt::If {
+            cond, then, els, ..
+        } => {
+            let u = uniform && uniform_expr(cond, ctx);
+            let before = ctx.locals.clone();
+            let mut then_ctx = Ctx {
+                locals: before.clone(),
+            };
+            let mut els_ctx = Ctx {
+                locals: before.clone(),
+            };
+            let then_term = check_stmts(then, &mut then_ctx, u)?;
+            let els_term = check_stmts(els, &mut els_ctx, u)?;
+            ctx.locals = match (then_term, els_term) {
+                (Term::Fallthrough, Term::Fallthrough) => {
+                    merge_branches(&before, &then_ctx.locals, &els_ctx.locals)
+                }
+                (Term::Fallthrough, _) => then_ctx.locals,
+                (_, Term::Fallthrough) => els_ctx.locals,
+                _ => before,
+            };
+            Ok(Term::Fallthrough)
+        }
+        Stmt::Loop { body, .. } => {
+            let before = ctx.locals.clone();
+            let mut body_ctx = Ctx {
+                locals: before.clone(),
+            };
+            check_stmts(body, &mut body_ctx, uniform)?;
+            ctx.locals = merge_back(&before, &body_ctx.locals);
+            Ok(Term::Fallthrough)
+        }
+        Stmt::For {
+            id,
+            start,
+            end,
+            body,
+            ..
+        } => {
+            let u = uniform && uniform_expr(start, ctx) && uniform_expr(end, ctx);
+            let before = ctx.locals.clone();
+            let mut body_ctx = Ctx {
+                locals: before.clone(),
+            };
+            body_ctx.locals.insert(*id, u);
+            check_stmts(body, &mut body_ctx, u)?;
+            ctx.locals = merge_back(&before, &body_ctx.locals);
+            Ok(Term::Fallthrough)
+        }
+        Stmt::Barrier { span } => {
+            if !uniform {
+                return Err(barrier_error(*span));
+            }
+            Ok(Term::Fallthrough)
+        }
+        Stmt::Break { .. } => Ok(Term::Break),
+        Stmt::Continue { .. } => Ok(Term::Continue),
+        Stmt::ExprStmt { expr, .. } => {
+            if let Expr::Call { name, .. } = expr
+                && let Some(sig) = builtin::lookup(name)
+                && sig.requires_uniform
+                && !uniform
+            {
+                return Err(barrier_error(expr_span(expr)));
+            }
+            Ok(Term::Fallthrough)
+        }
+    }
 }
 
 fn merge_branches(
@@ -156,11 +202,33 @@ fn merge_back(before: &HashMap<u32, bool>, body: &HashMap<u32, bool>) -> HashMap
     merged
 }
 
+fn expr_span(expr: &Expr) -> Span {
+    match expr {
+        Expr::IntLit { span, .. }
+        | Expr::FloatLit { span, .. }
+        | Expr::BoolLit { span, .. }
+        | Expr::ParamRef { span, .. }
+        | Expr::LocalRef { span, .. }
+        | Expr::ScalarRef { span, .. }
+        | Expr::Index { span, .. }
+        | Expr::Field { span, .. }
+        | Expr::Unary { span, .. }
+        | Expr::Binary { span, .. }
+        | Expr::Cond { span, .. }
+        | Expr::Convert { span, .. }
+        | Expr::OrderLit { span, .. }
+        | Expr::ConstructStruct { span, .. }
+        | Expr::Call { span, .. } => *span,
+    }
+}
+
+
+
 fn barrier_error(span: Span) -> Diagnostic {
     Diagnostic::new(
         span,
-        "barrier() inside non-uniform control flow: the enclosing condition \
-         depends on per-invocation values (gid, thread, lane, subgroup state, \
-         or buffer/shared reads with non-uniform indices)",
+        "barrier() inside non-uniform control flow: the enclosing condition depends on \
+         per-invocation values (@local_id, @lane, buffer or \
+         threadgroup reads with non-uniform indices)",
     )
 }

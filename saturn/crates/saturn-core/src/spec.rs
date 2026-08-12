@@ -43,7 +43,7 @@ pub struct PrecompiledScalar<'a> {
 pub struct PrecompiledKernel<'a> {
     pub name: &'a str,
     pub workgroup_size: [u32; 3],
-    pub buffers: usize,
+    pub bindings: &'a [u32],
     pub spirv: &'a [u8],
     pub msl: &'a str,
     pub scalars: &'a [PrecompiledScalar<'a>],

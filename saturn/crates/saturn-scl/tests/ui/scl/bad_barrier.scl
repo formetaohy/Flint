@@ -1,5 +1,6 @@
-kernel k [workgroup(64, 1, 1)] (a: buf<f32>) {
-    if thread.x < 32 {
+@workgroup_size(64, 1, 1)
+kernel k (@binding(0) a: buf<f32>) {
+    if local_id().x < 32 {
         barrier();
     }
 }

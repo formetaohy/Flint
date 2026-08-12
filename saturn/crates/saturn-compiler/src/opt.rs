@@ -76,10 +76,13 @@ fn fold_stmt(stmt: ir::Stmt) -> Vec<ir::Stmt> {
             id,
             name,
             ty,
-            mut init,
+            init,
             span,
         } => {
-            fold_expr(&mut init);
+            let init = init.map(|mut init| {
+                fold_expr(&mut init);
+                init
+            });
             vec![ir::Stmt::Var {
                 id,
                 name,
@@ -165,7 +168,7 @@ fn fold_expr(expr: &mut ir::Expr) {
             fold_expr(base);
             fold_expr(index);
         }
-        ir::Expr::Member { base, .. } => fold_expr(base),
+        ir::Expr::Field { base, .. } => fold_expr(base),
         ir::Expr::Unary { expr: inner, .. } => {
             fold_expr(inner);
             fold_unary(expr);
@@ -190,6 +193,11 @@ fn fold_expr(expr: &mut ir::Expr) {
         ir::Expr::Call { args, .. } => {
             for arg in args {
                 fold_expr(arg);
+            }
+        }
+        ir::Expr::ConstructStruct { fields, .. } => {
+            for (_, value) in fields {
+                fold_expr(value);
             }
         }
         _ => {}

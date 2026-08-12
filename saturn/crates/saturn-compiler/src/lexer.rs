@@ -1,10 +1,13 @@
 use crate::diag::{Diagnostic, Result, Span};
+use crate::ir::Scalar;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Ident(String),
-    Int(u64),
-    Float(f64),
+    Str(String),
+    Int(u64, Option<Scalar>),
+    Float(f64, Option<Scalar>),
+    At,
     LBrace,
     RBrace,
     LParen,
@@ -150,7 +153,9 @@ impl<'a> Lexer<'a> {
     fn lex_number(&mut self) -> Result<Tok> {
         let start = self.span();
         let mut text = String::new();
+        let mut is_hex = false;
         if self.peek() == Some(b'0') && matches!(self.peek_at(1), Some(b'x' | b'X')) {
+            is_hex = true;
             self.bump();
             self.bump();
             while let Some(c) = self.peek() {
@@ -167,19 +172,19 @@ impl<'a> Lexer<'a> {
                     "expected hex digits after 0x",
                 ));
             }
-            return Ok(Tok::Int(u64::from_str_radix(&text, 16).map_err(|_| {
-                Diagnostic::new(self.span_to(start), "hex literal out of range")
-            })?));
-        }
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
-                text.push(c as char);
-                self.bump();
-            } else {
-                break;
+        } else {
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    text.push(c as char);
+                    self.bump();
+                } else {
+                    break;
+                }
             }
         }
+        let mut is_float = false;
         if self.peek() == Some(b'.') && !matches!(self.peek_at(1), Some(b'.')) {
+            is_float = true;
             text.push('.');
             self.bump();
             while let Some(c) = self.peek() {
@@ -190,29 +195,91 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             }
-            if matches!(self.peek(), Some(b'e' | b'E')) {
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            is_float = true;
+            text.push(self.bump().unwrap() as char);
+            if matches!(self.peek(), Some(b'+' | b'-')) {
                 text.push(self.bump().unwrap() as char);
-                if matches!(self.peek(), Some(b'+' | b'-')) {
-                    text.push(self.bump().unwrap() as char);
-                }
-                while let Some(c) = self.peek() {
-                    if c.is_ascii_digit() {
-                        text.push(c as char);
-                        self.bump();
-                    } else {
-                        break;
-                    }
+            }
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    text.push(c as char);
+                    self.bump();
+                } else {
+                    break;
                 }
             }
+        }
+        let suffix_span = self.span();
+        let ty = match self.peek() {
+            Some(b'u') => {
+                self.bump();
+                if is_float {
+                    return Err(Diagnostic::new(
+                        suffix_span.to(self.span()),
+                        "u suffix requires an integer literal",
+                    ));
+                }
+                Some(Scalar::U32)
+            }
+            Some(b'i') => {
+                self.bump();
+                if is_float {
+                    return Err(Diagnostic::new(
+                        suffix_span.to(self.span()),
+                        "i suffix requires an integer literal",
+                    ));
+                }
+                Some(Scalar::I32)
+            }
+            Some(b'f') => {
+                self.bump();
+                if !is_float && !is_hex {
+                    return Err(Diagnostic::new(
+                        suffix_span.to(self.span()),
+                        "f suffix requires a float literal",
+                    ));
+                }
+                Some(Scalar::F32)
+            }
+            Some(b'h') => {
+                self.bump();
+                if !is_float {
+                    return Err(Diagnostic::new(
+                        suffix_span.to(self.span()),
+                        "h suffix requires a float literal",
+                    ));
+                }
+                Some(Scalar::F16)
+            }
+            Some(b'b') if self.peek_at(1) == Some(b'f') => {
+                self.bump();
+                self.bump();
+                if !is_float {
+                    return Err(Diagnostic::new(
+                        suffix_span.to(self.span()),
+                        "bf suffix requires a float literal",
+                    ));
+                }
+                Some(Scalar::Bf16)
+            }
+            _ => None,
+        };
+        if is_float {
             let value: f64 = text
                 .parse()
                 .map_err(|_| Diagnostic::new(self.span_to(start), "invalid float literal"))?;
-            return Ok(Tok::Float(value));
+            return Ok(Tok::Float(value, ty));
         }
-        let value: u64 = text
-            .parse()
-            .map_err(|_| Diagnostic::new(self.span_to(start), "invalid integer literal"))?;
-        Ok(Tok::Int(value))
+        let value = if is_hex {
+            u64::from_str_radix(&text, 16)
+                .map_err(|_| Diagnostic::new(self.span_to(start), "hex literal out of range"))?
+        } else {
+            text.parse()
+                .map_err(|_| Diagnostic::new(self.span_to(start), "invalid integer literal"))?
+        };
+        Ok(Tok::Int(value, ty))
     }
 
     fn lex_ident(&mut self) -> Tok {
@@ -241,6 +308,38 @@ pub fn lex(source: &crate::diag::Source) -> Result<Vec<Token>> {
         let tok = match c {
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => lexer.lex_ident(),
             b'0'..=b'9' => lexer.lex_number()?,
+            b'"' => {
+                lexer.bump();
+                let mut text = String::new();
+                loop {
+                    match lexer.peek() {
+                        Some(b'"') => {
+                            lexer.bump();
+                            break;
+                        }
+                        Some(b'\\') if lexer.peek_at(1) == Some(b'"') => {
+                            lexer.bump();
+                            lexer.bump();
+                            text.push('"');
+                        }
+                        Some(c) => {
+                            text.push(c as char);
+                            lexer.bump();
+                        }
+                        None => {
+                            return Err(Diagnostic::new(
+                                lexer.span_to(start),
+                                "unterminated string literal",
+                            ));
+                        }
+                    }
+                }
+                Tok::Str(text)
+            }
+            b'@' => {
+                lexer.bump();
+                Tok::At
+            }
             b'{' => {
                 lexer.bump();
                 Tok::LBrace
@@ -287,7 +386,11 @@ pub fn lex(source: &crate::diag::Source) -> Result<Vec<Token>> {
             }
             b'=' => {
                 lexer.bump();
-                if lexer.eat(b'=') { Tok::EqEq } else { Tok::Eq }
+                if lexer.eat(b'=') {
+                    Tok::EqEq
+                } else {
+                    Tok::Eq
+                }
             }
             b'+' => {
                 lexer.bump();
@@ -387,7 +490,11 @@ pub fn lex(source: &crate::diag::Source) -> Result<Vec<Token>> {
             }
             b'!' => {
                 lexer.bump();
-                if lexer.eat(b'=') { Tok::Ne } else { Tok::Bang }
+                if lexer.eat(b'=') {
+                    Tok::Ne
+                } else {
+                    Tok::Bang
+                }
             }
             b'?' => {
                 lexer.bump();

@@ -60,7 +60,7 @@ pub struct VkKernel {
 struct KernelMeta {
     name: String,
     workgroup_size: [u32; 3],
-    buffers: usize,
+    bindings: Vec<u32>,
     scalars: Vec<saturn_compiler::ir::ScalarParam>,
     coop_triples: Vec<(
         saturn_core::Scalar,
@@ -75,7 +75,7 @@ fn meta_from_precompiled(pc: &saturn_core::PrecompiledKernel) -> KernelMeta {
     KernelMeta {
         name: pc.name.to_string(),
         workgroup_size: pc.workgroup_size,
-        buffers: pc.buffers,
+        bindings: pc.bindings.to_vec(),
         scalars: pc
             .scalars
             .iter()
@@ -114,7 +114,7 @@ fn meta_from_compile(spec: &saturn_core::KernelSpec) -> Result<KernelMeta> {
     Ok(KernelMeta {
         name: kernel.name.clone(),
         workgroup_size: kernel.workgroup_size,
-        buffers: kernel.params.len(),
+        bindings: kernel.params.iter().map(|p| p.binding).collect(),
         scalars: kernel.scalars.clone(),
         coop_triples: kernel.coop_triples.clone(),
         coop_roles: kernel.coop_roles.clone(),
@@ -184,7 +184,7 @@ impl VkKernel {
             .collect();
         let name = meta.name.clone();
         let workgroup_size = meta.workgroup_size;
-        let bindings: Vec<u32> = (0..meta.buffers as u32).collect();
+        let bindings = meta.bindings;
         let shader = unsafe {
             inner
                 .device

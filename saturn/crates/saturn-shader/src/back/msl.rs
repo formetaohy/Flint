@@ -1,4 +1,4 @@
-use saturn_compiler::ir::{BinOp, Expr, Kernel, Scalar, Stmt, Type, UnOp};
+use saturn_compiler::ir::{BinOp, Expr, Kernel, MemOrder, Scalar, Stmt, Type, UnOp};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -28,22 +28,35 @@ pub fn to_msl(kernel: &Kernel) -> Result<(String, String)> {
 impl Msl {
     fn emit_kernel(&mut self, kernel: &Kernel) -> Result<()> {
         self.collect_builtins(&kernel.body);
+        self.emit_structs(kernel);
         self.emit_wrappers();
         self.out.push_str("kernel void ");
         self.out.push_str(&kernel.name);
         self.out.push('(');
         let mut first = true;
-        for (index, param) in kernel.params.iter().enumerate() {
+        for param in kernel.params.iter() {
             if !first {
                 self.out.push_str(", ");
             }
             first = false;
+            let Type::Buf(elem) = &param.ty else {
+                return Err("buffer parameter has non-buffer type".to_string());
+            };
+            if param.access == saturn_compiler::ir::Access::ReadOnly {
+                self.out.push_str("const ");
+            }
             self.out.push_str("device ");
-            self.out.push_str(msl_scalar(param.elem));
+            self.out.push_str(&msl_type(elem));
             self.out.push_str("* ");
             self.out.push_str(&param.name);
-            self.out.push_str(&format!(" [[buffer({index})]]"));
+            self.out.push_str(&format!(" [[buffer({})]]", param.binding));
         }
+        let scalars_base = kernel
+            .params
+            .iter()
+            .map(|p| p.binding)
+            .max()
+            .map_or(0, |max| max + 1);
         for (index, scalar) in kernel.scalars.iter().enumerate() {
             if !first {
                 self.out.push_str(", ");
@@ -53,8 +66,10 @@ impl Msl {
             self.out.push_str(msl_scalar(scalar.ty));
             self.out.push_str("& ");
             self.out.push_str(&scalar.name);
-            self.out
-                .push_str(&format!(" [[buffer({})]]", kernel.params.len() + index));
+            self.out.push_str(&format!(
+                " [[buffer({})]]",
+                scalars_base + index as u32
+            ));
         }
         for builtin in &self.builtins {
             if !first {
@@ -62,34 +77,34 @@ impl Msl {
             }
             first = false;
             let attr = match *builtin {
-                "gid" => "thread_position_in_grid",
-                "thread" => "thread_position_in_threadgroup",
-                "block" => "threadgroup_position_in_grid",
-                "block_dim" => "threads_per_threadgroup",
+                "global_id" => "thread_position_in_grid",
+                "local_id" => "thread_position_in_threadgroup",
+                "group_id" => "threadgroup_position_in_grid",
+                "group_size" => "threads_per_threadgroup",
                 "lane" => "simd_lane_id",
                 "subgroup_id" => "threadgroup_position_in_simdgroup",
                 "subgroup_size" => "simdgroups_per_threadgroup",
                 _ => unreachable!(),
             };
-            if matches!(*builtin, "lane" | "subgroup_id" | "subgroup_size") {
+            if matches!(
+                *builtin,
+                "lane" | "subgroup_id" | "subgroup_size"
+            ) {
                 self.out.push_str(&format!("uint {builtin} [[{attr}]]"));
             } else {
                 self.out.push_str(&format!("uint3 {builtin} [[{attr}]]"));
             }
         }
         self.out.push_str(") {\n");
-        for shared in &kernel.shareds {
-            self.out.push_str("    threadgroup ");
-            self.out.push_str(msl_scalar(shared.elem));
-            self.out.push(' ');
-            self.out.push_str(&shared.name);
-            self.out.push_str(&format!(
-                "[{}];
-",
-                shared.len
-            ));
-        }
-        if !kernel.shareds.is_empty() {
+        let threadgroup_vars = collect_threadgroup_vars(&kernel.body);
+        if !threadgroup_vars.is_empty() {
+            for (name, elem, len) in &threadgroup_vars {
+                self.out.push_str("    threadgroup ");
+                self.out.push_str(&msl_type(elem));
+                self.out.push(' ');
+                self.out.push_str(name);
+                self.out.push_str(&format!("[{len}];\n"));
+            }
             self.out.push('\n');
         }
         self.emit_stmts(&kernel.body, 1)?;
@@ -98,6 +113,16 @@ impl Msl {
 ",
         );
         Ok(())
+    }
+
+    fn emit_structs(&mut self, kernel: &Kernel) {
+        for decl in &kernel.structs {
+            self.out.push_str(&format!("struct {} {{\n", decl.name));
+            for (name, ty) in &decl.fields {
+                self.out.push_str(&format!("    {} {};\n", msl_scalar(scalar_of(ty)), name));
+            }
+            self.out.push_str("};\n\n");
+        }
     }
 
     fn emit_wrappers(&mut self) {
@@ -176,7 +201,9 @@ impl Msl {
     fn collect_builtins(&mut self, stmts: &[Stmt]) {
         for stmt in stmts {
             match stmt {
-                Stmt::Let { init, .. } | Stmt::Var { init, .. } => self.collect_expr(init),
+                Stmt::Let { init, .. } => self.collect_expr(init),
+                Stmt::Var { init: Some(init), .. } => self.collect_expr(init),
+                Stmt::Var { init: None, .. } => {}
                 Stmt::Assign { target, value, .. } => {
                     self.collect_expr(target);
                     self.collect_expr(value);
@@ -208,11 +235,24 @@ impl Msl {
                 for arg in args {
                     self.collect_expr(arg);
                 }
+                if matches!(
+                    *name,
+                    "global_id"
+                        | "local_id"
+                        | "group_id"
+                        | "group_size"
+                        | "subgroup_id"
+                        | "lane"
+                        | "subgroup_size"
+                ) && !self.builtins.contains(name)
+                {
+                    self.builtins.push(name);
+                }
                 match *name {
                     "coop_load_a" | "coop_load_b" => {
                         let elem = scalar_of(ty);
                         let space = match &args[0] {
-                            Expr::SharedRef { .. } => "threadgroup",
+                            Expr::LocalRef { .. } => "threadgroup",
                             _ => "device",
                         };
                         self.wrapped.insert(Wrapped::Load { elem, space });
@@ -231,7 +271,7 @@ impl Msl {
                             _ => &Type::Scalar(Scalar::F32),
                         });
                         let space = match &args[0] {
-                            Expr::SharedRef { .. } => "threadgroup",
+                            Expr::LocalRef { .. } => "threadgroup",
                             _ => "device",
                         };
                         self.wrapped.insert(Wrapped::Store { elem, space });
@@ -239,16 +279,11 @@ impl Msl {
                     _ => {}
                 }
             }
-            Expr::Builtin { name, .. } => {
-                if !self.builtins.contains(name) {
-                    self.builtins.push(name);
-                }
-            }
             Expr::Index { base, index, .. } => {
                 self.collect_expr(base);
                 self.collect_expr(index);
             }
-            Expr::Member { base, .. } => self.collect_expr(base),
+            Expr::Field { base, .. } => self.collect_expr(base),
             Expr::Unary { expr, .. } => self.collect_expr(expr),
             Expr::Binary { lhs, rhs, .. } => {
                 self.collect_expr(lhs);
@@ -262,6 +297,11 @@ impl Msl {
                 self.collect_expr(els);
             }
             Expr::Convert { expr, .. } => self.collect_expr(expr),
+            Expr::ConstructStruct { fields, .. } => {
+                for (_, value) in fields {
+                    self.collect_expr(value);
+                }
+            }
             _ => {}
         }
     }
@@ -286,13 +326,23 @@ impl Msl {
                 self.emit_expr(init)?;
                 self.out.push_str(";\n");
             }
-            Stmt::Var { name, ty, init, .. } => {
+            Stmt::Var {
+                name,
+                ty,
+                init,
+                ..
+            } => {
+                if matches!(ty, Type::Threadgroup(_)) {
+                    return Ok(());
+                }
                 self.out.push_str(&pad);
                 self.out.push_str(&msl_decl_type(ty));
                 self.out.push(' ');
                 self.out.push_str(name);
-                self.out.push_str(" = ");
-                self.emit_expr(init)?;
+                if let Some(init) = init {
+                    self.out.push_str(" = ");
+                    self.emit_expr(init)?;
+                }
                 self.out.push_str(";\n");
             }
             Stmt::Assign { target, value, .. } => {
@@ -377,7 +427,7 @@ impl Msl {
 
     fn emit_coop_ptr(&mut self, expr: &Expr) -> Result<()> {
         match expr {
-            Expr::SharedRef { name, .. } | Expr::ParamRef { name, .. } => {
+            Expr::LocalRef { name, .. } | Expr::ParamRef { name, .. } => {
                 self.out.push_str(name);
             }
             Expr::Index { base, index, .. } => {
@@ -424,23 +474,16 @@ impl Msl {
             Expr::LocalRef { name, .. } => self.out.push_str(name),
             Expr::ParamRef { name, .. } => self.out.push_str(name),
             Expr::ScalarRef { name, .. } => self.out.push_str(name),
-            Expr::SharedRef { name, .. } => self.out.push_str(name),
-            Expr::Builtin { name, .. } => self.out.push_str(name),
             Expr::Index { base, index, .. } => {
                 self.emit_expr(base)?;
                 self.out.push('[');
                 self.emit_expr(index)?;
                 self.out.push(']');
             }
-            Expr::Member { base, idx, .. } => {
+            Expr::Field { base, name, .. } => {
                 self.emit_expr(base)?;
                 self.out.push('.');
-                self.out.push(match idx {
-                    0 => 'x',
-                    1 => 'y',
-                    2 => 'z',
-                    _ => 'w',
-                });
+                self.out.push_str(name);
             }
             Expr::Unary { op, expr, .. } => {
                 match op {
@@ -500,18 +543,7 @@ impl Msl {
                 self.out.push(')');
             }
             Expr::Convert { ty, expr, .. } => {
-                let source = match &**expr {
-                    Expr::LocalRef { ty, .. } => Some(ty.elem().expect("local elem")),
-                    Expr::ScalarRef { ty, .. } => Some(*ty),
-                    Expr::IntLit { ty, .. } | Expr::FloatLit { ty, .. } => Some(*ty),
-                    Expr::Index { ty, .. } | Expr::Member { ty, .. } => Some(*ty),
-                    Expr::Unary { ty, .. } | Expr::Cond { ty, .. } | Expr::Convert { ty, .. } => {
-                        Some(*ty)
-                    }
-                    Expr::Binary { ty, .. } => Some(ty.elem().expect("binary elem")),
-                    Expr::Call { ty, .. } => Some(ty.elem().expect("call elem")),
-                    _ => None,
-                };
+                let source = source_scalar(expr);
                 match (source, *ty) {
                     (Some(Scalar::F32), Scalar::Bf16) => {
                         self.out.push_str("(ushort)((as_type<uint>(");
@@ -545,15 +577,32 @@ impl Msl {
                 self.emit_expr(expr)?;
                 self.out.push(')');
             }
+            Expr::OrderLit { order, .. } => {
+                self.out.push_str(msl_order(*order));
+            }
+            Expr::ConstructStruct { name, fields, .. } => {
+                self.out.push_str(name);
+                self.out.push('{');
+                for (index, (_, value)) in fields.iter().enumerate() {
+                    if index > 0 {
+                        self.out.push_str(", ");
+                    }
+                    self.emit_expr(value)?;
+                }
+                self.out.push('}');
+            }
             Expr::Call { name, args, ty, .. } => {
-                if *name == "select" {
-                    self.out.push('(');
-                    self.emit_expr(&args[2])?;
-                    self.out.push_str(" ? ");
-                    self.emit_expr(&args[0])?;
-                    self.out.push_str(" : ");
-                    self.emit_expr(&args[1])?;
-                    self.out.push(')');
+                if matches!(
+                    *name,
+                    "global_id"
+                        | "local_id"
+                        | "group_id"
+                        | "group_size"
+                        | "subgroup_id"
+                        | "lane"
+                        | "subgroup_size"
+                ) {
+                    self.out.push_str(name);
                     return Ok(());
                 }
                 if *name == "construct_vec" {
@@ -596,11 +645,7 @@ impl Msl {
                         | "atomic_or"
                         | "atomic_xor"
                 ) {
-                    let (base_name, space) = match &args[0] {
-                        Expr::ParamRef { name, .. } => (name.as_str(), "device"),
-                        Expr::SharedRef { name, .. } => (name.as_str(), "threadgroup"),
-                        _ => unreachable!("atomic base"),
-                    };
+                    let (space, base_name, index) = split_addr(&args[0]);
                     let ty_name = msl_scalar(scalar_of(ty));
                     let fn_name = match *name {
                         "atomic_add" => "atomic_fetch_add_explicit",
@@ -619,10 +664,25 @@ impl Msl {
                     self.out.push_str("*)&");
                     self.out.push_str(base_name);
                     self.out.push('[');
-                    self.emit_expr(&args[1])?;
+                    let mut msl = Msl {
+                        out: String::new(),
+                        builtins: Vec::new(),
+                        wrapped: std::collections::HashSet::new(),
+                    };
+                    match index {
+                        Some(index) => msl.emit_expr(index)?,
+                        None => msl.out.push('0'),
+                    }
+                    self.out.push_str(&msl.out);
                     self.out.push_str("], ");
-                    self.emit_expr(&args[2])?;
-                    self.out.push_str(", memory_order_relaxed)");
+                    self.emit_expr(&args[1])?;
+                    self.out.push_str(", ");
+                    let order = match &args[2] {
+                        Expr::OrderLit { order, .. } => *order,
+                        _ => MemOrder::Relaxed,
+                    };
+                    self.out.push_str(msl_order(order));
+                    self.out.push(')');
                     return Ok(());
                 }
                 if *name == "coop_zero" {
@@ -719,8 +779,7 @@ fn emit_lvalue(out: &mut String, expr: &Expr) -> Result<()> {
     match expr {
         Expr::LocalRef { name, .. }
         | Expr::ParamRef { name, .. }
-        | Expr::ScalarRef { name, .. }
-        | Expr::SharedRef { name, .. } => out.push_str(name),
+        | Expr::ScalarRef { name, .. } => out.push_str(name),
         Expr::Index { base, index, .. } => {
             emit_lvalue(out, base)?;
             out.push('[');
@@ -733,9 +792,77 @@ fn emit_lvalue(out: &mut String, expr: &Expr) -> Result<()> {
             out.push_str(&msl.out);
             out.push(']');
         }
+        Expr::Field { base, name, .. } => {
+            emit_lvalue(out, base)?;
+            out.push('.');
+            out.push_str(name);
+        }
         _ => return Err("invalid assignment target".to_string()),
     }
     Ok(())
+}
+
+fn split_addr<'a>(expr: &'a Expr) -> (&'static str, &'a str, Option<&'a Expr>) {
+    match expr {
+        Expr::Index { base, index, .. } => match &**base {
+            Expr::LocalRef { name, .. } => ("threadgroup", name, Some(index)),
+            _ => ("device", name_of(&**base), Some(index)),
+        },
+        _ => ("device", name_of(expr), None),
+    }
+}
+
+fn name_of(expr: &Expr) -> &str {
+    match expr {
+        Expr::LocalRef { name, .. } | Expr::ParamRef { name, .. } => name,
+        _ => "",
+    }
+}
+
+fn collect_threadgroup_vars(stmts: &[Stmt]) -> Vec<(String, Type, u64)> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            Stmt::Var { name, ty, .. } => {
+                if let Type::Threadgroup(inner) = ty {
+                    if let Type::Array { elem, len } = &**inner {
+                        out.push((name.clone(), (**elem).clone(), *len));
+                    }
+                }
+            }
+            Stmt::If { then, els, .. } => {
+                out.extend(collect_threadgroup_vars(then));
+                out.extend(collect_threadgroup_vars(els));
+            }
+            Stmt::Loop { body, .. } | Stmt::For { body, .. } => {
+                out.extend(collect_threadgroup_vars(body));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn source_scalar(expr: &Expr) -> Option<Scalar> {
+    match expr {
+        Expr::LocalRef { ty, .. } => ty.scalar(),
+        Expr::ScalarRef { ty, .. } => Some(*ty),
+        Expr::IntLit { ty, .. } | Expr::FloatLit { ty, .. } => Some(*ty),
+        Expr::Index { ty, .. } | Expr::Field { ty, .. } => ty.scalar(),
+        Expr::Unary { ty, .. } | Expr::Convert { ty, .. } => Some(*ty),
+        Expr::Cond { ty, .. } | Expr::Binary { ty, .. } | Expr::Call { ty, .. } => ty.scalar(),
+        _ => None,
+    }
+}
+
+fn msl_order(order: MemOrder) -> &'static str {
+    match order {
+        MemOrder::Relaxed => "memory_order_relaxed",
+        MemOrder::Acquire => "memory_order_acquire",
+        MemOrder::Release => "memory_order_release",
+        MemOrder::AcqRel => "memory_order_acq_rel",
+        MemOrder::SeqCst => "memory_order_seq_cst",
+    }
 }
 
 fn msl_simdgroup(elem: Scalar) -> &'static str {
@@ -750,6 +877,7 @@ fn scalar_of(ty: &Type) -> Scalar {
     match ty {
         Type::Scalar(scalar) => *scalar,
         Type::Matrix { elem, .. } => *elem,
+        Type::Vec { elem, .. } => *elem,
         _ => unreachable!("not a scalar type"),
     }
 }
@@ -765,7 +893,19 @@ fn msl_decl_type(ty: &Type) -> String {
             format!("metal::simdgroup_{name}16x16")
         }
         Type::Vec { size, elem } => format!("{}{}", msl_scalar(*elem), size),
+        Type::Array { elem, len } => format!("{} [{len}]", msl_decl_type(elem)),
+        Type::Threadgroup(elem) => msl_decl_type(elem),
+        Type::Struct { name, .. } => name.clone(),
         _ => unreachable!("not a local type"),
+    }
+}
+
+fn msl_type(ty: &Type) -> String {
+    match ty {
+        Type::Scalar(scalar) => msl_scalar(*scalar).to_string(),
+        Type::Vec { size, elem } => format!("{}{}", msl_scalar(*elem), size),
+        Type::Struct { name, .. } => name.clone(),
+        _ => unreachable!("not a buffer element type"),
     }
 }
 

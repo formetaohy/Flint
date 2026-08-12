@@ -45,13 +45,36 @@ fn scalar_ts(scalar: Scalar) -> &'static str {
 
 fn precompile(path: &Path) -> Result<String, String> {
     let source = saturn_compiler::Source::load(path).map_err(|e| e.to_string())?;
-    let kernel = Driver::new().compile(&source).map_err(|diags| {
-        diags
-            .iter()
-            .map(|d| format!("{}: {}", source.render_span(d.span), d.msg))
-            .collect::<Vec<_>>()
-            .join("\n")
-    })?;
+    let call_dir = path
+        .parent()
+        .ok_or_else(|| format!("cannot resolve directory of {}", path.display()))?
+        .to_path_buf();
+    let resolve = Box::new(move |name: &str, current: &Path| {
+        let mut dir = current.parent().unwrap_or(&call_dir).to_path_buf();
+        loop {
+            let candidate = dir.join("scl").join(name);
+            if candidate.is_file() {
+                return std::fs::read_to_string(&candidate)
+                    .map_err(|e| format!("cannot read {}: {e}", candidate.display()));
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent.to_path_buf(),
+                None => {
+                    return Err(format!("cannot find scl/{name} from {}", current.display()));
+                }
+            }
+        }
+    });
+    let kernel = Driver::new()
+        .with_import_resolver(resolve)
+        .compile(&source)
+        .map_err(|diags| {
+            diags
+                .iter()
+                .map(|d| format!("{}: {}", source.render_span(d.span), d.msg))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })?;
     let spirv = saturn_shader::to_spirv(&kernel).map_err(|e| format!("SPIR-V generation: {e}"))?;
     let (msl, entry) =
         saturn_shader::to_msl(&kernel).map_err(|e| format!("MSL generation: {e}"))?;
@@ -90,11 +113,17 @@ fn precompile(path: &Path) -> Result<String, String> {
         .join(",");
     let msl_ts = format!("{msl:?}");
     let wg = kernel.workgroup_size;
+    let bindings = kernel
+        .params
+        .iter()
+        .map(|p| p.binding.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let ts = format!(
         "&::saturn_core::PrecompiledKernel {{
              name: {:?},
              workgroup_size: [{}, {}, {}],
-             buffers: {},
+             bindings: &[{bindings}],
              spirv: &[{spirv_ts}],
              msl: {msl_ts},
              scalars: &[{scalars}],
@@ -105,7 +134,6 @@ fn precompile(path: &Path) -> Result<String, String> {
         wg[0],
         wg[1],
         wg[2],
-        kernel.params.len(),
     );
     ts.parse()
         .map_err(|e| format!("macro output generation: {e}"))
@@ -183,7 +211,7 @@ mod tests {
         let path = dir.join("bad.scl");
         std::fs::write(
             &path,
-            "kernel k [workgroup(1,1,1)] (a: buf<f32>) {\n    var x = 1;\n    a[0] = x;\n}",
+            "@workgroup_size(1,1,1) kernel k (@binding(0) a: buf<f32>) {\n    let mut x = 1;\n    a[0] = x;\n}",
         )
         .unwrap();
         let msg = precompile(&path).expect_err("bad kernel must fail");

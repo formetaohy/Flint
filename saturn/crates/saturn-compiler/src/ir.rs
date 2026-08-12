@@ -3,12 +3,42 @@ use crate::diag::Span;
 pub use saturn_core::{MatrixRole, Scalar};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemOrder {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
+impl MemOrder {
+    pub fn name(&self) -> &'static str {
+        match self {
+            MemOrder::Relaxed => "relaxed",
+            MemOrder::Acquire => "acquire",
+            MemOrder::Release => "release",
+            MemOrder::AcqRel => "acq_rel",
+            MemOrder::SeqCst => "seq_cst",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Access {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Scalar(Scalar),
     Vec { size: u32, elem: Scalar },
-    Buf(Scalar),
-    SharedArray { elem: Scalar, len: u64 },
+    Buf(Box<Type>),
+    Array { elem: Box<Type>, len: u64 },
+    Threadgroup(Box<Type>),
     Matrix { elem: Scalar, role: MatrixRole },
+    Struct { name: String, fields: Vec<(String, Type)> },
 }
 
 impl Type {
@@ -16,18 +46,37 @@ impl Type {
         match self {
             Type::Scalar(scalar) => Some(*scalar),
             Type::Vec { elem, .. } => Some(*elem),
-            Type::Buf(elem) => Some(*elem),
-            Type::SharedArray { elem, .. } => Some(*elem),
+            Type::Buf(elem) => elem.elem(),
+            Type::Array { elem, .. } => elem.elem(),
+            Type::Threadgroup(elem) => elem.elem(),
             Type::Matrix { elem, .. } => Some(*elem),
+            Type::Struct { fields, .. } => fields.first().map(|(_, ty)| ty.elem()).flatten(),
         }
+    }
+
+    pub fn scalar(&self) -> Option<Scalar> {
+        match self {
+            Type::Scalar(scalar) => Some(*scalar),
+            Type::Vec { elem, .. } | Type::Matrix { elem, .. } => Some(*elem),
+            _ => None,
+        }
+    }
+
+    pub fn is_float(&self) -> bool {
+        self.scalar().is_some_and(|s| s.is_float())
+    }
+
+    pub fn is_int(&self) -> bool {
+        self.scalar().is_some_and(|s| s.is_int())
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
-    pub elem: Scalar,
+    pub ty: Type,
     pub binding: u32,
+    pub access: Access,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,10 +87,10 @@ pub struct ScalarParam {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Shared {
+pub struct StructDecl {
     pub name: String,
-    pub elem: Scalar,
-    pub len: u64,
+    pub fields: Vec<(String, Type)>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,7 +99,7 @@ pub struct Kernel {
     pub workgroup_size: [u32; 3],
     pub params: Vec<Param>,
     pub scalars: Vec<ScalarParam>,
-    pub shareds: Vec<Shared>,
+    pub structs: Vec<StructDecl>,
     pub coop_triples: Vec<(Scalar, Scalar, Scalar)>,
     pub coop_roles: Vec<(Scalar, MatrixRole)>,
     pub body: Vec<Stmt>,
@@ -69,7 +118,7 @@ pub enum Stmt {
         id: u32,
         name: String,
         ty: Type,
-        init: Expr,
+        init: Option<Expr>,
         span: Span,
     },
     Assign {
@@ -128,18 +177,12 @@ pub enum Expr {
     },
     ParamRef {
         name: String,
-        elem: Scalar,
+        ty: Type,
         span: Span,
     },
     ScalarRef {
         name: String,
         ty: Scalar,
-        span: Span,
-    },
-    SharedRef {
-        name: String,
-        elem: Scalar,
-        len: u64,
         span: Span,
     },
     LocalRef {
@@ -148,21 +191,16 @@ pub enum Expr {
         ty: Type,
         span: Span,
     },
-    Builtin {
-        name: &'static str,
-        size: u32,
-        span: Span,
-    },
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
-        ty: Scalar,
+        ty: Type,
         span: Span,
     },
-    Member {
+    Field {
         base: Box<Expr>,
-        idx: u32,
-        ty: Scalar,
+        name: String,
+        ty: Type,
         span: Span,
     },
     Unary {
@@ -182,12 +220,22 @@ pub enum Expr {
         cond: Box<Expr>,
         then: Box<Expr>,
         els: Box<Expr>,
-        ty: Scalar,
+        ty: Type,
         span: Span,
     },
     Convert {
         ty: Scalar,
         expr: Box<Expr>,
+        span: Span,
+    },
+    OrderLit {
+        order: MemOrder,
+        span: Span,
+    },
+    ConstructStruct {
+        name: String,
+        fields: Vec<(String, Expr)>,
+        ty: Type,
         span: Span,
     },
     Call {
@@ -206,15 +254,15 @@ impl Expr {
             | Expr::BoolLit { span: s, .. }
             | Expr::ParamRef { span: s, .. }
             | Expr::ScalarRef { span: s, .. }
-            | Expr::SharedRef { span: s, .. }
             | Expr::LocalRef { span: s, .. }
-            | Expr::Builtin { span: s, .. }
             | Expr::Index { span: s, .. }
-            | Expr::Member { span: s, .. }
+            | Expr::Field { span: s, .. }
             | Expr::Unary { span: s, .. }
             | Expr::Binary { span: s, .. }
             | Expr::Cond { span: s, .. }
             | Expr::Convert { span: s, .. }
+            | Expr::OrderLit { span: s, .. }
+            | Expr::ConstructStruct { span: s, .. }
             | Expr::Call { span: s, .. } => *s = span,
         }
     }

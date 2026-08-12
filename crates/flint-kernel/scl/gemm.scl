@@ -15,7 +15,7 @@ fn decode_w(w: buf<u32>, scales: buf<f32>, n0: u32, kk: u32, k_base: u32,
         let word = w[(kb * N + n0) * 4 + (kk % 16) / 4];
         let byte = (word >> (((kk % 16) % 4) * 8)) & 255;
         let sc = scales[(kb / (GROUP / 16)) * N + n0];
-        return (((byte << 24) as i32 >> 24) as f32) * sc;
+        return (((byte << 24) as i32 >> 24i) as f32) * sc;
     } else {
         let word = w[n0 * (K / 2) + (k_base + kk) / 2];
         if kk % 2 == 0 {
@@ -25,8 +25,9 @@ fn decode_w(w: buf<u32>, scales: buf<f32>, n0: u32, kk: u32, k_base: u32,
     }
 }
 
-kernel gemm [workgroup(256, 1, 1)]
-    (x: buf<f32>, w: buf<u32>, scales: buf<f32>, y: buf<f32>,
+@workgroup_size(256, 1, 1)
+kernel gemm
+    (@binding(0) x: buf<f32>, @binding(1) w: buf<u32>, @binding(2) scales: buf<f32>, @binding(3) y: buf<f32>,
      N: u32, K: u32, M: u32, SEGS: u32, WDTYPE: u32, GROUP: u32,
      ACC: u32, Y_STRIDE: u32, Y_OFF: u32)
 {
@@ -34,21 +35,21 @@ kernel gemm [workgroup(256, 1, 1)]
     const TN: u32 = 32;
     const BK: u32 = 32;
     const PAD: u32 = 33;
-    shared xs: [f32; 2112];
-    shared wf: [f32; 2112];
-    let seg = block.z;
-    let m0 = block.y * TM;
-    let n0 = block.x * TN;
+    let mut xs: threadgroup<[f32; 2112]>;
+    let mut wf: threadgroup<[f32; 2112]>;
+    let seg = group_id().z;
+    let m0 = group_id().y * TM;
+    let n0 = group_id().x * TN;
     let ks = K / SEGS;
     let k_lo = seg * ks;
     let steps = ks / BK;
-    let ln = thread.x;
+    let ln = local_id().x;
     let r0 = (ln / 16) * 2;
     let c0 = (ln % 16) * 2;
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    var acc2 = 0.0;
-    var acc3 = 0.0;
+    let mut acc0 = 0.0;
+    let mut acc1 = 0.0;
+    let mut acc2 = 0.0;
+    let mut acc3 = 0.0;
     for i in 0..4 {
         let idx = ln + i * 256;
         xs[(idx / 32) * PAD + idx % 32] = load_x(x, m0 + idx / 32, k_lo + idx % 32, K, M);

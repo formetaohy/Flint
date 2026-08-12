@@ -61,7 +61,13 @@ impl MtlKernel {
                             ty: p.ty,
                         })
                         .collect(),
-                    kernel.params.len(),
+                    kernel.params.iter().map(|p| p.binding).collect(),
+                    kernel
+                        .params
+                        .iter()
+                        .map(|p| p.binding)
+                        .max()
+                        .map_or(0, |max| max + 1),
                     msl,
                     entry,
                 )
@@ -94,7 +100,8 @@ impl MtlKernel {
             name,
             workgroup_size,
             scalar_layout,
-            buffer_count,
+            bindings,
+            scalars_base,
             pipeline,
             max_threads,
         }))

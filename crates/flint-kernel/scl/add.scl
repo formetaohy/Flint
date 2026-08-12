@@ -1,5 +1,6 @@
-kernel add [workgroup(256, 1, 1)] (a: buf<f32>, b: buf<f32>, y: buf<f32>, N_ELEM: u32) {
-    if gid.x < N_ELEM {
-        y[gid.x] = a[gid.x] + b[gid.x];
+@workgroup_size(256, 1, 1)
+kernel add (@binding(0) a: buf<f32>, @binding(1) b: buf<f32>, @binding(2) y: buf<f32>, N_ELEM: u32) {
+    if global_id().x < N_ELEM {
+        y[global_id().x] = a[global_id().x] + b[global_id().x];
     }
 }

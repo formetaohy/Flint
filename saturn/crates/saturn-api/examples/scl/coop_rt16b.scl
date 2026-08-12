@@ -1,12 +1,13 @@
-kernel rt16b [workgroup(16, 16, 1)] (src: buf<f16>, dst: buf<f16>, n: u32) {
-    shared tiles: [f16; 16 * 16 * 8];
-    let sg = subgroup_id;
-    let lty = thread.y - sg * 2;
+@workgroup_size(16, 16, 1)
+kernel rt16b (@binding(0) src: buf<f16>, @binding(1) dst: buf<f16>, n: u32) {
+    let mut tiles: threadgroup<[f16; 16 * 16 * 8]>;
+    let sg = subgroup_id();
+    let lty = local_id().y - sg * 2;
     if sg * 16 < n {
-        for j in 0..8 unroll {
+        @unroll for j in 0..8 {
             let by = lty + j * 2;
-            tiles[sg * 256 + j * 32 + lty * 16 + thread.x] =
-                src[by * n + sg * 16 + thread.x];
+            tiles[sg * 256 + j * 32 + lty * 16 + local_id().x] =
+                src[by * n + sg * 16 + local_id().x];
         }
     }
     barrier();

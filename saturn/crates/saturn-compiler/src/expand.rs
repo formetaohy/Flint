@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Expr, FnDecl, Kernel, Program, Stmt, Type};
+use crate::builtin::is_reserved;
 use crate::consts::{self, CVal};
 use crate::diag::{Diagnostic, Result, Span};
 use crate::ir::Scalar;
-use crate::sema::is_reserved;
 
 const MAX_DEPTH: usize = 32;
 
@@ -26,13 +26,28 @@ pub fn expand(program: &Program) -> Result<Kernel> {
             ));
         }
     }
+    let mut structs = HashMap::new();
+    for s in &program.structs {
+        if structs.insert(s.name.clone(), s).is_some() {
+            return Err(Diagnostic::new(
+                s.span,
+                format!("duplicate struct '{}'", s.name),
+            ));
+        }
+    }
+    let kernel = program.kernel.as_ref().ok_or_else(|| {
+        Diagnostic::new(
+            Span::dummy(),
+            "entry file must contain a kernel".to_string(),
+        )
+    })?;
     let mut expander = Expander {
         fns,
         call_stack: Vec::new(),
         counter: 0,
         consts: HashMap::new(),
     };
-    for stmt in &program.kernel.body {
+    for stmt in &kernel.body {
         if let Stmt::Const {
             name,
             ty,
@@ -50,14 +65,15 @@ pub fn expand(program: &Program) -> Result<Kernel> {
             expander.consts.insert(name.clone(), (value, *ty));
         }
     }
-    let body = expander.expand_stmts(&program.kernel.body)?;
+    let body = expander.expand_stmts(&kernel.body)?;
     Ok(Kernel {
-        name: program.kernel.name.clone(),
-        workgroup_size: program.kernel.workgroup_size,
-        params: program.kernel.params.clone(),
-        specs: program.kernel.specs.clone(),
+        name: kernel.name.clone(),
+        workgroup_size: kernel.workgroup_size,
+        params: kernel.params.clone(),
+        specs: kernel.specs.clone(),
+        structs: program.structs.clone(),
         body,
-        span: program.kernel.span,
+        span: kernel.span,
     })
 }
 
@@ -76,29 +92,18 @@ fn validate_fn_decl(f: &FnDecl) -> Result<()> {
             ));
         }
         match &param.ty {
-            Type::Buf(_) | Type::Scalar(_) | Type::Vec { .. } => {}
-            Type::Matrix { .. } => {
+            Type::Scalar(_) | Type::Vec { .. } | Type::Matrix(_) | Type::Struct(_) => {}
+            Type::Buf(_) => {}
+            Type::Array { .. } | Type::Threadgroup(_) => {
                 return Err(Diagnostic::new(
                     f.span,
-                    format!("function '{}' cannot take matrix parameters", f.name),
+                    format!(
+                        "function '{}' cannot take array parameters: arrays are not first-class",
+                        f.name
+                    ),
                 ));
             }
-            Type::SharedArray { .. } => unreachable!("shared arrays are not parameter types"),
         }
-        if param.is_const && !matches!(param.ty, Type::Scalar(_)) {
-            return Err(Diagnostic::new(
-                f.span,
-                format!("const parameter '{}' must be scalar", param.name),
-            ));
-        }
-    }
-    if let Some(ret) = &f.ret
-        && matches!(ret, Type::Matrix { .. })
-    {
-        return Err(Diagnostic::new(
-            f.span,
-            format!("function '{}' cannot return a matrix", f.name),
-        ));
     }
     Ok(())
 }
@@ -123,29 +128,22 @@ impl<'a> Expander<'a> {
                 name,
                 ty,
                 init,
+                mutable,
                 span,
             } => {
-                let (prelude, init) = self.lift_expr(init)?;
+                let (prelude, init) = match init {
+                    Some(init) => {
+                        let (prelude, init) = self.lift_expr(init)?;
+                        (prelude, Some(init))
+                    }
+                    None => (Vec::new(), None),
+                };
                 out.extend(prelude);
                 out.push(Stmt::Let {
                     name: name.clone(),
-                    ty: *ty,
+                    ty: ty.clone(),
                     init,
-                    span: *span,
-                });
-            }
-            Stmt::Var {
-                name,
-                ty,
-                init,
-                span,
-            } => {
-                let (prelude, init) = self.lift_expr(init)?;
-                out.extend(prelude);
-                out.push(Stmt::Var {
-                    name: name.clone(),
-                    ty: *ty,
-                    init,
+                    mutable: *mutable,
                     span: *span,
                 });
             }
@@ -263,7 +261,8 @@ impl<'a> Expander<'a> {
                     body.push(Stmt::Let {
                         name: tmp.clone(),
                         ty: None,
-                        init: ret.expect("non-void function returns a value"),
+                        init: Some(ret.expect("non-void function returns a value")),
+                        mutable: false,
                         span: *span,
                     });
                     prelude.append(&mut body);
@@ -284,9 +283,9 @@ impl<'a> Expander<'a> {
                     span: *span,
                 })
             }
-            Expr::Member { base, idx, span } => Ok(Expr::Member {
+            Expr::Field { base, name, span } => Ok(Expr::Field {
                 base: Box::new(self.lift_inner(base, prelude)?),
-                idx: *idx,
+                name: name.clone(),
                 span: *span,
             }),
             Expr::Unary { op, expr: e, span } => Ok(Expr::Unary {
@@ -312,7 +311,7 @@ impl<'a> Expander<'a> {
                 span: *span,
             }),
             Expr::Convert { ty, expr: e, span } => Ok(Expr::Convert {
-                ty: *ty,
+                ty: ty.clone(),
                 expr: Box::new(self.lift_inner(e, prelude)?),
                 span: *span,
             }),
@@ -322,16 +321,22 @@ impl<'a> Expander<'a> {
                     lifted.push(self.lift_inner(arg, prelude)?);
                 }
                 Ok(Expr::Construct {
-                    ty: *ty,
+                    ty: ty.clone(),
                     args: lifted,
                     span: *span,
                 })
             }
-            Expr::Swizzle { base, mask, span } => Ok(Expr::Swizzle {
-                base: Box::new(self.lift_inner(base, prelude)?),
-                mask: mask.clone(),
-                span: *span,
-            }),
+            Expr::ConstructStruct { name, fields, span } => {
+                let mut lifted = Vec::new();
+                for (field_name, value) in fields {
+                    lifted.push((field_name.clone(), self.lift_inner(value, prelude)?));
+                }
+                Ok(Expr::ConstructStruct {
+                    name: name.clone(),
+                    fields: lifted,
+                    span: *span,
+                })
+            }
             _ => Ok(expr.clone()),
         }
     }
@@ -365,33 +370,24 @@ impl<'a> Expander<'a> {
                 ),
             ));
         }
+        let mut prelude = Vec::new();
         let mut bindings = HashMap::new();
         for (param, arg) in callee.params.iter().zip(args) {
-            if param.is_const {
-                let value = consts::const_eval(arg, &self.consts).ok_or_else(|| {
-                    Diagnostic::new(
-                        arg.span(),
-                        format!(
-                            "const argument for '{}' must be a constant expression",
-                            param.name
-                        ),
-                    )
-                })?;
-                let Type::Scalar(pty) = param.ty else {
-                    unreachable!("const parameter validated as scalar");
-                };
-                if !consts::validate(&value, pty) {
-                    return Err(Diagnostic::new(
-                        arg.span(),
-                        format!("const argument for '{}' out of range", param.name),
-                    ));
+            match &param.ty {
+                Type::Buf(_) => {
+                    bindings.insert(param.name.clone(), arg.clone());
                 }
-                bindings.insert(
-                    param.name.clone(),
-                    consts::to_literal(&value, pty, arg.span()),
-                );
-            } else {
-                bindings.insert(param.name.clone(), arg.clone());
+                _ => {
+                    let copy = self.fresh(&param.name);
+                    prelude.push(Stmt::Let {
+                        name: copy.clone(),
+                        ty: Some(param.ty.clone()),
+                        init: Some(arg.clone()),
+                        mutable: true,
+                        span,
+                    });
+                    bindings.insert(param.name.clone(), Expr::Name(copy, span));
+                }
             }
         }
         let mut body = callee.body.clone();
@@ -410,17 +406,22 @@ impl<'a> Expander<'a> {
         let ret_ref = ret_name.as_ref().map(|name| Expr::Name(name.clone(), span));
         let mut wrapped = Vec::new();
         if let (Some(ret_name), Some(ret_ty)) = (&ret_name, &callee.ret) {
-            wrapped.push(Stmt::Var {
+            wrapped.push(Stmt::Let {
                 name: ret_name.clone(),
-                ty: Some(*ret_ty),
+                ty: Some(ret_ty.clone()),
                 init: zero_expr(ret_ty, span),
+                mutable: true,
                 span,
             });
         }
-        wrapped.push(Stmt::Var {
+        wrapped.push(Stmt::Let {
             name: done_name.clone(),
             ty: Some(Type::Scalar(Scalar::Bool)),
-            init: Expr::BoolLit(false, span),
+            init: Some(Expr::BoolLit {
+                value: false,
+                span,
+            }),
+            mutable: true,
             span,
         });
         transform_returns(&mut body, ret_name.as_deref(), &done_name);
@@ -432,8 +433,9 @@ impl<'a> Expander<'a> {
             body: loop_body,
             span,
         });
+        prelude.append(&mut wrapped);
         self.call_stack.pop();
-        Ok((wrapped, ret_ref))
+        Ok((prelude, ret_ref))
     }
 }
 
@@ -444,12 +446,11 @@ fn subst_stmts(
 ) {
     for stmt in stmts {
         match stmt {
-            Stmt::Let { name, init, .. } | Stmt::Var { name, init, .. } => {
+            Stmt::Let { name, init: Some(init), .. } => {
                 subst_expr(init, bindings, shadow);
                 shadow.last_mut().unwrap().insert(name.clone());
             }
-            Stmt::Shared { name, len, .. } => {
-                subst_expr(len, bindings, shadow);
+            Stmt::Let { name, init: None, .. } => {
                 shadow.last_mut().unwrap().insert(name.clone());
             }
             Stmt::Const { name, init, .. } => {
@@ -512,7 +513,7 @@ fn subst_expr(expr: &mut Expr, bindings: &HashMap<String, Expr>, shadow: &[HashS
             subst_expr(base, bindings, shadow);
             subst_expr(index, bindings, shadow);
         }
-        Expr::Member { base, .. } => subst_expr(base, bindings, shadow),
+        Expr::Field { base, .. } => subst_expr(base, bindings, shadow),
         Expr::Unary { expr: e, .. } => subst_expr(e, bindings, shadow),
         Expr::Binary { lhs, rhs, .. } => {
             subst_expr(lhs, bindings, shadow);
@@ -536,7 +537,11 @@ fn subst_expr(expr: &mut Expr, bindings: &HashMap<String, Expr>, shadow: &[HashS
                 subst_expr(arg, bindings, shadow);
             }
         }
-        Expr::Swizzle { base, .. } => subst_expr(base, bindings, shadow),
+        Expr::ConstructStruct { fields, .. } => {
+            for (_, value) in fields {
+                subst_expr(value, bindings, shadow);
+            }
+        }
         _ => {}
     }
 }
@@ -557,10 +562,14 @@ fn check_stmts(stmts: &[Stmt], f: &FnDecl, loop_depth: &mut usize) -> Result<()>
                     ));
                 }
             }
-            Stmt::Shared { span, .. } => {
+            Stmt::Let {
+                ty: Some(Type::Threadgroup(_)),
+                span,
+                ..
+            } => {
                 return Err(Diagnostic::new(
                     *span,
-                    "shared arrays are not allowed inside functions".to_string(),
+                    "threadgroup variable is not allowed inside functions".to_string(),
                 ));
             }
             Stmt::Const { span, .. } => {
@@ -636,7 +645,10 @@ fn transform_returns(stmts: &mut Vec<Stmt>, ret_name: Option<&str>, done_name: &
                 }
                 out.push(Stmt::Assign {
                     target: Expr::Name(done_name.to_string(), span),
-                    value: Expr::BoolLit(true, span),
+                    value: Expr::BoolLit {
+                        value: true,
+                        span,
+                    },
                     span,
                 });
                 out.push(Stmt::Break { span });
@@ -709,19 +721,22 @@ fn contains_return(stmts: &[Stmt]) -> bool {
     })
 }
 
-fn zero_expr(ty: &Type, span: Span) -> Expr {
+fn zero_expr(ty: &Type, span: Span) -> Option<Expr> {
     match ty {
-        Type::Scalar(Scalar::F32 | Scalar::F16 | Scalar::Bf16) => Expr::FloatLit(0.0, span),
-        Type::Scalar(Scalar::Bool) => Expr::BoolLit(false, span),
-        Type::Scalar(_) => Expr::IntLit(0, span),
-        Type::Vec { size, elem } => Expr::Construct {
+        Type::Scalar(Scalar::F32 | Scalar::F16 | Scalar::Bf16) => {
+            Some(Expr::FloatLit { value: 0.0, ty: Some(Scalar::F32), span })
+        }
+        Type::Scalar(Scalar::Bool) => Some(Expr::BoolLit { value: false, span }),
+        Type::Scalar(_) => Some(Expr::IntLit { value: 0, ty: Some(Scalar::U32), span }),
+        Type::Vec { size, elem } => Some(Expr::Construct {
             ty: Type::Vec {
                 size: *size,
                 elem: *elem,
             },
-            args: vec![Expr::FloatLit(0.0, span); *size as usize],
+            args: vec![Expr::FloatLit { value: 0.0, ty: Some(Scalar::F32), span }; *size as usize],
             span,
-        },
-        _ => unreachable!("zero of non-scalar type"),
+        }),
+        Type::Matrix(_) | Type::Struct(_) => None,
+        _ => None,
     }
 }

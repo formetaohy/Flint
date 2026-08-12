@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use saturn_compiler::ir::{BinOp, Expr, Kernel, MatrixRole, Scalar, Stmt, Type, UnOp};
+use saturn_compiler::ir::{
+    BinOp, Expr, Kernel, MatrixRole, MemOrder, Scalar, Stmt, Type, UnOp,
+};
 use spirv::{
     AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel, GlslStd450Op,
     MemoryModel, Op, StorageClass,
@@ -28,7 +30,7 @@ enum T {
         elem: Box<T>,
         len: u64,
     },
-    Struct(Box<T>),
+    Struct(Vec<T>),
     PushStruct(Vec<Scalar>),
     CoopMat {
         elem: Scalar,
@@ -70,15 +72,6 @@ impl T {
         }
     }
 
-    fn width(&self) -> u32 {
-        match self {
-            T::Void => 0,
-            T::Bool => 1,
-            T::Int { width, .. } | T::Float { width } => *width,
-            T::Vec { size, elem } => elem.width() * *size,
-            _ => unreachable!("no scalar width"),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -90,10 +83,10 @@ enum ConstKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum BuiltinVar {
-    Gid,
-    Thread,
-    Block,
-    BlockDim,
+    GlobalId,
+    LocalId,
+    GroupId,
+    GroupSize,
     Lane,
     SubgroupId,
     SubgroupSize,
@@ -108,6 +101,7 @@ struct Collect {
     has_int8: bool,
     has_glsl_ext: bool,
     has_coop: bool,
+    has_vk_mem_model: bool,
 }
 
 struct Spv {
@@ -127,9 +121,9 @@ struct Spv {
     param_vars: Vec<u32>,
     push_var: Option<u32>,
     push_members: HashMap<String, u32>,
-    shared_vars: HashMap<String, u32>,
-    builtin_vars: HashMap<BuiltinVar, u32>,
     locals: HashMap<u32, u32>,
+    threadgroup_vars: HashMap<u32, u32>,
+    builtin_vars: HashMap<BuiltinVar, u32>,
     loop_stack: Vec<LoopCtx>,
     block_dim_const: Option<u32>,
     coop_zero_ids: HashMap<(Scalar, MatrixRole), u32>,
@@ -157,14 +151,13 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         has_int8: false,
         has_glsl_ext: false,
         has_coop: false,
+        has_vk_mem_model: false,
     };
     for param in &kernel.params {
-        match param.elem {
-            Scalar::F16 => collect.has_f16 = true,
-            Scalar::Bf16 => collect.has_int16 = true,
-            Scalar::I8 | Scalar::U8 => collect.has_int8 = true,
-            _ => {}
-        }
+        let Type::Buf(elem) = &param.ty else {
+            return Err("buffer parameter has non-buffer type".to_string());
+        };
+        collect_elem_type(&mut collect, elem);
     }
     for scalar in &kernel.scalars {
         match scalar.ty {
@@ -201,9 +194,9 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
             .enumerate()
             .map(|(index, p)| (p.name.clone(), index as u32))
             .collect(),
-        shared_vars: HashMap::new(),
-        builtin_vars: HashMap::new(),
         locals: HashMap::new(),
+        threadgroup_vars: HashMap::new(),
+        builtin_vars: HashMap::new(),
         loop_stack: Vec::new(),
         block_dim_const: None,
         coop_zero_ids: HashMap::new(),
@@ -225,8 +218,12 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         spv.caps.push(*cap);
     }
     if collect.has_coop {
-        spv.caps.push(6022);
-        spv.caps.push(5345);
+        spv.caps.push(Capability::CooperativeMatrixKHR as u32);
+        spv.caps.push(Capability::VulkanMemoryModel as u32);
+    }
+    if collect.has_vk_mem_model {
+        spv.caps.push(Capability::VulkanMemoryModel as u32);
+        spv.caps.push(Capability::VulkanMemoryModelDeviceScope as u32);
     }
     spv.caps = spv
         .caps
@@ -238,6 +235,9 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         extensions.extend(extension_words("SPV_KHR_cooperative_matrix"));
         extensions.extend(extension_words("SPV_KHR_vulkan_memory_model"));
     }
+    if collect.has_vk_mem_model {
+        extensions.extend(extension_words("SPV_KHR_vulkan_memory_model"));
+    }
     spv.extensions = extensions;
     if collect.has_glsl_ext {
         let id = spv.alloc();
@@ -247,25 +247,24 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
 
     let mut decorated: HashSet<T> = HashSet::new();
     for (index, param) in kernel.params.iter().enumerate() {
-        let elem = T::from_scalar(param.elem);
-        let rt_key = T::RtArray(Box::new(elem.clone()));
-        let rt = spv.ensure_type(&rt_key);
-        let struct_ty = spv.ensure_type(&T::Struct(Box::new(T::RtArray(Box::new(elem.clone())))));
-        if decorated.insert(rt_key) {
+        let Type::Buf(elem) = &param.ty else {
+            unreachable!()
+        };
+        let t_elem = type_of(elem);
+        let rt_key = T::RtArray(Box::new(t_elem.clone()));
+        let struct_ty = spv.ensure_type(&T::Struct(vec![T::RtArray(Box::new(t_elem.clone()))]));
+        if decorated.insert(rt_key.clone()) {
+            let rt_id = spv.ensure_type(&rt_key);
             spv.modes.extend(inst(
                 Op::Decorate,
-                &[rt, Decoration::ArrayStride as u32, elem.width() / 8],
+                &[rt_id, Decoration::ArrayStride as u32, elem_size(elem)],
             ));
             spv.modes
                 .extend(inst(Op::Decorate, &[struct_ty, Decoration::Block as u32]));
-            spv.modes.extend(inst(
-                Op::MemberDecorate,
-                &[struct_ty, 0, Decoration::Offset as u32, 0],
-            ));
         }
         let ptr = spv.ensure_type(&T::Ptr {
             class: StorageClass::StorageBuffer,
-            pointee: Box::new(T::Struct(Box::new(T::RtArray(Box::new(elem))))),
+            pointee: Box::new(T::Struct(vec![T::RtArray(Box::new(t_elem))])),
         });
         let var_id = spv.alloc();
         spv.param_index.insert(param.name.clone(), index);
@@ -280,7 +279,7 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         ));
         spv.modes.extend(inst(
             Op::Decorate,
-            &[var_id, Decoration::Binding as u32, index as u32],
+            &[var_id, Decoration::Binding as u32, param.binding],
         ));
     }
 
@@ -319,24 +318,28 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
     let mut interface = Vec::new();
     for builtin in &collect.builtins {
         let builtin_kind = match builtin {
-            BuiltinVar::Gid => BuiltIn::GlobalInvocationId,
-            BuiltinVar::Thread => BuiltIn::LocalInvocationId,
-            BuiltinVar::Block => BuiltIn::WorkgroupId,
+            BuiltinVar::GlobalId => BuiltIn::GlobalInvocationId,
+            BuiltinVar::LocalId => BuiltIn::LocalInvocationId,
+            BuiltinVar::GroupId => BuiltIn::WorkgroupId,
             BuiltinVar::Lane => BuiltIn::SubgroupLocalInvocationId,
             BuiltinVar::SubgroupId => BuiltIn::SubgroupId,
             BuiltinVar::SubgroupSize => BuiltIn::SubgroupSize,
-            BuiltinVar::BlockDim => continue,
+            BuiltinVar::GroupSize => continue,
         };
         let var_id = spv.alloc();
         spv.builtin_vars.insert(builtin.clone(), var_id);
         interface.push(var_id);
         let pointee = match builtin {
-            BuiltinVar::Gid | BuiltinVar::Thread | BuiltinVar::Block => T::Vec {
+            BuiltinVar::GlobalId
+            | BuiltinVar::LocalId
+            | BuiltinVar::GroupId => T::Vec {
                 size: 3,
                 elem: Box::new(U32),
             },
-            BuiltinVar::Lane | BuiltinVar::SubgroupId | BuiltinVar::SubgroupSize => U32,
-            BuiltinVar::BlockDim => unreachable!(),
+            BuiltinVar::Lane | BuiltinVar::SubgroupId | BuiltinVar::SubgroupSize => {
+                U32
+            }
+            BuiltinVar::GroupSize => unreachable!(),
         };
         let ptr_ty = spv.ensure_type(&T::Ptr {
             class: StorageClass::Input,
@@ -352,27 +355,21 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         ));
     }
 
-    for shared in &kernel.shareds {
-        let elem = T::from_scalar(shared.elem);
-        let array_key = T::Array {
-            elem: Box::new(elem.clone()),
-            len: shared.len,
-        };
-        let array_ty = spv.ensure_type(&array_key);
-        let _ = (array_ty, &decorated);
-        let ptr_ty = spv.ensure_type(&T::Ptr {
-            class: StorageClass::Workgroup,
-            pointee: Box::new(T::Array {
-                elem: Box::new(elem),
-                len: shared.len,
-            }),
-        });
-        let var_id = spv.alloc();
-        spv.types.extend(inst(
-            Op::Variable,
-            &[ptr_ty, var_id, StorageClass::Workgroup as u32],
-        ));
-        spv.shared_vars.insert(shared.name.clone(), var_id);
+    let mut vars = Vec::new();
+    collect_vars(&kernel.body, &mut vars);
+    for (id, ty) in &vars {
+        if is_threadgroup(ty) {
+            let ptr_ty = spv.ensure_type(&T::Ptr {
+                class: StorageClass::Workgroup,
+                pointee: Box::new(type_of(ty)),
+            });
+            let var_id = spv.alloc();
+            spv.types.extend(inst(
+                Op::Variable,
+                &[ptr_ty, var_id, StorageClass::Workgroup as u32],
+            ));
+            spv.threadgroup_vars.insert(*id, var_id);
+        }
     }
 
     let entry_id = spv.alloc();
@@ -394,7 +391,7 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         ],
     ));
 
-    if collect.builtins.contains(&BuiltinVar::BlockDim) {
+    if collect.builtins.contains(&BuiltinVar::GroupSize) {
         let x = spv.constant(&ConstKey::Int {
             ty: U32,
             bits: kernel.workgroup_size[0],
@@ -426,19 +423,19 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
     ));
     let entry_label = spv.alloc();
     spv.fns.extend(inst(Op::Label, &[entry_label]));
-    let mut local_vars = Vec::new();
-    collect_locals(&kernel.body, &mut local_vars);
-    for (id, ty) in local_vars {
-        let ptr_ty = spv.ensure_type(&T::Ptr {
-            class: StorageClass::Function,
-            pointee: Box::new(type_of(&ty)),
-        });
-        let var_id = spv.alloc();
-        spv.locals.insert(id, var_id);
-        spv.fns.extend(inst(
-            Op::Variable,
-            &[ptr_ty, var_id, StorageClass::Function as u32],
-        ));
+    for (id, ty) in &vars {
+        if !is_threadgroup(ty) {
+            let ptr_ty = spv.ensure_type(&T::Ptr {
+                class: StorageClass::Function,
+                pointee: Box::new(type_of(ty)),
+            });
+            let var_id = spv.alloc();
+            spv.locals.insert(*id, var_id);
+            spv.fns.extend(inst(
+                Op::Variable,
+                &[ptr_ty, var_id, StorageClass::Function as u32],
+            ));
+        }
     }
     spv.emit_stmts(&kernel.body)?;
     spv.fns.extend(inst(Op::Return, &[]));
@@ -453,7 +450,7 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         Op::MemoryModel,
         &[
             AddressingModel::Logical as u32,
-            if collect.has_coop {
+            if collect.has_coop || collect.has_vk_mem_model {
                 MemoryModel::Vulkan as u32
             } else {
                 MemoryModel::GLSL450 as u32
@@ -471,6 +468,34 @@ pub fn to_spirv(kernel: &Kernel) -> Result<Vec<u8>> {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
     Ok(bytes)
+}
+
+fn collect_elem_type(collect: &mut Collect, ty: &Type) {
+    match ty {
+        Type::Scalar(Scalar::F16) => collect.has_f16 = true,
+        Type::Scalar(Scalar::Bf16) => collect.has_int16 = true,
+        Type::Scalar(Scalar::I8 | Scalar::U8) => collect.has_int8 = true,
+        Type::Vec { elem, .. } => {
+            if *elem == Scalar::F16 {
+                collect.has_f16 = true;
+            }
+        }
+        Type::Struct { fields, .. } => {
+            for (_, field) in fields {
+                collect_elem_type(collect, field);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn elem_size(ty: &Type) -> u32 {
+    match ty {
+        Type::Scalar(scalar) => scalar.width(),
+        Type::Vec { size, elem } => elem.width() * *size,
+        Type::Struct { fields, .. } => 4 * fields.len() as u32,
+        _ => unreachable!("not a buffer element type"),
+    }
 }
 
 impl Spv {
@@ -503,9 +528,20 @@ impl Spv {
                 let elem_id = self.ensure_type(elem);
                 inst(Op::TypeRuntimeArray, &[id, elem_id])
             }
-            T::Struct(field) => {
-                let field_id = self.ensure_type(field);
-                inst(Op::TypeStruct, &[id, field_id])
+            T::Struct(fields) => {
+                let mut operands = vec![id];
+                for field in fields {
+                    operands.push(self.ensure_type(field));
+                }
+                let words = inst(Op::TypeStruct, &operands);
+                for (index, field) in fields.iter().enumerate() {
+                    self.modes.extend(inst(
+                        Op::MemberDecorate,
+                        &[id, index as u32, Decoration::Offset as u32, 4 * index as u32],
+                    ));
+                    let _ = field;
+                }
+                words
             }
             T::Array { elem, len } => {
                 let elem_id = self.ensure_type(elem);
@@ -528,7 +564,7 @@ impl Spv {
                         MatrixRole::Acc => 2,
                     },
                 });
-                inst_raw(4456, &[id, comp, scope, rows, cols, coop_use])
+                inst_raw(Op::TypeCooperativeMatrixKHR as u32, &[id, comp, scope, rows, cols, coop_use])
             }
             T::PushStruct(fields) => {
                 let mut operands = vec![id];
@@ -607,10 +643,17 @@ impl Spv {
 
     fn emit_stmt(&mut self, stmt: &Stmt) -> Result<()> {
         match stmt {
-            Stmt::Let { id, init, .. } | Stmt::Var { id, init, .. } => {
+            Stmt::Let { id, init, .. } | Stmt::Var { id, init: Some(init), .. } => {
                 let var_id = self.locals[id];
                 let init_id = self.emit_expr(init)?;
                 self.push_fn(inst(Op::Store, &[var_id, init_id]));
+            }
+            Stmt::Var {
+                id, init: None, ..
+            } => {
+                if let Some(var_id) = self.locals.get(id) {
+                    let _ = var_id;
+                }
             }
             Stmt::Assign { target, value, .. } => {
                 let ptr_id = self.emit_target(target)?;
@@ -722,7 +765,11 @@ impl Spv {
             }
             Stmt::Barrier { .. } => {
                 let scope = self.constant(&ConstKey::Int { ty: U32, bits: 2 });
-                let semantics = self.constant(&ConstKey::Int { ty: U32, bits: 264 });
+                let semantics = self.constant(&ConstKey::Int {
+                    ty: U32,
+                    bits: spirv::MemorySemantics::ACQUIRE_RELEASE.bits()
+                        | spirv::MemorySemantics::WORKGROUP_MEMORY.bits(),
+                });
                 self.push_fn(inst(Op::ControlBarrier, &[scope, scope, semantics]));
             }
         }
@@ -731,14 +778,19 @@ impl Spv {
 
     fn emit_target(&mut self, target: &Expr) -> Result<u32> {
         match target {
-            Expr::LocalRef { id, .. } => Ok(self.locals[id]),
-            Expr::Index { base, index, .. } => match &**base {
-                Expr::ParamRef { name, elem, .. } => {
+            Expr::LocalRef { id, .. } => {
+                if let Some(var_id) = self.threadgroup_vars.get(id) {
+                    return Ok(*var_id);
+                }
+                Ok(self.locals[id])
+            }
+            Expr::Index { base, index, ty, .. } => match &**base {
+                Expr::ParamRef { name, .. } => {
                     let var_id = self.param_vars[self.param_index[name]];
                     let index_id = self.emit_expr(index)?;
                     let ptr_elem = self.ensure_type(&T::Ptr {
                         class: StorageClass::StorageBuffer,
-                        pointee: Box::new(T::from_scalar(*elem)),
+                        pointee: Box::new(type_of(ty)),
                     });
                     let zero = self.constant(&ConstKey::Int { ty: U32, bits: 0 });
                     let result = self.alloc();
@@ -748,18 +800,50 @@ impl Spv {
                     ));
                     Ok(result)
                 }
-                Expr::SharedRef { name, elem, .. } => {
-                    let var_id = self.shared_vars[name];
+                Expr::LocalRef { id, .. } => {
                     let index_id = self.emit_expr(index)?;
+                    let (var_id, class) = if let Some(var_id) = self.threadgroup_vars.get(id) {
+                        (*var_id, StorageClass::Workgroup)
+                    } else {
+                        (self.locals[id], StorageClass::Function)
+                    };
                     let ptr_elem = self.ensure_type(&T::Ptr {
-                        class: StorageClass::Workgroup,
-                        pointee: Box::new(T::from_scalar(*elem)),
+                        class,
+                        pointee: Box::new(type_of(ty)),
                     });
                     let result = self.alloc();
                     self.push_fn(inst(Op::AccessChain, &[ptr_elem, result, var_id, index_id]));
                     Ok(result)
                 }
-                _ => Err("index base must be a buffer or shared array".to_string()),
+                _ => Err("index base must be a buffer or array".to_string()),
+            },
+            Expr::Field { base, name, .. } => match &**base {
+                Expr::LocalRef { id, ty, .. } => {
+                    let var_id = self.locals[id];
+                    let Type::Struct { fields, .. } = ty else {
+                        return Err("field assignment requires a struct".to_string());
+                    };
+                    let Some((field_idx, (_, field_ty))) = fields
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (n, _))| n == name)
+                        .map(|(i, pair)| (i as u32, pair))
+                    else {
+                        return Err(format!("unknown field '{name}'"));
+                    };
+                    let ptr_ty = self.ensure_type(&T::Ptr {
+                        class: StorageClass::Function,
+                        pointee: Box::new(type_of(field_ty)),
+                    });
+                    let member = self.constant(&ConstKey::Int {
+                        ty: U32,
+                        bits: field_idx,
+                    });
+                    let result = self.alloc();
+                    self.push_fn(inst(Op::AccessChain, &[ptr_ty, result, var_id, member]));
+                    Ok(result)
+                }
+                _ => Err("field assignment requires a local struct variable".to_string()),
             },
             _ => Err("invalid assignment target".to_string()),
         }
@@ -783,6 +867,9 @@ impl Spv {
             }
             Expr::BoolLit { value, .. } => Ok(self.constant(&ConstKey::Bool(*value))),
             Expr::LocalRef { id, ty, .. } => {
+                if self.threadgroup_vars.contains_key(id) {
+                    return Err("threadgroup array used as a value".to_string());
+                }
                 let var_id = self.locals[id];
                 let result = self.alloc();
                 let load_ty = self.ensure_type(&type_of(ty));
@@ -809,59 +896,46 @@ impl Spv {
                 ));
                 Ok(result)
             }
-            Expr::SharedRef { .. } => Err("shared array used as value".to_string()),
-            Expr::Builtin { name, .. } => {
-                if *name == "block_dim" {
-                    return Ok(self.block_dim_const.expect("block_dim constant missing"));
-                }
-                if matches!(*name, "lane" | "subgroup_id" | "subgroup_size") {
-                    let var = match *name {
-                        "lane" => &BuiltinVar::Lane,
-                        "subgroup_id" => &BuiltinVar::SubgroupId,
-                        _ => &BuiltinVar::SubgroupSize,
-                    };
-                    let var_id = self.builtin_vars[var];
-                    let result = self.alloc();
-                    let u32_ty = self.ensure_type(&U32);
-                    self.push_fn(inst(Op::Load, &[u32_ty, result, var_id]));
-                    return Ok(result);
-                }
-                let var_id = match *name {
-                    "gid" => self.builtin_vars[&BuiltinVar::Gid],
-                    "thread" => self.builtin_vars[&BuiltinVar::Thread],
-                    "block" => self.builtin_vars[&BuiltinVar::Block],
-                    _ => unreachable!(),
-                };
-                let vec_ty = self.ensure_type(&T::Vec {
-                    size: 3,
-                    elem: Box::new(U32),
-                });
-                let result = self.alloc();
-                self.push_fn(inst(Op::Load, &[vec_ty, result, var_id]));
-                Ok(result)
-            }
             Expr::Index {
                 base, index, ty, ..
             } => {
                 let ptr_id = self.emit_target(&Expr::Index {
                     base: base.clone(),
                     index: index.clone(),
-                    ty: *ty,
+                    ty: ty.clone(),
                     span: saturn_compiler::Span::dummy(),
                 })?;
                 let result = self.alloc();
-                self.push_fn(inst(
-                    Op::Load,
-                    &[self.type_id(&T::from_scalar(*ty)), result, ptr_id],
-                ));
+                let load_ty = self.ensure_type(&type_of(ty));
+                self.push_fn(inst(Op::Load, &[load_ty, result, ptr_id]));
                 Ok(result)
             }
-            Expr::Member { base, idx, ty, .. } => {
+            Expr::Field { base, name, ty, .. } => {
                 let base_id = self.emit_expr(base)?;
+                let idx = match type_of(self.base_ty_of(base)) {
+                    T::Struct(_) => {
+                        let Type::Struct { fields, .. } = self.base_ty_of(base) else {
+                            unreachable!()
+                        };
+                        fields
+                            .iter()
+                            .position(|(n, _)| n == name)
+                            .expect("field exists")
+                            as u32
+                    }
+                    _ => match name.as_str() {
+                        "x" => 0,
+                        "y" => 1,
+                        "z" => 2,
+                        "w" => 3,
+                        _ => unreachable!("vector component"),
+                    },
+                };
                 let result = self.alloc();
+                let field_ty = self.ensure_type(&type_of(ty));
                 self.push_fn(inst(
                     Op::CompositeExtract,
-                    &[self.type_id(&T::from_scalar(*ty)), result, base_id, *idx],
+                    &[field_ty, result, base_id, idx],
                 ));
                 Ok(result)
             }
@@ -1011,15 +1085,10 @@ impl Spv {
                 let then_id = self.emit_expr(then)?;
                 let els_id = self.emit_expr(els)?;
                 let result = self.alloc();
+                let sel_ty = self.ensure_type(&type_of(ty));
                 self.push_fn(inst(
                     Op::Select,
-                    &[
-                        self.type_id(&T::from_scalar(*ty)),
-                        result,
-                        cond_id,
-                        then_id,
-                        els_id,
-                    ],
+                    &[sel_ty, result, cond_id, then_id, els_id],
                 ));
                 Ok(result)
             }
@@ -1037,7 +1106,6 @@ impl Spv {
                         let u16_ty = self.type_id(&T::from_scalar(Scalar::Bf16));
                         let bitcast = self.alloc();
                         let shift = self.alloc();
-                        let result_ty = self.type_id(&target);
                         self.push_fn(inst(Op::Bitcast, &[u32_ty, bitcast, chain[0]]));
                         let sixteen = self.constant(&ConstKey::Int { ty: U32, bits: 16 });
                         self.push_fn(inst(
@@ -1045,7 +1113,6 @@ impl Spv {
                             &[u32_ty, shift, bitcast, sixteen],
                         ));
                         self.push_fn(inst(Op::UConvert, &[u16_ty, result, shift]));
-                        let _ = result_ty;
                         return Ok(result);
                     }
                     (
@@ -1153,7 +1220,51 @@ impl Spv {
                 ));
                 Ok(result)
             }
+            Expr::OrderLit { .. } => Err("memory order literal has no value".to_string()),
+            Expr::ConstructStruct { fields, ty, .. } => {
+                let struct_ty = self.ensure_type(&type_of(ty));
+                let id = self.alloc();
+                let mut operands = vec![struct_ty, id];
+                for (_, value) in fields {
+                    operands.push(self.emit_expr(value)?);
+                }
+                self.push_fn(inst(Op::CompositeConstruct, &operands));
+                Ok(id)
+            }
             Expr::Call { name, args, ty, .. } => {
+                if matches!(
+                    *name,
+                    "global_id" | "local_id" | "group_id" | "group_size"
+                ) {
+                    if *name == "group_size" {
+                        return Ok(self.block_dim_const.expect("group_size constant missing"));
+                    }
+                    let var_id = match *name {
+                        "global_id" => self.builtin_vars[&BuiltinVar::GlobalId],
+                        "local_id" => self.builtin_vars[&BuiltinVar::LocalId],
+                        "group_id" => self.builtin_vars[&BuiltinVar::GroupId],
+                        _ => unreachable!(),
+                    };
+                    let vec_ty = self.ensure_type(&T::Vec {
+                        size: 3,
+                        elem: Box::new(U32),
+                    });
+                    let result = self.alloc();
+                    self.push_fn(inst(Op::Load, &[vec_ty, result, var_id]));
+                    return Ok(result);
+                }
+                if matches!(*name, "lane" | "subgroup_id" | "subgroup_size") {
+                    let var = match *name {
+                        "lane" => &BuiltinVar::Lane,
+                        "subgroup_id" => &BuiltinVar::SubgroupId,
+                        _ => &BuiltinVar::SubgroupSize,
+                    };
+                    let var_id = self.builtin_vars[var];
+                    let result = self.alloc();
+                    let u32_ty = self.ensure_type(&U32);
+                    self.push_fn(inst(Op::Load, &[u32_ty, result, var_id]));
+                    return Ok(result);
+                }
                 if matches!(
                     *name,
                     "atomic_add"
@@ -1164,8 +1275,12 @@ impl Spv {
                         | "atomic_or"
                         | "atomic_xor"
                 ) {
+                    let ptr_id = self.emit_target(&args[0])?;
                     let class = match &args[0] {
-                        Expr::SharedRef { .. } => StorageClass::Workgroup,
+                        Expr::Index { base, .. } => match &**base {
+                            Expr::LocalRef { .. } => StorageClass::Workgroup,
+                            _ => StorageClass::StorageBuffer,
+                        },
                         _ => StorageClass::StorageBuffer,
                     };
                     let scope_bits = match class {
@@ -1176,30 +1291,35 @@ impl Spv {
                         ty: U32,
                         bits: scope_bits,
                     });
-                    let relaxed = self.constant(&ConstKey::Int { ty: U32, bits: 0 });
-                    let var_id = match &args[0] {
-                        Expr::ParamRef { name, .. } => self.param_vars[self.param_index[name]],
-                        Expr::SharedRef { name, .. } => self.shared_vars[name],
-                        _ => unreachable!("atomic base"),
+                    let order = match &args[2] {
+                        Expr::OrderLit { order, .. } => *order,
+                        _ => MemOrder::Relaxed,
                     };
+                    let order_bits = match order {
+                        MemOrder::Relaxed => 0,
+                        MemOrder::Acquire => spirv::MemorySemantics::ACQUIRE.bits(),
+                        MemOrder::Release => spirv::MemorySemantics::RELEASE.bits(),
+                        MemOrder::AcqRel => spirv::MemorySemantics::ACQUIRE_RELEASE.bits(),
+                        MemOrder::SeqCst => spirv::MemorySemantics::ACQUIRE_RELEASE.bits(),
+                    };
+                    let storage_bits = if order_bits == 0 {
+                        0
+                    } else {
+                        match class {
+                            StorageClass::Workgroup => {
+                                spirv::MemorySemantics::WORKGROUP_MEMORY.bits()
+                            }
+                            _ => spirv::MemorySemantics::UNIFORM_MEMORY.bits(),
+                        }
+                    };
+                    let semantics_bits = order_bits | storage_bits;
+                    let semantics = self.constant(&ConstKey::Int {
+                        ty: U32,
+                        bits: semantics_bits,
+                    });
                     let elem = scalar_of(ty);
                     let elem_ty = self.ensure_type(&T::from_scalar(elem));
-                    let ptr_ty = self.ensure_type(&T::Ptr {
-                        class,
-                        pointee: Box::new(T::from_scalar(elem)),
-                    });
-                    let index_id = self.emit_expr(&args[1])?;
-                    let ptr_id = self.alloc();
-                    if class == StorageClass::Workgroup {
-                        self.push_fn(inst(Op::AccessChain, &[ptr_ty, ptr_id, var_id, index_id]));
-                    } else {
-                        let zero = self.constant(&ConstKey::Int { ty: U32, bits: 0 });
-                        self.push_fn(inst(
-                            Op::AccessChain,
-                            &[ptr_ty, ptr_id, var_id, zero, index_id],
-                        ));
-                    }
-                    let value_id = self.emit_expr(&args[2])?;
+                    let value_id = self.emit_expr(&args[1])?;
                     let result = self.alloc();
                     let op = match (*name, elem) {
                         ("atomic_add", _) => Op::AtomicIAdd,
@@ -1215,7 +1335,7 @@ impl Spv {
                     };
                     self.push_fn(inst(
                         op,
-                        &[elem_ty, result, ptr_id, scope, relaxed, value_id],
+                        &[elem_ty, result, ptr_id, scope, semantics, value_id],
                     ));
                     return Ok(result);
                 }
@@ -1246,7 +1366,7 @@ impl Spv {
                     let result = self.alloc();
                     let coop_ty = self.type_id(&type_of(ty));
                     self.push_fn(inst_raw(
-                        4457,
+                        Op::CooperativeMatrixLoadKHR as u32,
                         &[coop_ty, result, ptr_id, layout_id, stride_id, 32],
                     ));
                     return Ok(result);
@@ -1257,7 +1377,7 @@ impl Spv {
                     let a = self.emit_expr(&args[0])?;
                     let b = self.emit_expr(&args[1])?;
                     let c = self.emit_expr(&args[2])?;
-                    self.push_fn(inst_raw(4459, &[coop_ty, result, a, b, c]));
+                    self.push_fn(inst_raw(Op::CooperativeMatrixMulAddKHR as u32, &[coop_ty, result, a, b, c]));
                     return Ok(result);
                 }
                 if *name == "construct_vec" {
@@ -1289,7 +1409,7 @@ impl Spv {
                     let mat_id = self.emit_expr(&args[1])?;
                     let stride_id = self.emit_expr(&args[2])?;
                     let layout_id = self.emit_expr(&args[3])?;
-                    self.push_fn(inst_raw(4458, &[ptr_id, mat_id, layout_id, stride_id, 32]));
+                    self.push_fn(inst_raw(Op::CooperativeMatrixStoreKHR as u32, &[ptr_id, mat_id, layout_id, stride_id, 32]));
                     return Ok(0);
                 }
                 let mut arg_ids = Vec::new();
@@ -1405,20 +1525,6 @@ impl Spv {
                         self.gl_ext(ext, ty_id, result, &arg_ids);
                         Ok(result)
                     }
-                    "select" => {
-                        let result = self.alloc();
-                        self.push_fn(inst(
-                            Op::Select,
-                            &[
-                                self.type_id(&T::from_scalar(scalar_ty)),
-                                result,
-                                arg_ids[2],
-                                arg_ids[0],
-                                arg_ids[1],
-                            ],
-                        ));
-                        Ok(result)
-                    }
                     "subgroup_broadcast"
                     | "subgroup_shuffle"
                     | "subgroup_shuffle_down"
@@ -1427,10 +1533,10 @@ impl Spv {
                         let result = self.alloc();
                         let ty_id = self.type_id(&T::from_scalar(scalar_ty));
                         let op = match *name {
-                            "subgroup_broadcast" => 337,
-                            "subgroup_shuffle" => 345,
-                            "subgroup_shuffle_down" => 348,
-                            "subgroup_shuffle_up" => 347,
+                            "subgroup_broadcast" => Op::GroupNonUniformBroadcast as u32,
+                            "subgroup_shuffle" => Op::GroupNonUniformShuffle as u32,
+                            "subgroup_shuffle_down" => Op::GroupNonUniformShuffleDown as u32,
+                            "subgroup_shuffle_up" => Op::GroupNonUniformShuffleUp as u32,
                             _ => unreachable!(),
                         };
                         self.push_fn(inst_raw(
@@ -1478,8 +1584,8 @@ impl Spv {
                         let scope = self.constant(&ConstKey::Int { ty: U32, bits: 3 });
                         let result = self.alloc();
                         let op = match *name {
-                            "subgroup_all" => 334,
-                            _ => 335,
+                            "subgroup_all" => Op::GroupNonUniformAll as u32,
+                            _ => Op::GroupNonUniformAny as u32,
                         };
                         self.push_fn(inst_raw(
                             op,
@@ -1500,11 +1606,11 @@ impl Spv {
             } => {
                 let index_id = self.emit_expr(index)?;
                 match &**base {
-                    Expr::SharedRef { name, .. } => {
-                        let var_id = self.shared_vars[name];
+                    Expr::LocalRef { id, .. } => {
+                        let var_id = self.threadgroup_vars[id];
                         let ptr_ty = self.ensure_type(&T::Ptr {
                             class: StorageClass::Workgroup,
-                            pointee: Box::new(T::from_scalar(*ty)),
+                            pointee: Box::new(type_of(ty)),
                         });
                         let result = self.alloc();
                         self.push_fn(inst(Op::AccessChain, &[ptr_ty, result, var_id, index_id]));
@@ -1515,7 +1621,7 @@ impl Spv {
                         let zero = self.constant(&ConstKey::Int { ty: U32, bits: 0 });
                         let ptr_ty = self.ensure_type(&T::Ptr {
                             class: StorageClass::StorageBuffer,
-                            pointee: Box::new(T::from_scalar(*ty)),
+                            pointee: Box::new(type_of(ty)),
                         });
                         let result = self.alloc();
                         self.push_fn(inst(
@@ -1527,23 +1633,26 @@ impl Spv {
                     _ => Err("coop source must be a buffer or shared array".to_string()),
                 }
             }
-            Expr::SharedRef { name, elem, .. } => {
-                let var_id = self.shared_vars[name];
+            Expr::LocalRef { id, ty, .. } => {
+                let var_id = self.threadgroup_vars[id];
                 let zero = self.constant(&ConstKey::Int { ty: U32, bits: 0 });
                 let ptr_ty = self.ensure_type(&T::Ptr {
                     class: StorageClass::Workgroup,
-                    pointee: Box::new(T::from_scalar(*elem)),
+                    pointee: Box::new(type_of(ty)),
                 });
                 let result = self.alloc();
                 self.push_fn(inst(Op::AccessChain, &[ptr_ty, result, var_id, zero]));
                 Ok(result)
             }
-            Expr::ParamRef { name, elem, .. } => {
+            Expr::ParamRef { name, ty, .. } => {
+                let Type::Buf(elem) = ty else {
+                    return Err("coop source must be a buffer".to_string());
+                };
                 let var_id = self.param_vars[self.param_index[name]];
                 let zero = self.constant(&ConstKey::Int { ty: U32, bits: 0 });
                 let ptr_ty = self.ensure_type(&T::Ptr {
                     class: StorageClass::StorageBuffer,
-                    pointee: Box::new(T::from_scalar(*elem)),
+                    pointee: Box::new(type_of(elem)),
                 });
                 let result = self.alloc();
                 self.push_fn(inst(Op::AccessChain, &[ptr_ty, result, var_id, zero, zero]));
@@ -1560,27 +1669,25 @@ impl Spv {
         self.push_fn(inst(Op::ExtInst, &operands));
     }
 
+    fn base_ty_of<'a>(&self, expr: &'a Expr) -> &'a Type {
+        match expr {
+            Expr::LocalRef { ty, .. } | Expr::ParamRef { ty, .. } => ty,
+            Expr::Call { ty, .. } | Expr::Index { ty, .. } | Expr::Field { ty, .. } => ty,
+            _ => unreachable!("no base type"),
+        }
+    }
+
     fn expr_type(&self, expr: &Expr) -> T {
         match expr {
-            Expr::Builtin { name, .. }
-                if matches!(*name, "lane" | "subgroup_id" | "subgroup_size") =>
-            {
-                U32
-            }
-            Expr::Builtin { .. } => T::Vec {
-                size: 3,
-                elem: Box::new(U32),
-            },
             Expr::IntLit { ty, .. } | Expr::FloatLit { ty, .. } => T::from_scalar(*ty),
             Expr::BoolLit { .. } => BOOL,
             Expr::LocalRef { ty, .. } => type_of(ty),
             Expr::ScalarRef { ty, .. } => T::from_scalar(*ty),
-            Expr::Index { ty, .. } | Expr::Member { ty, .. } => T::from_scalar(*ty),
-            Expr::Unary { ty, .. } | Expr::Cond { ty, .. } | Expr::Convert { ty, .. } => {
-                T::from_scalar(*ty)
-            }
-            Expr::Binary { ty, .. } => type_of(ty),
-            Expr::Call { ty, .. } => type_of(ty),
+            Expr::Index { ty, .. } | Expr::Field { ty, .. } => type_of(ty),
+            Expr::Unary { ty, .. } | Expr::Convert { ty, .. } => T::from_scalar(*ty),
+            Expr::Cond { ty, .. } => type_of(ty),
+            Expr::Binary { ty, .. } | Expr::Call { ty, .. } => type_of(ty),
+            Expr::ConstructStruct { ty, .. } => type_of(ty),
             _ => unreachable!("no value type"),
         }
     }
@@ -1597,6 +1704,12 @@ fn type_of(ty: &Type) -> T {
             size: *size,
             elem: Box::new(T::from_scalar(*elem)),
         },
+        Type::Array { elem, len } => T::Array {
+            elem: Box::new(type_of(elem)),
+            len: *len,
+        },
+        Type::Threadgroup(elem) => type_of(elem),
+        Type::Struct { fields, .. } => T::Struct(fields.iter().map(|(_, ty)| type_of(ty)).collect()),
         _ => unreachable!("not a local type"),
     }
 }
@@ -1744,27 +1857,32 @@ fn ext_inst_import_words(id: u32) -> Vec<u32> {
     words
 }
 
-fn collect_locals(stmts: &[Stmt], out: &mut Vec<(u32, Type)>) {
+fn collect_vars(stmts: &[Stmt], out: &mut Vec<(u32, Type)>) {
     for stmt in stmts {
         match stmt {
-            Stmt::Let { id, ty, .. } | Stmt::Var { id, ty, .. } => out.push((*id, *ty)),
+            Stmt::Let { id, ty, .. } => out.push((*id, ty.clone())),
+            Stmt::Var { id, ty, .. } => out.push((*id, ty.clone())),
             Stmt::For { id, body, .. } => {
                 out.push((*id, Type::Scalar(Scalar::U32)));
-                collect_locals(body, out);
+                collect_vars(body, out);
             }
             Stmt::If { then, els, .. } => {
-                collect_locals(then, out);
-                collect_locals(els, out);
+                collect_vars(then, out);
+                collect_vars(els, out);
             }
-            Stmt::Loop { body, .. } => collect_locals(body, out),
+            Stmt::Loop { body, .. } => collect_vars(body, out),
             _ => {}
         }
     }
 }
 
+fn is_threadgroup(ty: &Type) -> bool {
+    matches!(ty, Type::Threadgroup(_))
+}
+
 fn collect_stmt(collect: &mut Collect, stmt: &Stmt) {
     match stmt {
-        Stmt::Let { ty, init, .. } | Stmt::Var { ty, init, .. } => {
+        Stmt::Let { ty, init, .. } | Stmt::Var { ty, init: Some(init), .. } => {
             collect.types.insert(type_of(ty));
             if let Type::Matrix { elem, .. } = ty {
                 if *elem == Scalar::F16 {
@@ -1773,6 +1891,11 @@ fn collect_stmt(collect: &mut Collect, stmt: &Stmt) {
                 collect.has_coop = true;
             }
             collect_expr(collect, init);
+        }
+        Stmt::Var {
+            ty, init: None, ..
+        } => {
+            collect.types.insert(type_of(ty));
         }
         Stmt::Assign { target, value, .. } => {
             collect_expr(collect, target);
@@ -1839,7 +1962,14 @@ fn collect_expr(collect: &mut Collect, expr: &Expr) {
                 }
             }
         }
-        Expr::ParamRef { .. } => {}
+        Expr::ParamRef { ty, .. } => {
+            if let Type::Buf(elem) = ty {
+                collect.types.insert(type_of(elem));
+                collect_elem_type(collect, elem);
+            } else {
+                collect.types.insert(type_of(ty));
+            }
+        }
         Expr::ScalarRef { ty, .. } => {
             collect.types.insert(T::from_scalar(*ty));
             match *ty {
@@ -1849,44 +1979,16 @@ fn collect_expr(collect: &mut Collect, expr: &Expr) {
                 _ => {}
             }
         }
-        Expr::SharedRef { elem, len, .. } => {
-            collect.types.insert(T::Array {
-                elem: Box::new(T::from_scalar(*elem)),
-                len: *len,
-            });
-        }
-        Expr::Builtin { name, .. } => {
-            if matches!(*name, "lane" | "subgroup_id" | "subgroup_size") {
-                collect.types.insert(U32);
-                collect.builtins.insert(match *name {
-                    "lane" => BuiltinVar::Lane,
-                    "subgroup_id" => BuiltinVar::SubgroupId,
-                    _ => BuiltinVar::SubgroupSize,
-                });
-            } else {
-                collect.types.insert(T::Vec {
-                    size: 3,
-                    elem: Box::new(U32),
-                });
-                collect.builtins.insert(match *name {
-                    "gid" => BuiltinVar::Gid,
-                    "thread" => BuiltinVar::Thread,
-                    "block" => BuiltinVar::Block,
-                    "block_dim" => BuiltinVar::BlockDim,
-                    _ => unreachable!(),
-                });
-            }
-        }
         Expr::Index {
             base, index, ty, ..
         } => {
             collect_expr(collect, base);
             collect_expr(collect, index);
-            collect.types.insert(T::from_scalar(*ty));
+            collect.types.insert(type_of(ty));
         }
-        Expr::Member { base, ty, .. } => {
+        Expr::Field { base, ty, .. } => {
             collect_expr(collect, base);
-            collect.types.insert(T::from_scalar(*ty));
+            collect.types.insert(type_of(ty));
         }
         Expr::Unary { expr, ty, .. } => {
             collect_expr(collect, expr);
@@ -1910,7 +2012,7 @@ fn collect_expr(collect: &mut Collect, expr: &Expr) {
             collect_expr(collect, cond);
             collect_expr(collect, then);
             collect_expr(collect, els);
-            collect.types.insert(T::from_scalar(*ty));
+            collect.types.insert(type_of(ty));
         }
         Expr::Convert { ty, expr, .. } => {
             collect_expr(collect, expr);
@@ -1922,9 +2024,43 @@ fn collect_expr(collect: &mut Collect, expr: &Expr) {
                 _ => {}
             }
         }
+        Expr::OrderLit { .. } => {}
+        Expr::ConstructStruct { fields, ty, .. } => {
+            collect.types.insert(type_of(ty));
+            for (_, value) in fields {
+                collect_expr(collect, value);
+            }
+        }
         Expr::Call { name, args, ty, .. } => {
             for arg in args {
                 collect_expr(collect, arg);
+            }
+            if matches!(
+                *name,
+                "lane" | "subgroup_id" | "subgroup_size"
+            ) {
+                collect.types.insert(U32);
+                collect.builtins.insert(match *name {
+                    "lane" => BuiltinVar::Lane,
+                    "subgroup_id" => BuiltinVar::SubgroupId,
+                    _ => BuiltinVar::SubgroupSize,
+                });
+            }
+            if matches!(
+                *name,
+                "global_id" | "local_id" | "group_id" | "group_size"
+            ) {
+                collect.types.insert(T::Vec {
+                    size: 3,
+                    elem: Box::new(U32),
+                });
+                collect.builtins.insert(match *name {
+                    "global_id" => BuiltinVar::GlobalId,
+                    "local_id" => BuiltinVar::LocalId,
+                    "group_id" => BuiltinVar::GroupId,
+                    "group_size" => BuiltinVar::GroupSize,
+                    _ => unreachable!(),
+                });
             }
             collect.types.insert(type_of(ty));
             if scalar_of(ty) == Scalar::F16 {
@@ -1961,6 +2097,25 @@ fn collect_expr(collect: &mut Collect, expr: &Expr) {
                 "coop_zero" | "coop_load_a" | "coop_load_b" | "coop_mul_add" | "coop_store"
             ) {
                 collect.has_coop = true;
+            }
+            if matches!(
+                *name,
+                "atomic_add"
+                    | "atomic_max"
+                    | "atomic_min"
+                    | "atomic_exchange"
+                    | "atomic_and"
+                    | "atomic_or"
+                    | "atomic_xor"
+            ) && matches!(
+                &args[2],
+                Expr::OrderLit {
+                    order: MemOrder::Relaxed,
+                    ..
+                }
+            ) == false
+            {
+                collect.has_vk_mem_model = true;
             }
             if matches!(
                 *name,

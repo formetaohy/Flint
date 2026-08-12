@@ -1,10 +1,11 @@
-kernel merge_qkv [workgroup(256, 1, 1)]
-    (partial: buf<f32>, yq: buf<f32>, yk: buf<f32>, yv: buf<f32>,
+@workgroup_size(256, 1, 1)
+kernel merge_qkv
+    (@binding(0) partial: buf<f32>, @binding(1) yq: buf<f32>, @binding(2) yk: buf<f32>, @binding(3) yv: buf<f32>,
      NQ: u32, NK: u32, NV: u32, SEGS: u32)
 {
     let ntot = NQ + NK + NV;
-    let col = block.x * 256 + thread.x;
-    var s = 0.0;
+    let col = group_id().x * 256 + local_id().x;
+    let mut s = 0.0;
     if col < NQ {
         for i in 0..SEGS {
             s = s + partial[i * ntot + col];

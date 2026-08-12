@@ -1,7 +1,8 @@
-kernel expert_scatter [workgroup(256, 1, 1)] (acc: buf<f32>, src: buf<f32>, ids: buf<u32>, weights: buf<f32>, HIDDEN: u32, COUNT: u32) {
-    if gid.x < COUNT * HIDDEN {
-        let r = gid.x / HIDDEN;
-        let c = gid.x % HIDDEN;
-        acc[ids[r] * HIDDEN + c] = acc[ids[r] * HIDDEN + c] + weights[r] * src[gid.x];
+@workgroup_size(256, 1, 1)
+kernel expert_scatter (@binding(0) acc: buf<f32>, @binding(1) src: buf<f32>, @binding(2) ids: buf<u32>, @binding(3) weights: buf<f32>, HIDDEN: u32, COUNT: u32) {
+    if global_id().x < COUNT * HIDDEN {
+        let r = global_id().x / HIDDEN;
+        let c = global_id().x % HIDDEN;
+        acc[ids[r] * HIDDEN + c] = acc[ids[r] * HIDDEN + c] + weights[r] * src[global_id().x];
     }
 }

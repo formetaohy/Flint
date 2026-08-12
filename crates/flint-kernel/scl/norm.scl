@@ -1,22 +1,23 @@
-kernel norm [workgroup(256, 1, 1)]
-    (x: buf<f32>, w: buf<f32>, gate: buf<f32>, y: buf<f32>,
-     cos_tbl: buf<f32>, sin_tbl: buf<f32>, args: buf<u32>,
+@workgroup_size(256, 1, 1)
+kernel norm
+    (@binding(0) x: buf<f32>, @binding(1) w: buf<f32>, @binding(2) gate: buf<f32>, @binding(3) y: buf<f32>,
+     @binding(4) cos_tbl: buf<f32>, @binding(5) sin_tbl: buf<f32>, @binding(6) args: buf<u32>,
      MODE: u32, DIM: u32, W_DIM: u32, EPS: f32, HEADS: u32, ROT: u32, COS_STRIDE: u32,
      STRIDE: u32, PLE: u32, PLE_LAYERS: u32, PLE_STRIDE: u32)
 {
-    shared red: [f32; 256];
-    shared mean: [f32; 256];
-    shared tile: [f32; 520];
-    let row = block.x;
+    let mut red: threadgroup<[f32; 256]>;
+    let mut mean: threadgroup<[f32; 256]>;
+    let mut tile: threadgroup<[f32; 520]>;
+    let row = group_id().x;
     let base = PLE == 1
         ? (row / PLE_LAYERS) * PLE_STRIDE + (row % PLE_LAYERS) * DIM
         : row * STRIDE;
-    let t = thread.x;
+    let t = local_id().x;
     let vbase = base / 4;
     let vdim = DIM / 4;
-    var s = 0.0;
-    var m = 0.0;
-    var i = t;
+    let mut s = 0.0;
+    let mut m = 0.0;
+    let mut i = t;
     loop {
         if i >= vdim {
             break;
@@ -46,7 +47,7 @@ kernel norm [workgroup(256, 1, 1)]
         mean[t] = m;
     }
     barrier();
-    var size = 128;
+    let mut size = 128;
     loop {
         if size == 0 {
             break;
@@ -60,8 +61,8 @@ kernel norm [workgroup(256, 1, 1)]
         barrier();
         size = size / 2;
     }
-    var inv = 0.0;
-    var center = 0.0;
+    let mut inv = 0.0;
+    let mut center = 0.0;
     if MODE == 3 {
         let avg = mean[0] / (DIM as f32);
         let variance = red[0] / (DIM as f32) - avg * avg;
@@ -91,7 +92,7 @@ kernel norm [workgroup(256, 1, 1)]
         barrier();
         let pos_m = args[0] + row / HEADS;
         let half = ROT / 2;
-        var wt = t;
+        let mut wt = t;
         loop {
             if wt >= DIM {
                 break;
@@ -118,10 +119,10 @@ kernel norm [workgroup(256, 1, 1)]
             let xb = (vbase + i) * 4;
             let wb = i * 4;
             let gb = (vbase + i) * 4;
-            var v0 = (x[xb] - center) * inv;
-            var v1 = (x[xb + 1] - center) * inv;
-            var v2 = (x[xb + 2] - center) * inv;
-            var v3 = (x[xb + 3] - center) * inv;
+            let mut v0 = (x[xb] - center) * inv;
+            let mut v1 = (x[xb + 1] - center) * inv;
+            let mut v2 = (x[xb + 2] - center) * inv;
+            let mut v3 = (x[xb + 3] - center) * inv;
             if MODE == 0 {
                 v0 = v0 * (1.0 + w[wb]);
                 v1 = v1 * (1.0 + w[wb + 1]);
@@ -157,7 +158,7 @@ kernel norm [workgroup(256, 1, 1)]
         }
         if t < tail {
             let e = base + vdim * 4 + t;
-            var v = (x[e] - center) * inv;
+            let mut v = (x[e] - center) * inv;
             if MODE == 0 {
                 v = v * (1.0 + w[e]);
             } else if MODE == 1 {

@@ -1,12 +1,13 @@
-kernel delta_recur [workgroup(128, 1, 1)]
-    (q_in: buf<f32>, k_in: buf<f32>, v_in: buf<f32>, beta: buf<f32>, g: buf<f32>, state: buf<f32>, out: buf<f32>,
+@workgroup_size(128, 1, 1)
+kernel delta_recur
+    (@binding(0) q_in: buf<f32>, @binding(1) k_in: buf<f32>, @binding(2) v_in: buf<f32>, @binding(3) beta: buf<f32>, @binding(4) g: buf<f32>, @binding(5) state: buf<f32>, @binding(6) out: buf<f32>,
      HEADS: u32, K_DIM: u32, V_DIM: u32)
 {
-    shared kk: [f32; 128];
-    shared qq: [f32; 128];
-    shared red: [f32; 128];
-    let h = block.x;
-    let t = thread.x;
+    let mut kk: threadgroup<[f32; 128]>;
+    let mut qq: threadgroup<[f32; 128]>;
+    let mut red: threadgroup<[f32; 128]>;
+    let h = group_id().x;
+    let t = local_id().x;
     if t < K_DIM {
         kk[t] = k_in[h * K_DIM + t];
         qq[t] = q_in[h * K_DIM + t];
@@ -17,7 +18,7 @@ kernel delta_recur [workgroup(128, 1, 1)]
     barrier();
     red[t] = kk[t] * kk[t];
     barrier();
-    var size = 64;
+    let mut size = 64;
     loop {
         if size == 0 {
             break;
@@ -51,12 +52,12 @@ kernel delta_recur [workgroup(128, 1, 1)]
         let decay = exp(g[h]);
         let bt = beta[h];
         let base = h * K_DIM * V_DIM;
-        var kv_mem = 0.0;
+        let mut kv_mem = 0.0;
         for k in 0..K_DIM {
             kv_mem = kv_mem + state[base + k * V_DIM + t] * decay * kk[k];
         }
         let delta = (v_in[h * V_DIM + t] - kv_mem) * bt;
-        var acc = 0.0;
+        let mut acc = 0.0;
         for k in 0..K_DIM {
             let s = state[base + k * V_DIM + t] * decay + kk[k] * delta;
             state[base + k * V_DIM + t] = s;

@@ -1,9 +1,10 @@
-kernel quant [workgroup(64, 1, 1)]
-    (src: buf<f32>, w: buf<bf16>, q: buf<u8>, scale: f32)
+@workgroup_size(64, 1, 1)
+kernel quant
+    (@binding(0) src: buf<f32>, @binding(1) w: buf<bf16>, @binding(2) q: buf<u8>, scale: f32)
 {
-    let v = src[gid.x];
-    w[gid.x] = v as bf16;
-    let r = w[gid.x] as f32;
+    let v = src[global_id().x];
+    w[global_id().x] = v as bf16;
+    let r = w[global_id().x] as f32;
     let scaled = r * scale;
-    q[gid.x] = scaled > 255.0 ? 255 : (scaled < 0.0 ? 0 : scaled as u8);
+    q[global_id().x] = scaled > 255.0 ? 255 as u8 : (scaled < 0.0 ? 0 as u8 : scaled as u8);
 }

@@ -1,4 +1,5 @@
-kernel k [workgroup(1, 1, 1)] (a: buf<f32>) {
-    var x = 1;
+@workgroup_size(1, 1, 1)
+kernel k (@binding(0) a: buf<f32>) {
+    let mut x = 1;
     a[0] = x;
 }

@@ -13,9 +13,9 @@ pub enum CVal {
 
 pub fn const_eval(expr: &ast::Expr, consts: &HashMap<String, (CVal, Scalar)>) -> Option<CVal> {
     match expr {
-        ast::Expr::IntLit(value, _) => Some(CVal::Int(*value)),
-        ast::Expr::FloatLit(value, _) => Some(CVal::Float(*value)),
-        ast::Expr::BoolLit(value, _) => Some(CVal::Bool(*value)),
+        ast::Expr::IntLit { value, .. } => Some(CVal::Int(*value)),
+        ast::Expr::FloatLit { value, .. } => Some(CVal::Float(*value)),
+        ast::Expr::BoolLit { value, .. } => Some(CVal::Bool(*value)),
         ast::Expr::Name(name, _) => consts.get(name).map(|(value, _)| *value),
         ast::Expr::Unary { op, expr, .. } => {
             let value = const_eval(expr, consts)?;
@@ -131,15 +131,32 @@ pub fn validate(value: &CVal, ty: Scalar) -> bool {
 
 pub fn to_literal(value: &CVal, ty: Scalar, span: Span) -> ast::Expr {
     match (value, ty) {
-        (CVal::Int(value), Scalar::F32 | Scalar::F16 | Scalar::Bf16) => {
-            ast::Expr::FloatLit(*value as f64, span)
-        }
-        (CVal::Int(value), _) => ast::Expr::IntLit(*value, span),
+        (CVal::Int(value), Scalar::F32 | Scalar::F16 | Scalar::Bf16) => ast::Expr::FloatLit {
+            value: *value as f64,
+            ty: Some(Scalar::F32),
+            span,
+        },
+        (CVal::Int(value), _) => ast::Expr::IntLit {
+            value: *value,
+            ty: Some(Scalar::U32),
+            span,
+        },
         (CVal::Float(value), Scalar::U32 | Scalar::I32 | Scalar::U8 | Scalar::I8) => {
-            ast::Expr::IntLit(*value as u64, span)
+            ast::Expr::IntLit {
+                value: *value as u64,
+                ty: Some(Scalar::U32),
+                span,
+            }
         }
-        (CVal::Float(value), _) => ast::Expr::FloatLit(*value, span),
-        (CVal::Bool(value), _) => ast::Expr::BoolLit(*value, span),
+        (CVal::Float(value), _) => ast::Expr::FloatLit {
+            value: *value,
+            ty: Some(Scalar::F32),
+            span,
+        },
+        (CVal::Bool(value), _) => ast::Expr::BoolLit {
+            value: *value,
+            span,
+        },
     }
 }
 

@@ -1,9 +1,10 @@
-kernel merge_gemm [workgroup(256, 1, 1)] (partial: buf<f32>, y: buf<f32>, M: u32, N: u32, Y_STRIDE: u32, Y_OFF: u32, SEGS: u32, ACC: u32) {
-    let n0 = block.x * 256 + thread.x;
+@workgroup_size(256, 1, 1)
+kernel merge_gemm (@binding(0) partial: buf<f32>, @binding(1) y: buf<f32>, M: u32, N: u32, Y_STRIDE: u32, Y_OFF: u32, SEGS: u32, ACC: u32) {
+    let n0 = group_id().x * 256 + local_id().x;
     if n0 < N {
         let col = Y_OFF + n0;
         for m in 0..M {
-            var acc = ACC as f32 * y[m * Y_STRIDE + col];
+            let mut acc = ACC as f32 * y[m * Y_STRIDE + col];
             for s in 0..SEGS {
                 acc = acc + partial[s * (M * Y_STRIDE) + m * Y_STRIDE + col];
             }

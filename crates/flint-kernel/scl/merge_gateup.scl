@@ -1,10 +1,11 @@
-kernel merge_gateup [workgroup(256, 1, 1)]
-    (partial: buf<f32>, yg: buf<f32>, yu: buf<f32>,
+@workgroup_size(256, 1, 1)
+kernel merge_gateup
+    (@binding(0) partial: buf<f32>, @binding(1) yg: buf<f32>, @binding(2) yu: buf<f32>,
      NG: u32, SEGS: u32)
 {
     let ntot = 2 * NG;
-    let col = block.x * 256 + thread.x;
-    var s = 0.0;
+    let col = group_id().x * 256 + local_id().x;
+    let mut s = 0.0;
     if col < NG {
         for i in 0..SEGS {
             s = s + partial[i * ntot + col];

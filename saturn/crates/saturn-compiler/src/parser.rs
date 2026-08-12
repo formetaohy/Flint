@@ -1,5 +1,6 @@
-use crate::ast::{BinOp, Expr, FnDecl, Kernel, Param, Program, Scalar, SpecDecl, Stmt, Type, UnOp};
+use crate::ast::{BinOp, Expr, FnDecl, FnParam, Kernel, Param, Program, SpecDecl, Stmt, StructDecl, Type};
 use crate::diag::{Diagnostic, Span};
+use crate::ir::{Access, MemOrder, Scalar, UnOp};
 use crate::lexer::{Tok, Token};
 
 pub struct Parser {
@@ -51,11 +52,12 @@ impl Parser {
 
     fn expect(&mut self, tok: Tok) -> Result<Token, Diagnostic> {
         let span = self.span();
+        let desc = self.tok_desc_at(0);
         match self.bump() {
             Some(token) if token.tok == tok => Ok(token),
             _ => Err(Diagnostic::new(
                 span,
-                format!("expected {}, found {}", tok_desc(&tok), self.tok_desc_at(0)),
+                format!("expected {}, found {desc}", tok_desc(&tok)),
             )),
         }
     }
@@ -81,6 +83,7 @@ impl Parser {
 
     fn expect_ident(&mut self) -> Result<(String, Span), Diagnostic> {
         let span = self.span();
+        let desc = self.tok_desc_at(0);
         match self.bump() {
             Some(Token {
                 tok: Tok::Ident(name),
@@ -88,21 +91,45 @@ impl Parser {
             }) => Ok((name, span)),
             _ => Err(Diagnostic::new(
                 span,
-                format!("expected identifier, found {}", self.tok_desc_at(0)),
+                format!("expected identifier, found {desc}"),
             )),
         }
     }
 
-    fn expect_int(&mut self) -> Result<(u64, Span), Diagnostic> {
+    fn expect_u32(&mut self) -> Result<(u32, Span), Diagnostic> {
         let span = self.span();
+        let desc = self.tok_desc_at(0);
         match self.bump() {
             Some(Token {
-                tok: Tok::Int(value),
+                tok: Tok::Int(value, Some(Scalar::U32)),
                 span,
-            }) => Ok((value, span)),
+            }) => Ok((value as u32, span)),
+            Some(Token {
+                tok: Tok::Int(value, None),
+                span,
+            }) => Ok((value as u32, span)),
+            Some(Token {
+                tok: Tok::Int(_, _),
+                span,
+            }) => Err(Diagnostic::new(span, "expected u32 literal")),
             _ => Err(Diagnostic::new(
                 span,
-                format!("expected integer, found {}", self.tok_desc_at(0)),
+                format!("expected integer, found {desc}"),
+            )),
+        }
+    }
+
+    fn expect_ident_span(&mut self, name: &str) -> Result<(), Diagnostic> {
+        let span = self.span();
+        let desc = self.tok_desc_at(0);
+        match self.peek() {
+            Some(Tok::Ident(n)) if n == name => {
+                self.bump();
+                Ok(())
+            }
+            _ => Err(Diagnostic::new(
+                span,
+                format!("expected '{name}', found {desc}"),
             )),
         }
     }
@@ -163,9 +190,9 @@ impl Parser {
         if self.is_ident("buf") {
             self.bump();
             self.expect(Tok::Lt)?;
-            let elem = self.parse_scalar()?;
+            let elem = self.parse_type()?;
             self.expect(Tok::Gt)?;
-            return Ok(Type::Buf(elem));
+            return Ok(Type::Buf(Box::new(elem)));
         }
         if self.is_ident("vec2") || self.is_ident("vec3") || self.is_ident("vec4") {
             let (name, _) = self.expect_ident()?;
@@ -182,39 +209,65 @@ impl Parser {
             self.bump();
             self.expect(Tok::Lt)?;
             let elem = self.parse_scalar()?;
-            self.expect(Tok::Comma)?;
-            let role = match self.peek() {
-                Some(Tok::Ident(name)) => name.as_str(),
-                _ => {
-                    return Err(Diagnostic::new(
-                        self.span(),
-                        "matrix role must be 'a', 'b' or 'acc'".to_string(),
-                    ));
-                }
-            };
-            let role = match role {
-                "a" => crate::ir::MatrixRole::A,
-                "b" => crate::ir::MatrixRole::B,
-                "acc" => crate::ir::MatrixRole::Acc,
-                _ => {
-                    return Err(Diagnostic::new(
-                        self.span(),
-                        "matrix role must be 'a', 'b' or 'acc'".to_string(),
-                    ));
-                }
-            };
-            self.bump();
             self.expect(Tok::Gt)?;
-            return Ok(Type::Matrix { elem, role });
+            return Ok(Type::Matrix(elem));
         }
-        Ok(Type::Scalar(self.parse_scalar()?))
+        if self.is_ident("threadgroup") {
+            self.bump();
+            self.expect(Tok::Lt)?;
+            let elem = self.parse_type()?;
+            self.expect(Tok::Gt)?;
+            return Ok(Type::Threadgroup(Box::new(elem)));
+        }
+        if matches!(self.peek(), Some(Tok::LBracket)) {
+            self.bump();
+            let elem = self.parse_type()?;
+            self.expect(Tok::Semicolon)?;
+            let len = self.parse_expr()?;
+            self.expect(Tok::RBracket)?;
+            return Ok(Type::Array {
+                elem: Box::new(elem),
+                len: Box::new(len),
+            });
+        }
+        let (name, _) = self.expect_ident()?;
+        let scalar = match name.as_str() {
+            "f32" => Scalar::F32,
+            "f16" => Scalar::F16,
+            "bf16" => Scalar::Bf16,
+            "i32" => Scalar::I32,
+            "u32" => Scalar::U32,
+            "i8" => Scalar::I8,
+            "u8" => Scalar::U8,
+            "bool" => Scalar::Bool,
+            _ => return Ok(Type::Struct(name)),
+        };
+        Ok(Type::Scalar(scalar))
     }
 
     fn parse_program(&mut self) -> Result<Program, Diagnostic> {
+        let mut imports = Vec::new();
+        let mut structs = Vec::new();
         let mut fns = Vec::new();
-        let mut file_specs = Vec::new();
+        let mut kernel = None;
         loop {
-            if self.is_ident("fn") {
+            if self.is_ident("import") {
+                match self.parse_import() {
+                    Ok(import) => imports.push(import),
+                    Err(diag) => {
+                        self.errors.push(diag);
+                        self.recover();
+                    }
+                }
+            } else if self.is_ident("struct") {
+                match self.parse_struct() {
+                    Ok(s) => structs.push(s),
+                    Err(diag) => {
+                        self.errors.push(diag);
+                        self.recover();
+                    }
+                }
+            } else if self.is_ident("fn") {
                 match self.parse_fn() {
                     Ok(f) => fns.push(f),
                     Err(diag) => {
@@ -222,22 +275,26 @@ impl Parser {
                         self.recover();
                     }
                 }
-            } else if self.is_ident("spec") {
-                match self.parse_spec() {
-                    Ok(spec) => file_specs.push(spec),
-                    Err(diag) => {
-                        self.errors.push(diag);
-                        self.recover();
-                    }
+            } else if self.is_ident("kernel") || matches!(self.peek(), Some(Tok::At)) {
+                if kernel.is_some() {
+                    return Err(Diagnostic::new(
+                        self.span(),
+                        "multiple kernels in one file".to_string(),
+                    ));
                 }
-            } else if self.is_ident("kernel") {
+                kernel = Some(self.parse_kernel().map_err(|diag| {
+                    self.errors.push(diag);
+                    Diagnostic::new(Span::dummy(), "aborting after syntax errors".to_string())
+                })?);
+                break;
+            } else if self.peek().is_none() {
                 break;
             } else {
                 let span = self.span();
                 self.errors.push(Diagnostic::new(
                     span,
                     format!(
-                        "expected 'fn', 'spec' or 'kernel', found {}",
+                        "expected 'import', 'struct', 'fn' or 'kernel', found {}",
                         self.tok_desc_at(0)
                     ),
                 ));
@@ -247,34 +304,140 @@ impl Parser {
                 }
             }
         }
-        let mut kernel = self.parse_kernel().map_err(|diag| {
-            self.errors.push(diag);
-            Diagnostic::new(Span::dummy(), "aborting after syntax errors".to_string())
-        })?;
-        file_specs.extend(kernel.specs);
-        kernel.specs = file_specs;
-        Ok(Program { fns, kernel })
+        Ok(Program {
+            imports,
+            structs,
+            fns,
+            kernel,
+        })
+    }
+
+    fn parse_import(&mut self) -> Result<(String, Span), Diagnostic> {
+        let span = self.span();
+        self.expect_ident_span("import")?;
+        let name = match self.bump() {
+            Some(Token {
+                tok: Tok::Str(name),
+                span,
+            }) => {
+                if name.contains('/') || name.contains('\\') || name.contains("..") {
+                    return Err(Diagnostic::new(
+                        span,
+                        "import path must be a plain file name".to_string(),
+                    ));
+                }
+                name
+            }
+            _ => {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("expected string literal, found {}", self.tok_desc_at(0)),
+                ));
+            }
+        };
+        self.expect(Tok::Semicolon)?;
+        Ok((name, span))
+    }
+
+    fn parse_struct(&mut self) -> Result<StructDecl, Diagnostic> {
+        let head = self.span();
+        self.expect_ident_span("struct")?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(Tok::LBrace)?;
+        let mut fields = Vec::new();
+        loop {
+            if matches!(self.peek(), Some(Tok::RBrace)) {
+                break;
+            }
+            let (field_name, _) = self.expect_ident()?;
+            self.expect(Tok::Colon)?;
+            let ty = self.parse_type()?;
+            fields.push((field_name, ty));
+            if matches!(self.peek(), Some(Tok::Comma)) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        self.expect(Tok::RBrace)?;
+        let end = self.tokens.last().map(|t| t.span.end).unwrap_or(head.end);
+        Ok(StructDecl {
+            name,
+            fields,
+            span: Span {
+                start: head.start,
+                end,
+            },
+        })
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, Diagnostic> {
         self.expect(Tok::LParen)?;
         let mut params = Vec::new();
-        if !matches!(self.peek(), Some(Tok::RParen)) {
-            loop {
-                let is_const = self.eat_ident("const").is_some();
-                let (pname, _) = self.expect_ident()?;
+        loop {
+            if matches!(self.peek(), Some(Tok::RParen)) {
+                break;
+            }
+            {
+                let span = self.span();
+                let mut binding = None;
+                let mut access = Access::ReadWrite;
+                if matches!(self.peek(), Some(Tok::At)) {
+                    self.bump();
+                    self.expect_ident_span("binding")?;
+                    self.expect(Tok::LParen)?;
+                    let (value, _) = self.expect_u32()?;
+                    binding = Some(value);
+                    if matches!(self.peek(), Some(Tok::Comma)) {
+                        self.bump();
+                        let (mode, mode_span) = self.expect_ident()?;
+                        access = match mode.as_str() {
+                            "readonly" => Access::ReadOnly,
+                            "writeonly" => Access::WriteOnly,
+                            "readwrite" => Access::ReadWrite,
+                            _ => {
+                                return Err(Diagnostic::new(
+                                    mode_span,
+                                    "buffer access must be 'readonly', 'writeonly' or 'readwrite'"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+                    }
+                    self.expect(Tok::RParen)?;
+                }
+                let (name, _) = self.expect_ident()?;
                 self.expect(Tok::Colon)?;
                 let ty = self.parse_type()?;
                 params.push(Param {
-                    name: pname,
+                    name,
                     ty,
-                    is_const,
+                    binding,
+                    access,
+                    span,
                 });
                 if matches!(self.peek(), Some(Tok::Comma)) {
                     self.bump();
-                } else {
-                    break;
                 }
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(params)
+    }
+
+    fn parse_fn_params(&mut self) -> Result<Vec<FnParam>, Diagnostic> {
+        self.expect(Tok::LParen)?;
+        let mut params = Vec::new();
+        loop {
+            if matches!(self.peek(), Some(Tok::RParen)) {
+                break;
+            }
+            let (name, _) = self.expect_ident()?;
+            self.expect(Tok::Colon)?;
+            let ty = self.parse_type()?;
+            params.push(FnParam { name, ty });
+            if matches!(self.peek(), Some(Tok::Comma)) {
+                self.bump();
             }
         }
         self.expect(Tok::RParen)?;
@@ -285,7 +448,7 @@ impl Parser {
         let head = self.span();
         self.expect_ident_span("fn")?;
         let (name, _) = self.expect_ident()?;
-        let params = self.parse_params()?;
+        let params = self.parse_fn_params()?;
         let ret = if matches!(self.peek(), Some(Tok::Minus))
             && matches!(self.peek_at(1), Some(Tok::Gt))
         {
@@ -311,21 +474,22 @@ impl Parser {
 
     fn parse_kernel(&mut self) -> Result<Kernel, Diagnostic> {
         let head = self.span();
+        let mut workgroup_size = [0u32; 3];
+        if matches!(self.peek(), Some(Tok::At)) {
+            self.bump();
+            self.expect_ident_span("workgroup_size")?;
+            self.expect(Tok::LParen)?;
+            for (index, slot) in workgroup_size.iter_mut().enumerate() {
+                let (value, _) = self.expect_u32()?;
+                *slot = value;
+                if index < 2 {
+                    self.expect(Tok::Comma)?;
+                }
+            }
+            self.expect(Tok::RParen)?;
+        }
         self.expect_ident_span("kernel")?;
         let (name, _) = self.expect_ident()?;
-        self.expect(Tok::LBracket)?;
-        self.expect_ident_span("workgroup")?;
-        self.expect(Tok::LParen)?;
-        let mut workgroup_size = [0u32; 3];
-        for (index, slot) in workgroup_size.iter_mut().enumerate() {
-            let (value, _) = self.expect_int()?;
-            *slot = value as u32;
-            if index < 2 {
-                self.expect(Tok::Comma)?;
-            }
-        }
-        self.expect(Tok::RParen)?;
-        self.expect(Tok::RBracket)?;
         let mut params = Vec::new();
         if !matches!(self.peek(), Some(Tok::LParen) | Some(Tok::LBrace)) {
             return Err(Diagnostic::new(
@@ -353,6 +517,7 @@ impl Parser {
             workgroup_size,
             params,
             specs,
+            structs: Vec::new(),
             body,
             span: Span {
                 start: head.start,
@@ -360,20 +525,6 @@ impl Parser {
             },
         };
         Ok(kernel)
-    }
-
-    fn expect_ident_span(&mut self, name: &str) -> Result<(), Diagnostic> {
-        let span = self.span();
-        match self.peek() {
-            Some(Tok::Ident(n)) if n == name => {
-                self.bump();
-                Ok(())
-            }
-            _ => Err(Diagnostic::new(
-                span,
-                format!("expected '{name}', found {}", self.tok_desc_at(0)),
-            )),
-        }
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, Diagnostic> {
@@ -439,6 +590,7 @@ impl Parser {
         }
         if self.is_ident("let") {
             self.bump();
+            let mutable = self.eat_ident("mut").is_some();
             let (name, _) = self.expect_ident()?;
             let ty = if matches!(self.peek(), Some(Tok::Colon)) {
                 self.bump();
@@ -446,31 +598,44 @@ impl Parser {
             } else {
                 None
             };
-            self.expect(Tok::Eq)?;
-            let init = self.parse_expr()?;
+            let init = if matches!(self.peek(), Some(Tok::Eq)) {
+                self.bump();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.expect(Tok::Semicolon)?;
             return Ok(Stmt::Let {
                 name,
                 ty,
                 init,
+                mutable,
                 span,
             });
         }
         if self.is_ident("var") {
+            return Err(Diagnostic::new(
+                span,
+                "the 'var' keyword is removed: use 'let mut' instead".to_string(),
+            ));
+        }
+        if self.is_ident("const") {
             self.bump();
             let (name, _) = self.expect_ident()?;
-            let ty = if matches!(self.peek(), Some(Tok::Colon)) {
-                self.bump();
-                Some(self.parse_type()?)
-            } else {
-                None
+            self.expect(Tok::Colon)?;
+            let ty = self.parse_type()?;
+            let Type::Scalar(scalar) = ty else {
+                return Err(Diagnostic::new(
+                    span,
+                    "const type must be scalar".to_string(),
+                ));
             };
             self.expect(Tok::Eq)?;
             let init = self.parse_expr()?;
             self.expect(Tok::Semicolon)?;
-            return Ok(Stmt::Var {
+            return Ok(Stmt::Const {
                 name,
-                ty,
+                ty: scalar,
                 init,
                 span,
             });
@@ -506,54 +671,39 @@ impl Parser {
             let start = self.parse_expr()?;
             self.expect(Tok::Range)?;
             let end = self.parse_expr()?;
-            let unroll = self.eat_ident("unroll").is_some();
             let body = self.parse_block()?;
             return Ok(Stmt::For {
                 var,
                 start,
                 end,
                 body,
-                unroll,
+                unroll: false,
                 span,
             });
         }
-        if self.is_ident("shared") {
+        if matches!(self.peek(), Some(Tok::At))
+            && matches!(self.peek_at(1), Some(Tok::Ident(n)) if n == "unroll")
+        {
             self.bump();
-            let (name, _) = self.expect_ident()?;
-            self.expect(Tok::Colon)?;
-            self.expect(Tok::LBracket)?;
-            let elem = self.parse_scalar()?;
-            self.expect(Tok::Semicolon)?;
-            let len = self.parse_expr()?;
-            self.expect(Tok::RBracket)?;
-            self.expect(Tok::Semicolon)?;
-            return Ok(Stmt::Shared {
-                name,
-                elem,
-                len,
-                span,
-            });
-        }
-        if self.is_ident("const") {
             self.bump();
-            let (name, _) = self.expect_ident()?;
-            self.expect(Tok::Colon)?;
-            let ty = self.parse_type()?;
-            let Type::Scalar(scalar) = ty else {
-                return Err(Diagnostic::new(
+            return match self.parse_stmt()? {
+                Stmt::For {
+                    var,
+                    start,
+                    end,
+                    body,
+                    unroll: _,
                     span,
-                    "const type must be scalar".to_string(),
-                ));
+                } => Ok(Stmt::For {
+                    var,
+                    start,
+                    end,
+                    body,
+                    unroll: true,
+                    span,
+                }),
+                other => Ok(other),
             };
-            self.expect(Tok::Eq)?;
-            let init = self.parse_expr()?;
-            self.expect(Tok::Semicolon)?;
-            return Ok(Stmt::Const {
-                name,
-                ty: scalar,
-                init,
-                span,
-            });
         }
         if self.is_ident("return") {
             self.bump();
@@ -775,35 +925,14 @@ impl Parser {
                 Some(Tok::Dot) => {
                     let next = self.peek_at(1).cloned();
                     match next {
-                        Some(Tok::Ident(component))
-                            if component
-                                .chars()
-                                .all(|c| matches!(c, 'x' | 'y' | 'z' | 'w')) =>
-                        {
+                        Some(Tok::Ident(name)) => {
                             self.bump();
                             self.bump();
-                            let mask: Vec<u32> = component
-                                .chars()
-                                .map(|c| match c {
-                                    'x' => 0,
-                                    'y' => 1,
-                                    'z' => 2,
-                                    _ => 3,
-                                })
-                                .collect();
-                            if mask.len() == 1 {
-                                expr = Expr::Member {
-                                    base: Box::new(expr),
-                                    idx: mask[0],
-                                    span,
-                                };
-                            } else {
-                                expr = Expr::Swizzle {
-                                    base: Box::new(expr),
-                                    mask,
-                                    span,
-                                };
-                            }
+                            expr = Expr::Field {
+                                base: Box::new(expr),
+                                name,
+                                span,
+                            };
                         }
                         _ => break,
                     }
@@ -826,23 +955,44 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, Diagnostic> {
         let span = self.span();
         match self.peek().cloned() {
-            Some(Tok::Int(value)) => {
+            Some(Tok::Int(value, ty)) => {
                 self.bump();
-                Ok(Expr::IntLit(value, span))
+                Ok(Expr::IntLit { value, ty, span })
             }
-            Some(Tok::Float(value)) => {
+            Some(Tok::Float(value, ty)) => {
                 self.bump();
-                Ok(Expr::FloatLit(value, span))
+                Ok(Expr::FloatLit { value, ty, span })
             }
-            Some(Tok::Ident(name)) if name == "true" => {
+            Some(Tok::Dot) => {
                 self.bump();
-                Ok(Expr::BoolLit(true, span))
-            }
-            Some(Tok::Ident(name)) if name == "false" => {
-                self.bump();
-                Ok(Expr::BoolLit(false, span))
+                let (name, name_span) = self.expect_ident()?;
+                let order = match name.as_str() {
+                    "relaxed" => MemOrder::Relaxed,
+                    "acquire" => MemOrder::Acquire,
+                    "release" => MemOrder::Release,
+                    "acq_rel" => MemOrder::AcqRel,
+                    "seq_cst" => MemOrder::SeqCst,
+                    _ => {
+                        return Err(Diagnostic::new(
+                            name_span,
+                            format!(
+                                "unknown memory order '.{name}', expected relaxed, acquire, \
+                                 release, acq_rel or seq_cst"
+                            ),
+                        ));
+                    }
+                };
+                Ok(Expr::OrderLit(order, span))
             }
             Some(Tok::Ident(name)) => {
+                if name == "true" {
+                    self.bump();
+                    return Ok(Expr::BoolLit { value: true, span });
+                }
+                if name == "false" {
+                    self.bump();
+                    return Ok(Expr::BoolLit { value: false, span });
+                }
                 if matches!(self.peek_at(1), Some(Tok::Lt))
                     && matches!(name.as_str(), "vec2" | "vec3" | "vec4")
                 {
@@ -879,6 +1029,28 @@ impl Parser {
                         span,
                     });
                 }
+                if matches!(self.peek_at(1), Some(Tok::LBrace))
+                    && matches!(self.peek_at(3), Some(Tok::Colon))
+                {
+                    self.bump();
+                    self.bump();
+                    let mut fields = Vec::new();
+                    if !matches!(self.peek(), Some(Tok::RBrace)) {
+                        loop {
+                            let (field_name, _) = self.expect_ident()?;
+                            self.expect(Tok::Colon)?;
+                            let value = self.parse_expr()?;
+                            fields.push((field_name, value));
+                            if matches!(self.peek(), Some(Tok::Comma)) {
+                                self.bump();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(Tok::RBrace)?;
+                    return Ok(Expr::ConstructStruct { name, fields, span });
+                }
                 if matches!(self.peek_at(1), Some(Tok::LParen)) {
                     self.bump();
                     self.bump();
@@ -914,11 +1086,14 @@ impl Parser {
     }
 }
 
+
 fn tok_desc(tok: &Tok) -> String {
     match tok {
         Tok::Ident(name) => format!("'{name}'"),
-        Tok::Int(value) => value.to_string(),
-        Tok::Float(value) => value.to_string(),
+        Tok::Str(_) => "string literal".to_string(),
+        Tok::Int(value, _) => value.to_string(),
+        Tok::Float(value, _) => value.to_string(),
+        Tok::At => "'@'".to_string(),
         Tok::LBrace => "'{'".to_string(),
         Tok::RBrace => "'}'".to_string(),
         Tok::LParen => "'('".to_string(),

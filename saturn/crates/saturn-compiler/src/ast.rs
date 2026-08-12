@@ -1,27 +1,73 @@
 use crate::diag::Span;
+use crate::ir::{Access, MemOrder, Scalar};
 
-pub use crate::ir::{Scalar, Type};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnOp {
+    Neg,
+    Not,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    LAnd,
+    LOr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Type {
+    Scalar(Scalar),
+    Vec { size: u32, elem: Scalar },
+    Buf(Box<Type>),
+    Array { elem: Box<Type>, len: Box<Expr> },
+    Threadgroup(Box<Type>),
+    Matrix(Scalar),
+    Struct(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructDecl {
+    pub name: String,
+    pub fields: Vec<(String, Type)>,
+    pub span: Span,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
+    pub imports: Vec<(String, Span)>,
+    pub structs: Vec<StructDecl>,
     pub fns: Vec<FnDecl>,
-    pub kernel: Kernel,
+    pub kernel: Option<Kernel>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
     pub name: String,
-    pub params: Vec<Param>,
+    pub params: Vec<FnParam>,
     pub ret: Option<Type>,
     pub body: Vec<Stmt>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Param {
+pub struct FnParam {
     pub name: String,
     pub ty: Type,
-    pub is_const: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,7 +76,17 @@ pub struct Kernel {
     pub workgroup_size: [u32; 3],
     pub params: Vec<Param>,
     pub specs: Vec<SpecDecl>,
+    pub structs: Vec<StructDecl>,
     pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub ty: Type,
+    pub binding: Option<u32>,
+    pub access: Access,
     pub span: Span,
 }
 
@@ -47,19 +103,8 @@ pub enum Stmt {
     Let {
         name: String,
         ty: Option<Type>,
-        init: Expr,
-        span: Span,
-    },
-    Var {
-        name: String,
-        ty: Option<Type>,
-        init: Expr,
-        span: Span,
-    },
-    Shared {
-        name: String,
-        elem: Scalar,
-        len: Expr,
+        init: Option<Expr>,
+        mutable: bool,
         span: Span,
     },
     Const {
@@ -108,48 +153,31 @@ pub enum Stmt {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnOp {
-    Neg,
-    Not,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
-    And,
-    Or,
-    Xor,
-    Shl,
-    Shr,
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    LAnd,
-    LOr,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    IntLit(u64, Span),
-    FloatLit(f64, Span),
-    BoolLit(bool, Span),
+    IntLit {
+        value: u64,
+        ty: Option<Scalar>,
+        span: Span,
+    },
+    FloatLit {
+        value: f64,
+        ty: Option<Scalar>,
+        span: Span,
+    },
+    BoolLit {
+        value: bool,
+        span: Span,
+    },
     Name(String, Span),
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
         span: Span,
     },
-    Member {
+    Field {
         base: Box<Expr>,
-        idx: u32,
+        name: String,
         span: Span,
     },
     Unary {
@@ -174,6 +202,7 @@ pub enum Expr {
         expr: Box<Expr>,
         span: Span,
     },
+    OrderLit(MemOrder, Span),
     Call {
         name: String,
         args: Vec<Expr>,
@@ -184,29 +213,30 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
-    Swizzle {
-        base: Box<Expr>,
-        mask: Vec<u32>,
+    ConstructStruct {
+        name: String,
+        fields: Vec<(String, Expr)>,
         span: Span,
     },
 }
 
 impl Expr {
-    pub fn span(&self) -> crate::diag::Span {
+    pub fn span(&self) -> Span {
         match self {
-            Expr::IntLit(_, span)
-            | Expr::FloatLit(_, span)
-            | Expr::BoolLit(_, span)
+            Expr::IntLit { span, .. }
+            | Expr::FloatLit { span, .. }
+            | Expr::BoolLit { span, .. }
             | Expr::Name(_, span)
             | Expr::Index { span, .. }
-            | Expr::Member { span, .. }
+            | Expr::Field { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Cond { span, .. }
             | Expr::Convert { span, .. }
+            | Expr::OrderLit(_, span)
             | Expr::Call { span, .. }
             | Expr::Construct { span, .. }
-            | Expr::Swizzle { span, .. } => *span,
+            | Expr::ConstructStruct { span, .. } => *span,
         }
     }
 }

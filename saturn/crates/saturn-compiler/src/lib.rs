@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod builtin;
 pub mod consts;
 pub mod diag;
 pub mod driver;

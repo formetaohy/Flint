@@ -1,10 +1,11 @@
-kernel split_qg [workgroup(256, 1, 1)] (x: buf<f32>, q: buf<f32>, gate: buf<f32>, ROWS: u32, HEADS: u32, HD: u32) {
-    if gid.x < ROWS * HEADS * HD {
-        let d = gid.x % HD;
-        let h = (gid.x / HD) % HEADS;
-        let m = gid.x / (HD * HEADS);
+@workgroup_size(256, 1, 1)
+kernel split_qg (@binding(0) x: buf<f32>, @binding(1) q: buf<f32>, @binding(2) gate: buf<f32>, ROWS: u32, HEADS: u32, HD: u32) {
+    if global_id().x < ROWS * HEADS * HD {
+        let d = global_id().x % HD;
+        let h = (global_id().x / HD) % HEADS;
+        let m = global_id().x / (HD * HEADS);
         let base = (m * HEADS + h) * (2 * HD);
-        q[gid.x] = x[base + d];
-        gate[gid.x] = x[base + HD + d];
+        q[global_id().x] = x[base + d];
+        gate[global_id().x] = x[base + HD + d];
     }
 }

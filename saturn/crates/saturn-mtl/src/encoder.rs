@@ -70,6 +70,14 @@ impl CommandEncoder for MtlEncoder {
         let encoder = self.compute()?;
         encoder.setComputePipelineState(&kernel.pipeline);
         for binding in bindings {
+            if !kernel.bindings.contains(&binding.index) {
+                return Err(Error::UndeclaredBinding {
+                    index: binding.index,
+                    kernel: kernel.name().to_string(),
+                });
+            }
+        }
+        for binding in bindings {
             let buffer = binding.buffer.as_any().downcast_ref::<MtlBuffer>().ok_or(
                 Error::BufferTypeMismatch {
                     expected: std::any::type_name::<MtlBuffer>(),
@@ -126,7 +134,7 @@ impl CommandEncoder for MtlEncoder {
             });
         }
         let encoder = self.compute()?;
-        let base = kernel.buffer_count;
+        let base = kernel.scalars_base;
         for (index, field) in layout.fields.iter().enumerate() {
             let width = field.ty.width() as usize;
             let ptr: *const std::ffi::c_void = bytes

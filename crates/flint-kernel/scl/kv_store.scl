@@ -1,12 +1,13 @@
-kernel kv_store [workgroup(256, 1, 1)]
-    (k_src: buf<f32>, v_src: buf<f32>, k_cache: buf<u32>, v_cache: buf<u32>, args: buf<u32>,
+@workgroup_size(256, 1, 1)
+kernel kv_store
+    (@binding(0) k_src: buf<f32>, @binding(1) v_src: buf<f32>, @binding(2) k_cache: buf<u32>, @binding(3) v_cache: buf<u32>, @binding(4) args: buf<u32>,
      N_KV: u32, HEAD_DIM: u32, MAX_SEQ: u32)
 {
     let half_dim = HEAD_DIM / 2;
-    if gid.x < N_KV * half_dim {
-        let m = block.y;
-        let h = gid.x / half_dim;
-        let d2 = gid.x % half_dim;
+    if global_id().x < N_KV * half_dim {
+        let m = group_id().y;
+        let h = global_id().x / half_dim;
+        let d2 = global_id().x % half_dim;
         let s_base = (m * N_KV + h) * HEAD_DIM + d2 * 2;
         let c_base = (h * MAX_SEQ + args[0] + m) * half_dim + d2;
         k_cache[c_base] = (bitcast_u32(k_src[s_base]) >> 16) | ((bitcast_u32(k_src[s_base + 1]) >> 16) << 16);

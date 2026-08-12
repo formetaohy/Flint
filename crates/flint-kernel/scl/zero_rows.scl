@@ -1,5 +1,6 @@
-kernel zero_rows [workgroup(256, 1, 1)] (x: buf<f32>, N_ELEM: u32) {
-    if gid.x < N_ELEM {
-        x[gid.x] = 0.0;
+@workgroup_size(256, 1, 1)
+kernel zero_rows (@binding(0) x: buf<f32>, N_ELEM: u32) {
+    if global_id().x < N_ELEM {
+        x[global_id().x] = 0.0;
     }
 }

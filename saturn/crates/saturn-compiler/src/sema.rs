@@ -1,24 +1,24 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, BinOp, UnOp};
+use crate::builtin::{self, Arg, Ret};
 use crate::consts::{self, CVal};
 use crate::diag::{Diagnostic, Result, Span};
-use crate::ir::{self, MatrixRole, Scalar, Type};
+use crate::ir::{self, Access, MatrixRole, Scalar, Type};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Sym {
-    BufParam(Scalar),
+    BufParam { ty: Type, access: Access },
     ScalarParam(Scalar),
     Local { id: u32, ty: Type, mutable: bool },
     ForVar { id: u32 },
-    Shared { elem: Scalar, len: u64 },
     InlineConst(CVal),
 }
 
 struct Checker {
     params: Vec<ir::Param>,
     scalars: Vec<ir::ScalarParam>,
-    shareds: Vec<ir::Shared>,
+    structs: HashMap<String, Vec<(String, Type)>>,
     scopes: Vec<HashMap<String, Sym>>,
     consts: HashMap<String, (CVal, Scalar)>,
     loop_depth: u32,
@@ -40,9 +40,36 @@ pub fn check(kernel: &ast::Kernel, specs: &[(&str, f64)]) -> Result<ir::Kernel> 
             ));
         }
     }
+    let mut structs = HashMap::new();
+    for decl in &kernel.structs {
+        if builtin::is_reserved(&decl.name) || decl.name.starts_with("__scl") {
+            return Err(Diagnostic::new(
+                decl.span,
+                format!("'{}' is a reserved name", decl.name),
+            ));
+        }
+        let mut fields = Vec::new();
+        let mut seen = HashSet::new();
+        for (field_name, ty) in &decl.fields {
+            if !seen.insert(field_name.clone()) {
+                return Err(Diagnostic::new(
+                    decl.span,
+                    format!("duplicate field '{field_name}' in struct {}", decl.name),
+                ));
+            }
+            let ty = resolve_struct_field_type(ty, decl.span)?;
+            fields.push((field_name.clone(), ty));
+        }
+        if structs.insert(decl.name.clone(), fields).is_some() {
+            return Err(Diagnostic::new(
+                decl.span,
+                format!("duplicate struct '{}'", decl.name),
+            ));
+        }
+    }
     let mut consts = HashMap::new();
     for spec in &kernel.specs {
-        if is_reserved(&spec.name) || spec.name.starts_with("__scl") {
+        if builtin::is_reserved(&spec.name) || spec.name.starts_with("__scl") {
             return Err(Diagnostic::new(
                 spec.span,
                 format!("'{}' is a reserved name", spec.name),
@@ -101,63 +128,83 @@ pub fn check(kernel: &ast::Kernel, specs: &[(&str, f64)]) -> Result<ir::Kernel> 
     let mut scalars = Vec::new();
     let mut scope = HashMap::new();
     let mut scalar_offset = 0u32;
-    for param in kernel.params.iter() {
+    let mut bindings = HashSet::new();
+    for param in &kernel.params {
         let name = param.name.clone();
-        if is_reserved(&name) || name.starts_with("__scl") {
+        if builtin::is_reserved(&name) || name.starts_with("__scl") {
             return Err(Diagnostic::new(
-                kernel.span,
+                param.span,
                 format!("'{name}' is a reserved name"),
             ));
         }
-        match param.ty {
+        match &param.ty {
             ast::Type::Buf(elem) => {
-                if elem == Scalar::Bool {
+                let ty = resolve_buf_elem(elem, &structs, param.span)?;
+                let binding = param.binding.ok_or_else(|| {
+                    Diagnostic::new(
+                        param.span,
+                        format!("buffer parameter '{name}' must be annotated with @buffer(n)"),
+                    )
+                })?;
+                if !bindings.insert(binding) {
                     return Err(Diagnostic::new(
-                        kernel.span,
-                        format!(
-                            "parameter '{name}' cannot be buf<bool>: Vulkan forbids bool in externally visible storage"
-                        ),
+                        param.span,
+                        format!("duplicate @buffer({binding}) binding"),
                     ));
                 }
-                if scope.insert(name.clone(), Sym::BufParam(elem)).is_some() {
+                let buf_ty = Type::Buf(Box::new(ty));
+                if scope
+                    .insert(name.clone(), Sym::BufParam { ty: buf_ty.clone(), access: param.access })
+                    .is_some()
+                {
                     return Err(Diagnostic::new(
-                        kernel.span,
+                        param.span,
                         format!("duplicate parameter '{name}'"),
                     ));
                 }
                 params.push(ir::Param {
                     name,
-                    elem,
-                    binding: params.len() as u32,
+                    ty: buf_ty,
+                    binding,
+                    access: param.access,
                 });
             }
             ast::Type::Scalar(ty) => {
-                if ty == Scalar::Bool {
+                if param.binding.is_some() {
                     return Err(Diagnostic::new(
-                        kernel.span,
+                        param.span,
+                        format!("scalar parameter '{name}' cannot carry @buffer"),
+                    ));
+                }
+                if *ty == Scalar::Bool {
+                    return Err(Diagnostic::new(
+                        param.span,
                         format!(
                             "parameter '{name}' cannot be bool: Vulkan forbids bool in externally visible storage"
                         ),
                     ));
                 }
-                if scope.insert(name.clone(), Sym::ScalarParam(ty)).is_some() {
+                if scope.insert(name.clone(), Sym::ScalarParam(*ty)).is_some() {
                     return Err(Diagnostic::new(
-                        kernel.span,
+                        param.span,
                         format!("duplicate parameter '{name}'"),
                     ));
                 }
                 scalar_offset = scalar_offset.div_ceil(4) * 4;
                 scalars.push(ir::ScalarParam {
                     name,
-                    ty,
+                    ty: *ty,
                     offset: scalar_offset,
                 });
                 scalar_offset += ty.width();
             }
             _ => {
                 return Err(Diagnostic::new(
-                    kernel.span,
-                    format!("parameter '{}' must be buf<scalar> or scalar", param.name),
+                    param.span,
+                    format!(
+                        "parameter '{}' must be buf<scalar|vec|struct> or scalar",
+                        param.name
+                    ),
                 ));
             }
         }
@@ -165,7 +212,7 @@ pub fn check(kernel: &ast::Kernel, specs: &[(&str, f64)]) -> Result<ir::Kernel> 
     let mut checker = Checker {
         params,
         scalars,
-        shareds: Vec::new(),
+        structs,
         scopes: vec![scope],
         consts,
         loop_depth: 0,
@@ -175,16 +222,76 @@ pub fn check(kernel: &ast::Kernel, specs: &[(&str, f64)]) -> Result<ir::Kernel> 
         coop_roles: Vec::new(),
     };
     let body = checker.check_stmts(&kernel.body)?;
+    let structs = checker
+        .structs
+        .iter()
+        .map(|(name, fields)| ir::StructDecl {
+            name: name.clone(),
+            fields: fields.clone(),
+            span: kernel.span,
+        })
+        .collect();
     Ok(ir::Kernel {
         name: kernel.name.clone(),
         workgroup_size: kernel.workgroup_size,
         params: checker.params,
         scalars: checker.scalars,
-        shareds: checker.shareds,
+        structs,
         coop_triples: checker.coop_triples,
         coop_roles: checker.coop_roles,
         body,
     })
+}
+
+fn resolve_struct_field_type(ty: &ast::Type, span: Span) -> Result<Type> {
+    match ty {
+        ast::Type::Scalar(Scalar::F32 | Scalar::I32 | Scalar::U32) => {
+            let ast::Type::Scalar(scalar) = ty else {
+                unreachable!()
+            };
+            Ok(Type::Scalar(*scalar))
+        }
+        _ => Err(Diagnostic::new(
+            span,
+            "struct fields must be f32, i32 or u32 (4-byte types)".to_string(),
+        )),
+    }
+}
+
+fn resolve_buf_elem(
+    ty: &ast::Type,
+    structs: &HashMap<String, Vec<(String, Type)>>,
+    span: Span,
+) -> Result<Type> {
+    match ty {
+        ast::Type::Scalar(scalar) => {
+            if *scalar == Scalar::Bool {
+                return Err(Diagnostic::new(
+                    span,
+                    "buf<bool> is forbidden: Vulkan forbids bool in externally visible storage"
+                        .to_string(),
+                ));
+            }
+            Ok(Type::Scalar(*scalar))
+        }
+        ast::Type::Vec { size, elem } => Ok(Type::Vec {
+            size: *size,
+            elem: *elem,
+        }),
+        ast::Type::Struct(name) => {
+            let fields = structs.get(name).cloned().ok_or_else(|| {
+                Diagnostic::new(span, format!("unknown struct '{name}'"))
+            })?;
+            Ok(Type::Struct {
+                name: name.clone(),
+                fields,
+            })
+        }
+        _ => Err(Diagnostic::new(
+            span,
+            "buffer element must be a scalar, vector or struct".to_string(),
+        )),
+    }
 }
 
 impl Checker {
@@ -200,7 +307,7 @@ impl Checker {
     }
 
     fn declare(&mut self, name: &str, sym: Sym, span: Span) -> Result<()> {
-        if is_reserved(name) {
+        if builtin::is_reserved(name) {
             return Err(Diagnostic::new(
                 span,
                 format!("'{name}' is a reserved name"),
@@ -221,6 +328,69 @@ impl Checker {
         Ok(())
     }
 
+    fn resolve_type(&self, ty: &ast::Type, span: Span) -> Result<Type> {
+        match ty {
+            ast::Type::Scalar(scalar) => Ok(Type::Scalar(*scalar)),
+            ast::Type::Vec { size, elem } => Ok(Type::Vec {
+                size: *size,
+                elem: *elem,
+            }),
+            ast::Type::Matrix(elem) => {
+                check_matrix_elem(*elem, span)?;
+                Ok(Type::Matrix {
+                    elem: *elem,
+                    role: MatrixRole::Acc,
+                })
+            }
+            ast::Type::Struct(name) => {
+                let fields = self.structs.get(name).cloned().ok_or_else(|| {
+                    Diagnostic::new(span, format!("unknown struct '{name}'"))
+                })?;
+                Ok(Type::Struct {
+                    name: name.clone(),
+                    fields,
+                })
+            }
+            ast::Type::Threadgroup(elem) => {
+                let elem = self.resolve_type(elem, span)?;
+                if !matches!(elem, Type::Array { .. }) {
+                    return Err(Diagnostic::new(
+                        span,
+                        "threadgroup type requires an array element, e.g. threadgroup<[f32; 64]>"
+                            .to_string(),
+                    ));
+                }
+                Ok(Type::Threadgroup(Box::new(elem)))
+            }
+            ast::Type::Array { elem, len } => {
+                let elem = self.resolve_type(elem, span)?;
+                let value = consts::const_eval(len, &self.consts).ok_or_else(|| {
+                    Diagnostic::new(span, "array length must be a constant expression".to_string())
+                })?;
+                let CVal::Int(value) = value else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "array length must be an integer constant".to_string(),
+                    ));
+                };
+                if value == 0 {
+                    return Err(Diagnostic::new(
+                        span,
+                        "array length must be positive".to_string(),
+                    ));
+                }
+                Ok(Type::Array {
+                    elem: Box::new(elem),
+                    len: value,
+                })
+            }
+            ast::Type::Buf(_) => Err(Diagnostic::new(
+                span,
+                "buffer type is not valid here".to_string(),
+            )),
+        }
+    }
+
     fn check_stmts(&mut self, stmts: &[ast::Stmt]) -> Result<Vec<ir::Stmt>> {
         let mut out = Vec::new();
         for stmt in stmts {
@@ -235,48 +405,6 @@ impl Checker {
                 *span,
                 "return is only allowed inside functions".to_string(),
             )),
-            ast::Stmt::Shared {
-                name,
-                elem,
-                len,
-                span,
-            } => {
-                if self.block_depth != 0 {
-                    return Err(Diagnostic::new(
-                        *span,
-                        "shared must be declared at kernel top level".to_string(),
-                    ));
-                }
-                let value = match consts::const_eval(len, &self.consts) {
-                    Some(CVal::Int(value)) => value,
-                    _ => {
-                        return Err(Diagnostic::new(
-                            *span,
-                            "shared size must be a constant expression".to_string(),
-                        ));
-                    }
-                };
-                if value == 0 {
-                    return Err(Diagnostic::new(
-                        *span,
-                        "shared size must be positive".to_string(),
-                    ));
-                }
-                self.declare(
-                    name,
-                    Sym::Shared {
-                        elem: *elem,
-                        len: value,
-                    },
-                    *span,
-                )?;
-                self.shareds.push(ir::Shared {
-                    name: name.clone(),
-                    elem: *elem,
-                    len: value,
-                });
-                Ok(Vec::new())
-            }
             ast::Stmt::Const {
                 name,
                 ty,
@@ -315,132 +443,111 @@ impl Checker {
                 name,
                 ty,
                 init,
+                mutable,
                 span,
             } => {
-                let (init, init_ty) = match ty {
-                    Some(ast::Type::Scalar(scalar)) => {
-                        let (expr, ty) = self.check_expr(init, Some(Type::Scalar(*scalar)))?;
-                        (expr, ty)
-                    }
-                    Some(ast::Type::Matrix { elem, role }) => {
-                        check_matrix_elem(*elem, *span)?;
-                        let (expr, ty) = self.check_expr(
-                            init,
-                            Some(Type::Matrix {
-                                elem: *elem,
-                                role: *role,
-                            }),
-                        )?;
-                        (expr, ty)
-                    }
-                    Some(ast::Type::Vec { size, elem }) => {
-                        let (expr, ty) = self.check_expr(
-                            init,
-                            Some(Type::Vec {
-                                size: *size,
-                                elem: *elem,
-                            }),
-                        )?;
-                        (expr, ty)
-                    }
-                    Some(_) => {
+                let is_threadgroup = matches!(ty, Some(ast::Type::Threadgroup(_)));
+                if is_threadgroup {
+                    if !*mutable {
                         return Err(Diagnostic::new(
                             *span,
-                            "local variables must be scalar, matrix or vector".to_string(),
+                            "threadgroup variable must be declared with 'let mut'".to_string(),
                         ));
                     }
-                    None => {
-                        if let Some(value) = consts::const_eval(init, &self.consts)
-                            && !consts::may_negate(init)
-                        {
-                            self.declare(name, Sym::InlineConst(value), *span)?;
-                            return Ok(Vec::new());
-                        }
-                        self.check_expr(init, None)?
+                    if self.block_depth != 0 {
+                        return Err(Diagnostic::new(
+                            *span,
+                            "threadgroup variable must be declared at kernel top level".to_string(),
+                        ));
                     }
-                };
-                if !matches!(
-                    init_ty,
-                    Type::Scalar(_) | Type::Matrix { .. } | Type::Vec { .. }
-                ) {
-                    return Err(Diagnostic::new(
+                    if init.is_some() {
+                        return Err(Diagnostic::new(
+                            *span,
+                            "threadgroup variable cannot have an initializer".to_string(),
+                        ));
+                    }
+                    let ty = self.resolve_type(ty.as_ref().expect("annotated"), *span)?;
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    self.declare(
+                        name,
+                        Sym::Local {
+                            id,
+                            ty: ty.clone(),
+                            mutable: true,
+                        },
                         *span,
-                        "local variables must be scalar, matrix or vector".to_string(),
-                    ));
-                }
-                let id = self.next_id;
-                self.next_id += 1;
-                self.declare(
-                    name,
-                    Sym::Local {
+                    )?;
+                    return Ok(vec![ir::Stmt::Var {
                         id,
-                        ty: init_ty,
-                        mutable: false,
-                    },
-                    *span,
-                )?;
-                Ok(vec![ir::Stmt::Let {
-                    id,
-                    name: name.clone(),
-                    ty: init_ty,
-                    init,
-                    span: *span,
-                }])
-            }
-            ast::Stmt::Var {
-                name,
-                ty,
-                init,
-                span,
-            } => {
-                let (init, init_ty) = match ty {
-                    Some(ast::Type::Scalar(scalar)) => {
-                        let (expr, ty) = self.check_expr(init, Some(Type::Scalar(*scalar)))?;
-                        (expr, ty)
+                        name: name.clone(),
+                        ty,
+                        init: None,
+                        span: *span,
+                    }]);
+                }
+                let (init, init_ty) = match (ty, init) {
+                    (Some(ast::Type::Matrix(elem)), Some(init)) => {
+                        let (expr, ty) = self.check_matrix_init(init, *elem, *span)?;
+                        (Some(expr), ty)
                     }
-                    Some(ast::Type::Matrix { elem, role }) => {
-                        check_matrix_elem(*elem, *span)?;
-                        let (expr, ty) = self.check_expr(
-                            init,
-                            Some(Type::Matrix {
-                                elem: *elem,
-                                role: *role,
-                            }),
-                        )?;
-                        (expr, ty)
+                    (Some(annotated), Some(init)) => {
+                        let target = self.resolve_type(annotated, *span)?;
+                        let (expr, ty) = self.check_expr(init, Some(target.clone()))?;
+                        if ty != target {
+                            return Err(Diagnostic::new(
+                                *span,
+                                format!("type mismatch: expected {target:?}, found {ty:?}"),
+                            ));
+                        }
+                        (Some(expr), ty)
                     }
-                    Some(ast::Type::Vec { size, elem }) => {
-                        let (expr, ty) = self.check_expr(
-                            init,
-                            Some(Type::Vec {
-                                size: *size,
-                                elem: *elem,
-                            }),
-                        )?;
-                        (expr, ty)
-                    }
-                    Some(_) => {
-                        return Err(Diagnostic::new(
-                            *span,
-                            "local variables must be scalar, matrix or vector".to_string(),
-                        ));
-                    }
-                    None => {
-                        let expect = if matches!(init, ast::Expr::IntLit(..)) {
+                    (None, Some(init)) => {
+                        if !mutable {
+                            if let Some(value) = consts::const_eval(init, &self.consts)
+                                && !consts::may_negate(init)
+                            {
+                                self.declare(name, Sym::InlineConst(value), *span)?;
+                                return Ok(Vec::new());
+                            }
+                        }
+                        let expect = if matches!(init, ast::Expr::IntLit { .. }) {
                             Some(Type::Scalar(Scalar::U32))
                         } else {
                             None
                         };
-                        self.check_expr(init, expect)?
+                        let (expr, ty) = self.check_expr(init, expect)?;
+                        (Some(expr), ty)
+                    }
+                    (_, None) => {
+                        let Some(annotated) = ty else {
+                            return Err(Diagnostic::new(
+                                *span,
+                                "variable without initializer requires a type annotation"
+                                    .to_string(),
+                            ));
+                        };
+                        let ty = self.resolve_type(annotated, *span)?;
+                        if !matches!(ty, Type::Array { .. }) {
+                            return Err(Diagnostic::new(
+                                *span,
+                                "variable without initializer must be an array type".to_string(),
+                            ));
+                        }
+                        if !mutable {
+                            return Err(Diagnostic::new(
+                                *span,
+                                "array without initializer must be declared with 'let mut'"
+                                    .to_string(),
+                            ));
+                        }
+                        (None, ty)
                     }
                 };
-                if !matches!(
-                    init_ty,
-                    Type::Scalar(_) | Type::Matrix { .. } | Type::Vec { .. }
-                ) {
+                if !is_local_type(&init_ty) {
                     return Err(Diagnostic::new(
                         *span,
-                        "local variables must be scalar, matrix or vector".to_string(),
+                        format!("invalid local variable type {init_ty:?}"),
                     ));
                 }
                 let id = self.next_id;
@@ -449,18 +556,28 @@ impl Checker {
                     name,
                     Sym::Local {
                         id,
-                        ty: init_ty,
-                        mutable: true,
+                        ty: init_ty.clone(),
+                        mutable: *mutable,
                     },
                     *span,
                 )?;
-                Ok(vec![ir::Stmt::Var {
-                    id,
-                    name: name.clone(),
-                    ty: init_ty,
-                    init,
-                    span: *span,
-                }])
+                if *mutable {
+                    Ok(vec![ir::Stmt::Var {
+                        id,
+                        name: name.clone(),
+                        ty: init_ty,
+                        init,
+                        span: *span,
+                    }])
+                } else {
+                    Ok(vec![ir::Stmt::Let {
+                        id,
+                        name: name.clone(),
+                        ty: init_ty,
+                        init: init.expect("immutable let has initializer"),
+                        span: *span,
+                    }])
+                }
             }
             ast::Stmt::Assign {
                 target,
@@ -468,7 +585,7 @@ impl Checker {
                 span,
             } => {
                 let (target, target_ty) = self.check_target(target)?;
-                let (value, _) = self.check_expr(value, Some(target_ty))?;
+                let (value, _) = self.check_expr(value, Some(target_ty.clone()))?;
                 Ok(vec![ir::Stmt::Assign {
                     target,
                     value,
@@ -605,8 +722,14 @@ impl Checker {
                         "expression statement must be a call".to_string(),
                     ));
                 };
-                if name == "barrier" && args.is_empty() {
-                    return Ok(vec![ir::Stmt::Barrier { span: *span }]);
+                if name == "barrier" {
+                    if args.is_empty() {
+                        return Ok(vec![ir::Stmt::Barrier { span: *span }]);
+                    }
+                    return Err(Diagnostic::new(
+                        *span,
+                        "barrier takes no arguments".to_string(),
+                    ));
                 }
                 if name == "coop_store" {
                     if args.len() != 4 {
@@ -615,17 +738,14 @@ impl Checker {
                             "coop_store expects 4 arguments".to_string(),
                         ));
                     }
-                    let (dst, dst_ty) = self.check_expr(&args[0], None)?;
-                    match dst_ty {
-                        Type::Buf(_) | Type::SharedArray { .. } | Type::Scalar(_) => {}
-                        _ => {
-                            return Err(Diagnostic::new(
-                                *span,
-                                "coop_store destination must be a buffer or shared array"
-                                    .to_string(),
-                            ));
-                        }
+                    let (dst, dst_elem) = self.check_addr(&args[0], *span)?;
+                    if self.is_readonly_addr(&args[0])? {
+                        return Err(Diagnostic::new(
+                            *span,
+                            "coop_store destination buffer is readonly".to_string(),
+                        ));
                     }
+                    check_matrix_elem(dst_elem, *span)?;
                     let (mat, mat_ty) = self.check_expr(&args[1], None)?;
                     let Type::Matrix { .. } = mat_ty else {
                         return Err(Diagnostic::new(
@@ -666,16 +786,90 @@ impl Checker {
         }
     }
 
+    fn is_readonly_addr(&self, expr: &ast::Expr) -> Result<bool> {
+        let base = match expr {
+            ast::Expr::Name(name, _) => name.clone(),
+            ast::Expr::Index { base, .. } => match &**base {
+                ast::Expr::Name(name, _) => name.clone(),
+                _ => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+        match self.lookup(&base) {
+            Some(Sym::BufParam { access, .. }) => Ok(access == Access::ReadOnly),
+            _ => Ok(false),
+        }
+    }
+
+    fn check_addr(&mut self, expr: &ast::Expr, span: Span) -> Result<(ir::Expr, Scalar)> {
+        match expr {
+            ast::Expr::Name(name, _) => match self.lookup(name) {
+                Some(Sym::BufParam { ty, .. }) => {
+                    let elem = ty.elem().ok_or_else(|| {
+                        Diagnostic::new(span, "buffer element must be scalar".to_string())
+                    })?;
+                    Ok((
+                        ir::Expr::ParamRef {
+                            name: name.clone(),
+                            ty: ty.clone(),
+                            span,
+                        },
+                        elem,
+                    ))
+                }
+                Some(Sym::Local {
+                    ty: Type::Threadgroup(_),
+                    id,
+                    ..
+                }) => {
+                    let ty = match self.lookup(name) {
+                        Some(Sym::Local { ty, .. }) => ty,
+                        _ => unreachable!(),
+                    };
+                    let elem = ty.elem().ok_or_else(|| {
+                        Diagnostic::new(span, "array element must be scalar".to_string())
+                    })?;
+                    Ok((
+                        ir::Expr::LocalRef {
+                            id,
+                            name: name.clone(),
+                            ty,
+                            span,
+                        },
+                        elem,
+                    ))
+                }
+                _ => Err(Diagnostic::new(
+                    span,
+                    "expected a buffer or threadgroup array element".to_string(),
+                )),
+            },
+            ast::Expr::Index { base, index, span: _ } => {
+                let (base_expr, elem) = self.check_addr(base, span)?;
+                let (index, _) = self.check_expr(index, Some(Type::Scalar(Scalar::U32)))?;
+                Ok((
+                    ir::Expr::Index {
+                        base: Box::new(base_expr),
+                        index: Box::new(index),
+                        ty: elem_type(elem),
+                        span,
+                    },
+                    elem,
+                ))
+            }
+            _ => Err(Diagnostic::new(
+                span,
+                "expected a buffer element or threadgroup array element".to_string(),
+            )),
+        }
+    }
+
     fn check_target(&mut self, target: &ast::Expr) -> Result<(ir::Expr, Type)> {
         match target {
             ast::Expr::Name(name, span) => match self.lookup(name) {
-                Some(Sym::BufParam(_)) | Some(Sym::ScalarParam(_)) => Err(Diagnostic::new(
+                Some(Sym::BufParam { .. }) | Some(Sym::ScalarParam(_)) => Err(Diagnostic::new(
                     *span,
                     format!("cannot assign to parameter '{name}'"),
-                )),
-                Some(Sym::Shared { .. }) => Err(Diagnostic::new(
-                    *span,
-                    format!("cannot assign to shared array '{name}'"),
                 )),
                 Some(Sym::ForVar { .. }) => Err(Diagnostic::new(
                     *span,
@@ -685,7 +879,9 @@ impl Checker {
                     *span,
                     format!("cannot assign to constant '{name}'"),
                 )),
-                Some(Sym::Local { mutable: false, .. }) => Err(Diagnostic::new(
+                Some(Sym::Local {
+                    mutable: false, ..
+                }) => Err(Diagnostic::new(
                     *span,
                     format!("cannot assign to immutable '{name}'"),
                 )),
@@ -698,7 +894,7 @@ impl Checker {
                     ir::Expr::LocalRef {
                         id,
                         name: name.clone(),
-                        ty,
+                        ty: ty.clone(),
                         span: *span,
                     },
                     ty,
@@ -708,27 +904,90 @@ impl Checker {
                     format!("undefined variable '{name}'"),
                 )),
             },
-            ast::Expr::Index { base, index, span } => {
-                let (base, base_ty) = self.check_expr(base, None)?;
-                let elem = match base_ty {
-                    Type::Buf(elem) => elem,
-                    Type::SharedArray { elem, .. } => elem,
+            ast::Expr::Field { base, name, span } => {
+                let base_name = match &**base {
+                    ast::Expr::Name(name, _) => name.clone(),
                     _ => {
                         return Err(Diagnostic::new(
                             *span,
-                            "index target must be a buffer or shared array".to_string(),
+                            "field assignment requires a local struct variable".to_string(),
+                        ));
+                    }
+                };
+                let sym = self.lookup(&base_name).ok_or_else(|| {
+                    Diagnostic::new(*span, format!("undefined variable '{base_name}'"))
+                })?;
+                let Sym::Local {
+                    id,
+                    ty,
+                    mutable: true,
+                    ..
+                } = sym
+                else {
+                    return Err(Diagnostic::new(
+                        *span,
+                        format!("cannot assign to immutable '{base_name}'"),
+                    ));
+                };
+                let Type::Struct { fields, .. } = &ty else {
+                    return Err(Diagnostic::new(
+                        *span,
+                        "field assignment requires a struct".to_string(),
+                    ));
+                };
+                let field_ty = fields
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, ty)| ty.clone())
+                    .ok_or_else(|| {
+                        Diagnostic::new(*span, format!("unknown field '{name}'"))
+                    })?;
+                Ok((
+                    ir::Expr::Field {
+                        base: Box::new(ir::Expr::LocalRef {
+                            id,
+                            name: base_name.clone(),
+                            ty: ty.clone(),
+                            span: *span,
+                        }),
+                        name: name.clone(),
+                        ty: field_ty.clone(),
+                        span: *span,
+                    },
+                    field_ty,
+                ))
+            }
+            ast::Expr::Index { base, index, span } => {
+                if self.is_readonly_addr(&ast::Expr::Index {
+                    base: base.clone(),
+                    index: index.clone(),
+                    span: *span,
+                })? {
+                    return Err(Diagnostic::new(
+                        *span,
+                        "cannot write to a readonly buffer".to_string(),
+                    ));
+                }
+                let (base_expr, base_ty) = self.check_expr(base, None)?;
+                let elem = match &base_ty {
+                    Type::Buf(elem) => (**elem).clone(),
+                    Type::Array { elem, .. } => (**elem).clone(),
+                    _ => {
+                        return Err(Diagnostic::new(
+                            *span,
+                            "index target must be a buffer or array".to_string(),
                         ));
                     }
                 };
                 let (index, _) = self.check_expr(index, Some(Type::Scalar(Scalar::U32)))?;
                 Ok((
                     ir::Expr::Index {
-                        base: Box::new(base),
+                        base: Box::new(base_expr),
                         index: Box::new(index),
-                        ty: elem,
+                        ty: elem.clone(),
                         span: *span,
                     },
-                    Type::Scalar(elem),
+                    elem,
                 ))
             }
             _ => Err(Diagnostic::new(
@@ -739,44 +998,239 @@ impl Checker {
     }
 
     fn check_expr(&mut self, expr: &ast::Expr, expect: Option<Type>) -> Result<(ir::Expr, Type)> {
-        let (expr, ty) = self.check_expr_inner(expr, expect)?;
+        let (expr, ty) = self.check_expr_inner(expr, expect.clone())?;
         if let Some(target) = expect {
-            match (&ty, &target) {
-                (Type::Scalar(actual), Type::Scalar(expected)) => {
-                    if actual != expected {
-                        return Err(Diagnostic::new(
-                            expr_span(&expr),
-                            format!(
-                                "type mismatch: expected {}, found {}",
-                                scalar_name(*expected),
-                                scalar_name(*actual)
-                            ),
-                        ));
-                    }
-                }
-                (Type::Matrix { .. }, Type::Matrix { .. }) => {
-                    if ty != target {
-                        return Err(Diagnostic::new(
-                            expr_span(&expr),
-                            "matrix type mismatch".to_string(),
-                        ));
-                    }
-                }
-                (Type::Vec { .. }, Type::Vec { .. }) => {
-                    if ty != target {
-                        return Err(Diagnostic::new(
-                            expr_span(&expr),
-                            "vector type mismatch".to_string(),
-                        ));
-                    }
-                }
-                _ => {
+            if ty != target {
+                return Err(Diagnostic::new(
+                    expr_span(&expr),
+                    format!("type mismatch: expected {target:?}, found {ty:?}"),
+                ));
+            }
+        }
+        Ok((expr, ty))
+    }
+
+    fn check_int_literal(
+        &mut self,
+        value: u64,
+        suffix: Option<Scalar>,
+        expect: Option<Type>,
+        span: Span,
+    ) -> Result<(ir::Expr, Scalar)> {
+        let target = match expect {
+            Some(Type::Scalar(scalar)) => Some(scalar),
+            Some(Type::Matrix { elem, .. }) => {
+                check_matrix_elem(elem, span)?;
+                Some(elem)
+            }
+            _ => None,
+        };
+        if let Some(suffix) = suffix {
+            if value > range_max(suffix) {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("integer literal {value} out of {suffix:?} range"),
+                ));
+            }
+            return Ok((
+                ir::Expr::IntLit {
+                    value,
+                    ty: suffix,
+                    span,
+                },
+                suffix,
+            ));
+        }
+        match target {
+            Some(Scalar::F32 | Scalar::Bf16) => {
+                if value > (1u64 << 24) {
                     return Err(Diagnostic::new(
-                        expr_span(&expr),
-                        "type mismatch".to_string(),
+                        span,
+                        format!("integer literal {value} is not exactly representable as {target:?}"),
                     ));
                 }
+                Ok((
+                    ir::Expr::FloatLit {
+                        value: value as f64,
+                        ty: target.expect("float target"),
+                        span,
+                    },
+                    target.expect("float target"),
+                ))
             }
+            Some(Scalar::F16) => {
+                if value > 2048 {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("integer literal {value} is not exactly representable as f16"),
+                    ));
+                }
+                Ok((
+                    ir::Expr::FloatLit {
+                        value: value as f64,
+                        ty: Scalar::F16,
+                        span,
+                    },
+                    Scalar::F16,
+                ))
+            }
+            Some(Scalar::Bool) => Err(Diagnostic::new(
+                span,
+                "integer literal in bool context".to_string(),
+            )),
+            Some(integer @ (Scalar::U32 | Scalar::I32 | Scalar::U8 | Scalar::I8)) => {
+                if value > range_max(integer) {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("integer literal {value} out of {integer:?} range"),
+                    ));
+                }
+                Ok((
+                    ir::Expr::IntLit {
+                        value,
+                        ty: integer,
+                        span,
+                    },
+                    integer,
+                ))
+            }
+            None => {
+                if value > u32::MAX as u64 {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("integer literal {value} out of u32 range"),
+                    ));
+                }
+                Ok((
+                    ir::Expr::IntLit {
+                        value,
+                        ty: Scalar::U32,
+                        span,
+                    },
+                    Scalar::U32,
+                ))
+            }
+        }
+    }
+
+    fn check_float_literal(
+        &mut self,
+        value: f64,
+        suffix: Option<Scalar>,
+        expect: Option<Type>,
+        span: Span,
+    ) -> Result<(ir::Expr, Scalar)> {
+        let target = match expect {
+            Some(Type::Scalar(scalar)) => Some(scalar),
+            Some(Type::Matrix { elem, .. }) => {
+                check_matrix_elem(elem, span)?;
+                Some(elem)
+            }
+            _ => None,
+        };
+        if let Some(suffix) = suffix {
+            return Ok((
+                ir::Expr::FloatLit {
+                    value,
+                    ty: suffix,
+                    span,
+                },
+                suffix,
+            ));
+        }
+        match target {
+            Some(Scalar::F32 | Scalar::F16 | Scalar::Bf16) => Ok((
+                ir::Expr::FloatLit {
+                    value,
+                    ty: target.expect("float target"),
+                    span,
+                },
+                target.expect("float target"),
+            )),
+            Some(integer @ (Scalar::U32 | Scalar::I32 | Scalar::U8 | Scalar::I8)) => {
+                if value.fract() != 0.0 {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("float literal {value} is not an integer"),
+                    ));
+                }
+                let iv = value as i128;
+                let (min, max) = match integer {
+                    Scalar::U32 => (0, u32::MAX as i128),
+                    Scalar::I32 => (i32::MIN as i128, i32::MAX as i128),
+                    Scalar::U8 => (0, u8::MAX as i128),
+                    _ => (i8::MIN as i128, i8::MAX as i128),
+                };
+                if iv < min || iv > max {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("float literal {value} out of {integer:?} range"),
+                    ));
+                }
+                Ok((
+                    ir::Expr::IntLit {
+                        value: iv as u64,
+                        ty: integer,
+                        span,
+                    },
+                    integer,
+                ))
+            }
+            Some(Scalar::Bool) => Err(Diagnostic::new(
+                span,
+                "float literal in bool context".to_string(),
+            )),
+            None => Ok((
+                ir::Expr::FloatLit {
+                    value,
+                    ty: Scalar::F32,
+                    span,
+                },
+                Scalar::F32,
+            )),
+        }
+    }
+
+    fn check_matrix_init(
+        &mut self,
+        init: &ast::Expr,
+        elem: Scalar,
+        span: Span,
+    ) -> Result<(ir::Expr, Type)> {
+        check_matrix_elem(elem, span)?;
+        if let ast::Expr::Call {
+            name, args, span: call_span,
+        } = init
+            && name == "coop_zero"
+            && args.is_empty()
+        {
+            self.coop_roles.push((elem, MatrixRole::Acc));
+            let ty = Type::Matrix {
+                elem,
+                role: MatrixRole::Acc,
+            };
+            return Ok((
+                ir::Expr::Call {
+                    name: "coop_zero",
+                    args: Vec::new(),
+                    ty: ty.clone(),
+                    span: *call_span,
+                },
+                ty,
+            ));
+        }
+        let (expr, ty) = self.check_expr(init, None)?;
+        let Type::Matrix { elem: init_elem, .. } = ty else {
+            return Err(Diagnostic::new(
+                span,
+                "matrix annotation requires a matrix initializer".to_string(),
+            ));
+        };
+        if init_elem != elem {
+            return Err(Diagnostic::new(
+                span,
+                format!("matrix element mismatch: expected {elem:?}, found {init_elem:?}"),
+            ));
         }
         Ok((expr, ty))
     }
@@ -787,141 +1241,16 @@ impl Checker {
         expect: Option<Type>,
     ) -> Result<(ir::Expr, Type)> {
         match expr {
-            ast::Expr::IntLit(value, span) => {
-                let scalar = match expect {
-                    Some(Type::Scalar(Scalar::U32)) => {
-                        if *value > u32::MAX as u64 {
-                            return Err(Diagnostic::new(
-                                *span,
-                                format!("integer literal {value} out of u32 range"),
-                            ));
-                        }
-                        Scalar::U32
-                    }
-                    Some(Type::Scalar(Scalar::I32)) => {
-                        if *value > i32::MAX as u64 {
-                            return Err(Diagnostic::new(
-                                *span,
-                                format!("integer literal {value} out of i32 range"),
-                            ));
-                        }
-                        Scalar::I32
-                    }
-                    Some(Type::Scalar(Scalar::I8)) => {
-                        if *value > i8::MAX as u64 {
-                            return Err(Diagnostic::new(
-                                *span,
-                                format!("integer literal {value} out of i8 range"),
-                            ));
-                        }
-                        Scalar::I8
-                    }
-                    Some(Type::Scalar(Scalar::U8)) => {
-                        if *value > u8::MAX as u64 {
-                            return Err(Diagnostic::new(
-                                *span,
-                                format!("integer literal {value} out of u8 range"),
-                            ));
-                        }
-                        Scalar::U8
-                    }
-                    Some(Type::Scalar(Scalar::F32)) => {
-                        return Ok((
-                            ir::Expr::FloatLit {
-                                value: *value as f64,
-                                ty: Scalar::F32,
-                                span: *span,
-                            },
-                            Type::Scalar(Scalar::F32),
-                        ));
-                    }
-                    Some(Type::Scalar(Scalar::F16)) => {
-                        return Ok((
-                            ir::Expr::FloatLit {
-                                value: *value as f64,
-                                ty: Scalar::F16,
-                                span: *span,
-                            },
-                            Type::Scalar(Scalar::F16),
-                        ));
-                    }
-                    Some(Type::Scalar(Scalar::Bf16 | Scalar::Bool)) => {
-                        return Err(Diagnostic::new(
-                            *span,
-                            "integer literal in bf16/bool context".to_string(),
-                        ));
-                    }
-                    Some(Type::Matrix { .. }) => Scalar::F32,
-                    Some(Type::Vec { .. })
-                    | Some(Type::Buf(_))
-                    | Some(Type::SharedArray { .. }) => {
-                        return Err(Diagnostic::new(
-                            *span,
-                            "integer literal in non-scalar context".to_string(),
-                        ));
-                    }
-                    None => {
-                        if *value > u32::MAX as u64 {
-                            return Err(Diagnostic::new(
-                                *span,
-                                format!("integer literal {value} out of u32 range"),
-                            ));
-                        }
-                        Scalar::U32
-                    }
-                };
-                Ok((
-                    ir::Expr::IntLit {
-                        value: *value,
-                        ty: scalar,
-                        span: *span,
-                    },
-                    Type::Scalar(scalar),
-                ))
+            ast::Expr::IntLit { value, ty, span } => {
+                let (expr, scalar) = self.check_int_literal(*value, *ty, expect, *span)?;
+                Ok((expr, Type::Scalar(scalar)))
             }
-            ast::Expr::FloatLit(value, span) => {
-                let scalar = match expect {
-                    Some(Type::Scalar(Scalar::F32)) | None => Scalar::F32,
-                    Some(Type::Scalar(Scalar::F16)) => Scalar::F16,
-                    Some(Type::Scalar(Scalar::Bf16)) => {
-                        return Err(Diagnostic::new(
-                            *span,
-                            "float literal in bf16 context".to_string(),
-                        ));
-                    }
-                    Some(Type::Scalar(Scalar::I32 | Scalar::U32 | Scalar::I8 | Scalar::U8)) => {
-                        return Err(Diagnostic::new(
-                            *span,
-                            "float literal in integer context".to_string(),
-                        ));
-                    }
-                    Some(Type::Scalar(Scalar::Bool)) => {
-                        return Err(Diagnostic::new(
-                            *span,
-                            "float literal in bool context".to_string(),
-                        ));
-                    }
-                    Some(Type::Matrix { .. }) => Scalar::F32,
-                    Some(Type::Vec { .. })
-                    | Some(Type::Buf(_))
-                    | Some(Type::SharedArray { .. }) => {
-                        return Err(Diagnostic::new(
-                            *span,
-                            "float literal in non-scalar context".to_string(),
-                        ));
-                    }
-                };
-                Ok((
-                    ir::Expr::FloatLit {
-                        value: *value,
-                        ty: scalar,
-                        span: *span,
-                    },
-                    Type::Scalar(scalar),
-                ))
+            ast::Expr::FloatLit { value, ty, span } => {
+                let (expr, scalar) = self.check_float_literal(*value, *ty, expect, *span)?;
+                Ok((expr, Type::Scalar(scalar)))
             }
-            ast::Expr::BoolLit(value, span) => {
-                let scalar = match expect {
+            ast::Expr::BoolLit { value, span } => {
+                let ty = match expect {
                     Some(Type::Scalar(Scalar::Bool)) | None => Scalar::Bool,
                     Some(_) => {
                         return Err(Diagnostic::new(
@@ -935,52 +1264,40 @@ impl Checker {
                         value: *value,
                         span: *span,
                     },
-                    Type::Scalar(scalar),
+                    Type::Scalar(ty),
                 ))
             }
             ast::Expr::Name(name, span) => {
-                if let Some(builtin) = builtin_var(name) {
-                    if matches!(builtin, "lane" | "subgroup_id" | "subgroup_size") {
-                        return Ok((
-                            ir::Expr::Builtin {
-                                name: builtin,
-                                size: 0,
-                                span: *span,
-                            },
-                            Type::Scalar(Scalar::U32),
-                        ));
-                    }
-                    return Ok((
-                        ir::Expr::Builtin {
-                            name: builtin,
-                            size: 3,
-                            span: *span,
-                        },
-                        Type::Vec {
-                            size: 3,
-                            elem: Scalar::U32,
-                        },
-                    ));
-                }
                 if let Some((value, ty)) = self.consts.get(name).copied() {
                     return Ok((const_literal(value, ty, *span), Type::Scalar(ty)));
                 }
                 match self.lookup(name) {
                     Some(Sym::InlineConst(value)) => {
                         let lit = match value {
-                            CVal::Int(v) => ast::Expr::IntLit(v, *span),
-                            CVal::Float(v) => ast::Expr::FloatLit(v, *span),
-                            CVal::Bool(v) => ast::Expr::BoolLit(v, *span),
+                            CVal::Int(v) => ast::Expr::IntLit {
+                                value: v,
+                                ty: None,
+                                span: *span,
+                            },
+                            CVal::Float(v) => ast::Expr::FloatLit {
+                                value: v,
+                                ty: None,
+                                span: *span,
+                            },
+                            CVal::Bool(v) => ast::Expr::BoolLit {
+                                value: v,
+                                span: *span,
+                            },
                         };
                         self.check_expr_inner(&lit, expect)
                     }
-                    Some(Sym::BufParam(elem)) => Ok((
+                    Some(Sym::BufParam { ty, .. }) => Ok((
                         ir::Expr::ParamRef {
                             name: name.clone(),
-                            elem,
+                            ty: ty.clone(),
                             span: *span,
                         },
-                        Type::Buf(elem),
+                        ty.clone(),
                     )),
                     Some(Sym::ScalarParam(ty)) => Ok((
                         ir::Expr::ScalarRef {
@@ -990,24 +1307,30 @@ impl Checker {
                         },
                         Type::Scalar(ty),
                     )),
-                    Some(Sym::Shared { elem, len }) => Ok((
-                        ir::Expr::SharedRef {
-                            name: name.clone(),
-                            elem,
-                            len,
-                            span: *span,
-                        },
-                        Type::SharedArray { elem, len },
-                    )),
-                    Some(Sym::Local { id, ty, .. }) => Ok((
-                        ir::Expr::LocalRef {
-                            id,
-                            name: name.clone(),
+                    Some(Sym::Local { id, ty, .. }) => {
+                        let ty = match ty {
+                            Type::Threadgroup(inner) => {
+                                let Type::Array { elem, len } = &*inner else {
+                                    unreachable!("threadgroup element is array");
+                                };
+                                let elem = elem.elem().expect("array elem");
+                                Type::Array {
+                                    elem: Box::new(elem_type(elem)),
+                                    len: *len,
+                                }
+                            }
+                            _ => ty.clone(),
+                        };
+                        Ok((
+                            ir::Expr::LocalRef {
+                                id,
+                                name: name.clone(),
+                                ty: ty.clone(),
+                                span: *span,
+                            },
                             ty,
-                            span: *span,
-                        },
-                        ty,
-                    )),
+                        ))
+                    }
                     Some(Sym::ForVar { id }) => Ok((
                         ir::Expr::LocalRef {
                             id,
@@ -1023,112 +1346,169 @@ impl Checker {
                     )),
                 }
             }
-            ast::Expr::Index { base, index, span } => {
-                let (base, base_ty) = self.check_expr(base, None)?;
-                let elem = match base_ty {
-                    Type::Buf(elem) => elem,
-                    Type::SharedArray { elem, .. } => elem,
+            ast::Expr::Index {
+                base,
+                index,
+                span,
+            } => {
+                let (base_expr, base_ty) = self.check_expr(base, None)?;
+                let elem = match &base_ty {
+                    Type::Buf(elem) => (**elem).clone(),
+                    Type::Array { elem, .. } => (**elem).clone(),
                     _ => {
                         return Err(Diagnostic::new(
                             *span,
-                            "index target must be a buffer or shared array".to_string(),
+                            "index target must be a buffer or array".to_string(),
                         ));
                     }
                 };
                 let (index, _) = self.check_expr(index, Some(Type::Scalar(Scalar::U32)))?;
                 Ok((
                     ir::Expr::Index {
-                        base: Box::new(base),
+                        base: Box::new(base_expr),
                         index: Box::new(index),
-                        ty: elem,
+                        ty: elem.clone(),
                         span: *span,
                     },
-                    Type::Scalar(elem),
+                    elem,
                 ))
             }
-            ast::Expr::Member { base, idx, span } => {
-                let (base, base_ty) = self.check_expr(base, None)?;
-                let Type::Vec { size, elem } = base_ty else {
-                    return Err(Diagnostic::new(
+            ast::Expr::Field { base, name, span } => {
+                let (base_expr, base_ty) = self.check_expr(base, None)?;
+                match &base_ty {
+                    Type::Vec { size, elem } => {
+                        if name.len() == 1 {
+                            let idx = match name.as_bytes()[0] {
+                                b'x' => 0,
+                                b'y' => 1,
+                                b'z' => 2,
+                                b'w' => 3,
+                                _ => {
+                                    return Err(Diagnostic::new(
+                                        *span,
+                                        "vector components are x, y, z or w".to_string(),
+                                    ));
+                                }
+                            };
+                            if idx >= *size {
+                                return Err(Diagnostic::new(
+                                    *span,
+                                    format!("component '{name}' out of range for vec{size}"),
+                                ));
+                            }
+                            return Ok((
+                                ir::Expr::Field {
+                                    base: Box::new(base_expr),
+                                    name: name.clone(),
+                                    ty: Type::Scalar(*elem),
+                                    span: *span,
+                                },
+                                Type::Scalar(*elem),
+                            ));
+                        }
+                        let mut mask = Vec::new();
+                        for c in name.chars() {
+                            match c {
+                                'x' => mask.push(0),
+                                'y' => mask.push(1),
+                                'z' => mask.push(2),
+                                'w' => mask.push(3),
+                                _ => {
+                                    return Err(Diagnostic::new(
+                                        *span,
+                                        "vector swizzles use x, y, z or w".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        for &idx in &mask {
+                            if idx >= *size {
+                                return Err(Diagnostic::new(
+                                    *span,
+                                    format!("swizzle component out of range for vec{size}"),
+                                ));
+                            }
+                        }
+                        let out_size = mask.len() as u32;
+                        let mut args = vec![base_expr];
+                        for &idx in &mask {
+                            args.push(ir::Expr::IntLit {
+                                value: idx as u64,
+                                ty: Scalar::U32,
+                                span: *span,
+                            });
+                        }
+                        Ok((
+                            ir::Expr::Call {
+                                name: "swizzle_vec",
+                                args,
+                                ty: Type::Vec {
+                                    size: out_size,
+                                    elem: *elem,
+                                },
+                                span: *span,
+                            },
+                            Type::Vec {
+                                size: out_size,
+                                elem: *elem,
+                            },
+                        ))
+                    }
+                    Type::Struct { fields, .. } => {
+                        let (_, field_ty) = fields
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .ok_or_else(|| {
+                                Diagnostic::new(*span, format!("unknown field '{name}'"))
+                            })?;
+                        Ok((
+                            ir::Expr::Field {
+                                base: Box::new(base_expr),
+                                name: name.clone(),
+                                ty: field_ty.clone(),
+                                span: *span,
+                            },
+                            field_ty.clone(),
+                        ))
+                    }
+                    _ => Err(Diagnostic::new(
                         *span,
-                        "member access requires a vector".to_string(),
-                    ));
-                };
-                if *idx >= size {
-                    return Err(Diagnostic::new(
-                        *span,
-                        format!("member index {idx} out of range for vec{size}"),
-                    ));
+                        "field access requires a vector or struct".to_string(),
+                    )),
                 }
-                Ok((
-                    ir::Expr::Member {
-                        base: Box::new(base),
-                        idx: *idx,
-                        ty: elem,
-                        span: *span,
-                    },
-                    Type::Scalar(elem),
-                ))
             }
             ast::Expr::Unary { op, expr, span } => match op {
                 UnOp::Neg => {
-                    if let ast::Expr::IntLit(value, lit_span) = &**expr {
-                        let scalar = match expect {
-                            Some(Type::Scalar(Scalar::U32 | Scalar::U8)) => {
+                    if let ast::Expr::IntLit { value, ty, .. } = &**expr {
+                        let signed = match ty {
+                            Some(Scalar::I32) | None => Scalar::I32,
+                            Some(Scalar::U32) => {
                                 return Err(Diagnostic::new(
                                     *span,
-                                    "cannot negate an unsigned integer literal".to_string(),
+                                    "cannot negate a u32 literal".to_string(),
                                 ));
                             }
-                            Some(Type::Scalar(Scalar::I32)) => Scalar::I32,
-                            Some(Type::Scalar(Scalar::I8)) => Scalar::I8,
-                            Some(Type::Scalar(Scalar::F32 | Scalar::F16)) => {
-                                let scalar = match expect {
-                                    Some(Type::Scalar(s)) => s,
-                                    _ => unreachable!(),
-                                };
-                                return Ok((
-                                    ir::Expr::FloatLit {
-                                        value: -(*value as f64),
-                                        ty: scalar,
-                                        span: *span,
-                                    },
-                                    Type::Scalar(scalar),
-                                ));
-                            }
-                            Some(Type::Scalar(Scalar::Bf16 | Scalar::Bool)) => {
+                            _ => {
                                 return Err(Diagnostic::new(
                                     *span,
-                                    "cannot negate a bf16/bool literal".to_string(),
+                                    "negation requires a signed literal".to_string(),
                                 ));
                             }
-                            Some(Type::Matrix { .. }) | Some(Type::Vec { .. }) => {
-                                return Err(Diagnostic::new(
-                                    *span,
-                                    "cannot negate a literal in non-scalar context".to_string(),
-                                ));
-                            }
-                            _ => Scalar::I32,
                         };
                         let neg = (*value as i128).wrapping_neg();
-                        let (min, max) = match scalar {
-                            Scalar::I32 => (i32::MIN as i128, i32::MAX as i128),
-                            Scalar::I8 => (i8::MIN as i128, i8::MAX as i128),
-                            _ => unreachable!(),
-                        };
-                        if neg < min || neg > max {
+                        if neg < i32::MIN as i128 || neg > i32::MAX as i128 {
                             return Err(Diagnostic::new(
-                                *lit_span,
-                                format!("integer literal {} out of {scalar:?} range", *value),
+                                *span,
+                                "integer literal out of i32 range".to_string(),
                             ));
                         }
                         return Ok((
                             ir::Expr::IntLit {
                                 value: neg as u64,
-                                ty: scalar,
+                                ty: signed,
                                 span: *span,
                             },
-                            Type::Scalar(scalar),
+                            Type::Scalar(signed),
                         ));
                     }
                     let (expr, ty) = self.check_expr(expr, expect)?;
@@ -1175,42 +1555,39 @@ impl Checker {
                 span,
             } => {
                 let (cond, _) = self.check_expr(cond, Some(Type::Scalar(Scalar::Bool)))?;
-                let is_literal = |e: &ast::Expr| {
+                let unsuffixed = |e: &ast::Expr| {
                     matches!(
                         e,
-                        ast::Expr::IntLit(..) | ast::Expr::FloatLit(..) | ast::Expr::BoolLit(..)
+                        ast::Expr::IntLit { ty: None, .. } | ast::Expr::FloatLit { ty: None, .. }
                     )
                 };
-                let (then, els, branch_ty) = if is_literal(then) && !is_literal(els) {
-                    let (els, els_ty) = self.check_expr(els, None)?;
-                    let Type::Scalar(els_scalar) = els_ty else {
-                        return Err(Diagnostic::new(
-                            *span,
-                            "ternary branches must be scalar".to_string(),
-                        ));
+                let (then_expr, els_expr, branch_ty) =
+                    if unsuffixed(then) && unsuffixed(els) {
+                        if let Some(Type::Scalar(target)) = expect {
+                            let (then_expr, _) =
+                                self.check_expr(then, Some(Type::Scalar(target)))?;
+                            let (els_expr, _) =
+                                self.check_expr(els, Some(Type::Scalar(target)))?;
+                            (then_expr, els_expr, Type::Scalar(target))
+                        } else {
+                            let (then_expr, then_ty) = self.check_expr(then, None)?;
+                            let (els_expr, _) = self.check_expr(els, Some(then_ty.clone()))?;
+                            (then_expr, els_expr, then_ty)
+                        }
+                    } else {
+                        let (then_expr, then_ty) = self.check_expr(then, None)?;
+                        let (els_expr, _) = self.check_expr(els, Some(then_ty.clone()))?;
+                        (then_expr, els_expr, then_ty)
                     };
-                    let (then, _) = self.check_expr(then, Some(Type::Scalar(els_scalar)))?;
-                    (then, els, els_scalar)
-                } else {
-                    let (then, then_ty) = self.check_expr(then, None)?;
-                    let Type::Scalar(then_scalar) = then_ty else {
-                        return Err(Diagnostic::new(
-                            *span,
-                            "ternary branches must be scalar".to_string(),
-                        ));
-                    };
-                    let (els, _) = self.check_expr(els, Some(Type::Scalar(then_scalar)))?;
-                    (then, els, then_scalar)
-                };
                 Ok((
                     ir::Expr::Cond {
                         cond: Box::new(cond),
-                        then: Box::new(then),
-                        els: Box::new(els),
-                        ty: branch_ty,
+                        then: Box::new(then_expr),
+                        els: Box::new(els_expr),
+                        ty: branch_ty.clone(),
                         span: *span,
                     },
-                    Type::Scalar(branch_ty),
+                    branch_ty,
                 ))
             }
             ast::Expr::Convert { ty, expr, span } => {
@@ -1225,6 +1602,34 @@ impl Checker {
                         *span,
                         "bool cannot be a conversion target".to_string(),
                     ));
+                }
+                if let ast::Expr::IntLit { value, ty: None, .. } = &**expr {
+                    if *target == Scalar::U32 {
+                        return Err(Diagnostic::new(
+                            *span,
+                            format!(
+                                "redundant conversion to same type {}",
+                                scalar_name(*target)
+                            ),
+                        ));
+                    }
+                    let (expr, scalar) =
+                        self.check_int_literal(*value, None, Some(Type::Scalar(*target)), *span)?;
+                    return Ok((expr, Type::Scalar(scalar)));
+                }
+                if let ast::Expr::FloatLit { value, ty: None, .. } = &**expr {
+                    if *target == Scalar::F32 {
+                        return Err(Diagnostic::new(
+                            *span,
+                            format!(
+                                "redundant conversion to same type {}",
+                                scalar_name(*target)
+                            ),
+                        ));
+                    }
+                    let (expr, scalar) =
+                        self.check_float_literal(*value, None, Some(Type::Scalar(*target)), *span)?;
+                    return Ok((expr, Type::Scalar(scalar)));
                 }
                 let (expr, expr_ty) = self.check_expr(expr, None)?;
                 let Type::Scalar(source) = expr_ty else {
@@ -1256,6 +1661,10 @@ impl Checker {
                     Type::Scalar(*target),
                 ))
             }
+            ast::Expr::OrderLit(_, span) => Err(Diagnostic::new(
+                *span,
+                "memory order literal is only valid as an atomic order argument".to_string(),
+            )),
             ast::Expr::Call { name, args, span } => self.check_call(name, args, expect, *span),
             ast::Expr::Construct { ty, args, span } => {
                 let ast::Type::Vec { size, elem } = ty else {
@@ -1285,50 +1694,61 @@ impl Checker {
                     },
                 ))
             }
-            ast::Expr::Swizzle { base, mask, span } => {
-                let (base, base_ty) = self.check_expr(base, None)?;
-                let Type::Vec { size, elem } = base_ty else {
-                    return Err(Diagnostic::new(
-                        *span,
-                        "swizzle requires a vector".to_string(),
-                    ));
-                };
-                for &idx in mask {
-                    if idx >= size {
+            ast::Expr::ConstructStruct {
+                name,
+                fields,
+                span,
+            } => {
+                let struct_fields = self.structs.get(name).cloned().ok_or_else(|| {
+                    Diagnostic::new(*span, format!("unknown struct '{name}'"))
+                })?;
+                let mut checked = Vec::new();
+                let mut seen = HashSet::new();
+                for (field_name, value) in fields {
+                    if !seen.insert(field_name.clone()) {
                         return Err(Diagnostic::new(
                             *span,
-                            format!("swizzle component out of range for vec{size}"),
+                            format!("duplicate field '{field_name}'"),
                         ));
                     }
+                    let (_, field_ty) = struct_fields
+                        .iter()
+                        .find(|(n, _)| n == field_name)
+                        .ok_or_else(|| {
+                            Diagnostic::new(
+                                *span,
+                                format!(
+                                    "unknown field '{field_name}' for struct '{name}'"
+                                ),
+                            )
+                        })?;
+                    let (value, _) = self.check_expr(value, Some(field_ty.clone()))?;
+                    checked.push((field_name.clone(), value));
                 }
-                if mask.len() == 1 {
-                    return Ok((
-                        ir::Expr::Member {
-                            base: Box::new(base),
-                            idx: mask[0],
-                            ty: elem,
-                            span: *span,
-                        },
-                        Type::Scalar(elem),
+                if seen.len() != struct_fields.len() {
+                    return Err(Diagnostic::new(
+                        *span,
+                        format!(
+                            "struct '{name}' requires {} fields, got {}",
+                            struct_fields.len(),
+                            seen.len()
+                        ),
                     ));
                 }
-                let size = mask.len() as u32;
-                let mut args = vec![base];
-                for &idx in mask {
-                    args.push(ir::Expr::IntLit {
-                        value: idx as u64,
-                        ty: Scalar::U32,
-                        span: *span,
-                    });
-                }
                 Ok((
-                    ir::Expr::Call {
-                        name: "swizzle_vec",
-                        args,
-                        ty: Type::Vec { size, elem },
+                    ir::Expr::ConstructStruct {
+                        name: name.clone(),
+                        fields: checked,
+                        ty: Type::Struct {
+                            name: name.clone(),
+                            fields: struct_fields.clone(),
+                        },
                         span: *span,
                     },
-                    Type::Vec { size, elem },
+                    Type::Struct {
+                        name: name.clone(),
+                        fields: struct_fields,
+                    },
                 ))
             }
         }
@@ -1354,28 +1774,42 @@ impl Checker {
             if args.len() != 3 {
                 return Err(Diagnostic::new(span, format!("{name} expects 3 arguments")));
             }
-            let (buf, buf_ty) = self.check_expr(&args[0], None)?;
-            let elem = match buf_ty {
-                Type::Buf(elem) | Type::SharedArray { elem, .. } => elem,
-                _ => {
-                    return Err(Diagnostic::new(
-                        span,
-                        format!("{name} target must be a buffer or shared array"),
-                    ));
-                }
+            let (target, elem) = self.check_addr(&args[0], span)?;
+            let ir::Expr::Index { .. } = target else {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("{name} target must be a buffer or threadgroup array element"),
+                ));
             };
             if !elem.is_int() {
                 return Err(Diagnostic::new(
                     span,
-                    format!("{name} requires an integer buffer"),
+                    format!("{name} requires an integer element type"),
                 ));
             }
-            let (index, _) = self.check_expr(&args[1], Some(Type::Scalar(Scalar::U32)))?;
-            let (value, _) = self.check_expr(&args[2], Some(Type::Scalar(elem)))?;
+            if self.is_readonly_addr(&args[0])? {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("{name} target buffer is readonly"),
+                ));
+            }
+            let (value, _) = self.check_expr(&args[1], Some(Type::Scalar(elem)))?;
+            let order = match &args[2] {
+                ast::Expr::OrderLit(order, order_span) => ir::Expr::OrderLit {
+                    order: *order,
+                    span: *order_span,
+                },
+                _ => {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("{name} order must be a memory order literal"),
+                    ));
+                }
+            };
             return Ok((
                 ir::Expr::Call {
                     name: name_static(name),
-                    args: vec![buf, index, value],
+                    args: vec![target, value, order],
                     ty: Type::Scalar(elem),
                     span,
                 },
@@ -1389,7 +1823,7 @@ impl Checker {
                     "coop_zero takes no arguments".to_string(),
                 ));
             }
-            let Some(Type::Matrix { elem, role }) = expect else {
+            let Some(Type::Matrix { elem, .. }) = expect else {
                 return Err(Diagnostic::new(
                     span,
                     "coop_zero requires a matrix type annotation".to_string(),
@@ -1401,28 +1835,24 @@ impl Checker {
                 ir::Expr::Call {
                     name: "coop_zero",
                     args: Vec::new(),
-                    ty: Type::Matrix { elem, role },
+                    ty: Type::Matrix {
+                        elem,
+                        role: MatrixRole::Acc,
+                    },
                     span,
                 },
-                Type::Matrix { elem, role },
+                Type::Matrix {
+                    elem,
+                    role: MatrixRole::Acc,
+                },
             ));
         }
         if name == "coop_load_a" || name == "coop_load_b" {
             if args.len() != 3 {
                 return Err(Diagnostic::new(span, format!("{name} expects 3 arguments")));
             }
-            let (src, src_ty) = self.check_expr(&args[0], None)?;
-            let elem = match src_ty {
-                Type::Buf(elem) => elem,
-                Type::SharedArray { elem, .. } => elem,
-                Type::Scalar(elem) => elem,
-                _ => {
-                    return Err(Diagnostic::new(
-                        span,
-                        format!("{name} source must be a buffer or shared array"),
-                    ));
-                }
-            };
+            let (src, elem) = self.check_addr(&args[0], span)?;
+            check_matrix_elem(elem, span)?;
             let (stride, _) = self.check_expr(&args[1], Some(Type::Scalar(Scalar::U32)))?;
             let layout = match consts::const_eval(&args[2], &self.consts) {
                 Some(CVal::Bool(row_major)) => ir::Expr::IntLit {
@@ -1437,21 +1867,21 @@ impl Checker {
                     ));
                 }
             };
-            check_matrix_elem(elem, span)?;
             let role = if name == "coop_load_a" {
                 MatrixRole::A
             } else {
                 MatrixRole::B
             };
             self.coop_roles.push((elem, role));
+            let ty = Type::Matrix { elem, role };
             return Ok((
                 ir::Expr::Call {
                     name: name_static(name),
                     args: vec![src, stride, layout],
-                    ty: Type::Matrix { elem, role },
+                    ty: ty.clone(),
                     span,
                 },
-                Type::Matrix { elem, role },
+                ty,
             ));
         }
         if name == "coop_mul_add" {
@@ -1515,312 +1945,142 @@ impl Checker {
                 ir::Expr::Call {
                     name: "coop_mul_add",
                     args: vec![a, b, c],
-                    ty: ret,
+                    ty: ret.clone(),
                     span,
                 },
                 ret,
             ));
         }
-        if name == "bitcast_f32" || name == "bitcast_u32" {
-            if args.len() != 1 {
-                return Err(Diagnostic::new(span, format!("{name} expects 1 argument")));
-            }
-            let (arg, _) = self.check_expr(
-                &args[0],
-                Some(Type::Scalar(if name == "bitcast_f32" {
-                    Scalar::U32
-                } else {
-                    Scalar::F32
-                })),
-            )?;
-            let ret = if name == "bitcast_f32" {
-                Scalar::F32
-            } else {
-                Scalar::U32
-            };
-            return Ok((
-                ir::Expr::Call {
-                    name: name_static(name),
-                    args: vec![arg],
-                    ty: Type::Scalar(ret),
-                    span,
-                },
-                Type::Scalar(ret),
+        let sig = builtin::lookup(name).ok_or_else(|| {
+            Diagnostic::new(span, format!("unknown function or builtin '{name}'"))
+        })?;
+        if sig.ret == Ret::Void {
+            return Err(Diagnostic::new(
+                span,
+                format!("'{name}' does not return a value and must be a statement"),
             ));
         }
-        if matches!(name, "popcount" | "clz" | "ctz") {
-            if args.len() != 1 {
-                return Err(Diagnostic::new(span, format!("{name} expects 1 argument")));
-            }
-            let (arg, _) = self.check_expr(&args[0], Some(Type::Scalar(Scalar::U32)))?;
-            return Ok((
-                ir::Expr::Call {
-                    name: name_static(name),
-                    args: vec![arg],
-                    ty: Type::Scalar(Scalar::U32),
-                    span,
-                },
-                Type::Scalar(Scalar::U32),
-            ));
-        }
-        if name == "dot" {
-            if args.len() != 2 {
-                return Err(Diagnostic::new(span, "dot expects 2 arguments"));
-            }
-            let (a, a_ty) = self.check_expr(&args[0], None)?;
-            let Type::Vec { size, elem } = a_ty else {
-                return Err(Diagnostic::new(span, "dot requires vector arguments"));
-            };
-            if !elem.is_float() {
-                return Err(Diagnostic::new(
-                    span,
-                    "dot requires float vector arguments".to_string(),
-                ));
-            }
-            let (b, _) = self.check_expr(&args[1], Some(Type::Vec { size, elem }))?;
-            return Ok((
-                ir::Expr::Call {
-                    name: "dot",
-                    args: vec![a, b],
-                    ty: Type::Scalar(elem),
-                    span,
-                },
-                Type::Scalar(elem),
-            ));
-        }
-        let builtin = match name {
-            "min"
-            | "max"
-            | "abs"
-            | "floor"
-            | "ceil"
-            | "round"
-            | "trunc"
-            | "sign"
-            | "fract"
-            | "sqrt"
-            | "rsqrt"
-            | "exp"
-            | "exp2"
-            | "log"
-            | "log2"
-            | "tanh"
-            | "pow"
-            | "clamp"
-            | "fma"
-            | "select"
-            | "subgroup_broadcast"
-            | "subgroup_shuffle"
-            | "subgroup_shuffle_down"
-            | "subgroup_shuffle_up"
-            | "subgroup_reduce_add"
-            | "subgroup_reduce_max"
-            | "subgroup_reduce_min"
-            | "subgroup_inclusive_add"
-            | "subgroup_all"
-            | "subgroup_any" => name_static(name),
-            _ => {
-                return Err(Diagnostic::new(span, format!("unknown builtin '{name}'")));
-            }
-        };
-        let arity = match builtin {
-            "abs"
-            | "floor"
-            | "ceil"
-            | "round"
-            | "trunc"
-            | "sign"
-            | "fract"
-            | "sqrt"
-            | "rsqrt"
-            | "exp"
-            | "exp2"
-            | "log"
-            | "log2"
-            | "tanh"
-            | "subgroup_reduce_add"
-            | "subgroup_reduce_max"
-            | "subgroup_reduce_min"
-            | "subgroup_inclusive_add"
-            | "subgroup_all"
-            | "subgroup_any" => 1,
-            "min"
-            | "max"
-            | "pow"
-            | "subgroup_broadcast"
-            | "subgroup_shuffle"
-            | "subgroup_shuffle_down"
-            | "subgroup_shuffle_up" => 2,
-            "clamp" | "fma" | "select" => 3,
-            _ => unreachable!(),
-        };
-        if args.len() != arity {
+        if args.len() != sig.args.len() {
             return Err(Diagnostic::new(
                 span,
                 format!(
-                    "builtin '{name}' expects {arity} arguments, got {}",
+                    "builtin '{name}' expects {} arguments, got {}",
+                    sig.args.len(),
                     args.len()
                 ),
             ));
         }
-        let mut checked = Vec::with_capacity(arity);
-        let (first_expr, first_ty) = self.check_expr(&args[0], None)?;
-        let Type::Scalar(first_scalar) = first_ty else {
-            return Err(Diagnostic::new(
-                span,
-                format!("{name} requires scalar arguments"),
-            ));
-        };
-        checked.push((first_expr, Type::Scalar(first_scalar)));
-        for (index, arg) in args.iter().enumerate().skip(1) {
-            let expect = match (builtin, index) {
-                ("select", 2) => Some(Type::Scalar(Scalar::Bool)),
-                (
-                    "subgroup_broadcast"
-                    | "subgroup_shuffle"
-                    | "subgroup_shuffle_down"
-                    | "subgroup_shuffle_up",
-                    1,
-                ) => Some(Type::Scalar(Scalar::U32)),
-                ("subgroup_all" | "subgroup_any", 0) => Some(Type::Scalar(Scalar::Bool)),
-                _ => Some(Type::Scalar(first_scalar)),
-            };
-            let (expr, ty) = self.check_expr(arg, expect)?;
-            checked.push((expr, ty));
-        }
-        let (ret, unified) = match builtin {
-            "subgroup_all" | "subgroup_any" => {
-                let Type::Scalar(_) = checked[0].1 else {
-                    return Err(Diagnostic::new(
-                        span,
-                        "subgroup_all/subgroup_any require a bool argument".to_string(),
-                    ));
-                };
-                (Scalar::Bool, Scalar::Bool)
-            }
-            "subgroup_broadcast"
-            | "subgroup_shuffle"
-            | "subgroup_shuffle_down"
-            | "subgroup_shuffle_up"
-            | "subgroup_reduce_add"
-            | "subgroup_reduce_max"
-            | "subgroup_reduce_min"
-            | "subgroup_inclusive_add" => {
-                let Type::Scalar(first) = checked[0].1 else {
-                    return Err(Diagnostic::new(
-                        span,
-                        format!("{name} requires scalar arguments"),
-                    ));
-                };
-                if !first.is_float() && !first.is_int() {
-                    return Err(Diagnostic::new(
-                        span,
-                        format!("{name} requires numeric arguments"),
-                    ));
-                }
-                (first, first)
-            }
-            "select" => {
-                let Type::Scalar(a) = checked[0].1 else {
-                    return Err(Diagnostic::new(
-                        span,
-                        "select requires numeric arguments".to_string(),
-                    ));
-                };
-                let Type::Scalar(b) = checked[1].1 else {
-                    return Err(Diagnostic::new(
-                        span,
-                        "select requires numeric arguments".to_string(),
-                    ));
-                };
-                let Type::Scalar(Scalar::Bool) = checked[2].1 else {
-                    return Err(Diagnostic::new(
-                        span,
-                        "select condition must be bool".to_string(),
-                    ));
-                };
-                if a != b {
-                    return Err(Diagnostic::new(
-                        span,
-                        format!(
-                            "select branches must match: {} vs {}",
-                            scalar_name(a),
-                            scalar_name(b)
-                        ),
-                    ));
-                }
-                if !a.is_float() && !a.is_int() {
-                    return Err(Diagnostic::new(
-                        span,
-                        "select requires numeric arguments".to_string(),
-                    ));
-                }
-                (a, a)
-            }
-            "min" | "max" | "clamp" | "fma" | "pow" | "abs" => {
-                let Type::Scalar(first) = checked[0].1 else {
-                    return Err(Diagnostic::new(
-                        span,
-                        format!("{name} requires scalar arguments"),
-                    ));
-                };
-                if !first.is_float() && !first.is_int() {
-                    return Err(Diagnostic::new(
-                        span,
-                        format!("{name} requires numeric arguments"),
-                    ));
-                }
-                if first == Scalar::U32 && builtin == "abs" {
-                    return Err(Diagnostic::new(
-                        span,
-                        "abs is not defined for u32".to_string(),
-                    ));
-                }
-                for (_, ty) in &checked[1..] {
-                    let Type::Scalar(other) = ty else {
+        let mut checked = Vec::with_capacity(args.len());
+        let mut first: Option<(ir::Expr, Type)> = None;
+        for (index, arg) in args.iter().enumerate() {
+            let spec = sig.args[index];
+            let (expr, ty) = match spec {
+                Arg::Num => match &first {
+                    Some((_, Type::Scalar(s))) => {
+                        let (e, t) = self.check_expr(arg, Some(Type::Scalar(*s)))?;
+                        (e, t)
+                    }
+                    Some(_) => {
                         return Err(Diagnostic::new(
                             span,
                             format!("{name} requires scalar arguments"),
                         ));
-                    };
-                    if *other != first {
-                        return Err(Diagnostic::new(
-                            span,
-                            format!(
-                                "{name} argument types must match: {} vs {}",
-                                scalar_name(first),
-                                scalar_name(*other)
-                            ),
-                        ));
                     }
+                    None => self.check_expr(arg, None)?,
+                },
+                Arg::Float => {
+                    let (e, t) = self.check_expr(arg, None)?;
+                    match &t {
+                        Type::Scalar(s) if s.is_float() => {}
+                        _ => {
+                            return Err(Diagnostic::new(
+                                span,
+                                format!("{name} requires a float argument"),
+                            ));
+                        }
+                    }
+                    (e, t)
                 }
-                (first, first)
-            }
-            _ => {
-                let Type::Scalar(first) = checked[0].1 else {
+                Arg::Bool => {
+                    let (e, t) = self.check_expr(arg, Some(Type::Scalar(Scalar::Bool)))?;
+                    (e, t)
+                }
+                Arg::U32 => {
+                    let (e, t) = self.check_expr(arg, Some(Type::Scalar(Scalar::U32)))?;
+                    (e, t)
+                }
+                Arg::Vec => {
+                    let (e, t) = self.check_expr(arg, None)?;
+                    match &t {
+                        Type::Vec { .. } => {}
+                        _ => {
+                            return Err(Diagnostic::new(
+                                span,
+                                format!("{name} requires a vector argument"),
+                            ));
+                        }
+                    }
+                    (e, t)
+                }
+                Arg::Order => {
                     return Err(Diagnostic::new(
                         span,
-                        format!("{name} requires a float argument"),
+                        format!("internal error: bare order argument for {name}"),
+                    ));
+                }
+                Arg::ConstBool => {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("internal error: bare const-bool argument for {name}"),
+                    ));
+                }
+                Arg::Addr | Arg::MatA | Arg::MatB | Arg::MatAcc => {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("internal error: bare specialized argument for {name}"),
+                    ));
+                }
+            };
+            if first.is_none() {
+                first = Some((expr.clone(), ty.clone()));
+            }
+            checked.push(expr);
+        }
+        let first_ty = first.as_ref().map(|(_, ty)| ty.clone());
+        let ret_ty = match sig.ret {
+            Ret::SameAsFirst => first_ty.expect("first argument exists"),
+            Ret::Bool => Type::Scalar(Scalar::Bool),
+            Ret::U32 => Type::Scalar(Scalar::U32),
+            Ret::F32 => Type::Scalar(Scalar::F32),
+            Ret::Vec3U32 => Type::Vec {
+                size: 3,
+                elem: Scalar::U32,
+            },
+            Ret::ScalarOfVec => {
+                let Type::Vec { elem, .. } = first_ty.expect("first argument exists") else {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("{name} requires a vector argument"),
                     ));
                 };
-                if !first.is_float() {
+                if !elem.is_float() {
                     return Err(Diagnostic::new(
                         span,
-                        format!("{name} requires a float argument"),
+                        format!("{name} requires a float vector argument"),
                     ));
                 }
-                (first, first)
+                Type::Scalar(elem)
             }
+            _ => unreachable!(),
         };
-        let args = checked.into_iter().map(|(expr, _)| expr).collect();
         Ok((
             ir::Expr::Call {
-                name: builtin,
-                args,
-                ty: Type::Scalar(ret),
+                name: name_static(name),
+                args: checked,
+                ty: ret_ty.clone(),
                 span,
             },
-            Type::Scalar(unified),
+            ret_ty,
         ))
     }
 
@@ -1848,13 +2108,7 @@ impl Checker {
             }
             BinOp::Eq | BinOp::Ne => {
                 let (lhs, lhs_ty) = self.check_expr(lhs, None)?;
-                let Type::Scalar(lhs_scalar) = lhs_ty else {
-                    return Err(Diagnostic::new(
-                        span,
-                        "comparison requires scalars".to_string(),
-                    ));
-                };
-                let (rhs, _) = self.check_expr(rhs, Some(Type::Scalar(lhs_scalar)))?;
+                let (rhs, _) = self.check_expr(rhs, Some(lhs_ty.clone()))?;
                 Ok((
                     ir::Expr::Binary {
                         op,
@@ -1896,6 +2150,35 @@ impl Checker {
                 ))
             }
             _ => {
+                let int_float_mix = matches!(
+                    (lhs, rhs),
+                    (
+                        ast::Expr::IntLit { ty: None, .. },
+                        ast::Expr::FloatLit { .. }
+                    ) | (
+                        ast::Expr::FloatLit { .. },
+                        ast::Expr::IntLit { ty: None, .. }
+                    )
+                );
+                if int_float_mix {
+                    let (lhs, _) = self.check_expr(lhs, Some(Type::Scalar(Scalar::F32)))?;
+                    let (rhs, _) = self.check_expr(rhs, Some(Type::Scalar(Scalar::F32)))?;
+                    let ty = if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+                        Type::Scalar(Scalar::Bool)
+                    } else {
+                        Type::Scalar(Scalar::F32)
+                    };
+                    return Ok((
+                        ir::Expr::Binary {
+                            op,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                            ty: ty.clone(),
+                            span,
+                        },
+                        ty,
+                    ));
+                }
                 let (lhs, lhs_ty) = self.check_expr(lhs, None)?;
                 match lhs_ty {
                     Type::Scalar(lhs_scalar) => {
@@ -1919,7 +2202,7 @@ impl Checker {
                                 op,
                                 lhs: Box::new(lhs),
                                 rhs: Box::new(rhs),
-                                ty,
+                                ty: ty.clone(),
                                 span,
                             },
                             ty,
@@ -1943,7 +2226,7 @@ impl Checker {
                                 op,
                                 lhs: Box::new(lhs),
                                 rhs: Box::new(rhs),
-                                ty,
+                                ty: ty.clone(),
                                 span,
                             },
                             ty,
@@ -1956,6 +2239,32 @@ impl Checker {
                 }
             }
         }
+    }
+}
+
+fn is_local_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Scalar(_)
+            | Type::Vec { .. }
+            | Type::Matrix { .. }
+            | Type::Array { .. }
+            | Type::Threadgroup(_)
+            | Type::Struct { .. }
+    )
+}
+
+fn elem_type(elem: Scalar) -> Type {
+    Type::Scalar(elem)
+}
+
+fn range_max(ty: Scalar) -> u64 {
+    match ty {
+        Scalar::U32 => u32::MAX as u64,
+        Scalar::I32 => i32::MAX as u64,
+        Scalar::U8 => u8::MAX as u64,
+        Scalar::I8 => i8::MAX as u64,
+        _ => u64::MAX,
     }
 }
 
@@ -1974,11 +2283,14 @@ fn const_literal(value: CVal, ty: Scalar, span: Span) -> ir::Expr {
 
 fn substitute_loop_var(stmt: &mut ir::Stmt, var: &str, value: u64) {
     match stmt {
-        ir::Stmt::Let { init, .. } | ir::Stmt::Var { init, .. } => {
+        ir::Stmt::Let { init, .. } | ir::Stmt::Var { init: Some(init), .. } => {
             substitute_loop_expr(init, var, value);
         }
+        ir::Stmt::Var { init: None, .. } => {}
         ir::Stmt::Assign {
-            target, value: v, ..
+            target,
+            value: v,
+            ..
         } => {
             substitute_loop_expr(target, var, value);
             substitute_loop_expr(v, var, value);
@@ -2026,7 +2338,7 @@ fn substitute_loop_expr(expr: &mut ir::Expr, var: &str, value: u64) {
             substitute_loop_expr(base, var, value);
             substitute_loop_expr(index, var, value);
         }
-        ir::Expr::Member { base, .. } => substitute_loop_expr(base, var, value),
+        ir::Expr::Field { base, .. } => substitute_loop_expr(base, var, value),
         ir::Expr::Unary { expr: e, .. } => substitute_loop_expr(e, var, value),
         ir::Expr::Binary { lhs, rhs, .. } => {
             substitute_loop_expr(lhs, var, value);
@@ -2045,6 +2357,11 @@ fn substitute_loop_expr(expr: &mut ir::Expr, var: &str, value: u64) {
                 substitute_loop_expr(arg, var, value);
             }
         }
+        ir::Expr::ConstructStruct { fields, .. } => {
+            for (_, field_expr) in fields {
+                substitute_loop_expr(field_expr, var, value);
+            }
+        }
         _ => {}
     }
 }
@@ -2057,91 +2374,15 @@ fn expr_span(expr: &ir::Expr) -> Span {
         | ir::Expr::ParamRef { span, .. }
         | ir::Expr::LocalRef { span, .. }
         | ir::Expr::ScalarRef { span, .. }
-        | ir::Expr::SharedRef { span, .. }
-        | ir::Expr::Builtin { span, .. }
         | ir::Expr::Index { span, .. }
-        | ir::Expr::Member { span, .. }
+        | ir::Expr::Field { span, .. }
         | ir::Expr::Unary { span, .. }
         | ir::Expr::Binary { span, .. }
         | ir::Expr::Cond { span, .. }
         | ir::Expr::Convert { span, .. }
+        | ir::Expr::OrderLit { span, .. }
+        | ir::Expr::ConstructStruct { span, .. }
         | ir::Expr::Call { span, .. } => *span,
-    }
-}
-
-pub(crate) fn is_reserved(name: &str) -> bool {
-    matches!(
-        name,
-        "kernel"
-            | "fn"
-            | "return"
-            | "spec"
-            | "let"
-            | "var"
-            | "const"
-            | "shared"
-            | "if"
-            | "else"
-            | "loop"
-            | "for"
-            | "in"
-            | "break"
-            | "continue"
-            | "as"
-            | "unroll"
-            | "workgroup"
-            | "true"
-            | "false"
-            | "buf"
-            | "vec2"
-            | "vec3"
-            | "vec4"
-            | "matrix"
-            | "gid"
-            | "thread"
-            | "block"
-            | "block_dim"
-            | "lane"
-            | "subgroup_id"
-            | "subgroup_size"
-            | "barrier"
-            | "bitcast_f32"
-            | "bitcast_u32"
-            | "atomic_add"
-            | "atomic_max"
-            | "atomic_min"
-            | "atomic_exchange"
-            | "atomic_and"
-            | "atomic_or"
-            | "atomic_xor"
-            | "subgroup_broadcast"
-            | "subgroup_shuffle"
-            | "subgroup_shuffle_down"
-            | "subgroup_shuffle_up"
-            | "subgroup_reduce_add"
-            | "subgroup_reduce_max"
-            | "subgroup_reduce_min"
-            | "subgroup_inclusive_add"
-            | "subgroup_all"
-            | "subgroup_any"
-            | "coop_zero"
-            | "coop_load_a"
-            | "coop_load_b"
-            | "coop_mul_add"
-            | "coop_store"
-    )
-}
-
-fn builtin_var(name: &str) -> Option<&'static str> {
-    match name {
-        "gid" => Some("gid"),
-        "thread" => Some("thread"),
-        "block" => Some("block"),
-        "block_dim" => Some("block_dim"),
-        "lane" => Some("lane"),
-        "subgroup_id" => Some("subgroup_id"),
-        "subgroup_size" => Some("subgroup_size"),
-        _ => None,
     }
 }
 
@@ -2164,7 +2405,6 @@ fn name_static(name: &str) -> &'static str {
         "max" => "max",
         "clamp" => "clamp",
         "fma" => "fma",
-        "select" => "select",
         "abs" => "abs",
         "floor" => "floor",
         "ceil" => "ceil",
@@ -2179,13 +2419,13 @@ fn name_static(name: &str) -> &'static str {
         "log" => "log",
         "log2" => "log2",
         "tanh" => "tanh",
+        "pow" => "pow",
         "dot" => "dot",
         "popcount" => "popcount",
         "clz" => "clz",
         "ctz" => "ctz",
         "bitcast_f32" => "bitcast_f32",
         "bitcast_u32" => "bitcast_u32",
-        "pow" => "pow",
         "atomic_and" => "atomic_and",
         "atomic_or" => "atomic_or",
         "atomic_xor" => "atomic_xor",
@@ -2205,7 +2445,14 @@ fn name_static(name: &str) -> &'static str {
         "atomic_max" => "atomic_max",
         "atomic_min" => "atomic_min",
         "atomic_exchange" => "atomic_exchange",
-        _ => unreachable!(),
+        "global_id" => "global_id",
+        "local_id" => "local_id",
+        "group_id" => "group_id",
+        "group_size" => "group_size",
+        "subgroup_id" => "subgroup_id",
+        "lane" => "lane",
+        "subgroup_size" => "subgroup_size",
+        _ => unreachable!("unknown builtin {name}"),
     }
 }
 

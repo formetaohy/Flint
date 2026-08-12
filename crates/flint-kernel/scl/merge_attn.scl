@@ -1,30 +1,31 @@
-kernel merge_attn [workgroup(512, 1, 1)]
-    (scratch: buf<f32>, y: buf<f32>, args: buf<u32>,
+@workgroup_size(512, 1, 1)
+kernel merge_attn
+    (@binding(0) scratch: buf<f32>, @binding(1) y: buf<f32>, @binding(2) args: buf<u32>,
      N_HEADS: u32, KV_HEADS: u32, HEAD_DIM: u32, STRIDE: u32)
 {
     const CHUNK: u32 = 64;
     const SEGS: u32 = 32;
     const NEG_INF: f32 = -3.4e38;
-    let m = block.x;
-    let kvh = block.y;
-    let t = thread.x;
+    let m = group_id().x;
+    let kvh = group_id().y;
+    let t = local_id().x;
     let hl = t / CHUNK;
     let slot = t % CHUNK;
     let segs = min(SEGS, max(1, args[1]));
-    var mx = NEG_INF;
+    let mut mx = NEG_INF;
     for s in 0..segs {
         let base = ((m * KV_HEADS + kvh) * SEGS + s) * (8 * STRIDE) + hl * STRIDE;
         mx = max(mx, scratch[base + HEAD_DIM]);
     }
-    var wsum = 0.0;
-    var o0 = 0.0;
-    var o1 = 0.0;
-    var o2 = 0.0;
-    var o3 = 0.0;
-    var o4 = 0.0;
-    var o5 = 0.0;
-    var o6 = 0.0;
-    var o7 = 0.0;
+    let mut wsum = 0.0;
+    let mut o0 = 0.0;
+    let mut o1 = 0.0;
+    let mut o2 = 0.0;
+    let mut o3 = 0.0;
+    let mut o4 = 0.0;
+    let mut o5 = 0.0;
+    let mut o6 = 0.0;
+    let mut o7 = 0.0;
     for s in 0..segs {
         let base = ((m * KV_HEADS + kvh) * SEGS + s) * (8 * STRIDE) + hl * STRIDE;
         let w = exp(scratch[base + HEAD_DIM] - mx);

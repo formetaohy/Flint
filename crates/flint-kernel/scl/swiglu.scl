@@ -1,11 +1,12 @@
-kernel swiglu [workgroup(256, 1, 1)] (gate: buf<f32>, up: buf<f32>, y: buf<f32>, N_ELEM: u32, MODE: u32) {
-    if gid.x < N_ELEM {
-        let gv = gate[gid.x];
+@workgroup_size(256, 1, 1)
+kernel swiglu (@binding(0) gate: buf<f32>, @binding(1) up: buf<f32>, @binding(2) y: buf<f32>, N_ELEM: u32, MODE: u32) {
+    if global_id().x < N_ELEM {
+        let gv = gate[global_id().x];
         if MODE == 1 {
             let v = gv * (gv * gv * 0.044715 + 1.0) * 0.7978845608028654;
-            y[gid.x] = (tanh(v) + 1.0) * 0.5 * gv * up[gid.x];
+            y[global_id().x] = (tanh(v) + 1.0) * 0.5 * gv * up[global_id().x];
         } else {
-            y[gid.x] = gv / (1.0 + exp(-gv)) * up[gid.x];
+            y[global_id().x] = gv / (1.0 + exp(-gv)) * up[global_id().x];
         }
     }
 }

@@ -1,17 +1,18 @@
-kernel repeat_qk [workgroup(256, 1, 1)]
-    (x: buf<f32>, y: buf<f32>,
+@workgroup_size(256, 1, 1)
+kernel repeat_qk
+    (@binding(0) x: buf<f32>, @binding(1) y: buf<f32>,
      ROWS: u32, N_K: u32, N_V: u32, K_DIM: u32, RATIO: u32, CONV_DIM: u32)
 {
-    if block.x < ROWS {
+    if group_id().x < ROWS {
         let total = 2 * N_V * K_DIM;
-        let base = block.x * CONV_DIM;
-        for i in thread.x..total {
+        let base = group_id().x * CONV_DIM;
+        for i in local_id().x..total {
             let seg = i / (N_V * K_DIM);
             let rem = i % (N_V * K_DIM);
             let h = rem / K_DIM;
             let d = rem % K_DIM;
             let src = base + seg * (N_K * K_DIM) + (h / RATIO) * K_DIM + d;
-            y[block.x * total + i] = x[src];
+            y[group_id().x * total + i] = x[src];
         }
     }
 }

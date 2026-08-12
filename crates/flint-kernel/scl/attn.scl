@@ -1,5 +1,6 @@
-kernel attn [workgroup(512, 1, 1)]
-    (q: buf<f32>, k_cache: buf<u32>, v_cache: buf<u32>, scratch: buf<f32>, args: buf<u32>,
+@workgroup_size(512, 1, 1)
+kernel attn
+    (@binding(0) q: buf<f32>, @binding(1) k_cache: buf<u32>, @binding(2) v_cache: buf<u32>, @binding(3) scratch: buf<f32>, @binding(4) args: buf<u32>,
      N_HEADS: u32, KV_HEADS: u32, HEAD_DIM: u32, MAX_SEQ: u32, SCALE: f32,
      WINDOW: u32, NQ_PER_KV: u32, STRIDE: u32)
 {
@@ -8,19 +9,19 @@ kernel attn [workgroup(512, 1, 1)]
     const HALF: u32 = 128;
     const STAGE: u32 = 4096;
     const NEG_INF: f32 = -3.4e38;
-    shared kt: [u32; 4160];
-    shared scs: [f32; 512];
-    shared red: [f32; 512];
-    shared segstat: [f32; 16];
+    let mut kt: threadgroup<[u32; 4160]>;
+    let mut scs: threadgroup<[f32; 512]>;
+    let mut red: threadgroup<[f32; 512]>;
+    let mut segstat: threadgroup<[f32; 16]>;
     let pos = args[0];
     let segs = min(SEGS, max(1, args[1]));
-    let m = block.x;
-    let kvh = block.y;
-    let seg = block.z;
+    let m = group_id().x;
+    let kvh = group_id().y;
+    let seg = group_id().z;
     if seg < segs {
         let qpos = pos + m;
         let kv_len = qpos + 1;
-        var win_start = 0;
+        let mut win_start = 0;
         if WINDOW != 0 && kv_len > WINDOW {
             win_start = kv_len - WINDOW;
         }
@@ -29,18 +30,18 @@ kernel attn [workgroup(512, 1, 1)]
         let seg_hi = min(seg_lo + seg_len, kv_len);
         let q0 = (m * N_HEADS + kvh * NQ_PER_KV) * HEAD_DIM;
         let cache_plane = kvh * MAX_SEQ * HEAD_DIM;
-        let t = thread.x;
+        let t = local_id().x;
         let hl = t / CHUNK;
         let slot = t % CHUNK;
-        var o0 = 0.0;
-        var o1 = 0.0;
-        var o2 = 0.0;
-        var o3 = 0.0;
-        var o4 = 0.0;
-        var o5 = 0.0;
-        var o6 = 0.0;
-        var o7 = 0.0;
-        var c0 = seg_lo;
+        let mut o0 = 0.0;
+        let mut o1 = 0.0;
+        let mut o2 = 0.0;
+        let mut o3 = 0.0;
+        let mut o4 = 0.0;
+        let mut o5 = 0.0;
+        let mut o6 = 0.0;
+        let mut o7 = 0.0;
+        let mut c0 = seg_lo;
         loop {
             if c0 >= seg_hi {
                 break;
@@ -51,7 +52,7 @@ kernel attn [workgroup(512, 1, 1)]
             }
             barrier();
             let limit = min(CHUNK, seg_hi - c0);
-            var dot = 0.0;
+            let mut dotp = 0.0;
             let halves = (HEAD_DIM + HALF - 1) / HALF;
             for half in 0..halves {
                 for j in 0..8 {
@@ -75,32 +76,32 @@ kernel attn [workgroup(512, 1, 1)]
                         let e = slot * HALF + dd;
                         let word = kt[slot * 65 + dd / 2];
                         if e % 2 == 0 {
-                            dot = dot + q[qb + dd] * bitcast_f32((word & 65535) << 16);
+                            dotp = dotp + q[qb + dd] * bitcast_f32((word & 65535) << 16);
                         } else {
-                            dot = dot + q[qb + dd] * bitcast_f32((word >> 16) << 16);
+                            dotp = dotp + q[qb + dd] * bitcast_f32((word >> 16) << 16);
                         }
                     }
                 }
                 barrier();
             }
-            var sc = NEG_INF;
+            let mut sc = NEG_INF;
             if hl < NQ_PER_KV && c0 + slot >= win_start && c0 + slot < seg_hi {
-                sc = dot * SCALE;
+                sc = dotp * SCALE;
             }
             scs[hl * CHUNK + slot] = sc;
             red[hl * CHUNK + slot] = sc;
             barrier();
             if slot < CHUNK / 32 {
-                var m = NEG_INF;
+                let mut m = NEG_INF;
                 for w in 0..32 {
                     m = max(m, red[hl * CHUNK + slot * 32 + w]);
                 }
                 red[hl * (CHUNK / 32) + slot] = m;
             }
             barrier();
-            var c_max = NEG_INF;
+            let mut c_max = NEG_INF;
             if slot == 0 {
-                var cm = NEG_INF;
+                let mut cm = NEG_INF;
                 for w in 0..(CHUNK / 32) {
                     cm = max(cm, red[hl * (CHUNK / 32) + w]);
                 }
@@ -110,8 +111,8 @@ kernel attn [workgroup(512, 1, 1)]
             barrier();
             c_max = red[16 + hl];
             barrier();
-            var prev_max = NEG_INF;
-            var align = 1.0;
+            let mut prev_max = NEG_INF;
+            let mut align = 1.0;
             if hl < NQ_PER_KV && c0 != seg_lo {
                 prev_max = segstat[hl * 2];
                 if prev_max > NEG_INF / 2.0 {
@@ -131,7 +132,7 @@ kernel attn [workgroup(512, 1, 1)]
                 }
             }
             barrier();
-            var e = 0.0;
+            let mut e = 0.0;
             if hl < NQ_PER_KV && c0 + slot >= win_start && c0 + slot < seg_hi {
                 e = exp(sc - c_max) * align;
                 if sc == NEG_INF {
@@ -142,16 +143,16 @@ kernel attn [workgroup(512, 1, 1)]
             red[hl * CHUNK + slot] = e;
             barrier();
             if slot < CHUNK / 32 {
-                var s = 0.0;
+                let mut s = 0.0;
                 for w in 0..32 {
                     s = s + red[hl * CHUNK + slot * 32 + w];
                 }
                 red[hl * (CHUNK / 32) + slot] = s;
             }
             barrier();
-            var c_sum = 0.0;
+            let mut c_sum = 0.0;
             if slot == 0 {
-                var cs = 0.0;
+                let mut cs = 0.0;
                 for w in 0..(CHUNK / 32) {
                     cs = cs + red[hl * (CHUNK / 32) + w];
                 }
