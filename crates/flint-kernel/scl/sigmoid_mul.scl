@@ -1,6 +1,0 @@
-@workgroup_size(256, 1, 1)
-kernel sigmoid_mul (@binding(0) a: buf<f32>, @binding(1) b: buf<f32>, @binding(2) y: buf<f32>, N_ELEM: u32) {
-    if global_id().x < N_ELEM {
-        y[global_id().x] = a[global_id().x] / (1.0 + exp(-b[global_id().x]));
-    }
-}

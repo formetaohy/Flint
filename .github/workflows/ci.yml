@@ -1,4 +1,4 @@
-# CI on GitHub-hosted runners, which have no GPU: saturn runs on lavapipe,
+# CI on GitHub-hosted runners, which have no GPU: wgpu runs on lavapipe,
 # the Mesa CPU-only Vulkan ICD (the same setup llama.cpp / sherpa-onnx /
 # rerun use for their Vulkan CI legs). Lavapipe caps workgroup shared
 # memory at 32 KiB, below the attention kernel's 36 KiB, so the GPU-bound

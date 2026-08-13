@@ -98,11 +98,13 @@ impl Checkpoint for FakeSource {
     fn read(&self, name: &str) -> flint_error::Result<RawTensor> {
         unreachable!("synthesize never reads tensor bytes ({name})")
     }
-    fn metadata(&self) -> &Metadata {
-        &self.meta
+    fn metadata(&self) -> flint_error::Result<&Metadata> {
+        Ok(&self.meta)
     }
-    fn config_json(&self) -> flint_error::Result<Option<serde_json::Value>> {
-        Ok(None)
+    fn config_json(&self) -> flint_error::Result<serde_json::Value> {
+        Err(flint_error::Error::Checkpoint(
+            "fake GGUF source has no config.json".into(),
+        ))
     }
     fn kind(&self) -> CheckpointKind {
         CheckpointKind::Gguf

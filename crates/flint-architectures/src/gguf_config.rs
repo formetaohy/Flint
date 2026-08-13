@@ -17,7 +17,7 @@ pub fn synthesize_config(source: &dyn Checkpoint, family: Family) -> Result<Valu
 }
 
 fn transformer_config(source: &dyn Checkpoint, gemma: bool) -> Result<Value> {
-    let m = source.metadata();
+    let m = source.metadata()?;
     let arch = m
         .str("general.architecture")
         .ok_or_else(|| Error::Config("GGUF missing general.architecture".into()))?;
@@ -94,7 +94,7 @@ fn transformer_config(source: &dyn Checkpoint, gemma: bool) -> Result<Value> {
 }
 
 fn phi_config(source: &dyn Checkpoint) -> Result<Value> {
-    let m = source.metadata();
+    let m = source.metadata()?;
     let key = |k: &str| format!("phi3.{k}");
     let req = |k: &str| -> Result<u32> {
         m.u32(&key(k))
@@ -150,7 +150,7 @@ fn phi_config(source: &dyn Checkpoint) -> Result<Value> {
 }
 
 fn gemma4_config(source: &dyn Checkpoint) -> Result<Value> {
-    let m = source.metadata();
+    let m = source.metadata()?;
     let key = |k: &str| format!("gemma4.{k}");
     let req = |k: &str| -> Result<u32> {
         m.u32(&key(k))

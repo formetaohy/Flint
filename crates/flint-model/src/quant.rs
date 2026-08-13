@@ -1,5 +1,5 @@
 use flint_error::{Error, Result};
-use saturn_core::num::f16_to_f32;
+use flint_num::f16_to_f32;
 
 pub fn choose_group(k: u32) -> Result<u32> {
     for g in [128u32, 64, 32] {
@@ -12,7 +12,7 @@ pub fn choose_group(k: u32) -> Result<u32> {
     )))
 }
 
-pub fn repack_q8(bytes: &[u8], rows: usize, cols: usize) -> Result<(Vec<u8>, Vec<f32>)> {
+pub(crate) fn repack_q8(bytes: &[u8], rows: usize, cols: usize) -> Result<(Vec<u8>, Vec<f32>)> {
     assert!(cols.is_multiple_of(32), "Q8_0 K must be a multiple of 32");
     let groups = cols / 32;
     let expect = rows * groups * 34;

@@ -1,4 +1,0 @@
-@workgroup_size(64, 1, 1)
-kernel scale (@binding(0) src: buf<f32>, @binding(1) dst: buf<f32>) {
-    dst[global_id().x] = src[global_id().x] * 2.0;
-}

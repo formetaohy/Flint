@@ -1,7 +1,8 @@
-pub mod math;
-pub mod nn;
-pub mod quant;
-pub mod tensor;
+mod control_flow;
+mod layout;
+mod math;
+mod nn;
+mod quant;
 
 use std::collections::HashMap;
 
@@ -10,7 +11,7 @@ use flint_error::{Error, Result};
 use crate::graph::Node;
 use crate::tensor::{Data, Tensor};
 
-pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
+pub(crate) fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
     match node.op_type.as_str() {
         "Add" => math::arith(env, node, |a, b| a + b, |a, b| a + b),
         "Sub" => math::arith(env, node, |a, b| a - b, |a, b| a - b),
@@ -46,7 +47,7 @@ pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
         "Exp" => math::unary_f32(env, node, f32::exp),
         "Log" => math::unary_f32(env, node, f32::ln),
         "Sqrt" => math::unary_f32(env, node, f32::sqrt),
-        "Erf" => math::unary_f32(env, node, erf),
+        "Erf" => math::unary_f32(env, node, math::erf),
         "Relu" => math::unary_f32(env, node, |x| x.max(0.0)),
         "LeakyRelu" => math::leaky_relu(env, node),
         "Sigmoid" => math::unary_f32(env, node, |x| 1.0 / (1.0 + (-x).exp())),
@@ -68,32 +69,32 @@ pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
         "ArgMax" => math::argmax(env, node, true),
         "ArgMin" => math::argmax(env, node, false),
 
-        "Shape" => tensor::shape(env, node),
-        "Size" => tensor::size(env, node),
-        "Reshape" => tensor::reshape(env, node),
-        "Transpose" => tensor::transpose(env, node),
-        "Concat" => tensor::concat(env, node),
-        "Split" => tensor::split(env, node),
-        "Slice" => tensor::slice(env, node),
-        "Gather" => tensor::gather(env, node),
-        "GatherElements" => tensor::gather_elements(env, node),
-        "GatherND" => tensor::gather_nd(env, node),
-        "Squeeze" => tensor::squeeze(env, node),
-        "Unsqueeze" => tensor::unsqueeze(env, node),
-        "Flatten" => tensor::flatten(env, node),
-        "Expand" => tensor::expand(env, node),
-        "Tile" => tensor::tile(env, node),
-        "ConstantOfShape" => tensor::constant_of_shape(env, node),
-        "Range" => tensor::range(env, node),
-        "Identity" => tensor::identity(env, node),
-        "Constant" => tensor::constant(env, node),
-        "Cast" => tensor::cast(env, node),
-        "CastLike" => tensor::cast_like(env, node),
-        "Pad" => tensor::pad(env, node),
-        "TopK" => tensor::topk(env, node),
-        "NonZero" => tensor::nonzero(env, node),
-        "ScatterND" => tensor::scatter_nd(env, node),
-        "ScatterElements" => tensor::scatter_elements(env, node),
+        "Shape" => layout::shape(env, node),
+        "Size" => layout::size(env, node),
+        "Reshape" => layout::reshape(env, node),
+        "Transpose" => layout::transpose(env, node),
+        "Concat" => layout::concat(env, node),
+        "Split" => layout::split(env, node),
+        "Slice" => layout::slice(env, node),
+        "Gather" => layout::gather(env, node),
+        "GatherElements" => layout::gather_elements(env, node),
+        "GatherND" => layout::gather_nd(env, node),
+        "Squeeze" => layout::squeeze(env, node),
+        "Unsqueeze" => layout::unsqueeze(env, node),
+        "Flatten" => layout::flatten(env, node),
+        "Expand" => layout::expand(env, node),
+        "Tile" => layout::tile(env, node),
+        "ConstantOfShape" => layout::constant_of_shape(env, node),
+        "Range" => layout::range(env, node),
+        "Identity" => layout::identity(env, node),
+        "Constant" => layout::constant(env, node),
+        "Cast" => layout::cast(env, node),
+        "CastLike" => layout::cast_like(env, node),
+        "Pad" => layout::pad(env, node),
+        "TopK" => layout::topk(env, node),
+        "NonZero" => layout::nonzero(env, node),
+        "ScatterND" => layout::scatter_nd(env, node),
+        "ScatterElements" => layout::scatter_elements(env, node),
 
         "MatMul" => nn::matmul(env, node),
         "Gemm" => nn::gemm(env, node),
@@ -111,8 +112,8 @@ pub fn run(node: &Node, env: &mut HashMap<String, Tensor>) -> Result<()> {
         "DequantizeLinear" => quant::dequantize_linear(env, node),
         "MatMulInteger" => quant::matmul_integer(env, node),
 
-        "If" => crate::graph_ops::if_op(env, node),
-        "Loop" => crate::graph_ops::loop_op(env, node),
+        "If" => control_flow::if_op(env, node),
+        "Loop" => control_flow::loop_op(env, node),
 
         other => Err(Error::Model(format!("unsupported operator {other:?}"))),
     }
@@ -195,16 +196,4 @@ pub(crate) fn axes_attr(node: &Node, rank: usize) -> Result<Option<Vec<usize>>> 
             .map(|&a| norm_axis(a, rank))
             .collect::<Result<_>>()?,
     ))
-}
-
-pub(crate) fn erf(x: f32) -> f32 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let y = 1.0
-        - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_72) * t
-            + 0.254_829_6)
-            * t
-            * (-x * x).exp();
-    sign * y
 }

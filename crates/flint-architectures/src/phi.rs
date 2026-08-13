@@ -8,9 +8,7 @@ use flint_tensor::Weight;
 use serde_json::Value;
 
 use crate::keys::{gguf_key, gguf_moe_key, hf_key};
-use crate::transformer::{
-    MoeConfig, RopeSpec, TransformerConfig, TransformerModel, transformer_role,
-};
+use crate::transformer::{Config, Model, MoeConfig, RopeSpec, role as dense_role};
 
 fn moe_key(name: &str) -> Option<(String, MoEPart)> {
     let rest = name.strip_prefix("model.layers.")?;
@@ -39,8 +37,8 @@ fn moe_key(name: &str) -> Option<(String, MoEPart)> {
     Some((format!("{prefix}.experts.{e}"), part))
 }
 
-fn parse_transformer(v: &Value) -> Result<TransformerConfig> {
-    let mut cfg = TransformerConfig::parse(v, true)?;
+fn parse_transformer(v: &Value) -> Result<Config> {
+    let mut cfg = Config::parse(v, true)?;
     let hd = cfg.head_dims[0];
     let factor = v
         .get("partial_rotary_factor")
@@ -108,8 +106,8 @@ fn parse_transformer(v: &Value) -> Result<TransformerConfig> {
     Ok(cfg)
 }
 
-fn parse_moe(v: &Value) -> Result<TransformerConfig> {
-    let mut cfg = TransformerConfig::parse(v, false)?;
+fn parse_moe(v: &Value) -> Result<Config> {
+    let mut cfg = Config::parse(v, false)?;
     cfg.layernorm = true;
     cfg.lm_bias = v
         .get("lm_head_bias")
@@ -132,18 +130,18 @@ fn parse_moe(v: &Value) -> Result<TransformerConfig> {
     Ok(cfg)
 }
 
-fn role(key: &str) -> Role {
+fn phi_role(key: &str) -> Role {
     if key == "embed_tokens.weight" {
         Role::I8
     } else {
-        transformer_role(key)
+        dense_role(key)
     }
 }
 
-fn plan(gguf: bool) -> Plan {
+fn phi_plan(gguf: bool) -> Plan {
     Plan {
         key: if gguf { gguf_key } else { hf_key },
-        role,
+        role: phi_role,
     }
 }
 
@@ -152,21 +150,21 @@ pub fn load(
     v: &Value,
     max_seq: u32,
     backend: &Backend,
-) -> Result<TransformerModel> {
+) -> Result<Model> {
     let cfg = parse_transformer(v)?;
     let gguf = source.kind() == CheckpointKind::Gguf;
     let extra = if gguf {
-        gguf_split_qkv(backend, source, &cfg, role)?
+        gguf_split_qkv(backend, source, &cfg, phi_role)?
     } else {
-        hf_split_fused(backend, source, &cfg, role)?
+        hf_split_fused(backend, source, &cfg, phi_role)?
     };
-    TransformerModel::load_extra(source, cfg, &plan(gguf), extra, max_seq, backend)
+    Model::load_extra(source, cfg, &phi_plan(gguf), extra, max_seq, backend)
 }
 
 fn hf_split_fused(
     backend: &Backend,
     source: &dyn Checkpoint,
-    cfg: &TransformerConfig,
+    cfg: &Config,
     role: fn(&str) -> Role,
 ) -> Result<Vec<(String, Weight)>> {
     let hd = cfg.head_dims[0];
@@ -229,19 +227,19 @@ pub fn load_moe(
     v: &Value,
     max_seq: u32,
     backend: &Backend,
-) -> Result<TransformerModel> {
+) -> Result<Model> {
     let cfg = parse_moe(v)?;
     let experts = cfg.moe.expect("MoE config").experts;
     let gguf = source.kind() == CheckpointKind::Gguf;
     let plan = if gguf {
         Plan {
             key: gguf_key,
-            role,
+            role: phi_role,
         }
     } else {
         Plan {
             key: hf_key_moe,
-            role,
+            role: phi_role,
         }
     };
     let moe_plan = MoEPlan {
@@ -249,8 +247,8 @@ pub fn load_moe(
         experts,
         shared: false,
     };
-    let extra = load_moe_experts(backend, source, &moe_plan, transformer_role)?;
-    TransformerModel::load_extra(source, cfg, &plan, extra, max_seq, backend)
+    let extra = load_moe_experts(backend, source, &moe_plan, dense_role)?;
+    Model::load_extra(source, cfg, &plan, extra, max_seq, backend)
 }
 
 fn f32_list(v: &Value, key: &str) -> Result<Vec<f32>> {
@@ -268,10 +266,10 @@ fn f32_list(v: &Value, key: &str) -> Result<Vec<f32>> {
         .unwrap_or_else(|| Err(Error::Config(format!("missing {key:?}"))))
 }
 
-pub fn gguf_split_qkv(
+fn gguf_split_qkv(
     backend: &Backend,
     source: &dyn Checkpoint,
-    cfg: &TransformerConfig,
+    cfg: &Config,
     role: fn(&str) -> Role,
 ) -> Result<Vec<(String, Weight)>> {
     let hd = cfg.head_dims[0];

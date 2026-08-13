@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use safetensors::serialize;
 use safetensors::tensor::{Dtype, TensorView};
 
-use flint_checkpoint::{Checkpoint, CheckpointKind, Safetensors, write_tensors};
+use flint_checkpoint::{Checkpoint, CheckpointKind, SafetensorEntry, Safetensors, write_tensors};
 
 fn tmp_dir(test: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("flint-safetensors-{test}-{}", std::process::id()));
@@ -21,14 +21,28 @@ fn tensor(name: &str, shape: &[u32], data: &[f32]) -> (String, Vec<u32>, Vec<u8>
     (name.to_string(), shape.to_vec(), bytes, false)
 }
 
+fn entry<'a>(name: &'a str, shape: &'a [u32], data: &'a [u8], bf16: bool) -> SafetensorEntry<'a> {
+    SafetensorEntry {
+        name,
+        shape,
+        bytes: data,
+        bf16,
+    }
+}
+
 #[test]
 fn single_shard_roundtrip_without_index() {
     let dir = tmp_dir("single");
-    let tensors = vec![
-        tensor("a", &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-        tensor("b", &[4], &[-1.0, 0.0, 2.5, 1e30]),
-    ];
-    write_tensors(&dir.join("model.safetensors"), &tensors).unwrap();
+    let a = tensor("a", &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let b = tensor("b", &[4], &[-1.0, 0.0, 2.5, 1e30]);
+    write_tensors(
+        &dir.join("model.safetensors"),
+        &[
+            entry(&a.0, &a.1, &a.2, a.3),
+            entry(&b.0, &b.1, &b.2, b.3),
+        ],
+    )
+    .unwrap();
     std::fs::write(dir.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
 
     let st = Safetensors::open(&dir).unwrap();
@@ -48,7 +62,7 @@ fn single_shard_roundtrip_without_index() {
     let b = st.read("b").unwrap();
     assert_eq!(b.data.into_f32().unwrap(), vec![-1.0, 0.0, 2.5, 1e30]);
 
-    let cfg = st.config_json().unwrap().unwrap();
+    let cfg = st.config_json().unwrap();
     assert_eq!(cfg["model_type"], "llama");
 
     assert!(
@@ -68,7 +82,12 @@ fn bf16_and_f16_decode_to_f32() {
         .collect();
     write_tensors(
         &dir.join("model.safetensors"),
-        &[("b".to_string(), vec![3], bf16_bytes, true)],
+        &[SafetensorEntry {
+            name: "b",
+            shape: &[3],
+            bytes: &bf16_bytes,
+            bf16: true,
+        }],
     )
     .unwrap();
 
@@ -101,14 +120,16 @@ fn bf16_and_f16_decode_to_f32() {
 #[test]
 fn sharded_index_dispatches_across_files() {
     let dir = tmp_dir("sharded");
+    let q = tensor("layers.0.q.weight", &[16, 64], &[1.0; 1024]);
     write_tensors(
         &dir.join("model-00001-of-00002.safetensors"),
-        &[tensor("layers.0.q.weight", &[16, 64], &[1.0; 1024])],
+        &[entry(&q.0, &q.1, &q.2, q.3)],
     )
     .unwrap();
+    let n = tensor("norm.weight", &[64], &[2.0; 64]);
     write_tensors(
         &dir.join("model-00002-of-00002.safetensors"),
-        &[tensor("norm.weight", &[64], &[2.0; 64])],
+        &[entry(&n.0, &n.1, &n.2, n.3)],
     )
     .unwrap();
     std::fs::write(

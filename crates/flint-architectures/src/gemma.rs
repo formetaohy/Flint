@@ -3,10 +3,10 @@ use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::{Error, Result};
 use serde_json::Value;
 
-use crate::transformer::{TransformerConfig, TransformerModel, transformer_plan};
+use crate::transformer::{Config, Model, plan};
 
-pub fn parse_config(v: &Value) -> Result<TransformerConfig> {
-    let mut cfg = TransformerConfig::parse(v, true)?;
+pub fn parse_config(v: &Value) -> Result<Config> {
+    let mut cfg = Config::parse(v, true)?;
     cfg.embed_scale = (cfg.hidden as f32).sqrt();
     cfg.qk_norm = v.get("qk_norm").and_then(Value::as_bool).unwrap_or(true);
     cfg.sandwich = true;
@@ -40,13 +40,13 @@ pub fn load(
     v: &Value,
     max_seq: u32,
     backend: &Backend,
-) -> Result<TransformerModel> {
+) -> Result<Model> {
     let mut cfg = parse_config(v)?;
     cfg.hf_names = source.kind() == CheckpointKind::Safetensors;
-    TransformerModel::load(
+    Model::load(
         source,
         cfg,
-        &transformer_plan(source.kind() == CheckpointKind::Gguf),
+        &plan(source.kind() == CheckpointKind::Gguf),
         max_seq,
         backend,
     )

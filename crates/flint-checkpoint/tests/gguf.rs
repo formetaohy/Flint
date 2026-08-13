@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+﻿use std::path::{Path, PathBuf};
 
 use flint_checkpoint::{Checkpoint, CheckpointKind, Gguf, MetaVal};
 
@@ -116,9 +116,9 @@ fn reads_metadata_and_tensors() {
     let gguf = Gguf::open(&path).unwrap();
 
     assert_eq!(gguf.kind(), CheckpointKind::Gguf);
-    assert!(gguf.config_json().unwrap().is_none());
+    assert!(gguf.config_json().is_err());
 
-    let meta = gguf.metadata();
+    let meta = gguf.metadata().unwrap();
     assert_eq!(meta.str("general.architecture"), Some("llama"));
     assert_eq!(meta.u32("llama.block_count"), Some(24));
     assert_eq!(
@@ -174,22 +174,22 @@ fn open_dispatches_on_directory_contents() {
     let dir = tmp_dir("open");
     std::fs::write(dir.join("m.gguf"), synth_gguf()).unwrap();
     assert_eq!(
-        flint_checkpoint::open(&dir).unwrap().kind(),
+        flint_checkpoint::open_checkpoint(&dir).unwrap().kind(),
         CheckpointKind::Gguf
     );
 
     std::fs::write(dir.join("m-00001.gguf"), synth_gguf()).unwrap();
     assert!(
-        err_str(flint_checkpoint::open(&dir)).contains("shards"),
+        err_str(flint_checkpoint::open_checkpoint(&dir)).contains("shards"),
         "split shards fail fast"
     );
     std::fs::remove_dir_all(&dir).ok();
 
     let empty = tmp_dir("empty");
-    assert!(flint_checkpoint::open(&empty).is_err());
+    assert!(flint_checkpoint::open_checkpoint(&empty).is_err());
     std::fs::remove_dir_all(&empty).ok();
 
-    assert!(flint_checkpoint::open(Path::new("./no-such-dir-flint")).is_err());
+    assert!(flint_checkpoint::open_checkpoint(Path::new("./no-such-dir-flint")).is_err());
 }
 
 fn synth_full_types() -> Vec<u8> {
@@ -228,7 +228,7 @@ fn reads_every_metadata_value_type() {
     let path = dir.join("m.gguf");
     std::fs::write(&path, synth_full_types()).unwrap();
     let gguf = Gguf::open(&path).unwrap();
-    let meta = gguf.metadata();
+    let meta = gguf.metadata().unwrap();
 
     assert_eq!(meta.u64("t_u8"), Some(200));
     assert_eq!(meta.u64("t_i8"), None, "negative i8 is not a u64");
@@ -279,7 +279,7 @@ fn rejects_unknown_value_types_and_versions() {
     let p = dir.join("v2.gguf");
     std::fs::write(&p, &v2).unwrap();
     assert_eq!(
-        Gguf::open(&p).unwrap().metadata().u32("llama.block_count"),
+        Gguf::open(&p).unwrap().metadata().unwrap().u32("llama.block_count"),
         Some(24)
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -307,20 +307,20 @@ fn writer_roundtrips_through_reader() {
 
     let g = Gguf::open(&dir.join("m.gguf")).unwrap();
     assert_eq!(g.kind(), CheckpointKind::Gguf);
-    assert_eq!(g.metadata().str("general.architecture"), Some("llama"));
-    assert_eq!(g.metadata().u32("llama.block_count"), Some(2));
-    assert_eq!(g.metadata().f64("llama.rope.freq_base"), Some(10000.0));
-    assert_eq!(g.metadata().get("llama.bool"), Some(&MetaVal::Bool(true)));
+    assert_eq!(g.metadata().unwrap().str("general.architecture"), Some("llama"));
+    assert_eq!(g.metadata().unwrap().u32("llama.block_count"), Some(2));
+    assert_eq!(g.metadata().unwrap().f64("llama.rope.freq_base"), Some(10000.0));
+    assert_eq!(g.metadata().unwrap().get("llama.bool"), Some(&MetaVal::Bool(true)));
     assert_eq!(
-        g.metadata().str_array("tokenizer.ggml.tokens"),
+        g.metadata().unwrap().str_array("tokenizer.ggml.tokens"),
         Some(vec!["a", "b", "<|endoftext|>"])
     );
     assert_eq!(
-        g.metadata().u32_array("tokenizer.ggml.token_type"),
+        g.metadata().unwrap().u32_array("tokenizer.ggml.token_type"),
         Some(vec![0, 0, 3])
     );
     assert_eq!(
-        g.metadata().f64_array("tokenizer.ggml.scores"),
+        g.metadata().unwrap().f64_array("tokenizer.ggml.scores"),
         Some(vec![1.5, 0.5, -1.0])
     );
 

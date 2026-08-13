@@ -26,27 +26,3 @@ impl KvCache {
         backend.zero_fill(&self.v);
     }
 }
-
-pub struct RecurrentState {
-    pub recur: Tensor,
-    pub conv: Tensor,
-}
-
-impl RecurrentState {
-    pub fn new(backend: &Backend, recur_shape: [u32; 3], conv_dim: u32) -> Self {
-        Self {
-            recur: backend.zero_tensor(&recur_shape),
-            conv: backend.zero_tensor(&[conv_dim, 3]),
-        }
-    }
-
-    pub fn zero(&self, backend: &Backend) {
-        backend.zero_fill(&self.recur);
-        backend.zero_fill(&self.conv);
-    }
-
-    pub fn copy_from(&self, backend: &Backend, src: &RecurrentState) {
-        backend.copy(&src.recur, &self.recur);
-        backend.copy(&src.conv, &self.conv);
-    }
-}

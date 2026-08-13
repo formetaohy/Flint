@@ -4,11 +4,9 @@ use flint_error::{Error, Result};
 use flint_model::ops::Act;
 use serde_json::{Value, json};
 
-use crate::transformer::{
-    PerLayerConfig, RopeSpec, TransformerConfig, TransformerModel, transformer_plan,
-};
+use crate::transformer::{Config, Model, PerLayerConfig, RopeSpec, plan};
 
-pub fn parse_config(v: &Value) -> Result<TransformerConfig> {
+pub fn parse_config(v: &Value) -> Result<Config> {
     let base = v.get("text_config").unwrap_or(v);
     let t = if base.get("rope_theta").is_some() {
         base.clone()
@@ -22,7 +20,7 @@ pub fn parse_config(v: &Value) -> Result<TransformerConfig> {
             .unwrap_or_else(|| json!(10000.0));
         owned
     };
-    let mut cfg = TransformerConfig::parse(&t, true)?;
+    let mut cfg = Config::parse(&t, true)?;
     cfg.embed_scale = (cfg.hidden as f32).sqrt();
     cfg.qk_norm = true;
     cfg.v_norm = true;
@@ -144,13 +142,13 @@ pub fn load(
     v: &Value,
     max_seq: u32,
     backend: &Backend,
-) -> Result<TransformerModel> {
+) -> Result<Model> {
     let mut cfg = parse_config(v)?;
     cfg.hf_names = source.kind() == CheckpointKind::Safetensors;
-    TransformerModel::load(
+    Model::load(
         source,
         cfg,
-        &transformer_plan(source.kind() == CheckpointKind::Gguf),
+        &plan(source.kind() == CheckpointKind::Gguf),
         max_seq,
         backend,
     )

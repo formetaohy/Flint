@@ -131,13 +131,15 @@ impl Checkpoint for SynthCheckpoint {
         })
     }
 
-    fn metadata(&self) -> &Metadata {
+    fn metadata(&self) -> Result<&Metadata> {
         static EMPTY: std::sync::LazyLock<Metadata> = std::sync::LazyLock::new(Metadata::default);
-        &EMPTY
+        Ok(&EMPTY)
     }
 
-    fn config_json(&self) -> Result<Option<serde_json::Value>> {
-        Ok(None)
+    fn config_json(&self) -> Result<serde_json::Value> {
+        Err(flint_error::Error::Model(
+            "synthetic checkpoints carry no config.json".into(),
+        ))
     }
 
     fn kind(&self) -> CheckpointKind {

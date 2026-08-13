@@ -1,6 +1,0 @@
-@workgroup_size(256, 1, 1)
-kernel bias (@binding(0) x: buf<f32>, @binding(1) bias: buf<f32>, N_ELEM: u32, DIM: u32) {
-    if global_id().x < N_ELEM {
-        x[global_id().x] = x[global_id().x] + bias[global_id().x % DIM];
-    }
-}

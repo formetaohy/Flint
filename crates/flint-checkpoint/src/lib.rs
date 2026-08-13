@@ -7,9 +7,8 @@ use std::path::Path;
 
 use flint_error::{Error, Result};
 
-pub use gguf::Gguf;
-pub use gguf::GgufWriter;
-pub use safetensors::{Safetensors, write_tensors};
+pub use gguf::{Gguf, GgufWriter};
+pub use safetensors::{SafetensorEntry, Safetensors, write_tensors};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MetaVal {
@@ -116,7 +115,7 @@ pub enum TensorData {
 
     Bf16Bytes(Vec<u8>),
 
-    Q8Blocks { bytes: Vec<u8>, numel: usize },
+    Q8_0 { bytes: Vec<u8>, numel: usize },
 }
 
 impl TensorData {
@@ -125,9 +124,9 @@ impl TensorData {
             TensorData::F32(v) => Ok(v),
             TensorData::Bf16Bytes(b) => Ok(b
                 .chunks_exact(2)
-                .map(|c| saturn_core::num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .map(|c| flint_num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect()),
-            TensorData::Q8Blocks { bytes, numel } => {
+            TensorData::Q8_0 { bytes, numel } => {
                 dequant::to_f32(dequant::GgmlType::Q8_0, &bytes, numel)
             }
         }
@@ -148,12 +147,12 @@ pub enum CheckpointKind {
 pub trait Checkpoint {
     fn names(&self) -> Vec<String>;
     fn read(&self, name: &str) -> Result<RawTensor>;
-    fn metadata(&self) -> &Metadata;
-    fn config_json(&self) -> Result<Option<serde_json::Value>>;
+    fn metadata(&self) -> Result<&Metadata>;
+    fn config_json(&self) -> Result<serde_json::Value>;
     fn kind(&self) -> CheckpointKind;
 }
 
-pub fn open(model_dir: &Path) -> Result<Box<dyn Checkpoint>> {
+pub fn open_checkpoint(model_dir: &Path) -> Result<Box<dyn Checkpoint>> {
     if let Some(gguf) = find_gguf(model_dir)? {
         return Ok(Box::new(Gguf::open(&gguf)?));
     }
@@ -162,7 +161,7 @@ pub fn open(model_dir: &Path) -> Result<Box<dyn Checkpoint>> {
 
 fn find_gguf(model_dir: &Path) -> Result<Option<std::path::PathBuf>> {
     let mut found: Vec<_> = std::fs::read_dir(model_dir)
-        .map_err(|e| Error::Model(format!("cannot read {}: {e}", model_dir.display())))?
+        .map_err(|e| Error::Checkpoint(format!("cannot read {}: {e}", model_dir.display())))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "gguf"))
@@ -170,7 +169,7 @@ fn find_gguf(model_dir: &Path) -> Result<Option<std::path::PathBuf>> {
     match found.len() {
         0 => Ok(None),
         1 => Ok(Some(found.remove(0))),
-        _ => Err(Error::Model(format!(
+        _ => Err(Error::Checkpoint(format!(
             "multiple .gguf shards in {} — merge into one file",
             model_dir.display()
         ))),

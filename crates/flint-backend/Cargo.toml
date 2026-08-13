@@ -1,16 +1,16 @@
-[package]
+﻿[package]
 name = "flint-backend"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]
 bytemuck.workspace = true
 flint-error.workspace = true
+flint-gpu.workspace = true
 flint-kernel.workspace = true
 flint-tensor.workspace = true
-saturn-api = { path = "../../saturn/crates/saturn-api" }
-saturn-core = { path = "../../saturn/crates/saturn-core" }
 
 [dev-dependencies]
 flint-profiler = { path = "../flint-profiler" }
-flint-tensor.workspace = true
+flint-num.workspace = true

@@ -6,6 +6,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("gpu: {0}")]
     Gpu(String),
+    #[error("checkpoint: {0}")]
+    Checkpoint(String),
     #[error("model: {0}")]
     Model(String),
     #[error("config: {0}")]
@@ -14,16 +16,4 @@ pub enum Error {
     Tokenizer(String),
     #[error("profiler: {0}")]
     Profiler(String),
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(e: serde_json::Error) -> Self {
-        Error::Config(e.to_string())
-    }
-}
-
-impl From<saturn_core::Error> for Error {
-    fn from(e: saturn_core::Error) -> Self {
-        Error::Gpu(e.to_string())
-    }
 }

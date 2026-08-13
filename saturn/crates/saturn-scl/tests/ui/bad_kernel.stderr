@@ -1,8 +1,0 @@
-error: scl/bad_kernel.scl is invalid:
-       $DIR/tests/ui/scl/bad_kernel.scl:4:12: type mismatch: expected Scalar(F32), found Scalar(U32)
- --> tests/ui/bad_kernel.rs:4:13
-  |
-4 |     let _ = scl!("bad_kernel.scl");
-  |             ^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: this error originates in the macro `scl` (in Nightly builds, run with -Z macro-backtrace for more info)

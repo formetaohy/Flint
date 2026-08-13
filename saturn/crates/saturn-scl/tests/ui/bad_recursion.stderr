@@ -1,8 +1,0 @@
-error: scl/bad_recursion.scl is invalid:
-       $DIR/tests/ui/scl/bad_recursion.scl:3:12: recursive call to 'f'
- --> tests/ui/bad_recursion.rs:4:13
-  |
-4 |     let _ = scl!("bad_recursion.scl");
-  |             ^^^^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: this error originates in the macro `scl` (in Nightly builds, run with -Z macro-backtrace for more info)

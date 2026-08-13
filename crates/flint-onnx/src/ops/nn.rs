@@ -518,10 +518,10 @@ pub(crate) fn global_avg_pool(env: &mut HashMap<String, Tensor>, node: &Node) ->
     let inner: usize = x.shape[2..].iter().product();
     let (n, c) = (x.shape[0], x.shape[1]);
     let mut out = vec![0f32; n * c];
-    for i in 0..n * c {
+    for (i, slot) in out.iter_mut().enumerate() {
         let base = i * inner;
         let sum: f32 = v[base..base + inner].iter().sum();
-        out[i] = sum / inner as f32;
+        *slot = sum / inner as f32;
     }
     let mut shape = vec![n, c];
     shape.extend(std::iter::repeat_n(1, spatial));

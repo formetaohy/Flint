@@ -1,4 +1,0 @@
-@workgroup_size(4, 4, 1)
-kernel blk (@binding(0) out: buf<u32>) {
-    out[global_id().y * 8 + global_id().x] = group_id().y * 16 + group_id().x;
-}

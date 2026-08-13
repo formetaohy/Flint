@@ -22,8 +22,8 @@ impl Session {
         Ok(Session { graph, env })
     }
 
-    pub fn graph(&self) -> &Graph {
-        &self.graph
+    pub fn input_names(&self) -> impl Iterator<Item = &str> {
+        self.graph.inputs.iter().map(|v| v.name.as_str())
     }
 
     pub fn set_input(&mut self, name: &str, t: Tensor) -> Result<()> {

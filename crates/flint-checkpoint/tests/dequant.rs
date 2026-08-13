@@ -1,6 +1,6 @@
 use flint_checkpoint::TensorData;
 use flint_checkpoint::dequant::{GgmlType, to_f32};
-use saturn_core::num::f16_to_f32;
+use flint_num::f16_to_f32;
 
 #[test]
 fn f16_covers_the_ieee754_cases() {

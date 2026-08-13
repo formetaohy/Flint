@@ -2,7 +2,6 @@ pub mod chat;
 pub mod gemma;
 pub mod gemma4;
 pub mod gguf_config;
-pub mod gguf_tokenizer;
 pub mod keys;
 pub mod llama;
 pub mod phi;
@@ -12,7 +11,7 @@ pub mod transformer;
 use std::path::Path;
 
 use flint_backend::Backend;
-use flint_checkpoint::{Checkpoint, CheckpointKind, open};
+use flint_checkpoint::{Checkpoint, CheckpointKind, open_checkpoint};
 use flint_error::{Error, Result};
 use flint_model::LanguageModel;
 use flint_tokenizer::Tokenizer;
@@ -88,7 +87,7 @@ fn llama_chat(config: &serde_json::Value) -> Box<dyn ChatFormat> {
 }
 
 pub fn load(model_dir: &Path, max_seq: u32, backend: &Backend) -> Result<ChatModel> {
-    let source = open(model_dir)?;
+    let source = open_checkpoint(model_dir)?;
     let family = family_of(source.as_ref())?;
     let config = config_for(source.as_ref(), family)?;
     let model: Box<dyn LanguageModel> = match family {
@@ -99,7 +98,7 @@ pub fn load(model_dir: &Path, max_seq: u32, backend: &Backend) -> Result<ChatMod
         Family::PhiMoe => Box::new(phi::load_moe(source.as_ref(), &config, max_seq, backend)?),
         Family::Gemma4 => Box::new(gemma4::load(source.as_ref(), &config, max_seq, backend)?),
     };
-    let tokenizer = crate::gguf_tokenizer::load(model_dir, source.as_ref())?;
+    let tokenizer = flint_tokenizer::load_gguf(model_dir, source.as_ref())?;
     let chat = family.chat_format(&config);
     let stop = stop_tokens(model.eos(), &tokenizer, chat.stop_literals());
     Ok(ChatModel {
@@ -125,14 +124,11 @@ fn stop_tokens(eos: &[u32], tokenizer: &Tokenizer, literals: &[&str]) -> Vec<u32
 fn family_of(source: &dyn Checkpoint) -> Result<Family> {
     match source.kind() {
         CheckpointKind::Safetensors => {
-            let v = source
-                .config_json()?
-                .ok_or_else(|| Error::Config("safetensors checkpoint has no config.json".into()))?;
-            Family::from_model_type(v["model_type"].as_str())
+            Family::from_model_type(source.config_json()?["model_type"].as_str())
         }
         CheckpointKind::Gguf => {
             let arch = source
-                .metadata()
+                .metadata()?
                 .str("general.architecture")
                 .ok_or_else(|| Error::Config("GGUF missing general.architecture".into()))?;
             Family::from_gguf_arch(arch)
@@ -142,9 +138,7 @@ fn family_of(source: &dyn Checkpoint) -> Result<Family> {
 
 fn config_for(source: &dyn Checkpoint, family: Family) -> Result<Value> {
     match source.kind() {
-        CheckpointKind::Safetensors => source
-            .config_json()?
-            .ok_or_else(|| Error::Config("safetensors checkpoint has no config.json".into())),
+        CheckpointKind::Safetensors => source.config_json(),
         CheckpointKind::Gguf => gguf_config::synthesize_config(source, family),
     }
 }

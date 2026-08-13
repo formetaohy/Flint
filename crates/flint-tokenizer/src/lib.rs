@@ -5,6 +5,9 @@ use tokenizers::tokenizer::step_decode_stream;
 
 use flint_error::{Error, Result};
 
+mod gguf;
+
+pub use gguf::{from_metadata, from_source, load_gguf};
 pub struct Tokenizer {
     inner: HfTokenizer,
 }

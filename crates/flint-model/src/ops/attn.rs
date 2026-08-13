@@ -1,544 +1,142 @@
-use flint_backend::{Backend, Binding, Pass};
+use flint_backend::{Backend, Binding, Commands, shader};
 use flint_error::Result;
-use flint_kernel::name;
-use flint_tensor::{Tensor, Weight};
+use flint_tensor::Tensor;
 
-use crate::ops::NormMode;
-use crate::step::{ATTN_SEGS, MAX_GQA};
+pub const ATTN_SEGS: u32 = 32;
 
-const NORM_ROPE_MODE: u32 = 4;
+pub const MAX_GQA: u32 = 8;
 
-pub fn norm(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    mode: NormMode,
-    x: Binding<'_>,
-    weight: &Tensor,
-    gate: Binding<'_>,
-    y: Binding<'_>,
-    rows: u32,
-    dim: u32,
-    w_dim: u32,
-    eps: f32,
-) -> Result<()> {
-    norm_strided(
-        backend, pass, mode, x, weight, gate, y, rows, dim, w_dim, eps, dim,
-    )
+pub const ATTN_PAD: u32 = 2;
+
+pub struct AttnSpec<'a> {
+    pub q_heads: u32,
+    pub window: u32,
+    pub stride: u32,
+    pub scale: f32,
+    pub m: u32,
+    pub args: &'a Tensor,
 }
 
-pub fn norm_strided(
+pub fn attn(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    mode: NormMode,
-    x: Binding<'_>,
-    weight: &Tensor,
-    gate: Binding<'_>,
+    commands: &mut Commands<'_>,
+    q: Binding<'_>,
+    kv: &crate::cache::KvCache,
+    scratch: &Tensor,
     y: Binding<'_>,
-    rows: u32,
-    dim: u32,
-    w_dim: u32,
-    eps: f32,
-    stride: u32,
+    spec: &AttnSpec<'_>,
 ) -> Result<()> {
-    norm_impl(
-        backend, pass, mode, x, weight, gate, y, rows, dim, w_dim, eps, stride, 0, 0, 0,
-    )
-}
+    assert!(
+        spec.q_heads / kv.kv_heads <= MAX_GQA,
+        "GQA ratio {} exceeds the attention shader's {MAX_GQA} head slots",
+        spec.q_heads / kv.kv_heads
+    );
 
-pub fn norm_per_layer(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    x: Binding<'_>,
-    weight: &Tensor,
-    y: Binding<'_>,
-    rows: u32,
-    dim: u32,
-    eps: f32,
-    layers: u32,
-    stride: u32,
-) -> Result<()> {
-    norm_impl(
-        backend,
-        pass,
-        NormMode::Direct,
-        x,
-        weight,
-        x,
-        y,
-        rows,
-        dim,
-        dim,
-        eps,
-        stride,
-        1,
-        layers,
-        stride,
-    )
-}
-
-fn norm_impl(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    mode: NormMode,
-    x: Binding<'_>,
-    weight: &Tensor,
-    gate: Binding<'_>,
-    y: Binding<'_>,
-    rows: u32,
-    dim: u32,
-    w_dim: u32,
-    eps: f32,
-    stride: u32,
-    ple: u32,
-    ple_layers: u32,
-    ple_stride: u32,
-) -> Result<()> {
     backend.dispatch(
-        pass,
-        name::NORM,
+        commands,
+        shader::ATTN,
         &[
-            ("MODE", mode as u32 as f64),
-            ("DIM", dim as f64),
-            ("W_DIM", w_dim as f64),
-            ("EPS", eps as f64),
-            ("HEADS", 1.0),
-            ("ROT", 2.0),
-            ("COS_STRIDE", 1.0),
-            ("STRIDE", stride as f64),
-            ("PLE", ple as f64),
-            ("PLE_LAYERS", ple_layers as f64),
-            ("PLE_STRIDE", ple_stride as f64),
-        ],
-        &[x, Binding::Full(weight), gate, y, gate, gate, gate],
-        [rows, 1, 1],
-    )
-}
-pub fn norm_rope(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    x: Binding<'_>,
-    weight: &Tensor,
-    y: Binding<'_>,
-    rows: u32,
-    dim: u32,
-    eps: f32,
-    heads: u32,
-    rot: u32,
-    cos: &Tensor,
-    sin: &Tensor,
-    args: &Tensor,
-) -> Result<()> {
-    backend.dispatch(
-        pass,
-        name::NORM,
-        &[
-            ("MODE", NORM_ROPE_MODE as f64),
-            ("DIM", dim as f64),
-            ("W_DIM", dim as f64),
-            ("EPS", eps as f64),
-            ("HEADS", heads as f64),
-            ("ROT", rot as f64),
-            ("COS_STRIDE", (rot / 2) as f64),
-            ("STRIDE", dim as f64),
-            ("PLE", 0.0),
-            ("PLE_LAYERS", 0.0),
-            ("PLE_STRIDE", 0.0),
+            ("N_HEADS", spec.q_heads as f64),
+            ("KV_HEADS", kv.kv_heads as f64),
+            ("HEAD_DIM", kv.head_dim as f64),
+            ("MAX_SEQ", kv.max_seq as f64),
+            ("SCALE", spec.scale as f64),
+            ("WINDOW", spec.window as f64),
+            ("NQ_PER_KV", (spec.q_heads / kv.kv_heads) as f64),
+            ("STRIDE", spec.stride as f64),
         ],
         &[
-            x,
-            Binding::Full(weight),
-            x,
+            q,
+            Binding::Full(&kv.k),
+            Binding::Full(&kv.v),
+            Binding::Full(scratch),
+            Binding::Full(spec.args),
+        ],
+        [spec.m, kv.kv_heads, ATTN_SEGS],
+    )?;
+    backend.dispatch(
+        commands,
+        shader::MERGE_ATTN,
+        &[
+            ("N_HEADS", spec.q_heads as f64),
+            ("KV_HEADS", kv.kv_heads as f64),
+            ("HEAD_DIM", kv.head_dim as f64),
+            ("STRIDE", spec.stride as f64),
+        ],
+        &[
+            Binding::Full(scratch),
             y,
-            Binding::Full(cos),
-            Binding::Full(sin),
-            Binding::Full(args),
+            Binding::Full(spec.args),
         ],
-        [rows, 1, 1],
-    )
-}
-pub fn embed(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    ids: &Tensor,
-    table: &Weight,
-    y: Binding<'_>,
-    rows: u32,
-    dim: u32,
-    scale: f32,
-) -> Result<()> {
-    let (wdt, wd, group, scales) = match table {
-        Weight::Plain(t) => (0.0, Binding::Full(t), 128.0, Binding::Full(t)),
-        Weight::Quantized {
-            tensor: t,
-            scale: s,
-            group: g,
-        } => (1.0, Binding::Full(t), *g as f64, Binding::Full(s)),
-    };
-    embed_dispatch(
-        backend,
-        pass,
-        ids,
-        wd,
-        wd,
-        scales,
-        y,
-        rows,
-        dim,
-        scale,
-        wdt,
-        group,
-        u32::MAX as f64,
-        table.tensor().shape[0],
+        [spec.m, kv.kv_heads, 1],
     )
 }
 
-pub fn embed_split(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    ids: &Tensor,
-    table: &Weight,
-    split: u32,
-    y: Binding<'_>,
-    rows: u32,
-    dim: u32,
-    scale: f32,
-) -> Result<()> {
-    let t = match table {
-        Weight::Plain(t) => t,
-        Weight::Quantized { tensor: t, .. } => t,
-    };
-    let (wdt, group, scales) = match table {
-        Weight::Plain(_) => (0.0, 128.0, Binding::Slice(t, 0, t.byte_len())),
-        Weight::Quantized {
-            scale: s, group: g, ..
-        } => (1.0, *g as f64, Binding::Full(s)),
-    };
-    let half = split as u64 * dim as u64 * 2;
-    let t0 = Binding::Slice(t, 0, half);
-    let t1 = Binding::Slice(t, half, t.byte_len() - half);
-    embed_dispatch(
-        backend,
-        pass,
-        ids,
-        t0,
-        t1,
-        scales,
-        y,
-        rows,
-        dim,
-        scale,
-        wdt,
-        group,
-        split as f64,
-        t.shape[0],
-    )
-}
-
-fn embed_dispatch(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    ids: &Tensor,
-    w0: Binding<'_>,
-    w1: Binding<'_>,
-    scales: Binding<'_>,
-    y: Binding<'_>,
-    rows: u32,
-    dim: u32,
-    scale: f32,
-    wdt: f64,
-    group: f64,
-    split: f64,
-    table_rows: u32,
-) -> Result<()> {
-    backend.dispatch(
-        pass,
-        name::EMBED,
-        &[
-            ("M", rows as f64),
-            ("DIM", dim as f64),
-            ("SCALE", scale as f64),
-            ("WDTYPE", wdt),
-            ("GROUP", group),
-            ("SPLIT", split),
-            ("ROWS", table_rows as f64),
-        ],
-        &[Binding::Full(ids), w0, w1, scales, y],
-        [(rows * dim).div_ceil(256), 1, 1],
-    )
-}
-pub fn rope(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    cos: &Tensor,
-    sin: &Tensor,
-    x: Binding<'_>,
-    heads: u32,
-    head_dim: u32,
-    rot: u32,
-    m: u32,
-    args: &Tensor,
-) -> Result<()> {
-    backend.dispatch(
-        pass,
-        name::ROPE,
-        &[
-            ("HEADS", heads as f64),
-            ("HEAD_DIM", head_dim as f64),
-            ("ROT", rot as f64),
-            ("COS_STRIDE", (rot / 2) as f64),
-        ],
-        &[
-            Binding::Full(cos),
-            Binding::Full(sin),
-            x,
-            Binding::Full(args),
-        ],
-        [m, heads, 1],
-    )
-}
 pub fn kv_store(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     k_src: Binding<'_>,
     v_src: Binding<'_>,
-    k_cache: &Tensor,
-    v_cache: &Tensor,
-    kv_heads: u32,
-    head_dim: u32,
-    max_seq: u32,
-    args: &Tensor,
+    kv: &crate::cache::KvCache,
     m: u32,
+    args: &Tensor,
 ) -> Result<()> {
     backend.dispatch(
-        pass,
-        name::KV_STORE,
+        commands,
+        shader::KV_STORE,
         &[
-            ("N_KV", kv_heads as f64),
-            ("HEAD_DIM", head_dim as f64),
-            ("MAX_SEQ", max_seq as f64),
+            ("N_KV", kv.kv_heads as f64),
+            ("HEAD_DIM", kv.head_dim as f64),
+            ("MAX_SEQ", kv.max_seq as f64),
         ],
         &[
             k_src,
             v_src,
-            Binding::Full(k_cache),
-            Binding::Full(v_cache),
+            Binding::Full(&kv.k),
+            Binding::Full(&kv.v),
             Binding::Full(args),
         ],
-        [(kv_heads * (head_dim / 2)).div_ceil(256), m, 1],
-    )
-}
-pub fn attn(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    q: Binding<'_>,
-    k_cache: &Tensor,
-    v_cache: &Tensor,
-    scratch: &Tensor,
-    y: Binding<'_>,
-    q_heads: u32,
-    kv_heads: u32,
-    head_dim: u32,
-    max_seq: u32,
-    args: &Tensor,
-    m: u32,
-    window: u32,
-    stride: u32,
-    scale: f32,
-) -> Result<()> {
-    assert!(
-        q_heads / kv_heads <= MAX_GQA,
-        "GQA ratio {} exceeds the attention shader's {MAX_GQA} head slots",
-        q_heads / kv_heads
-    );
-
-    backend.dispatch(
-        pass,
-        name::ATTN,
-        &[
-            ("N_HEADS", q_heads as f64),
-            ("KV_HEADS", kv_heads as f64),
-            ("HEAD_DIM", head_dim as f64),
-            ("MAX_SEQ", max_seq as f64),
-            ("SCALE", scale as f64),
-            ("WINDOW", window as f64),
-            ("NQ_PER_KV", (q_heads / kv_heads) as f64),
-            ("STRIDE", stride as f64),
-        ],
-        &[
-            q,
-            Binding::Full(k_cache),
-            Binding::Full(v_cache),
-            Binding::Full(scratch),
-            Binding::Full(args),
-        ],
-        [m, kv_heads, ATTN_SEGS],
-    )?;
-    backend.dispatch(
-        pass,
-        name::MERGE_ATTN,
-        &[
-            ("N_HEADS", q_heads as f64),
-            ("KV_HEADS", kv_heads as f64),
-            ("HEAD_DIM", head_dim as f64),
-            ("STRIDE", stride as f64),
-        ],
-        &[Binding::Full(scratch), y, Binding::Full(args)],
-        [m, kv_heads, 1],
-    )
-}
-pub fn split_qg(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    x: Binding<'_>,
-    q: Binding<'_>,
-    gate: Binding<'_>,
-    rows: u32,
-    heads: u32,
-    head_dim: u32,
-) -> Result<()> {
-    backend.dispatch(
-        pass,
-        name::SPLIT_QG,
-        &[
-            ("ROWS", rows as f64),
-            ("HEADS", heads as f64),
-            ("HD", head_dim as f64),
-        ],
-        &[x, q, gate],
-        [(rows * heads * head_dim).div_ceil(256), 1, 1],
+        [(kv.kv_heads * (kv.head_dim / 2)).div_ceil(256), m, 1],
     )
 }
 
-pub fn conv1d(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    x: Binding<'_>,
-    weight: &Tensor,
-    state: &Tensor,
-    y: Binding<'_>,
-    dim: u32,
-) -> Result<()> {
-    backend.dispatch(
-        pass,
-        name::CONV1D,
-        &[("DIM", dim as f64)],
-        &[x, Binding::Full(weight), Binding::Full(state), y],
-        [dim.div_ceil(256), 1, 1],
-    )
+pub struct RepeatQkSpec {
+    pub rows: u32,
+    pub n_k: u32,
+    pub n_v: u32,
+    pub key_dim: u32,
+    pub val_dim: u32,
 }
+
 pub fn repeat_qk(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     x: Binding<'_>,
     y: Binding<'_>,
-    rows: u32,
-    n_k: u32,
-    n_v: u32,
-    kd: u32,
-    vd: u32,
+    spec: &RepeatQkSpec,
 ) -> Result<()> {
-    let conv_dim = 2 * n_k * kd + n_v * vd;
+    let conv_dim = 2 * spec.n_k * spec.key_dim + spec.n_v * spec.val_dim;
     backend.dispatch(
-        pass,
-        name::REPEAT_QK,
+        commands,
+        shader::REPEAT_QK,
         &[
-            ("ROWS", rows as f64),
-            ("N_K", n_k as f64),
-            ("N_V", n_v as f64),
-            ("K_DIM", kd as f64),
-            ("RATIO", (n_v / n_k) as f64),
+            ("ROWS", spec.rows as f64),
+            ("N_K", spec.n_k as f64),
+            ("N_V", spec.n_v as f64),
+            ("K_DIM", spec.key_dim as f64),
+            ("RATIO", (spec.n_v / spec.n_k) as f64),
             ("CONV_DIM", conv_dim as f64),
         ],
         &[x, y],
-        [rows, 1, 1],
-    )
-}
-pub fn delta_gate(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    b: Binding<'_>,
-    a: Binding<'_>,
-    a_log: &Tensor,
-    dt_bias: &Tensor,
-    beta: Binding<'_>,
-    g: Binding<'_>,
-    heads: u32,
-    row: u32,
-) -> Result<()> {
-    backend.dispatch(
-        pass,
-        name::DELTA_GATE,
-        &[("HEADS", heads as f64), ("ROW_T", row as f64)],
-        &[b, a, Binding::Full(a_log), Binding::Full(dt_bias), beta, g],
-        [1, 1, 1],
-    )
-}
-pub fn delta_recur(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    q: Binding<'_>,
-    k: Binding<'_>,
-    v: Binding<'_>,
-    beta: Binding<'_>,
-    g: Binding<'_>,
-    state: &Tensor,
-    y: Binding<'_>,
-    heads: u32,
-    key_dim: u32,
-    val_dim: u32,
-) -> Result<()> {
-    backend.dispatch(
-        pass,
-        name::DELTA_RECUR,
-        &[
-            ("HEADS", heads as f64),
-            ("K_DIM", key_dim as f64),
-            ("V_DIM", val_dim as f64),
-        ],
-        &[q, k, v, beta, g, Binding::Full(state), y],
-        [heads, 1, 1],
-    )
-}
-pub fn rope_tables(
-    backend: &Backend,
-    max_seq: u32,
-    rotary_dim: u32,
-    freq_dim: u32,
-    theta: f64,
-    partial: Option<u32>,
-    scaling: Option<&RopeScaling>,
-) -> (Tensor, Tensor) {
-    let half = rotary_dim / 2;
-    let mut cos = Vec::with_capacity((max_seq * half) as usize);
-    let mut sin = Vec::with_capacity((max_seq * half) as usize);
-    for pos in 0..max_seq {
-        for i in 0..half {
-            let inv = if partial.is_some_and(|p| i >= p) {
-                0.0
-            } else {
-                1.0 / theta.powf((2 * i) as f64 / freq_dim as f64)
-            };
-            let factor = scaling.and_then(|s| {
-                (pos < s.original_max)
-                    .then(|| s.short.get(i as usize))
-                    .flatten()
-                    .or_else(|| s.long.get(i as usize))
-            });
-            let inv = factor.map_or(inv, |f| inv / *f as f64);
-            let angle = pos as f64 * inv;
-            cos.push(angle.cos() as f32);
-            sin.push(angle.sin() as f32);
-        }
-    }
-    (
-        backend.tensor_f32(&cos, vec![max_seq, half]),
-        backend.tensor_f32(&sin, vec![max_seq, half]),
+        [spec.rows, 1, 1],
     )
 }
 
-#[derive(Clone, Debug)]
-pub struct RopeScaling {
-    pub short: Vec<f32>,
-    pub long: Vec<f32>,
-    pub original_max: u32,
+pub fn check_head_dim(head_dim: u32) -> Result<()> {
+    if !(64..=512).contains(&head_dim) {
+        return Err(flint_error::Error::Config(format!(
+            "head_dim {head_dim} outside [64, 512]"
+        )));
+    }
+    Ok(())
 }

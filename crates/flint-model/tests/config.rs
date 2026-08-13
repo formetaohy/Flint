@@ -1,11 +1,10 @@
-use flint_model::config::{
-    bool_field, check_gemm_dims, check_head_dim, f64_field, req, u32_field, u32_list,
-};
+use flint_model::config::{f64_field, req, u32_field, u32_list};
+use flint_model::ops::{check_gemm_dims, check_head_dim};
 use serde_json::json;
 
 #[test]
 fn typed_field_access() {
-    let v = json!({"n": 42u32, "f": 1.5, "b": true, "s": "x", "neg": -3});
+    let v = json!({"n": 42u32, "f": 1.5, "s": "x", "neg": -3});
 
     assert_eq!(req(&v, "n").unwrap(), &json!(42));
     assert!(req(&v, "missing").is_err());
@@ -19,9 +18,6 @@ fn typed_field_access() {
     assert_eq!(f64_field(&v, "f").unwrap(), 1.5);
     assert_eq!(f64_field(&v, "n").unwrap(), 42.0, "integers coerce to f64");
     assert!(f64_field(&v, "s").is_err());
-
-    assert!(bool_field(&v, "b").unwrap());
-    assert!(bool_field(&v, "n").is_err());
 }
 
 #[test]

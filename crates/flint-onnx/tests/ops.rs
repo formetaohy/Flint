@@ -1,10 +1,63 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+﻿use std::sync::atomic::{AtomicU32, Ordering};
 
 use flint_onnx::onnx;
 use flint_onnx::tensor::Data;
-use flint_onnx::{Session, Tensor};
+use flint_onnx::tensor::Tensor;
+use flint_onnx::Session;
 
 static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
+
+fn node(
+    op_type: &str,
+    inputs: &[&str],
+    outputs: &[&str],
+    attrs: Vec<onnx::AttributeProto>,
+) -> onnx::NodeProto {
+    onnx::NodeProto {
+        op_type: op_type.to_string(),
+        input: inputs.iter().map(|s| s.to_string()).collect(),
+        output: outputs.iter().map(|s| s.to_string()).collect(),
+        attribute: attrs,
+        ..Default::default()
+    }
+}
+
+fn value(name: &str) -> onnx::ValueInfoProto {
+    onnx::ValueInfoProto {
+        name: name.to_string(),
+        ..Default::default()
+    }
+}
+
+fn graph(
+    nodes: Vec<onnx::NodeProto>,
+    inits: Vec<onnx::TensorProto>,
+    inputs: Vec<onnx::ValueInfoProto>,
+    outputs: Vec<onnx::ValueInfoProto>,
+) -> onnx::GraphProto {
+    onnx::GraphProto {
+        node: nodes,
+        initializer: inits,
+        input: inputs,
+        output: outputs,
+        ..Default::default()
+    }
+}
+
+fn model(g: onnx::GraphProto) -> Vec<u8> {
+    let m = onnx::ModelProto {
+        ir_version: 9,
+        opset_import: vec![onnx::OperatorSetIdProto {
+            version: 17,
+            ..Default::default()
+        }],
+        graph: Some(g),
+        ..Default::default()
+    };
+    let mut buf = Vec::new();
+    prost::Message::encode(&m, &mut buf).unwrap();
+    buf
+}
 
 fn one_op(
     op_type: &str,
@@ -14,73 +67,50 @@ fn one_op(
     inits: Vec<onnx::TensorProto>,
     graph_inputs: &[&str],
 ) -> Vec<u8> {
-    let mut node = onnx::NodeProto::default();
-    node.op_type = op_type.to_string();
-    node.input = inputs.iter().map(|s| s.to_string()).collect();
-    node.output = outputs.iter().map(|s| s.to_string()).collect();
-    node.attribute = attrs;
-    let mut g = onnx::GraphProto::default();
-    g.node.push(node);
-    g.initializer = inits;
-    g.input = graph_inputs
-        .iter()
-        .map(|n| {
-            let mut v = onnx::ValueInfoProto::default();
-            v.name = n.to_string();
-            v
-        })
-        .collect();
-    g.output = outputs
-        .iter()
-        .map(|n| {
-            let mut v = onnx::ValueInfoProto::default();
-            v.name = n.to_string();
-            v
-        })
-        .collect();
-    let mut m = onnx::ModelProto::default();
-    m.ir_version = 9;
-    m.graph = Some(g);
-    let mut opset = onnx::OperatorSetIdProto::default();
-    opset.version = 17;
-    m.opset_import.push(opset);
-    let mut buf = Vec::new();
-    prost::Message::encode(&m, &mut buf).unwrap();
-    buf
+    model(graph(
+        vec![node(op_type, inputs, outputs, attrs)],
+        inits,
+        graph_inputs.iter().map(|n| value(n)).collect(),
+        outputs.iter().map(|n| value(n)).collect(),
+    ))
 }
 
 fn attr_int(name: &str, v: i64) -> onnx::AttributeProto {
-    let mut a = onnx::AttributeProto::default();
-    a.name = name.to_string();
-    a.r#type = onnx::attribute_proto::AttributeType::Int as i32;
-    a.i = v;
-    a
+    onnx::AttributeProto {
+        name: name.to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Int as i32,
+        i: v,
+        ..Default::default()
+    }
 }
 
 fn attr_ints(name: &str, v: &[i64]) -> onnx::AttributeProto {
-    let mut a = onnx::AttributeProto::default();
-    a.name = name.to_string();
-    a.r#type = onnx::attribute_proto::AttributeType::Ints as i32;
-    a.ints = v.to_vec();
-    a
+    onnx::AttributeProto {
+        name: name.to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Ints as i32,
+        ints: v.to_vec(),
+        ..Default::default()
+    }
 }
 
 fn init_f32(name: &str, dims: &[i64], data: &[f32]) -> onnx::TensorProto {
-    let mut t = onnx::TensorProto::default();
-    t.name = name.to_string();
-    t.dims = dims.to_vec();
-    t.data_type = 1;
-    t.float_data = data.to_vec();
-    t
+    onnx::TensorProto {
+        name: name.to_string(),
+        dims: dims.to_vec(),
+        data_type: 1,
+        float_data: data.to_vec(),
+        ..Default::default()
+    }
 }
 
 fn init_i64(name: &str, dims: &[i64], data: &[i64]) -> onnx::TensorProto {
-    let mut t = onnx::TensorProto::default();
-    t.name = name.to_string();
-    t.dims = dims.to_vec();
-    t.data_type = 7;
-    t.int64_data = data.to_vec();
-    t
+    onnx::TensorProto {
+        name: name.to_string(),
+        dims: dims.to_vec(),
+        data_type: 7,
+        int64_data: data.to_vec(),
+        ..Default::default()
+    }
 }
 
 fn run_bytes(
@@ -224,68 +254,32 @@ fn layernorm_decomposition() {
         init_f32("eps", &[], &[1e-5]),
         init_f32("two", &[], &[2.0]),
     ];
-    let mut n1 = onnx::NodeProto::default();
-    n1.op_type = "ReduceMean".into();
-    n1.input = vec!["x".into()];
-    n1.output = vec!["mean".into()];
-    n1.attribute.push(attr_ints("axes", &[-1]));
-    let mut n2 = onnx::NodeProto::default();
-    n2.op_type = "Sub".into();
-    n2.input = vec!["x".into(), "mean".into()];
-    n2.output = vec!["centered".into()];
-    let mut n3 = onnx::NodeProto::default();
-    n3.op_type = "Pow".into();
-    n3.input = vec!["centered".into(), "two".into()];
-    n3.output = vec!["sq".into()];
-    let mut n4 = onnx::NodeProto::default();
-    n4.op_type = "ReduceMean".into();
-    n4.input = vec!["sq".into()];
-    n4.output = vec!["var".into()];
-    n4.attribute.push(attr_ints("axes", &[-1]));
-    let mut n5 = onnx::NodeProto::default();
-    n5.op_type = "Add".into();
-    n5.input = vec!["var".into(), "eps".into()];
-    n5.output = vec!["var_eps".into()];
-    let mut n6 = onnx::NodeProto::default();
-    n6.op_type = "Sqrt".into();
-    n6.input = vec!["var_eps".into()];
-    n6.output = vec!["std".into()];
-    let mut n7 = onnx::NodeProto::default();
-    n7.op_type = "Div".into();
-    n7.input = vec!["centered".into(), "std".into()];
-    n7.output = vec!["norm".into()];
-    let mut n8 = onnx::NodeProto::default();
-    n8.op_type = "Mul".into();
-    n8.input = vec!["norm".into(), "w".into()];
-    n8.output = vec!["scaled".into()];
-    let mut n9 = onnx::NodeProto::default();
-    n9.op_type = "Add".into();
-    n9.input = vec!["scaled".into(), "b".into()];
-    n9.output = vec!["y".into()];
-
-    let mut g = onnx::GraphProto::default();
-    g.node = vec![n1, n2, n3, n4, n5, n6, n7, n8, n9];
-    g.initializer = inits;
-    {
-        let name = "x";
-        let mut v = onnx::ValueInfoProto::default();
-        v.name = name.into();
-        g.input.push(v);
-    }
-    {
-        let name = "y";
-        let mut v = onnx::ValueInfoProto::default();
-        v.name = name.into();
-        g.output.push(v);
-    }
-    let mut m = onnx::ModelProto::default();
-    m.ir_version = 9;
-    m.graph = Some(g);
-    let mut opset = onnx::OperatorSetIdProto::default();
-    opset.version = 17;
-    m.opset_import.push(opset);
-    let mut bytes = Vec::new();
-    prost::Message::encode(&m, &mut bytes).unwrap();
+    let n1 = node(
+        "ReduceMean",
+        &["x"],
+        &["mean"],
+        vec![attr_ints("axes", &[-1])],
+    );
+    let n2 = node("Sub", &["x", "mean"], &["centered"], vec![]);
+    let n3 = node("Pow", &["centered", "two"], &["sq"], vec![]);
+    let n4 = node(
+        "ReduceMean",
+        &["sq"],
+        &["var"],
+        vec![attr_ints("axes", &[-1])],
+    );
+    let n5 = node("Add", &["var", "eps"], &["var_eps"], vec![]);
+    let n6 = node("Sqrt", &["var_eps"], &["std"], vec![]);
+    let n7 = node("Div", &["centered", "std"], &["norm"], vec![]);
+    let n8 = node("Mul", &["norm", "w"], &["scaled"], vec![]);
+    let n9 = node("Add", &["scaled", "b"], &["y"], vec![]);
+    let g = graph(
+        vec![n1, n2, n3, n4, n5, n6, n7, n8, n9],
+        inits,
+        vec![value("x")],
+        vec![value("y")],
+    );
+    let bytes = model(g);
 
     let x = Tensor::f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
     let (_, out) = run_bytes(&bytes, &[("x", x.clone())]);
@@ -308,37 +302,15 @@ fn layernorm_decomposition() {
 
 #[test]
 fn gather_negative_and_reshape() {
-    let mut g1 = onnx::NodeProto::default();
-    g1.op_type = "Gather".into();
-    g1.input = vec!["data".into(), "idx".into()];
-    g1.output = vec!["g".into()];
-    g1.attribute.push(attr_int("axis", 0));
-    let mut r = onnx::NodeProto::default();
-    r.op_type = "Reshape".into();
-    r.input = vec!["g".into(), "shape".into()];
-    r.output = vec!["y".into()];
-    let mut g = onnx::GraphProto::default();
-    g.node = vec![g1, r];
-    g.initializer.push(init_i64("shape", &[2], &[2, -1]));
-    for name in ["data", "idx"] {
-        let mut v = onnx::ValueInfoProto::default();
-        v.name = name.into();
-        g.input.push(v);
-    }
-    {
-        let name = "y";
-        let mut v = onnx::ValueInfoProto::default();
-        v.name = name.into();
-        g.output.push(v);
-    }
-    let mut m = onnx::ModelProto::default();
-    m.ir_version = 9;
-    m.graph = Some(g);
-    let mut opset = onnx::OperatorSetIdProto::default();
-    opset.version = 17;
-    m.opset_import.push(opset);
-    let mut bytes = Vec::new();
-    prost::Message::encode(&m, &mut bytes).unwrap();
+    let g1 = node("Gather", &["data", "idx"], &["g"], vec![attr_int("axis", 0)]);
+    let r = node("Reshape", &["g", "shape"], &["y"], vec![]);
+    let g = graph(
+        vec![g1, r],
+        vec![init_i64("shape", &[2], &[2, -1])],
+        vec![value("data"), value("idx")],
+        vec![value("y")],
+    );
+    let bytes = model(g);
 
     let (_, out) = run_bytes(
         &bytes,
@@ -393,71 +365,38 @@ fn erf_accuracy() {
 
 #[test]
 fn if_control_flow() {
-    let mut then_g = onnx::GraphProto::default();
-    let mut add = onnx::NodeProto::default();
-    add.op_type = "Add".into();
-    add.input = vec!["x".into(), "one".into()];
-    add.output = vec!["res".into()];
-    then_g.node.push(add);
-    then_g.initializer.push(init_f32("one", &[], &[1.0]));
-    for name in ["x", "res"] {
-        let mut v = onnx::ValueInfoProto::default();
-        v.name = name.into();
-        then_g.input.push(v);
-    }
-    {
-        let mut v = onnx::ValueInfoProto::default();
-        v.name = "res".into();
-        then_g.output.push(v);
-    }
-    let mut else_g = onnx::GraphProto::default();
-    let mut sub = onnx::NodeProto::default();
-    sub.op_type = "Sub".into();
-    sub.input = vec!["x".into(), "one".into()];
-    sub.output = vec!["res".into()];
-    else_g.node.push(sub);
-    else_g.initializer.push(init_f32("one", &[], &[1.0]));
-    for name in ["x", "res"] {
-        let mut v = onnx::ValueInfoProto::default();
-        v.name = name.into();
-        else_g.input.push(v);
-    }
-    {
-        let mut v = onnx::ValueInfoProto::default();
-        v.name = "res".into();
-        else_g.output.push(v);
-    }
-    let mut a_then = onnx::AttributeProto::default();
-    a_then.name = "then_branch".into();
-    a_then.r#type = onnx::attribute_proto::AttributeType::Graph as i32;
-    a_then.g = Some(then_g);
-    let mut a_else = onnx::AttributeProto::default();
-    a_else.name = "else_branch".into();
-    a_else.r#type = onnx::attribute_proto::AttributeType::Graph as i32;
-    a_else.g = Some(else_g);
-    let mut iff = onnx::NodeProto::default();
-    iff.op_type = "If".into();
-    iff.input = vec!["cond".into()];
-    iff.output = vec!["y".into()];
-    iff.attribute = vec![a_then, a_else];
-    let mut g = onnx::GraphProto::default();
-    g.node.push(iff);
-    for name in ["cond", "x", "y"] {
-        let mut v = onnx::ValueInfoProto::default();
-        v.name = name.into();
-        g.input.push(v);
-        let mut v2 = onnx::ValueInfoProto::default();
-        v2.name = name.into();
-        g.output.push(v2);
-    }
-    let mut m = onnx::ModelProto::default();
-    m.ir_version = 9;
-    m.graph = Some(g);
-    let mut opset = onnx::OperatorSetIdProto::default();
-    opset.version = 17;
-    m.opset_import.push(opset);
-    let mut bytes = Vec::new();
-    prost::Message::encode(&m, &mut bytes).unwrap();
+    let then_g = graph(
+        vec![node("Add", &["x", "one"], &["res"], vec![])],
+        vec![init_f32("one", &[], &[1.0])],
+        vec![value("x"), value("res")],
+        vec![value("res")],
+    );
+    let else_g = graph(
+        vec![node("Sub", &["x", "one"], &["res"], vec![])],
+        vec![init_f32("one", &[], &[1.0])],
+        vec![value("x"), value("res")],
+        vec![value("res")],
+    );
+    let a_then = onnx::AttributeProto {
+        name: "then_branch".into(),
+        r#type: onnx::attribute_proto::AttributeType::Graph as i32,
+        g: Some(then_g),
+        ..Default::default()
+    };
+    let a_else = onnx::AttributeProto {
+        name: "else_branch".into(),
+        r#type: onnx::attribute_proto::AttributeType::Graph as i32,
+        g: Some(else_g),
+        ..Default::default()
+    };
+    let iff = node("If", &["cond"], &["y"], vec![a_then, a_else]);
+    let g = graph(
+        vec![iff],
+        vec![],
+        vec![value("cond"), value("x"), value("y")],
+        vec![value("cond"), value("x"), value("y")],
+    );
+    let bytes = model(g);
 
     let (_, out) = run_bytes(
         &bytes,

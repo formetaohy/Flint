@@ -1,8 +1,0 @@
-@workgroup_size(64, 1, 1)
-kernel hist (@binding(0) a: buf<u32>, @binding(1) out: buf<u32>) {
-    atomic_add(out[0], a[global_id().x], .relaxed);
-    barrier();
-    if local_id().x == 0 {
-        out[1] = out[0];
-    }
-}

@@ -452,7 +452,7 @@ where
         .product::<usize>()
         .max(1);
     let mut out = vec![seed; kept];
-    for o in 0..kept {
+    for (o, slot) in out.iter_mut().enumerate() {
         for r in 0..reduced {
             let mut perm_idx = vec![0usize; shape.len()];
             let mut rem = o * reduced + r;
@@ -464,7 +464,7 @@ where
             for (k, &src) in order.iter().enumerate() {
                 flat = flat * shape[src] + perm_idx[k];
             }
-            out[o] = combine(out[o], v[flat]);
+            *slot = combine(*slot, v[flat]);
         }
     }
     for o in out.iter_mut() {
@@ -524,4 +524,16 @@ pub(crate) fn argmax(env: &mut HashMap<String, Tensor>, node: &Node, largest: bo
     }
     output(env, node, 0, Tensor::i64(out, shape))?;
     Ok(())
+}
+
+pub(crate) fn erf(x: f32) -> f32 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
+            * t
+            * (-x * x).exp();
+    sign * y
 }

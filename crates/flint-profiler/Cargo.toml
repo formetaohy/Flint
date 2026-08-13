@@ -1,8 +1,9 @@
-[package]
+﻿[package]
 name = "flint-profiler"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]
 flint-error.workspace = true
-saturn-core = { path = "../../saturn/crates/saturn-core" }
+flint-gpu.workspace = true

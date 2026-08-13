@@ -8,13 +8,11 @@ use safetensors::tensor::{Dtype, SafeTensors, TensorView};
 
 use flint_error::{Error, Result};
 
-use super::Metadata;
-use super::{Checkpoint, CheckpointKind, RawTensor, TensorData};
+use super::{Checkpoint, CheckpointKind, Metadata, RawTensor, TensorData};
 
 pub struct Safetensors {
     dir: PathBuf,
     weight_map: HashMap<String, String>,
-    meta: Metadata,
 }
 
 impl Safetensors {
@@ -22,13 +20,13 @@ impl Safetensors {
         let index_path = dir.join("model.safetensors.index.json");
         let index: Index = match std::fs::read_to_string(&index_path) {
             Ok(raw) => serde_json::from_str(&raw).map_err(|e| {
-                Error::Model(format!("invalid index {}: {e}", index_path.display()))
+                Error::Checkpoint(format!("invalid index {}: {e}", index_path.display()))
             })?,
 
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let shard = dir.join("model.safetensors");
                 if !shard.exists() {
-                    return Err(Error::Model(format!(
+                    return Err(Error::Checkpoint(format!(
                         "no safetensors index or model.safetensors in {}",
                         dir.display()
                     )));
@@ -41,7 +39,7 @@ impl Safetensors {
                 Index { weight_map }
             }
             Err(e) => {
-                return Err(Error::Model(format!(
+                return Err(Error::Checkpoint(format!(
                     "cannot read {}: {e}",
                     index_path.display()
                 )));
@@ -50,7 +48,6 @@ impl Safetensors {
         Ok(Self {
             dir: dir.to_path_buf(),
             weight_map: index.weight_map,
-            meta: Metadata::default(),
         })
     }
 }
@@ -61,27 +58,31 @@ impl Checkpoint for Safetensors {
     }
 
     fn read(&self, name: &str) -> Result<RawTensor> {
-        let file_name = self
-            .weight_map
-            .get(name)
-            .ok_or_else(|| Error::Model(format!("tensor {name:?} not in checkpoint index")))?;
+        let file_name = self.weight_map.get(name).ok_or_else(|| {
+            Error::Checkpoint(format!("tensor {name:?} not in checkpoint index"))
+        })?;
         let file = File::open(self.dir.join(file_name))
-            .map_err(|e| Error::Model(format!("missing shard {file_name}: {e}")))?;
+            .map_err(|e| Error::Checkpoint(format!("missing shard {file_name}: {e}")))?;
         let mmap = unsafe { Mmap::map(&file) }
-            .map_err(|e| Error::Model(format!("mmap {file_name}: {e}")))?;
+            .map_err(|e| Error::Checkpoint(format!("mmap {file_name}: {e}")))?;
         let tables = SafeTensors::deserialize(&mmap)
-            .map_err(|e| Error::Model(format!("parse {file_name}: {e}")))?;
+            .map_err(|e| Error::Checkpoint(format!("parse {file_name}: {e}")))?;
         let view = tables
             .tensor(name)
-            .map_err(|e| Error::Model(format!("tensor {name}: {e}")))?;
+            .map_err(|e| Error::Checkpoint(format!("tensor {name}: {e}")))?;
 
         let shape: Vec<u32> = view.shape().iter().map(|d| *d as u32).collect();
         let data = match view.dtype() {
             Dtype::F32 => TensorData::F32(f32_bytes(view.data()).to_vec()),
             Dtype::BF16 => TensorData::Bf16Bytes(view.data().to_vec()),
-            Dtype::F16 => TensorData::F32(view.data().chunks_exact(2).map(f16).collect()),
+            Dtype::F16 => TensorData::F32(
+                view.data()
+                    .chunks_exact(2)
+                    .map(|c| flint_num::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect(),
+            ),
             other => {
-                return Err(Error::Model(format!(
+                return Err(Error::Checkpoint(format!(
                     "{name}: unsupported safetensors dtype {other:?}"
                 )));
             }
@@ -89,15 +90,18 @@ impl Checkpoint for Safetensors {
         Ok(RawTensor { shape, data })
     }
 
-    fn metadata(&self) -> &Metadata {
-        &self.meta
+    fn metadata(&self) -> Result<&Metadata> {
+        Err(Error::Checkpoint(
+            "safetensors checkpoints carry no GGUF metadata".into(),
+        ))
     }
 
-    fn config_json(&self) -> Result<Option<serde_json::Value>> {
+    fn config_json(&self) -> Result<serde_json::Value> {
         let path = self.dir.join("config.json");
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
-        Ok(Some(serde_json::from_str(&raw)?))
+        serde_json::from_str(&raw)
+            .map_err(|e| Error::Config(format!("invalid {}: {e}", path.display())))
     }
 
     fn kind(&self) -> CheckpointKind {
@@ -113,26 +117,33 @@ struct Index {
 
 fn shard_tensor_names(path: &Path) -> Result<Vec<String>> {
     let file =
-        File::open(path).map_err(|e| Error::Model(format!("open {}: {e}", path.display())))?;
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| Error::Model(format!("mmap: {e}")))?;
+        File::open(path).map_err(|e| Error::Checkpoint(format!("open {}: {e}", path.display())))?;
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| Error::Checkpoint(format!("mmap: {e}")))?;
     let tables =
-        SafeTensors::deserialize(&mmap).map_err(|e| Error::Model(format!("parse: {e}")))?;
+        SafeTensors::deserialize(&mmap).map_err(|e| Error::Checkpoint(format!("parse: {e}")))?;
     Ok(tables.tensors().into_iter().map(|(n, _)| n).collect())
 }
 
-pub fn write_tensors(path: &Path, tensors: &[(String, Vec<u32>, Vec<u8>, bool)]) -> Result<()> {
+pub struct SafetensorEntry<'a> {
+    pub name: &'a str,
+    pub shape: &'a [u32],
+    pub bytes: &'a [u8],
+    pub bf16: bool,
+}
+
+pub fn write_tensors(path: &Path, tensors: &[SafetensorEntry<'_>]) -> Result<()> {
     let mut views = Vec::with_capacity(tensors.len());
-    for (name, shape, data, bf16) in tensors {
-        let dtype = if *bf16 { Dtype::BF16 } else { Dtype::F32 };
-        let shape: Vec<usize> = shape.iter().map(|d| *d as usize).collect();
-        let view = TensorView::new(dtype, shape, data)
-            .map_err(|e| Error::Model(format!("{name}: {e}")))?;
-        views.push((name.clone(), view));
+    for t in tensors {
+        let dtype = if t.bf16 { Dtype::BF16 } else { Dtype::F32 };
+        let shape: Vec<usize> = t.shape.iter().map(|d| *d as usize).collect();
+        let view = TensorView::new(dtype, shape, t.bytes)
+            .map_err(|e| Error::Checkpoint(format!("{}: {e}", t.name)))?;
+        views.push((t.name.to_string(), view));
     }
-    let bytes =
-        serialize(views, None).map_err(|e| Error::Model(format!("serialize safetensors: {e}")))?;
+    let bytes = serialize(views, None)
+        .map_err(|e| Error::Checkpoint(format!("serialize safetensors: {e}")))?;
     std::fs::write(path, bytes)
-        .map_err(|e| Error::Model(format!("write {}: {e}", path.display())))?;
+        .map_err(|e| Error::Checkpoint(format!("write {}: {e}", path.display())))?;
     Ok(())
 }
 
@@ -142,8 +153,4 @@ fn f32_bytes(data: &[u8]) -> &[f32] {
         "safetensors data is not f32-aligned"
     );
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) }
-}
-
-fn f16(c: &[u8]) -> f32 {
-    saturn_core::num::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))
 }

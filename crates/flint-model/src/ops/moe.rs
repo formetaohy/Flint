@@ -1,12 +1,11 @@
-use flint_backend::{Backend, Binding, Pass};
+use flint_backend::{Backend, Binding, Commands, shader};
 use flint_error::Result;
-use flint_kernel::name;
 use flint_tensor::{DType, Tensor};
 
-use crate::blocks::{ExpertWeights, MoeMlp};
+use crate::mlp_weights::{ExpertWeights, MoeMlp};
+use crate::model::MAX_M;
 use crate::ops::{Act, gemm, swiglu};
 use crate::routing::Routing;
-use crate::step::MAX_M;
 
 pub struct MoeTiles {
     pub logits: Tensor,
@@ -22,6 +21,7 @@ pub struct MoeTiles {
     pub rows: Tensor,
     pub weights: Tensor,
 }
+
 impl MoeTiles {
     pub fn new(cfg: &MoeTilesConfig, backend: &Backend) -> Self {
         let z = |shape: &[u32]| backend.zero_tensor(shape);
@@ -48,16 +48,21 @@ pub struct MoeTilesConfig {
     pub hidden: u32,
     pub intermediate: u32,
 }
+
+pub struct MoeSpec {
+    pub intermediate: u32,
+    pub act: Act,
+    pub hidden: u32,
+}
+
 pub fn moe_apply(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     x: Binding<'_>,
     moe: &MoeMlp,
     t: &MoeTiles,
     r: &Routing,
-    intermediate: u32,
-    act: Act,
-    hidden: u32,
+    spec: &MoeSpec,
 ) -> Result<()> {
     for e in 0..=moe.experts.len() {
         let c = r.count(e);
@@ -69,12 +74,14 @@ pub fn moe_apply(
             let off = r.offset(e);
             expert_gather(
                 backend,
-                pass,
+                commands,
                 x,
                 Binding::Slice(&t.rows, off, c as u64 * 4),
                 Binding::Full(&t.packed[e]),
-                hidden,
-                c,
+                &GatherSpec {
+                    hidden: spec.hidden,
+                    count: c,
+                },
             )?;
             Binding::Full(&t.packed[e])
         } else {
@@ -85,103 +92,119 @@ pub fn moe_apply(
         } else {
             moe.shared.as_ref().expect("shared expert present")
         };
-        expert_mlp(backend, pass, packed, ew, t, intermediate, act, c)?;
+        expert_mlp(backend, commands, packed, ew, t, spec, c)?;
         let off = r.offset(e);
         expert_scatter(
             backend,
-            pass,
+            commands,
             Binding::Full(&t.acc),
             Binding::Full(&t.down),
             Binding::Slice(&t.rows, off, c as u64 * 4),
             Binding::Slice(&t.weights, off, c as u64 * 4),
-            hidden,
-            c,
+            &GatherSpec {
+                hidden: spec.hidden,
+                count: c,
+            },
         )?;
     }
     Ok(())
 }
+
 fn expert_mlp(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     x: Binding<'_>,
     ew: &ExpertWeights,
     t: &MoeTiles,
-    intermediate: u32,
-    act: Act,
+    spec: &MoeSpec,
     count: u32,
 ) -> Result<()> {
-    let rows = count;
     let y_gate = if count == 1 {
-        Binding::Slice(&t.gate, 0, intermediate as u64 * 4)
+        Binding::Slice(&t.gate, 0, spec.intermediate as u64 * 4)
     } else {
         Binding::Full(&t.gate)
     };
     let y_up = if count == 1 {
-        Binding::Slice(&t.up, 0, intermediate as u64 * 4)
+        Binding::Slice(&t.up, 0, spec.intermediate as u64 * 4)
     } else {
         Binding::Full(&t.up)
     };
-    gemm(backend, pass, x, &ew.gate, y_gate, rows)?;
-    gemm(backend, pass, x, &ew.up, y_up, rows)?;
+    gemm(backend, commands, x, &ew.gate, y_gate, count)?;
+    gemm(backend, commands, x, &ew.up, y_up, count)?;
     swiglu(
         backend,
-        pass,
+        commands,
         Binding::Full(&t.gate),
         Binding::Full(&t.up),
         Binding::Full(&t.act),
-        count * intermediate,
-        act,
+        count * spec.intermediate,
+        spec.act,
     )?;
     gemm(
         backend,
-        pass,
+        commands,
         Binding::Full(&t.act),
         &ew.down,
         Binding::Full(&t.down),
-        rows,
+        count,
     )
+}
+
+pub struct GatherSpec {
+    pub hidden: u32,
+    pub count: u32,
 }
 
 pub fn expert_gather(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     x: Binding<'_>,
     ids: Binding<'_>,
     out: Binding<'_>,
-    hidden: u32,
-    count: u32,
+    spec: &GatherSpec,
 ) -> Result<()> {
     backend.dispatch(
-        pass,
-        name::EXPERT_GATHER,
-        &[("HIDDEN", hidden as f64), ("COUNT", count as f64)],
+        commands,
+        shader::EXPERT_GATHER,
+        &[
+            ("HIDDEN", spec.hidden as f64),
+            ("COUNT", spec.count as f64),
+        ],
         &[x, ids, out],
-        [(count * hidden).div_ceil(256), 1, 1],
+        [(spec.count * spec.hidden).div_ceil(256), 1, 1],
     )
 }
+
 pub fn expert_scatter(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     acc: Binding<'_>,
     src: Binding<'_>,
     ids: Binding<'_>,
     weights: Binding<'_>,
-    hidden: u32,
-    count: u32,
+    spec: &GatherSpec,
 ) -> Result<()> {
     backend.dispatch(
-        pass,
-        name::EXPERT_SCATTER,
-        &[("HIDDEN", hidden as f64), ("COUNT", count as f64)],
+        commands,
+        shader::EXPERT_SCATTER,
+        &[
+            ("HIDDEN", spec.hidden as f64),
+            ("COUNT", spec.count as f64),
+        ],
         &[acc, src, ids, weights],
-        [(count * hidden).div_ceil(256), 1, 1],
+        [(spec.count * spec.hidden).div_ceil(256), 1, 1],
     )
 }
 
-pub fn zero_rows(backend: &mut Backend, pass: &mut Pass<'_>, x: Binding<'_>, n: u32) -> Result<()> {
+pub fn zero_rows(
+    backend: &mut Backend,
+    commands: &mut Commands<'_>,
+    x: Binding<'_>,
+    n: u32,
+) -> Result<()> {
     backend.dispatch(
-        pass,
-        name::ZERO_ROWS,
+        commands,
+        shader::ZERO_ROWS,
         &[("N_ELEM", n as f64)],
         &[x],
         [n.div_ceil(256), 1, 1],

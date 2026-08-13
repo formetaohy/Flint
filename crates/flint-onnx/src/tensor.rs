@@ -63,14 +63,6 @@ impl Tensor {
         self.shape.iter().product()
     }
 
-    pub fn broadcast_f32(&self, other: &Self) -> Result<(Vec<f32>, Vec<f32>)> {
-        let shape = broadcast_shape(&self.shape, &other.shape)?;
-        Ok((
-            self.broadcast_to_f32(&shape)?,
-            other.broadcast_to_f32(&shape)?,
-        ))
-    }
-
     pub fn broadcast_to_f32(&self, shape: &[usize]) -> Result<Vec<f32>> {
         let src = self.data.as_f32();
         broadcast_to(&src, &self.shape, shape)
@@ -88,13 +80,13 @@ impl Tensor {
             crate::dtype::F16 => Data::F32(
                 raw(t, model_dir)?
                     .chunks_exact(2)
-                    .map(|c| saturn_core::num::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .map(|c| flint_num::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect(),
             ),
             crate::dtype::BF16 => Data::F32(
                 raw(t, model_dir)?
                     .chunks_exact(2)
-                    .map(|c| saturn_core::num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .map(|c| flint_num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect(),
             ),
             crate::dtype::F64 => Data::F32(
@@ -138,6 +130,10 @@ impl Tensor {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn describe(&self, limit: usize) -> String {
         let dt = match self.data {
             Data::F32(_) => "f32",
@@ -159,7 +155,7 @@ impl Tensor {
     }
 }
 
-pub fn broadcast_to<T: Copy>(data: &[T], src: &[usize], dst: &[usize]) -> Result<Vec<T>> {
+pub(crate) fn broadcast_to<T: Copy>(data: &[T], src: &[usize], dst: &[usize]) -> Result<Vec<T>> {
     if src.is_empty() {
         return Ok(vec![data[0]; dst.iter().product()]);
     }
@@ -203,7 +199,7 @@ pub fn broadcast_to<T: Copy>(data: &[T], src: &[usize], dst: &[usize]) -> Result
     Ok(out)
 }
 
-pub fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
+pub(crate) fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
     let n = a.len().max(b.len());
     let mut out = vec![0usize; n];
     for i in 0..n {

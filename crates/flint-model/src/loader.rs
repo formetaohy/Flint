@@ -4,7 +4,7 @@ use flint_backend::Backend;
 use flint_checkpoint::{Checkpoint, RawTensor, TensorData};
 use flint_error::{Error, Result};
 use flint_tensor::{Tensor, Weight};
-use saturn_core::num::f32_to_bf16;
+use flint_num::f32_to_bf16;
 
 use crate::quant::{choose_group, quantize, repack_q8};
 
@@ -215,7 +215,7 @@ pub fn upload(backend: &Backend, key: &str, raw: RawTensor, role: Role) -> Resul
                     .iter()
                     .flat_map(|v| f32_to_bf16(*v).to_le_bytes())
                     .collect(),
-                TensorData::Q8Blocks { .. } => raw
+                TensorData::Q8_0 { .. } => raw
                     .data
                     .into_f32()?
                     .iter()
@@ -232,7 +232,7 @@ pub fn upload(backend: &Backend, key: &str, raw: RawTensor, role: Role) -> Resul
             }
             let (n, k) = (shape[0], shape[1]);
             match raw.data {
-                TensorData::Q8Blocks { bytes, numel } => {
+                TensorData::Q8_0 { bytes, numel } => {
                     if numel != (n * k) as usize {
                         return Err(Error::Model(format!(
                             "{key}: Q8_0 numel {numel} does not match shape {shape:?}"

@@ -1,21 +1,21 @@
 use flint_backend::Backend;
 use flint_error::Result;
-use flint_model::blocks::{MlpBlock, take_mlp, take_moe};
+use flint_model::MAX_M;
 use flint_model::loader::{Plan, Role, WeightSet};
-use flint_model::ops::{self, MlpTiles, MoeTiles};
-use flint_model::step::{self, MAX_M};
+use flint_model::mlp_weights::{MlpBlock, take_mlp, take_moe};
+use flint_model::ops::{self, ATTN_PAD, ATTN_SEGS, MAX_GQA, MlpTiles, MoeTiles};
+use flint_model::step;
 use flint_tensor::{Tensor, Weight};
 
 use crate::keys::{gguf_key, hf_key};
-use crate::transformer::config::TransformerConfig;
+use crate::transformer::config::Config;
 
-pub fn transformer_role(key: &str) -> Role {
+pub fn role(key: &str) -> Role {
     if key.contains("norm") || key.ends_with(".bias") || key.ends_with("layer_scalar") {
         Role::F32
     } else if key == "embed_tokens.weight"
         || key == "embed_tokens_per_layer.weight"
         || key.contains("router")
-        || std::env::var("FLINT_NO_QUANT").is_ok()
     {
         Role::Bf16
     } else {
@@ -23,10 +23,10 @@ pub fn transformer_role(key: &str) -> Role {
     }
 }
 
-pub fn transformer_plan(gguf: bool) -> Plan {
+pub fn plan(gguf: bool) -> Plan {
     Plan {
         key: if gguf { gguf_key } else { hf_key },
-        role: transformer_role,
+        role,
     }
 }
 
@@ -70,7 +70,7 @@ fn take_optional(w: &mut WeightSet, on: bool, key: &str) -> Result<Option<Tensor
 
 pub(crate) fn take_layer(
     w: &mut WeightSet,
-    cfg: &TransformerConfig,
+    cfg: &Config,
     l: u32,
     backend: &Backend,
 ) -> Result<LayerW> {
@@ -185,7 +185,7 @@ pub(crate) struct Scratch {
     pub(crate) per_layer_ones: Option<Tensor>,
 }
 
-pub(crate) fn alloc_scratch(cfg: &TransformerConfig, backend: &Backend) -> Scratch {
+pub(crate) fn alloc_scratch(cfg: &Config, backend: &Backend) -> Scratch {
     let max_hd = *cfg.head_dims.iter().max().unwrap();
     let mlp_w = cfg.max_mlp_width();
     let moe = cfg.moe.map(|m| {
@@ -211,11 +211,11 @@ pub(crate) fn alloc_scratch(cfg: &TransformerConfig, backend: &Backend) -> Scrat
         attn_scratch: backend.zero_tensor(&[
             MAX_M,
             cfg.kv_heads,
-            step::ATTN_SEGS,
-            step::MAX_GQA,
-            max_hd + step::ATTN_PAD,
+            ATTN_SEGS,
+            MAX_GQA,
+            max_hd + ATTN_PAD,
         ]),
-        attn_stride: max_hd + step::ATTN_PAD,
+        attn_stride: max_hd + ATTN_PAD,
         mlp: MlpTiles {
             gate_out: backend.zero_tensor(&[MAX_M, mlp_w]),
             up_out: backend.zero_tensor(&[MAX_M, mlp_w]),

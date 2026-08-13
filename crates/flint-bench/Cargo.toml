@@ -1,6 +1,7 @@
-[package]
+﻿[package]
 name = "flint-bench"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]
@@ -8,10 +9,10 @@ flint-architectures.workspace = true
 flint-backend.workspace = true
 flint-checkpoint.workspace = true
 flint-error.workspace = true
+flint-gpu.workspace = true
 flint-kernel.workspace = true
 flint-model.workspace = true
 flint-profiler.workspace = true
 clap.workspace = true
 serde_json.workspace = true
-saturn-core.workspace = true
 

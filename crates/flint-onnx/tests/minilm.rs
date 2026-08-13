@@ -1,5 +1,5 @@
-use flint_onnx::tensor::Data;
-use flint_onnx::{Session, Tensor};
+﻿use flint_onnx::Session;
+use flint_onnx::tensor::{Data, Tensor};
 
 fn model_path() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("ONNX_TEST_MODEL") {

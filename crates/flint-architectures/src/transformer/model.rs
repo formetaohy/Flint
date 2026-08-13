@@ -1,20 +1,20 @@
-use flint_backend::{Backend, Binding, Pass};
+﻿use flint_backend::{Backend, Binding, Commands};
 use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
-use flint_model::blocks::MlpBlock;
 use flint_model::cache::KvCache;
 use flint_model::loader::{self, Plan};
-use flint_model::ops::{self, NormMode};
+use flint_model::mlp_weights::MlpBlock;
+use flint_model::ops::{self, NormMode, NormSpec, RopeArgs, RopeInputs};
 use flint_model::routing::Routing;
-use flint_model::step::{self, MAX_M};
-use flint_model::{ChunkOut, LanguageModel};
+use flint_model::step;
+use flint_model::{ChunkOut, LanguageModel, MAX_M};
 use flint_tensor::{Tensor, Weight};
 
-use crate::transformer::config::TransformerConfig;
+use crate::transformer::config::Config;
 use crate::transformer::weights::{LayerW, Scratch, alloc_scratch, take_layer};
 
-pub struct TransformerModel {
-    cfg: TransformerConfig,
+pub struct Model {
+    cfg: Config,
     max_seq: u32,
     pos: u32,
     embed: Weight,
@@ -43,10 +43,10 @@ pub struct TransformerModel {
     per_layer_combine_scale: Tensor,
 }
 
-impl TransformerModel {
+impl Model {
     pub fn load(
         source: &dyn Checkpoint,
-        cfg: TransformerConfig,
+        cfg: Config,
         plan: &Plan,
         max_seq: u32,
         backend: &Backend,
@@ -56,7 +56,7 @@ impl TransformerModel {
 
     pub fn load_extra(
         source: &dyn Checkpoint,
-        cfg: TransformerConfig,
+        cfg: Config,
         plan: &Plan,
         extra: Vec<(String, Weight)>,
         max_seq: u32,
@@ -183,7 +183,7 @@ impl TransformerModel {
     fn per_layer_embed(
         &self,
         backend: &mut Backend,
-        pass: &mut Pass<'_>,
+        commands: &mut Commands<'_>,
         s: &Scratch,
         m: u32,
     ) -> Result<()> {
@@ -204,18 +204,20 @@ impl TransformerModel {
         let embed_scale = (per_layer.dim as f32).sqrt();
         ops::embed_split(
             backend,
-            pass,
+            commands,
             &s.ids,
             pe,
-            pe.tensor().shape[0] / 2,
             Binding::Full(pt),
-            m,
-            pd,
-            embed_scale,
+            &ops::EmbedSpec {
+                rows: m,
+                dim: pd,
+                scale: embed_scale,
+                split: pe.tensor().shape[0] / 2,
+            },
         )?;
         ops::gemm(
             backend,
-            pass,
+            commands,
             Binding::Full(&s.hidden),
             pp,
             Binding::Full(pc),
@@ -223,28 +225,35 @@ impl TransformerModel {
         )?;
         ops::mul(
             backend,
-            pass,
+            commands,
             Binding::Full(pc),
             Binding::Full(&self.per_layer_proj_scale),
             Binding::Full(pc),
             m * pd,
             1,
         )?;
-        ops::norm_per_layer(
+        ops::norm(
             backend,
-            pass,
+            commands,
+            &NormSpec {
+                ple: 1,
+                ple_layers: self.cfg.layers,
+                ple_stride: pd,
+                ..NormSpec::new(
+                    NormMode::Direct,
+                    m * self.cfg.layers,
+                    per_layer.dim,
+                    self.cfg.norm_eps,
+                )
+            },
             Binding::Full(pc),
             pn,
             Binding::Full(pc),
-            m * self.cfg.layers,
-            per_layer.dim,
-            self.cfg.norm_eps,
-            self.cfg.layers,
-            pd,
+            Binding::Full(pc),
         )?;
         ops::add(
             backend,
-            pass,
+            commands,
             Binding::Full(pc),
             Binding::Full(pt),
             Binding::Full(po),
@@ -252,7 +261,7 @@ impl TransformerModel {
         )?;
         ops::mul(
             backend,
-            pass,
+            commands,
             Binding::Full(po),
             Binding::Full(&self.per_layer_combine_scale),
             Binding::Full(po),
@@ -265,7 +274,7 @@ impl TransformerModel {
     fn per_layer_step(
         &self,
         backend: &mut Backend,
-        pass: &mut Pass<'_>,
+        commands: &mut Commands<'_>,
         s: &Scratch,
         lw: &LayerW,
         l: usize,
@@ -288,7 +297,7 @@ impl TransformerModel {
         let pd = per_layer.dim;
         ops::gemm(
             backend,
-            pass,
+            commands,
             Binding::Full(&s.hidden),
             gate,
             Binding::Full(pg),
@@ -296,7 +305,7 @@ impl TransformerModel {
         )?;
         ops::swiglu(
             backend,
-            pass,
+            commands,
             Binding::Full(pg),
             Binding::Full(pon),
             Binding::Full(pc),
@@ -305,18 +314,20 @@ impl TransformerModel {
         )?;
         ops::row_mul(
             backend,
-            pass,
+            commands,
             Binding::Full(pc),
             Binding::Full(po),
             Binding::Full(pg),
-            m,
-            pd,
-            pd * self.cfg.layers,
-            l as u32 * pd,
+            &ops::RowMulSpec {
+                rows: m,
+                cols: pd,
+                stride: pd * self.cfg.layers,
+                offset: l as u32 * pd,
+            },
         )?;
         ops::gemm(
             backend,
-            pass,
+            commands,
             Binding::Full(pg),
             proj,
             Binding::Full(&s.mlp.down_out),
@@ -324,21 +335,17 @@ impl TransformerModel {
         )?;
         ops::norm(
             backend,
-            pass,
-            NormMode::Direct,
+            commands,
+            &NormSpec::new(NormMode::Direct, m, self.cfg.hidden, self.cfg.norm_eps),
             Binding::Full(&s.mlp.down_out),
             pn,
             Binding::Full(&s.mlp.down_out),
             Binding::Full(&s.normed),
-            m,
-            self.cfg.hidden,
-            self.cfg.hidden,
-            self.cfg.norm_eps,
         )?;
         if let Some(os) = &lw.out_scale {
             ops::add(
                 backend,
-                pass,
+                commands,
                 Binding::Full(&s.hidden),
                 Binding::Full(&s.normed),
                 Binding::Full(&s.hidden2),
@@ -346,7 +353,7 @@ impl TransformerModel {
             )?;
             ops::mul(
                 backend,
-                pass,
+                commands,
                 Binding::Full(&s.hidden2),
                 Binding::Full(os),
                 Binding::Full(&s.hidden),
@@ -356,7 +363,7 @@ impl TransformerModel {
         } else {
             ops::add(
                 backend,
-                pass,
+                commands,
                 Binding::Full(&s.hidden),
                 Binding::Full(&s.normed),
                 Binding::Full(&s.hidden),
@@ -367,48 +374,40 @@ impl TransformerModel {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn residual_add(
-    backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    s: &Scratch,
-    post_norm: Option<&Tensor>,
-    y: Binding<'_>,
-    src: Binding<'_>,
-    out: Binding<'_>,
+struct ResidualSpec<'a> {
+    scratch: &'a Scratch,
+    post_norm: Option<&'a Tensor>,
     m: u32,
     hidden: u32,
     eps: f32,
+}
+
+fn residual_add(
+    backend: &mut Backend,
+    commands: &mut Commands<'_>,
+    y: Binding<'_>,
+    src: Binding<'_>,
+    out: Binding<'_>,
+    spec: &ResidualSpec<'_>,
 ) -> Result<()> {
-    match post_norm {
+    match spec.post_norm {
         Some(pn) => {
             ops::norm(
                 backend,
-                pass,
-                NormMode::Direct,
+                commands,
+                &NormSpec::new(NormMode::Direct, spec.m, spec.hidden, spec.eps),
                 y,
                 pn,
                 y,
-                Binding::Full(&s.normed),
-                m,
-                hidden,
-                hidden,
-                eps,
+                Binding::Full(&spec.scratch.normed),
             )?;
-            ops::add(
-                backend,
-                pass,
-                src,
-                Binding::Full(&s.normed),
-                out,
-                m * hidden,
-            )
+            ops::add(backend, commands, src, Binding::Full(&spec.scratch.normed), out, spec.m * spec.hidden)
         }
-        None => ops::add(backend, pass, src, y, out, m * hidden),
+        None => ops::add(backend, commands, src, y, out, spec.m * spec.hidden),
     }
 }
 
-impl LanguageModel for TransformerModel {
+impl LanguageModel for Model {
     fn forward(
         &mut self,
         backend: &mut Backend,
@@ -428,41 +427,40 @@ impl LanguageModel for TransformerModel {
         }
         let mut ids = vec![0u32; MAX_M as usize];
         ids[..tokens.len()].copy_from_slice(tokens);
-        backend.write_u32(self.s.ids.buf.as_ref(), &ids);
+        backend.write_u32(&self.s.ids.buf, &ids);
         step::write_step_args(backend, &self.s.args, self.pos, self.pos + m);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder()?;
         {
-            let mut pass = Pass::begin(enc.as_mut());
+            let mut commands = Commands::begin(&mut enc);
             let s = &self.s;
             ops::embed(
                 backend,
-                &mut pass,
+                &mut commands,
                 &s.ids,
                 &self.embed,
                 Binding::Full(&s.hidden),
-                m,
-                cfg.hidden,
-                cfg.embed_scale,
+                &ops::EmbedSpec {
+                    rows: m,
+                    dim: cfg.hidden,
+                    scale: cfg.embed_scale,
+                    split: 0,
+                },
             )?;
-            self.per_layer_embed(backend, &mut pass, s, m)?;
+            self.per_layer_embed(backend, &mut commands, s, m)?;
 
             for (l, lw) in self.layers.iter().enumerate() {
                 let hd = cfg.head_dim(l as u32);
                 let (nq, nkv) = (cfg.q_heads, cfg.kv_heads);
                 ops::norm(
                     backend,
-                    &mut pass,
-                    self.norm_mode(),
+                    &mut commands,
+                    &NormSpec::new(self.norm_mode(), m, cfg.hidden, cfg.norm_eps),
                     Binding::Full(&s.hidden),
                     &lw.attn_norm,
                     self.norm_bias(lw.attn_norm_bias.as_ref()),
                     Binding::Full(&s.normed),
-                    m,
-                    cfg.hidden,
-                    cfg.hidden,
-                    cfg.norm_eps,
                 )?;
                 let kv_width = match (&lw.k, &lw.v) {
                     (Some(_), Some(_)) => nkv * hd,
@@ -483,23 +481,25 @@ impl LanguageModel for TransformerModel {
                 };
                 ops::gemm_qkv(
                     backend,
-                    &mut pass,
+                    &mut commands,
                     Binding::Full(&s.normed),
-                    &lw.q,
-                    lw.k.as_ref().unwrap_or(&lw.q),
-                    lw.v.as_ref().unwrap_or(&lw.q),
-                    yq,
-                    yk,
-                    yv,
-                    m,
-                    kv_width,
+                    &ops::QkvSpec {
+                        wq: &lw.q,
+                        wk: lw.k.as_ref().unwrap_or(&lw.q),
+                        wv: lw.v.as_ref().unwrap_or(&lw.q),
+                        yq,
+                        yk,
+                        yv,
+                        rows: m,
+                        kv_width,
+                    },
                 )?;
 
                 if let (Some(qb), Some(kb), Some(vb)) = (&lw.q_bias, &lw.k_bias, &lw.v_bias) {
-                    ops::bias(backend, &mut pass, Binding::Full(&lw.q_out), qb, m, nq * hd)?;
+                    ops::bias(backend, &mut commands, Binding::Full(&lw.q_out), qb, m, nq * hd)?;
                     ops::bias(
                         backend,
-                        &mut pass,
+                        &mut commands,
                         Binding::Full(&lw.k_out),
                         kb,
                         m,
@@ -507,7 +507,7 @@ impl LanguageModel for TransformerModel {
                     )?;
                     ops::bias(
                         backend,
-                        &mut pass,
+                        &mut commands,
                         Binding::Full(&lw.v_out),
                         vb,
                         m,
@@ -521,53 +521,45 @@ impl LanguageModel for TransformerModel {
                 let qk_has_kv = lw.k.is_some();
                 let (q_src, k_src): (&Tensor, Option<&Tensor>) = match (&lw.q_norm, &lw.k_norm) {
                     (Some(qn), Some(kn)) if qk_has_kv => {
+                        let rope = RopeInputs {
+                            cos,
+                            sin,
+                            args: &self.s.args,
+                        };
                         ops::norm_rope(
                             backend,
-                            &mut pass,
+                            &mut commands,
+                            &ops::NormRopeSpec { rows: m * nq, dim: hd, eps: cfg.norm_eps, heads: nq, rot },
                             Binding::Full(&lw.q_out),
                             qn,
                             Binding::Full(&lw.q_normed),
-                            m * nq,
-                            hd,
-                            cfg.norm_eps,
-                            nq,
-                            rot,
-                            cos,
-                            sin,
-                            &self.s.args,
+                            &rope,
                         )?;
                         ops::norm_rope(
                             backend,
-                            &mut pass,
+                            &mut commands,
+                            &ops::NormRopeSpec { rows: m * nkv, dim: hd, eps: cfg.norm_eps, heads: nkv, rot },
                             Binding::Full(&lw.k_out),
                             kn,
                             Binding::Full(&lw.k_normed),
-                            m * nkv,
-                            hd,
-                            cfg.norm_eps,
-                            nkv,
-                            rot,
-                            cos,
-                            sin,
-                            &self.s.args,
+                            &rope,
                         )?;
                         (&lw.q_normed, Some(&lw.k_normed))
                     }
                     (Some(qn), _) => {
+                        let rope = RopeInputs {
+                            cos,
+                            sin,
+                            args: &self.s.args,
+                        };
                         ops::norm_rope(
                             backend,
-                            &mut pass,
+                            &mut commands,
+                            &ops::NormRopeSpec { rows: m * nq, dim: hd, eps: cfg.norm_eps, heads: nq, rot },
                             Binding::Full(&lw.q_out),
                             qn,
                             Binding::Full(&lw.q_normed),
-                            m * nq,
-                            hd,
-                            cfg.norm_eps,
-                            nq,
-                            rot,
-                            cos,
-                            sin,
-                            &self.s.args,
+                            &rope,
                         )?;
                         (&lw.q_normed, None)
                     }
@@ -577,45 +569,46 @@ impl LanguageModel for TransformerModel {
                 if cfg.v_norm && lw.k.is_some() {
                     ops::norm(
                         backend,
-                        &mut pass,
-                        NormMode::Direct,
+                        &mut commands,
+                        &NormSpec::new(NormMode::Direct, m * nkv, hd, cfg.norm_eps),
                         Binding::Full(&lw.v_out),
                         &self.ones,
                         Binding::Full(&lw.v_out),
                         Binding::Full(&lw.v_normed),
-                        m * nkv,
-                        hd,
-                        hd,
-                        cfg.norm_eps,
                     )?;
                 }
 
                 let qk_fused = lw.q_norm.is_some();
                 if !qk_fused {
-                    ops::rope(
-                        backend,
-                        &mut pass,
+                    let rope = RopeInputs {
                         cos,
                         sin,
+                        args: &self.s.args,
+                    };
+                    ops::rope(
+                        backend,
+                        &mut commands,
                         Binding::Full(q_src),
-                        nq,
-                        hd,
-                        rot,
-                        m,
-                        &self.s.args,
+                        &rope,
+                        &RopeArgs {
+                            heads: nq,
+                            head_dim: hd,
+                            rot,
+                            m,
+                        },
                     )?;
                     if let Some(k_src) = k_src {
                         ops::rope(
                             backend,
-                            &mut pass,
-                            cos,
-                            sin,
+                            &mut commands,
                             Binding::Full(k_src),
-                            nkv,
-                            hd,
-                            rot,
-                            m,
-                            &self.s.args,
+                            &rope,
+                            &RopeArgs {
+                                heads: nkv,
+                                head_dim: hd,
+                                rot,
+                                m,
+                            },
                         )?;
                     }
                 }
@@ -625,42 +618,36 @@ impl LanguageModel for TransformerModel {
                 if let Some(k_src) = k_src {
                     ops::kv_store(
                         backend,
-                        &mut pass,
+                        &mut commands,
                         Binding::Full(k_src),
                         Binding::Full(if cfg.v_norm { &lw.v_normed } else { &lw.v_out }),
-                        &kv.k,
-                        &kv.v,
-                        nkv,
-                        hd,
-                        kv.max_seq,
-                        &self.s.args,
+                        kv,
                         m,
+                        &self.s.args,
                     )?;
                 }
 
                 ops::attn(
                     backend,
-                    &mut pass,
+                    &mut commands,
                     Binding::Full(q_src),
-                    &kv.k,
-                    &kv.v,
+                    kv,
                     &s.attn_scratch,
                     Binding::Full(&lw.attn_out),
-                    nq,
-                    nkv,
-                    hd,
-                    kv.max_seq,
-                    &self.s.args,
-                    m,
-                    cfg.window(l as u32),
-                    s.attn_stride,
-                    cfg.attn_scale.unwrap_or_else(|| (hd as f32).sqrt().recip()),
+                    &ops::AttnSpec {
+                        q_heads: nq,
+                        window: cfg.window(l as u32),
+                        stride: s.attn_stride,
+                        scale: cfg.attn_scale.unwrap_or_else(|| (hd as f32).sqrt().recip()),
+                        m,
+                        args: &self.s.args,
+                    },
                 )?;
 
                 let attn_fused = lw.post_attn_norm.is_none();
                 ops::gemm_acc(
                     backend,
-                    &mut pass,
+                    &mut commands,
                     Binding::Full(&lw.attn_out),
                     &lw.o,
                     Binding::Full(if attn_fused {
@@ -674,7 +661,7 @@ impl LanguageModel for TransformerModel {
                 if let Some(ob) = &lw.o_bias {
                     ops::bias(
                         backend,
-                        &mut pass,
+                        &mut commands,
                         Binding::Full(if attn_fused {
                             &s.hidden
                         } else {
@@ -688,15 +675,17 @@ impl LanguageModel for TransformerModel {
 
                 residual_add(
                     backend,
-                    &mut pass,
-                    s,
-                    lw.post_attn_norm.as_ref(),
+                    &mut commands,
                     Binding::Full(&s.mlp.down_out),
                     Binding::Full(&s.hidden),
                     Binding::Full(&s.hidden2),
-                    m,
-                    cfg.hidden,
-                    cfg.norm_eps,
+                    &ResidualSpec {
+                        scratch: s,
+                        post_norm: lw.post_attn_norm.as_ref(),
+                        m,
+                        hidden: cfg.hidden,
+                        eps: cfg.norm_eps,
+                    },
                 )?;
 
                 let mlp_src = if attn_fused {
@@ -706,16 +695,12 @@ impl LanguageModel for TransformerModel {
                 };
                 ops::norm(
                     backend,
-                    &mut pass,
-                    self.norm_mode(),
+                    &mut commands,
+                    &NormSpec::new(self.norm_mode(), m, cfg.hidden, cfg.norm_eps),
                     mlp_src,
                     lw.mlp.norm(),
                     self.norm_bias(lw.mlp.norm_bias()),
                     Binding::Full(&s.normed),
-                    m,
-                    cfg.hidden,
-                    cfg.hidden,
-                    cfg.norm_eps,
                 )?;
 
                 match &lw.mlp {
@@ -728,28 +713,32 @@ impl LanguageModel for TransformerModel {
                         });
                         ops::swiglu_mlp(
                             backend,
-                            &mut pass,
+                            &mut commands,
                             Binding::Full(&s.normed),
                             mlp,
                             &s.mlp,
-                            m,
-                            cfg.mlp_width(l as u32),
-                            cfg.act,
                             y,
-                            ffn_fused,
+                            &ops::MlpSpec {
+                                rows: m,
+                                intermediate: cfg.mlp_width(l as u32),
+                                act: cfg.act,
+                                acc: ffn_fused,
+                            },
                         )?;
                         if !ffn_fused {
                             residual_add(
                                 backend,
-                                &mut pass,
-                                s,
-                                lw.post_ffn_norm.as_ref(),
+                                &mut commands,
                                 Binding::Full(&s.mlp.down_out),
                                 Binding::Full(&s.hidden2),
                                 Binding::Full(&s.hidden),
-                                m,
-                                cfg.hidden,
-                                cfg.norm_eps,
+                                &ResidualSpec {
+                                    scratch: s,
+                                    post_norm: lw.post_ffn_norm.as_ref(),
+                                    m,
+                                    hidden: cfg.hidden,
+                                    eps: cfg.norm_eps,
+                                },
                             )?;
                         }
                     }
@@ -759,16 +748,15 @@ impl LanguageModel for TransformerModel {
 
                         ops::gemm(
                             backend,
-                            &mut pass,
+                            &mut commands,
                             Binding::Full(&s.normed),
                             &moe.router,
                             Binding::Full(&mt.logits),
                             m,
                         )?;
-                        drop(pass);
-                        backend.submit(enc)?;
+                        backend.submit(commands.raw())?;
                         let logits = backend.read_f32(
-                            mt.logits.buf.as_ref(),
+                            &mt.logits.buf,
                             0,
                             (m * moe_cfg.experts) as usize,
                         )?;
@@ -780,56 +768,59 @@ impl LanguageModel for TransformerModel {
                             moe_cfg.kind,
                             moe.shared_scale,
                         );
-                        backend.write_u32(mt.rows.buf.as_ref(), &r.rows);
-                        backend.write_f32(mt.weights.buf.as_ref(), &r.weights);
-                        enc = backend.encoder()?;
-                        pass = Pass::begin(enc.as_mut());
-                        ops::zero_rows(backend, &mut pass, Binding::Full(&mt.acc), m * cfg.hidden)?;
+                        backend.write_u32(&mt.rows.buf, &r.rows);
+                        backend.write_f32(&mt.weights.buf, &r.weights);
+                        ops::zero_rows(
+                            backend,
+                            &mut commands,
+                            Binding::Full(&mt.acc),
+                            m * cfg.hidden,
+                        )?;
                         ops::moe_apply(
                             backend,
-                            &mut pass,
+                            &mut commands,
                             Binding::Full(&s.normed),
                             moe,
                             mt,
                             &r,
-                            cfg.intermediate,
-                            cfg.act,
-                            cfg.hidden,
+                            &ops::MoeSpec {
+                                intermediate: cfg.intermediate,
+                                act: cfg.act,
+                                hidden: cfg.hidden,
+                            },
                         )?;
                         residual_add(
                             backend,
-                            &mut pass,
-                            s,
-                            lw.post_ffn_norm.as_ref(),
+                            &mut commands,
                             Binding::Full(&mt.acc),
                             Binding::Full(&s.hidden2),
                             Binding::Full(&s.hidden),
-                            m,
-                            cfg.hidden,
-                            cfg.norm_eps,
+                            &ResidualSpec {
+                                scratch: s,
+                                post_norm: lw.post_ffn_norm.as_ref(),
+                                m,
+                                hidden: cfg.hidden,
+                                eps: cfg.norm_eps,
+                            },
                         )?;
                     }
                 }
 
-                self.per_layer_step(backend, &mut pass, s, lw, l, m)?;
+                self.per_layer_step(backend, &mut commands, s, lw, l, m)?;
             }
 
             ops::norm(
                 backend,
-                &mut pass,
-                self.norm_mode(),
+                &mut commands,
+                &NormSpec::new(self.norm_mode(), m, cfg.hidden, cfg.norm_eps),
                 Binding::Full(&s.hidden),
                 &self.norm,
                 self.norm_bias(self.norm_bias.as_ref()),
                 Binding::Full(&s.normed),
-                m,
-                cfg.hidden,
-                cfg.hidden,
-                cfg.norm_eps,
             )?;
             ops::gemm(
                 backend,
-                &mut pass,
+                &mut commands,
                 Binding::Full(&s.normed),
                 self.head_weight(),
                 Binding::Full(&s.logits),
@@ -838,7 +829,7 @@ impl LanguageModel for TransformerModel {
             if let Some(lb) = &self.lm_bias {
                 ops::bias(
                     backend,
-                    &mut pass,
+                    &mut commands,
                     Binding::Full(&s.logits),
                     lb,
                     m,
@@ -848,14 +839,14 @@ impl LanguageModel for TransformerModel {
             if let Some(cap) = cfg.softcap {
                 ops::softcap(
                     backend,
-                    &mut pass,
+                    &mut commands,
                     Binding::Full(&s.logits),
                     m * cfg.vocab,
                     cap,
                 )?;
             }
         }
-        backend.submit(enc)?;
+        backend.submit(&mut enc)?;
 
         let out = ChunkOut {
             logits: step::read_rows(backend, &self.s.logits, logit_rows, m, cfg.vocab)?,

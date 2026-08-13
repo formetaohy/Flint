@@ -6,7 +6,7 @@ use flint_error::{Error, Result};
 use crate::tensor::Tensor;
 
 #[derive(Debug)]
-pub struct Node {
+pub(crate) struct Node {
     pub op_type: String,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
@@ -34,7 +34,7 @@ impl Node {
 }
 
 #[derive(Debug)]
-pub enum Attr {
+pub(crate) enum Attr {
     F(f32),
     I(i64),
     S(Vec<u8>),
@@ -43,8 +43,6 @@ pub enum Attr {
     Floats(Vec<f32>),
     Ints(Vec<i64>),
     Strings(Vec<Vec<u8>>),
-    Tensors(Vec<Tensor>),
-    Graphs(Vec<Graph>),
 }
 
 impl Attr {
@@ -95,17 +93,12 @@ impl Attr {
 }
 
 #[derive(Debug)]
-pub struct ValueInfo {
+pub(crate) struct ValueInfo {
     pub name: String,
-
-    pub elem_type: i32,
-
-    pub dims: Vec<i64>,
 }
 
 #[derive(Debug)]
-pub struct Graph {
-    pub name: String,
+pub(crate) struct Graph {
     pub nodes: Vec<Node>,
     pub initializers: HashMap<String, Tensor>,
     pub inputs: Vec<ValueInfo>,
@@ -150,30 +143,8 @@ impl Graph {
         let inputs = g
             .input
             .iter()
-            .map(|v| {
-                let mut vi = ValueInfo {
-                    name: v.name.clone(),
-                    elem_type: 0,
-                    dims: vec![],
-                };
-                if let Some(t) = v.r#type.as_ref().and_then(|t| t.value.as_ref())
-                    && let crate::onnx::type_proto::Value::TensorType(tensor) = t
-                {
-                    vi.elem_type = tensor.elem_type;
-                    if let Some(shape) = tensor.shape.as_ref() {
-                        vi.dims = shape
-                            .dim
-                            .iter()
-                            .map(|d| match d.value {
-                                Some(
-                                    crate::onnx::tensor_shape_proto::dimension::Value::DimValue(x),
-                                ) => x,
-                                _ => 0,
-                            })
-                            .collect();
-                    }
-                }
-                vi
+            .map(|v| ValueInfo {
+                name: v.name.clone(),
             })
             .collect();
         let outputs = g
@@ -181,13 +152,10 @@ impl Graph {
             .iter()
             .map(|v| ValueInfo {
                 name: v.name.clone(),
-                elem_type: 0,
-                dims: vec![],
             })
             .collect();
 
         Ok(Graph {
-            name: g.name.clone(),
             nodes,
             initializers,
             inputs,
@@ -222,18 +190,6 @@ impl Graph {
                 crate::onnx::attribute_proto::AttributeType::Strings => {
                     Attr::Strings(a.strings.clone())
                 }
-                crate::onnx::attribute_proto::AttributeType::Tensors => Attr::Tensors(
-                    a.tensors
-                        .iter()
-                        .map(|t| Tensor::from_proto(t, dir))
-                        .collect::<Result<_>>()?,
-                ),
-                crate::onnx::attribute_proto::AttributeType::Graphs => Attr::Graphs(
-                    a.graphs
-                        .iter()
-                        .map(|g| Self::from_proto(g, dir))
-                        .collect::<Result<_>>()?,
-                ),
                 other => {
                     return Err(Error::Model(format!(
                         "unsupported attribute type {other:?} on {}",

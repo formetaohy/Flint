@@ -2,6 +2,6 @@ mod config;
 mod model;
 mod weights;
 
-pub use config::{MoeConfig, PerLayerConfig, RopeSpec, TransformerConfig};
-pub use model::TransformerModel;
-pub use weights::{transformer_plan, transformer_role};
+pub use config::{Config, MoeConfig, PerLayerConfig, RopeSpec};
+pub use model::Model;
+pub use weights::{plan, role};

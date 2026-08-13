@@ -53,10 +53,6 @@ impl Sampler {
         }
     }
 
-    pub fn params(&self) -> &SamplingParams {
-        &self.params
-    }
-
     pub fn transform(&self, logits: &[f32], context: &[u32]) -> Dist {
         let p = self.params;
         let mut scores = logits.to_vec();

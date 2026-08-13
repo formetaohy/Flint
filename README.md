@@ -17,9 +17,7 @@
 
 ## What is Flint?
 
-**Flint** is a high-performance Rust-based LLM inference engine, running natively on Windows, Linux, Android, macOS, and iOS.
-
-At its core is **Saturn**, a cross-platform GPU compute layer unifying Vulkan and Metal. Saturn abstracts away low-level syntax differences via **SCL** (Saturn Compute Language), enabling a single compute-shader codebase for all supported platforms. 
+Flint is a LLM inference engine written in pure Rust on [WGPU](https://github.com/gfx-rs/wgpu). It runs on the GPU via portable compute shaders, supporting **Windows**, **Linux/Android**, **macOS/iOS**, and the **Web (WASM)**.
 
 ## Features
 

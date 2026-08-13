@@ -1,13 +1,13 @@
-[package]
+﻿[package]
 name = "flint-model"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]
 flint-backend.workspace = true
 flint-checkpoint.workspace = true
 flint-error.workspace = true
-flint-kernel.workspace = true
+flint-num.workspace = true
 flint-tensor.workspace = true
-saturn-core = { path = "../../saturn/crates/saturn-core" }
 serde_json.workspace = true

@@ -1,4 +1,4 @@
-use flint_backend::{Backend, Binding, Pass};
+use flint_backend::{Backend, Binding, Commands};
 use flint_profiler::GpuProfiler;
 use flint_tensor::{DType, Weight};
 
@@ -7,17 +7,14 @@ fn f32_roundtrip() {
     let backend = Backend::new().unwrap();
     let data = [1.5f32, -2.25, 0.0, 1e30];
     let t = backend.tensor_f32(&data, vec![4]);
-    assert_eq!(backend.read_f32(t.buf.as_ref(), 0, 4).unwrap(), data);
+    assert_eq!(backend.read_f32(&t.buf, 0, 4).unwrap(), data);
 }
 
 #[test]
 fn read_f32_honors_byte_offset() {
     let backend = Backend::new().unwrap();
     let t = backend.tensor_f32(&[1.0, 2.0, 3.0, 4.0], vec![4]);
-    assert_eq!(
-        backend.read_f32(t.buf.as_ref(), 8, 2).unwrap(),
-        vec![3.0, 4.0]
-    );
+    assert_eq!(backend.read_f32(&t.buf, 8, 2).unwrap(), vec![3.0, 4.0]);
 }
 
 #[test]
@@ -25,10 +22,7 @@ fn zero_fill_resets_a_written_tensor() {
     let backend = Backend::new().unwrap();
     let t = backend.tensor_f32(&[9.0; 4], vec![4]);
     backend.zero_fill(&t);
-    assert_eq!(
-        backend.read_f32(t.buf.as_ref(), 0, 4).unwrap(),
-        vec![0.0; 4]
-    );
+    assert_eq!(backend.read_f32(&t.buf, 0, 4).unwrap(), vec![0.0; 4]);
 }
 
 #[test]
@@ -37,18 +31,15 @@ fn copy_duplicates_contents() {
     let src = backend.tensor_f32(&[5.0, 6.0], vec![2]);
     let dst = backend.zero_tensor(&[2]);
     backend.copy(&src, &dst);
-    assert_eq!(
-        backend.read_f32(dst.buf.as_ref(), 0, 2).unwrap(),
-        vec![5.0, 6.0]
-    );
+    assert_eq!(backend.read_f32(&dst.buf, 0, 2).unwrap(), vec![5.0, 6.0]);
 }
 
 #[test]
 fn write_u32_is_little_endian() {
     let backend = Backend::new().unwrap();
     let buf = backend.storage(8);
-    backend.write_u32(buf.as_ref(), &[f32::to_bits(1.0), 42]);
-    let got = backend.read_f32(buf.as_ref(), 0, 2).unwrap();
+    backend.write_u32(&buf, &[f32::to_bits(1.0), 42]);
+    let got = backend.read_f32(&buf, 0, 2).unwrap();
     assert_eq!(got[0], 1.0);
     assert_eq!(got[1], f32::from_bits(42));
 }
@@ -90,9 +81,9 @@ fn unknown_shader_is_an_error_not_a_panic() {
     let mut backend = Backend::new().unwrap();
     let t = backend.zero_tensor(&[1]);
     let mut enc = backend.encoder().unwrap();
-    let mut pass = Pass::begin(enc.as_mut());
+    let mut commands = Commands::begin(&mut enc);
     let err = backend
-        .dispatch(&mut pass, "nope", &[], &[Binding::Full(&t)], [1, 1, 1])
+        .dispatch(&mut commands, "nope", &[], &[Binding::Full(&t)], [1, 1, 1])
         .unwrap_err();
     assert!(err.to_string().contains("unknown shader"), "{err}");
 }
@@ -107,10 +98,10 @@ fn weight_invariants() {
 
     assert!(matches!(Weight::plain(f), Weight::Plain(_)));
     assert!(matches!(Weight::plain(b), Weight::Plain(_)));
-    match Weight::quant(i, s, 128) {
-        Weight::Quantized { group, .. } => assert_eq!(group, 128),
-        Weight::Plain(_) => unreachable!(),
-    }
+    assert!(matches!(
+        Weight::quant(i, s, 128),
+        Weight::Quantized { group: 128, .. }
+    ));
 
     let f = backend.tensor_f32(&[0.0; 4], vec![2, 2]);
     let w = Weight::plain(f);
@@ -148,9 +139,9 @@ fn adapter_name_is_reported() {
 }
 
 #[test]
-fn dummy_scale_is_a_single_element_tensor() {
+fn unit_scale_is_a_single_element_tensor() {
     let backend = Backend::new().unwrap();
-    let d = backend.dummy_scale();
+    let d = backend.unit_scale();
     assert_eq!(d.numel(), 1);
     assert_eq!(d.dtype, DType::F32);
 }
@@ -162,18 +153,18 @@ fn external_profiler_records_spans() {
     let span = prof.begin_span().unwrap();
     let t = backend.zero_tensor(&[1]);
     let mut enc = backend.encoder().unwrap();
-    let mut pass = Pass::begin(enc.as_mut());
+    let mut commands = Commands::begin(&mut enc);
     let binds = [Binding::Full(&t), Binding::Full(&t), Binding::Full(&t)];
     backend
         .dispatch(
-            &mut pass,
+            &mut commands,
             flint_kernel::name::ADD,
             &[("N_ELEM", 1.0)],
             &binds,
             [1, 1, 1],
         )
         .unwrap();
-    backend.submit(enc).unwrap();
+    backend.submit(&mut enc).unwrap();
     prof.end_span("add", span).unwrap();
     prof.flush().unwrap();
     let rows = prof.report();
@@ -193,9 +184,8 @@ fn profiler_grows_beyond_initial_capacity() {
     for _ in 0..5 {
         spans.push(prof.begin_span().unwrap());
     }
-    for (i, span) in spans.into_iter().enumerate() {
+    for span in spans {
         prof.end_span("s", span).unwrap();
-        let _ = i;
     }
     prof.flush().unwrap();
     let rows = prof.report();

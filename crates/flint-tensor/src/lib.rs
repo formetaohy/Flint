@@ -2,26 +2,24 @@ mod weight;
 
 pub use weight::Weight;
 
-use saturn_core::Buffer;
+use flint_gpu::Buffer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DType {
     F32,
     U32,
-
     Bf16,
-
     I8,
 }
 
 pub struct Tensor {
-    pub buf: Box<dyn Buffer>,
+    pub buf: Buffer,
     pub shape: Vec<u32>,
     pub dtype: DType,
 }
 
 impl Tensor {
-    pub fn new(buf: Box<dyn Buffer>, shape: Vec<u32>, dtype: DType) -> Self {
+    pub fn new(buf: Buffer, shape: Vec<u32>, dtype: DType) -> Self {
         Self { buf, shape, dtype }
     }
 

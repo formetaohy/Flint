@@ -72,7 +72,7 @@ impl Engine {
         }
     }
 
-    pub fn reset(&mut self) {
+    fn reset(&mut self) {
         self.model.reset(&self.backend);
     }
 

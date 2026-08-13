@@ -1,8 +1,0 @@
-@workgroup_size(256, 1, 1)
-kernel expert_gather (@binding(0) x: buf<f32>, @binding(1) ids: buf<u32>, @binding(2) out: buf<f32>, HIDDEN: u32, COUNT: u32) {
-    if global_id().x < COUNT * HIDDEN {
-        let r = global_id().x / HIDDEN;
-        let c = global_id().x % HIDDEN;
-        out[r * HIDDEN + c] = x[ids[r] * HIDDEN + c];
-    }
-}

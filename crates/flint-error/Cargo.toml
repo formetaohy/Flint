@@ -1,9 +1,8 @@
-[package]
+﻿[package]
 name = "flint-error"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]
-saturn-core = { path = "../../saturn/crates/saturn-core" }
-serde_json.workspace = true
 thiserror.workspace = true

@@ -3,10 +3,10 @@ use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::Result;
 use serde_json::Value;
 
-use crate::transformer::{TransformerConfig, TransformerModel, transformer_plan};
+use crate::transformer::{Config, Model, plan};
 
-pub fn parse_config(v: &Value) -> Result<TransformerConfig> {
-    let mut cfg = TransformerConfig::parse(v, false)?;
+pub fn parse_config(v: &Value) -> Result<Config> {
+    let mut cfg = Config::parse(v, false)?;
     cfg.qkv_bias = v
         .get("attention_bias")
         .and_then(Value::as_bool)
@@ -21,7 +21,7 @@ pub fn load(
     v: &Value,
     max_seq: u32,
     backend: &Backend,
-) -> Result<TransformerModel> {
+) -> Result<Model> {
     let mut cfg = parse_config(v)?;
     if source
         .names()
@@ -37,10 +37,10 @@ pub fn load(
     {
         cfg.qk_norm = true;
     }
-    TransformerModel::load(
+    Model::load(
         source,
         cfg,
-        &transformer_plan(source.kind() == CheckpointKind::Gguf),
+        &plan(source.kind() == CheckpointKind::Gguf),
         max_seq,
         backend,
     )

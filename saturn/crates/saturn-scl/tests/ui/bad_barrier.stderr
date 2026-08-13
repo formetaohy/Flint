@@ -1,8 +1,0 @@
-error: scl/bad_barrier.scl is invalid:
-       $DIR/tests/ui/scl/bad_barrier.scl:4:9: barrier() inside non-uniform control flow: the enclosing condition depends on per-invocation values (@local_id, @lane, buffer or threadgroup reads with non-uniform indices)
- --> tests/ui/bad_barrier.rs:4:13
-  |
-4 |     let _ = scl!("bad_barrier.scl");
-  |             ^^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: this error originates in the macro `scl` (in Nightly builds, run with -Z macro-backtrace for more info)

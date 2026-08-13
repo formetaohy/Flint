@@ -1,42 +1,47 @@
-use flint_backend::{Backend, Binding, Pass};
-use flint_error::Result;
+use flint_backend::{Backend, Binding, Commands};
+use flint_error::{Error, Result};
 use flint_tensor::Weight;
 
 pub fn gemm(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     x: Binding<'_>,
     w: &Weight,
     y: Binding<'_>,
     rows: u32,
 ) -> Result<()> {
-    gemm_acc(backend, pass, x, w, y, rows, false)
+    gemm_acc(backend, commands, x, w, y, rows, false)
 }
+
+pub struct QkvSpec<'a> {
+    pub wq: &'a Weight,
+    pub wk: &'a Weight,
+    pub wv: &'a Weight,
+    pub yq: Binding<'a>,
+    pub yk: Binding<'a>,
+    pub yv: Binding<'a>,
+    pub rows: u32,
+    pub kv_width: u32,
+}
+
 pub fn gemm_qkv(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     x: Binding<'_>,
-    wq: &Weight,
-    wk: &Weight,
-    wv: &Weight,
-    yq: Binding<'_>,
-    yk: Binding<'_>,
-    yv: Binding<'_>,
-    rows: u32,
-    kv_width: u32,
+    spec: &QkvSpec<'_>,
 ) -> Result<()> {
-    if rows == 1 {
-        gemv(backend, pass, x, wq, yq)?;
-        if kv_width > 0 {
-            gemv(backend, pass, x, wk, yk)?;
-            gemv(backend, pass, x, wv, yv)?;
+    if spec.rows == 1 {
+        gemv(backend, commands, x, spec.wq, spec.yq)?;
+        if spec.kv_width > 0 {
+            gemv(backend, commands, x, spec.wk, spec.yk)?;
+            gemv(backend, commands, x, spec.wv, spec.yv)?;
         }
         Ok(())
     } else {
-        gemm(backend, pass, x, wq, yq, rows)?;
-        if kv_width > 0 {
-            gemm(backend, pass, x, wk, yk, rows)?;
-            gemm(backend, pass, x, wv, yv, rows)?;
+        gemm(backend, commands, x, spec.wq, spec.yq, spec.rows)?;
+        if spec.kv_width > 0 {
+            gemm(backend, commands, x, spec.wk, spec.yk, spec.rows)?;
+            gemm(backend, commands, x, spec.wv, spec.yv, spec.rows)?;
         }
         Ok(())
     }
@@ -44,17 +49,17 @@ pub fn gemm_qkv(
 
 pub fn gemv(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     x: Binding<'_>,
     w: &Weight,
     y: Binding<'_>,
 ) -> Result<()> {
-    backend.gemv(pass, x, w, y)
+    backend.gemv(commands, x, w, y)
 }
 
 pub fn gemm_acc(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     x: Binding<'_>,
     w: &Weight,
     y: Binding<'_>,
@@ -62,8 +67,19 @@ pub fn gemm_acc(
     acc: bool,
 ) -> Result<()> {
     if rows == 1 {
-        backend.gemv_acc(pass, x, w, y, acc)
+        backend.gemv_acc(commands, x, w, y, acc)
     } else {
-        backend.gemm_acc(pass, x, w, y, rows, acc)
+        backend.gemm_acc(commands, x, w, y, rows, acc)
     }
+}
+
+pub fn check_gemm_dims(pairs: &[(u32, u32)]) -> Result<()> {
+    for &(n, k) in pairs {
+        if !n.is_multiple_of(16) || !k.is_multiple_of(64) {
+            return Err(Error::Config(format!(
+                "dimension pair (N={n}, K={k}) does not satisfy N%16 and K%64"
+            )));
+        }
+    }
+    Ok(())
 }

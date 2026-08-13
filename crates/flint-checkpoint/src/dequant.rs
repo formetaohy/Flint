@@ -1,5 +1,5 @@
 use flint_error::{Error, Result};
-use saturn_core::num::{bf16_to_f32, f16_to_f32};
+use flint_num::{bf16_to_f32, f16_to_f32};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GgmlType {

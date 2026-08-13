@@ -1,6 +1,8 @@
 use flint_backend::Backend;
 use flint_error::Result;
 
+pub const MAX_M: u32 = 128;
+
 #[derive(Debug)]
 pub struct ChunkOut {
     pub logits: Vec<Vec<f32>>,

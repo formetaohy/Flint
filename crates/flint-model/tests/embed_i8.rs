@@ -1,4 +1,4 @@
-use flint_backend::{Backend, Binding, Pass};
+use flint_backend::{Backend, Binding, Commands};
 use flint_model::ops;
 use flint_model::quant::quantize;
 use flint_tensor::{DType, Tensor, Weight};
@@ -19,28 +19,31 @@ fn embed_i8_matches_cpu_dequant() {
         group,
     );
     let ids_t = Tensor::new(backend.storage(16), vec![4], DType::U32);
-    backend.write_u32(ids_t.buf.as_ref(), &[3, 1, 0, 2]);
+    backend.write_u32(&ids_t.buf, &[3, 1, 0, 2]);
     let y = backend.zero_tensor(&[16, dim]);
     {
         let mut enc = backend.encoder().unwrap();
         {
-            let mut pass = Pass::begin(enc.as_mut());
+            let mut commands = Commands::begin(&mut enc);
             ops::embed(
                 &mut backend,
-                &mut pass,
+                &mut commands,
                 &ids_t,
                 &w,
                 Binding::Full(&y),
-                4,
-                dim,
-                1.0,
+                &ops::EmbedSpec {
+                    rows: 4,
+                    dim,
+                    scale: 1.0,
+                    split: 0,
+                },
             )
             .unwrap();
         }
-        backend.submit(enc).unwrap();
+        backend.submit(&mut enc).unwrap();
     }
     let got = backend
-        .read_f32(y.buf.as_ref(), 0, (4 * dim) as usize)
+        .read_f32(&y.buf, 0, (4 * dim) as usize)
         .unwrap();
     let ids = [3u32, 1, 0, 2];
     for r in 0..rows {

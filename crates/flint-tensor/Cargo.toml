@@ -1,7 +1,8 @@
-[package]
+﻿[package]
 name = "flint-tensor"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]
-saturn-core = { path = "../../saturn/crates/saturn-core" }
+flint-gpu.workspace = true

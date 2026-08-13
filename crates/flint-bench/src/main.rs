@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use flint_architectures::transformer::{TransformerConfig, TransformerModel, transformer_plan};
+use flint_architectures::transformer::{Config, Model, plan};
 use flint_backend::Backend;
 use flint_error::Result;
 use flint_model::LanguageModel;
@@ -57,7 +57,7 @@ struct Args {
     profile: bool,
 }
 
-fn config(s: &BenchSpec) -> TransformerConfig {
+fn config(s: &BenchSpec) -> Config {
     let v = json!({
         "hidden_size": s.hidden,
         "intermediate_size": s.intermediate,
@@ -70,25 +70,25 @@ fn config(s: &BenchSpec) -> TransformerConfig {
         "eos_token_id": [0],
         "tie_word_embeddings": false,
     });
-    TransformerConfig::parse(&v, false).unwrap()
+    Config::parse(&v, false).unwrap()
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.bandwidth {
-        return probes::bandwidth_probe();
+        return probes::run("bandwidth");
     }
     if args.gemv_probe {
-        return probes::gemv_probe();
+        return probes::run("gemv");
     }
     if args.cpu_probe {
-        return probes::cpu_probe();
+        return probes::run("cpu");
     }
     if args.gemm_probe {
-        return probes::gemm_probe();
+        return probes::run("gemm");
     }
     if args.attn_probe {
-        return probes::attn_probe();
+        return probes::run("attn");
     }
     let spec = BenchSpec {
         hidden: args.hidden,
@@ -123,9 +123,9 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let source = SynthCheckpoint::new(spec);
     let cfg = config(&spec);
-    let plan = transformer_plan(false);
+    let plan = plan(false);
     let mut backend = backend;
-    let mut model = TransformerModel::load(&source, cfg, &plan, args.max_seq, &backend)?;
+    let mut model = Model::load(&source, cfg, &plan, args.max_seq, &backend)?;
     eprintln!(
         "[bench] weights loaded in {:.1}s",
         t0.elapsed().as_secs_f64()
@@ -139,7 +139,7 @@ fn main() -> Result<()> {
 
     let warm_ids: Vec<u32> = (0..16).map(|i| i % (args.vocab - 1) + 1).collect();
     model.forward(&mut backend, &warm_ids, &[], &[])?;
-    let _ = backend.read_f32(backend.dummy_scale().buf.as_ref(), 0, 1)?;
+    let _ = backend.read_f32(&backend.unit_scale().buf, 0, 1)?;
     let prefill_span = match &mut profiler {
         Some(p) => Some(p.begin_span()?),
         None => None,
@@ -160,7 +160,7 @@ fn main() -> Result<()> {
         p.end_span("prefill", span)?;
     }
 
-    let _ = backend.read_f32(backend.dummy_scale().buf.as_ref(), 0, 1)?;
+    let _ = backend.read_f32(&backend.unit_scale().buf, 0, 1)?;
     let prefill_secs = t0.elapsed().as_secs_f64();
     eprintln!(
         "[bench] prefill: {} tok in {:.2}s ({:.1} tok/s)",

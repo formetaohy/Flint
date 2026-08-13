@@ -1,5 +1,5 @@
 use flint_backend::Backend;
-use flint_checkpoint::GgufWriter;
+use flint_checkpoint::{GgufWriter, SafetensorEntry};
 
 #[test]
 fn unsupported_formats_fail_fast() {
@@ -10,7 +10,12 @@ fn unsupported_formats_fail_fast() {
     std::fs::create_dir_all(&dir).unwrap();
     flint_checkpoint::write_tensors(
         &dir.join("model.safetensors"),
-        &[("a".to_string(), vec![1], vec![0u8; 4], false)],
+        &[SafetensorEntry {
+            name: "a",
+            shape: &[1],
+            bytes: &[0u8; 4],
+            bf16: false,
+        }],
     )
     .unwrap();
     std::fs::write(dir.join("config.json"), r#"{"model_type": "bert"}"#).unwrap();

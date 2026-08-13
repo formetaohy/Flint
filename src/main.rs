@@ -125,11 +125,10 @@ fn onnx_run(model: &Path, args: OnnxArgs) -> Result<()> {
         session.set_input(name, t)?;
     }
 
-    for v in &session.graph().inputs {
-        if !inputs.contains_key(&v.name) {
+    for name in session.input_names() {
+        if !inputs.contains_key(name) {
             return Err(flint_error::Error::Model(format!(
-                "graph input {:?} is not provided",
-                v.name
+                "graph input {name:?} is not provided"
             )));
         }
     }
@@ -154,7 +153,7 @@ fn onnx_run(model: &Path, args: OnnxArgs) -> Result<()> {
     Ok(())
 }
 
-fn json_to_tensor(v: &serde_json::Value) -> Result<flint_onnx::Tensor> {
+fn json_to_tensor(v: &serde_json::Value) -> Result<flint_onnx::tensor::Tensor> {
     fn flatten(
         v: &serde_json::Value,
         f32s: &mut Vec<f32>,
@@ -205,9 +204,9 @@ fn json_to_tensor(v: &serde_json::Value) -> Result<flint_onnx::Tensor> {
         (!bools.is_empty()) as u8,
     ];
     match kinds {
-        [1, 0, 0] => Ok(flint_onnx::Tensor::f32(f32s, shape)),
-        [0, 1, 0] => Ok(flint_onnx::Tensor::i64(i64s, shape)),
-        [0, 0, 1] => Ok(flint_onnx::Tensor::bool(bools, shape)),
+        [1, 0, 0] => Ok(flint_onnx::tensor::Tensor::f32(f32s, shape)),
+        [0, 1, 0] => Ok(flint_onnx::tensor::Tensor::i64(i64s, shape)),
+        [0, 0, 1] => Ok(flint_onnx::tensor::Tensor::bool(bools, shape)),
         _ => Err(flint_error::Error::Model(
             "inputs must be a homogeneous nested array of numbers or booleans".into(),
         )),
@@ -255,7 +254,6 @@ fn chat_main(model: &Path, args: ChatArgs) -> Result<()> {
         &mut engine,
         chat.as_ref(),
         &args.system,
-        &[],
         &prompt,
         args.max_tokens,
     )?;
@@ -266,11 +264,10 @@ fn run_turn(
     engine: &mut Engine,
     chat: &dyn ChatFormat,
     system: &str,
-    history: &[(String, String)],
     user: &str,
     max_tokens: usize,
 ) -> Result<()> {
-    let text = chat.render(system, history, user);
+    let text = chat.render(system, &[], user);
     let mut stream = engine.stream(&text, max_tokens)?;
     for piece in stream.by_ref() {
         let piece = piece?;

@@ -1,8 +1,8 @@
 use flint_backend::Backend;
 use flint_error::Result;
 
-pub fn bandwidth_probe() -> Result<()> {
-    use flint_backend::{Binding, Pass};
+fn bandwidth_probe() -> Result<()> {
+    use flint_backend::{Binding, Commands};
 
     let mut backend = Backend::new()?;
     eprintln!("[bench] adapter: {}", backend.adapter_name());
@@ -13,16 +13,16 @@ pub fn bandwidth_probe() -> Result<()> {
     let run = |backend: &mut Backend| -> Result<()> {
         let mut enc = backend.encoder().unwrap();
         {
-            let mut pass = Pass::begin(enc.as_mut());
+            let mut commands = Commands::begin(&mut enc);
             backend.dispatch(
-                &mut pass,
+                &mut commands,
                 flint_kernel::name::ADD,
                 &[("N_ELEM", n as f64)],
                 &[Binding::Full(&x), Binding::Full(&x), Binding::Full(&y)],
                 [1024, (n as u32).div_ceil(256 * 1024), 1],
             )?;
         }
-        backend.submit(enc).unwrap();
+        backend.submit(&mut enc).unwrap();
         Ok(())
     };
 
@@ -35,15 +35,15 @@ pub fn bandwidth_probe() -> Result<()> {
         run(&mut backend)?;
     }
 
-    let _ = backend.read_f32(y.buf.as_ref(), 0, 1)?;
+    let _ = backend.read_f32(&y.buf, 0, 1)?;
     let secs = t0.elapsed().as_secs_f64();
     let bytes = n as f64 * 4.0 * 2.0 * iters as f64;
     eprintln!("[bench] copy bandwidth: {:.1} GB/s", bytes / secs / 1e9);
     Ok(())
 }
 
-pub fn gemv_probe() -> Result<()> {
-    use flint_backend::{Binding, Pass};
+fn gemv_probe() -> Result<()> {
+    use flint_backend::{Binding, Commands};
     use flint_model::quant::{choose_group, quantize};
 
     let mut backend = Backend::new()?;
@@ -81,9 +81,9 @@ pub fn gemv_probe() -> Result<()> {
     let run = |backend: &mut Backend| -> Result<()> {
         let mut enc = backend.encoder().unwrap();
         {
-            let mut pass = Pass::begin(enc.as_mut());
+            let mut commands = Commands::begin(&mut enc);
             backend.dispatch(
-                &mut pass,
+                &mut commands,
                 kernel,
                 &[
                     ("N", n as f64),
@@ -102,14 +102,14 @@ pub fn gemv_probe() -> Result<()> {
                 [n.div_ceil(cols), segs, 1],
             )?;
             backend.dispatch(
-                &mut pass,
+                &mut commands,
                 flint_kernel::name::MERGE_GEMV,
                 &[("N", n as f64), ("SEGS", segs as f64), ("ACC", 0.0)],
                 &[Binding::Full(&partial), Binding::Full(&y)],
                 [n.div_ceil(256), 1, 1],
             )?;
         }
-        backend.submit(enc).unwrap();
+        backend.submit(&mut enc).unwrap();
         Ok(())
     };
 
@@ -121,7 +121,7 @@ pub fn gemv_probe() -> Result<()> {
     for _ in 0..iters {
         run(&mut backend)?;
     }
-    let _ = backend.read_f32(y.buf.as_ref(), 0, 1)?;
+    let _ = backend.read_f32(&y.buf, 0, 1)?;
     let secs = t0.elapsed().as_secs_f64();
     let bytes = n as f64 * k as f64 * iters as f64;
     eprintln!(
@@ -132,8 +132,8 @@ pub fn gemv_probe() -> Result<()> {
     Ok(())
 }
 
-pub fn cpu_probe() -> Result<()> {
-    use flint_backend::{Binding, Pass};
+fn cpu_probe() -> Result<()> {
+    use flint_backend::{Binding, Commands};
     use flint_model::quant::{choose_group, quantize};
 
     let mut backend = Backend::new()?;
@@ -154,9 +154,9 @@ pub fn cpu_probe() -> Result<()> {
     for _ in 0..3 {
         let mut enc = backend.encoder().unwrap();
         {
-            let mut pass = Pass::begin(enc.as_mut());
+            let mut commands = Commands::begin(&mut enc);
             backend.dispatch(
-                &mut pass,
+                &mut commands,
                 flint_kernel::name::GEMV,
                 &[
                     ("N", n as f64),
@@ -175,13 +175,13 @@ pub fn cpu_probe() -> Result<()> {
                 [n.div_ceil(256), 2, 1],
             )?;
         }
-        backend.submit(enc)?;
+        backend.submit(&mut enc)?;
     }
 
     let kernel = backend.kernel("gemv")?;
     let mut enc = backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(enc.as_mut());
+        let mut commands = Commands::begin(&mut enc);
         let consts = [
             ("N", n as f64),
             ("K", k as f64),
@@ -192,27 +192,27 @@ pub fn cpu_probe() -> Result<()> {
         ];
         let scalars = backend.pack_scalars("gemv", &consts)?;
         let binds = [
-            saturn_core::BindingRef {
+            flint_gpu::BindingRef {
                 index: 0,
-                buffer: xb.buf.as_ref(),
+                buffer: &xb.buf,
                 offset: 0,
                 size: 0,
             },
-            saturn_core::BindingRef {
+            flint_gpu::BindingRef {
                 index: 1,
-                buffer: wb.buf.as_ref(),
+                buffer: &wb.buf,
                 offset: 0,
                 size: 0,
             },
-            saturn_core::BindingRef {
+            flint_gpu::BindingRef {
                 index: 2,
-                buffer: sb.buf.as_ref(),
+                buffer: &sb.buf,
                 offset: 0,
                 size: 0,
             },
-            saturn_core::BindingRef {
+            flint_gpu::BindingRef {
                 index: 3,
-                buffer: partial.buf.as_ref(),
+                buffer: &partial.buf,
                 offset: 0,
                 size: 0,
             },
@@ -220,7 +220,7 @@ pub fn cpu_probe() -> Result<()> {
 
         let t0 = std::time::Instant::now();
         for _ in 0..100 {
-            pass.raw().bind(kernel, &binds)?;
+            commands.raw().bind(kernel, &binds)?;
         }
         eprintln!(
             "[probe] bind: {:.1} us",
@@ -229,7 +229,7 @@ pub fn cpu_probe() -> Result<()> {
 
         let t0 = std::time::Instant::now();
         for _ in 0..100 {
-            pass.raw().set_scalars(kernel, &scalars)?;
+            commands.raw().set_scalars(&scalars)?;
         }
         eprintln!(
             "[probe] set_scalars: {:.1} us",
@@ -238,29 +238,17 @@ pub fn cpu_probe() -> Result<()> {
 
         let t0 = std::time::Instant::now();
         for _ in 0..100 {
-            pass.raw().dispatch([56, 2, 1])?;
+            commands.raw().dispatch([56, 2, 1])?;
         }
         eprintln!(
             "[probe] dispatch: {:.1} us",
             t0.elapsed().as_secs_f64() / 100.0 * 1e6
         );
-
-        let t0 = std::time::Instant::now();
-        for _ in 0..100 {
-            pass.raw().barrier()?;
-        }
-        eprintln!(
-            "[probe] barrier: {:.1} us",
-            t0.elapsed().as_secs_f64() / 100.0 * 1e6
-        );
     }
-    let encoders = vec![enc];
 
     let t0 = std::time::Instant::now();
-    for enc in encoders {
-        backend.submit(enc)?;
-    }
-    let _ = backend.read_f32(y.buf.as_ref(), 0, 1)?;
+    backend.submit(&mut enc)?;
+    let _ = backend.read_f32(&y.buf, 0, 1)?;
     eprintln!(
         "[probe] submit+drain: {:.2} ms total ({} us/dispatch)",
         t0.elapsed().as_secs_f64() * 1e3,
@@ -269,8 +257,8 @@ pub fn cpu_probe() -> Result<()> {
     Ok(())
 }
 
-pub fn gemm_probe() -> Result<()> {
-    use flint_backend::{Binding, Pass};
+fn gemm_probe() -> Result<()> {
+    use flint_backend::{Binding, Commands};
     use flint_model::quant::{choose_group, quantize};
 
     let mut backend = Backend::new()?;
@@ -293,9 +281,9 @@ pub fn gemm_probe() -> Result<()> {
     let run = |backend: &mut Backend| -> Result<()> {
         let mut enc = backend.encoder().unwrap();
         {
-            let mut pass = Pass::begin(enc.as_mut());
+            let mut commands = Commands::begin(&mut enc);
             backend.dispatch(
-                &mut pass,
+                &mut commands,
                 flint_kernel::name::GEMM,
                 &[
                     ("N", n as f64),
@@ -317,7 +305,7 @@ pub fn gemm_probe() -> Result<()> {
                 [n.div_ceil(32), m.div_ceil(32), 1],
             )?;
         }
-        backend.submit(enc).unwrap();
+        backend.submit(&mut enc).unwrap();
         Ok(())
     };
     for _ in 0..40 {
@@ -328,7 +316,7 @@ pub fn gemm_probe() -> Result<()> {
     for _ in 0..iters {
         run(&mut backend)?;
     }
-    let _ = backend.read_f32(y.buf.as_ref(), 0, 1)?;
+    let _ = backend.read_f32(&y.buf, 0, 1)?;
     let secs = t0.elapsed().as_secs_f64();
     let flops = 2.0 * m as f64 * n as f64 * k as f64 * iters as f64;
     eprintln!(
@@ -339,9 +327,10 @@ pub fn gemm_probe() -> Result<()> {
     Ok(())
 }
 
-pub fn attn_probe() -> Result<()> {
-    use flint_backend::{Binding, Pass};
-    use flint_model::step::{MAX_M, step_args};
+fn attn_probe() -> Result<()> {
+    use flint_backend::{Binding, Commands};
+    use flint_model::step::step_args;
+
     let mut backend = Backend::new()?;
     eprintln!("[probe] adapter: {}", backend.adapter_name());
     let (m, nq, nkv, hd, max_seq, pos) = (128u32, 32u32, 8u32, 128u32, 2048u32, 1024u32);
@@ -370,19 +359,18 @@ pub fn attn_probe() -> Result<()> {
         .tensor_bf16(&vbytes, vec![nkv, max_seq, hd])
         .unwrap();
     let y = backend.zero_tensor(&[m, nq, hd]);
-    let _ = MAX_M;
     let scratch = backend.zero_tensor(&[m, nkv, 32, 8, hd + 2]);
     let segs = std::env::var("PROBE_SEGS")
         .map(|v| v.parse().unwrap())
         .unwrap_or_else(|_| (pos + m).div_ceil(256).clamp(1, 32));
     let args = step_args(&backend);
-    backend.write_u32(args.buf.as_ref(), &[pos, segs]);
+    backend.write_u32(&args.buf, &[pos, segs]);
     let run = |backend: &mut Backend| -> Result<()> {
         let mut enc = backend.encoder().unwrap();
         {
-            let mut pass = Pass::begin(enc.as_mut());
+            let mut commands = Commands::begin(&mut enc);
             backend.dispatch(
-                &mut pass,
+                &mut commands,
                 flint_kernel::name::ATTN,
                 &[
                     ("N_HEADS", nq as f64),
@@ -404,7 +392,7 @@ pub fn attn_probe() -> Result<()> {
                 [m, nkv, segs],
             )?;
         }
-        backend.submit(enc).unwrap();
+        backend.submit(&mut enc).unwrap();
         Ok(())
     };
     for _ in 0..10 {
@@ -415,12 +403,25 @@ pub fn attn_probe() -> Result<()> {
     for _ in 0..iters {
         run(&mut backend)?;
     }
-    let _ = backend.read_f32(y.buf.as_ref(), 0, 1)?;
+    let _ = backend.read_f32(&y.buf, 0, 1)?;
     let secs = t0.elapsed().as_secs_f64();
     eprintln!(
-        "[probe] attn M={m} kv={} segs={segs}: {:.2} ms/call",
+        "[probe] attn M={} kv={pos} segs={segs}: {:.2} ms/call",
         pos + m,
         secs / iters as f64 * 1e3
     );
     Ok(())
+}
+
+pub fn run(name: &str) -> Result<()> {
+    match name {
+        "bandwidth" => bandwidth_probe(),
+        "gemv" => gemv_probe(),
+        "cpu" => cpu_probe(),
+        "gemm" => gemm_probe(),
+        "attn" => attn_probe(),
+        other => Err(flint_error::Error::Model(format!(
+            "unknown probe {other:?}"
+        ))),
+    }
 }

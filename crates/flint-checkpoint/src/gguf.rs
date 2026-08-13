@@ -5,7 +5,7 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use flint_error::{Error, Result};
-use saturn_core::num::{f32_to_bf16, f32_to_f16};
+use flint_num::{f32_to_bf16, f32_to_f16};
 
 use super::dequant::{self, GgmlType};
 use super::{Checkpoint, CheckpointKind, MetaVal, Metadata, RawTensor, TensorData};
@@ -29,21 +29,23 @@ pub struct Gguf {
 impl Gguf {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)
-            .map_err(|e| Error::Model(format!("cannot open {}: {e}", path.display())))?;
+            .map_err(|e| Error::Checkpoint(format!("cannot open {}: {e}", path.display())))?;
         let mmap = unsafe { Mmap::map(&file) }
-            .map_err(|e| Error::Model(format!("mmap {}: {e}", path.display())))?;
+            .map_err(|e| Error::Checkpoint(format!("mmap {}: {e}", path.display())))?;
         let mut r = Reader(&mmap, 0);
 
         let magic = r.u32()?;
         if magic != MAGIC {
-            return Err(Error::Model(format!(
+            return Err(Error::Checkpoint(format!(
                 "{:?} is not a GGUF file",
                 path.file_name()
             )));
         }
         let version = r.u32()?;
         if !(2..=3).contains(&version) {
-            return Err(Error::Model(format!("unsupported GGUF version {version}")));
+            return Err(Error::Checkpoint(format!(
+                "unsupported GGUF version {version}"
+            )));
         }
         let tensor_count = r.u64()? as usize;
         let kv_count = r.u64()? as usize;
@@ -118,7 +120,7 @@ impl Gguf {
         self.meta.u32(&format!("{arch}.attention.key_length"))
     }
 
-    fn qk_permuted(&self) -> bool {
+    fn qk_interleaved(&self) -> bool {
         self.meta.str("general.architecture") == Some("llama")
     }
 }
@@ -186,11 +188,11 @@ impl Checkpoint for Gguf {
         let info = self
             .tensors
             .get(name)
-            .ok_or_else(|| Error::Model(format!("gguf tensor {name:?} not found")))?;
+            .ok_or_else(|| Error::Checkpoint(format!("gguf tensor {name:?} not found")))?;
         let need = info.numel.div_ceil(info.ty.block_len()) * info.ty.block_bytes();
         let end = info.offset + need;
         if end > self.mmap.len() {
-            return Err(Error::Model(format!(
+            return Err(Error::Checkpoint(format!(
                 "gguf tensor {name:?} data out of bounds ({}..{} of {})",
                 info.offset,
                 end,
@@ -202,7 +204,7 @@ impl Checkpoint for Gguf {
         let shape: Vec<u32> = info.shape.iter().rev().cloned().collect();
 
         let hd = self.head_dim().unwrap_or(0);
-        let interleaved = self.qk_permuted() && hd > 0 && hd.is_multiple_of(2) && {
+        let interleaved = self.qk_interleaved() && hd > 0 && hd.is_multiple_of(2) && {
             let is_qk = name.ends_with("attn_q.weight")
                 || name.ends_with("attn_k.weight")
                 || name.ends_with("attn_q.bias")
@@ -227,7 +229,7 @@ impl Checkpoint for Gguf {
                 if interleaved {
                     deinterleave_rows_q8(&mut d, rows, cols, hd);
                 }
-                TensorData::Q8Blocks {
+                TensorData::Q8_0 {
                     bytes: d,
                     numel: info.numel,
                 }
@@ -243,12 +245,12 @@ impl Checkpoint for Gguf {
         Ok(RawTensor { shape, data })
     }
 
-    fn metadata(&self) -> &Metadata {
-        &self.meta
+    fn metadata(&self) -> Result<&Metadata> {
+        Ok(&self.meta)
     }
 
-    fn config_json(&self) -> Result<Option<serde_json::Value>> {
-        Ok(None)
+    fn config_json(&self) -> Result<serde_json::Value> {
+        Err(Error::Checkpoint("GGUF has no config.json".into()))
     }
 
     fn kind(&self) -> CheckpointKind {
@@ -261,7 +263,7 @@ struct Reader<'a>(&'a [u8], usize);
 impl Reader<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8]> {
         if self.1 + n > self.0.len() {
-            return Err(Error::Model("GGUF header truncated".into()));
+            return Err(Error::Checkpoint("GGUF header truncated".into()));
         }
         let s = &self.0[self.1..self.1 + n];
         self.1 += n;
@@ -297,7 +299,8 @@ impl Reader<'_> {
     fn string(&mut self) -> Result<String> {
         let len = self.u64()? as usize;
         let b = self.take(len)?;
-        String::from_utf8(b.to_vec()).map_err(|_| Error::Model("GGUF string is not UTF-8".into()))
+        String::from_utf8(b.to_vec())
+            .map_err(|_| Error::Checkpoint("GGUF string is not UTF-8".into()))
     }
     fn value(&mut self) -> Result<MetaVal> {
         let ty = self.u32()?;
@@ -328,7 +331,7 @@ impl Reader<'_> {
             11 => MetaVal::Int(self.u64()? as i64),
             12 => MetaVal::Float(self.f64()?),
             t => {
-                return Err(Error::Model(format!(
+                return Err(Error::Checkpoint(format!(
                     "unknown GGUF metadata value type {t}"
                 )));
             }
@@ -342,11 +345,11 @@ fn align_up(v: usize, a: usize) -> usize {
 
 pub struct GgufWriter {
     kvs: Vec<(String, MetaVal)>,
-    tensors: Vec<TensorSpec>,
+    tensors: Vec<GgufTensor>,
     alignment: usize,
 }
 
-struct TensorSpec {
+struct GgufTensor {
     name: String,
     ty: GgmlType,
 
@@ -413,7 +416,7 @@ impl GgufWriter {
         for v in data {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
-        self.tensors.push(TensorSpec {
+        self.tensors.push(GgufTensor {
             name: name.to_string(),
             ty: GgmlType::F32,
             shape: shape.to_vec(),
@@ -426,7 +429,7 @@ impl GgufWriter {
         for v in data {
             bytes.extend_from_slice(&f32_to_bf16(*v).to_le_bytes());
         }
-        self.tensors.push(TensorSpec {
+        self.tensors.push(GgufTensor {
             name: name.to_string(),
             ty: GgmlType::Bf16,
             shape: shape.to_vec(),
@@ -449,7 +452,7 @@ impl GgufWriter {
                 bytes.push(((v / d).round().clamp(-127.0, 127.0) as i8) as u8);
             }
         }
-        self.tensors.push(TensorSpec {
+        self.tensors.push(GgufTensor {
             name: name.to_string(),
             ty: GgmlType::Q8_0,
             shape: shape.to_vec(),
@@ -470,7 +473,7 @@ impl GgufWriter {
         }
 
         let header_end = out.len();
-        let rec_len = |t: &TensorSpec| 8 + t.name.len() + 4 + t.shape.len() * 8 + 4 + 8;
+        let rec_len = |t: &GgufTensor| 8 + t.name.len() + 4 + t.shape.len() * 8 + 4 + 8;
         for t in &self.tensors {
             write_str(&mut out, &t.name);
             out.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());

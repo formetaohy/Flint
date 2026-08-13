@@ -17,9 +17,7 @@
 
 ## Flint 是什么？
 
-**Flint** 是一款基于 Rust 的高性能 LLM 推理引擎，原生支持 Windows、Linux、Android、macOS 与 iOS。
-
-其核心是一个专为跨平台 Compute Shader 优化的 GPU 抽象层 **Saturn**，支持 Vulkan 和 Metal 后端。**Saturn** 还引入了 **SCL**（Saturn Compute Language）以屏蔽底层语法的差异，让一套代码适配所有支持的平台。
+Flint 是用纯 Rust 编写、基于 [WGPU](https://github.com/gfx-rs/wgpu) 的大模型推理引擎。通过可移植的 Compute Shader 在 GPU 上运行，支持 **Windows**、**Linux/Android**、**macOS/iOS** 和 **Web (WASM)**。
 
 ## 特性
 

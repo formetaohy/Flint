@@ -2,7 +2,13 @@
 name = "flint-tokenizer"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
+flint-checkpoint.workspace = true
 flint-error.workspace = true
+ahash.workspace = true
 tokenizers.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

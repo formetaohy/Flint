@@ -1,6 +1,6 @@
 use flint_error::{Error, Result};
-use flint_model::config::{check_gemm_dims, check_head_dim, f64_field, u32_field, u32_list};
-use flint_model::ops::{Act, RopeScaling};
+use flint_model::config::{f64_field, u32_field, u32_list};
+use flint_model::ops::{Act, MAX_GQA, RopeScaling, check_gemm_dims, check_head_dim};
 use flint_model::routing::RouteKind;
 use serde_json::Value;
 
@@ -29,7 +29,7 @@ pub struct PerLayerConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct TransformerConfig {
+pub struct Config {
     pub hidden: u32,
     pub intermediate: u32,
     pub layers: u32,
@@ -79,7 +79,7 @@ pub struct TransformerConfig {
     pub per_layer: Option<PerLayerConfig>,
 }
 
-impl TransformerConfig {
+impl Config {
     pub fn parse(v: &Value, tied_default: bool) -> Result<Self> {
         let hidden = u32_field(v, "hidden_size")?;
         let q_heads = u32_field(v, "num_attention_heads")?;
@@ -157,11 +157,10 @@ impl TransformerConfig {
         if !t.q_heads.is_multiple_of(t.kv_heads) {
             return Err(Error::Config("q heads not divisible by kv heads".into()));
         }
-        if t.q_heads / t.kv_heads > flint_model::step::MAX_GQA {
+        if t.q_heads / t.kv_heads > MAX_GQA {
             return Err(Error::Config(format!(
-                "GQA ratio {} exceeds the attention shader's {} head slots",
-                t.q_heads / t.kv_heads,
-                flint_model::step::MAX_GQA
+                "GQA ratio {} exceeds the attention shader's {MAX_GQA} head slots",
+                t.q_heads / t.kv_heads
             )));
         }
         if t.head_dims.len() != t.layers as usize {

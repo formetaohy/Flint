@@ -1,5 +1,8 @@
-use flint_backend::{Backend, Binding, Pass};
-use flint_kernel::{Act, NormMode, cpu, name};
+﻿use flint_backend::{Backend, Binding, Commands};
+use flint_kernel::{Act, NormMode, name};
+
+mod support;
+use support::cpu_ref;
 use flint_tensor::{DType, Tensor, Weight};
 
 struct Ctx {
@@ -37,14 +40,14 @@ impl Ctx {
         let segs = kv_len.div_ceil(256).clamp(1, 32);
         let t = Tensor::new(self.backend.storage(8), vec![2], DType::U32);
         self.backend
-            .write_u32(t.buf.as_ref(), &[pos as u32, segs as u32]);
+            .write_u32(&t.buf, &[pos as u32, segs as u32]);
         t
     }
 
     fn read_bf16(&self, t: &Tensor) -> Vec<f32> {
         let raw = self
             .backend
-            .read_f32(t.buf.as_ref(), 0, (t.numel() / 2) as usize)
+            .read_f32(&t.buf, 0, (t.numel() / 2) as usize)
             .unwrap();
         let mut out = Vec::with_capacity(t.numel() as usize);
         for w in raw {
@@ -64,17 +67,17 @@ impl Ctx {
     ) {
         let mut enc = self.backend.encoder().unwrap();
         {
-            let mut pass = Pass::begin(enc.as_mut());
+            let mut pass = Commands::begin(&mut enc);
             self.backend
                 .dispatch(&mut pass, name, consts, bufs, groups)
                 .unwrap();
         }
-        self.backend.submit(enc).unwrap();
+        self.backend.submit(&mut enc).unwrap();
     }
 
     fn read(&self, t: &Tensor) -> Vec<f32> {
         self.backend
-            .read_f32(t.buf.as_ref(), 0, t.numel() as usize)
+            .read_f32(&t.buf, 0, t.numel() as usize)
             .unwrap()
     }
 }
@@ -204,7 +207,7 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
         ],
         [n.div_ceil(32) as u32, m.div_ceil(32) as u32, 1],
     );
-    agree(&ctx.read(&y), &cpu::gemm(&x, &cpu_w, m, n, k), rel, abs);
+    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), rel, abs);
 }
 
 #[test]
@@ -290,7 +293,7 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
             [(n.div_ceil(256)) as u32, 1, 1],
         );
     }
-    agree(&ctx.read(&y), &cpu::gemv(&x, &cpu_w, n, k), rel, abs);
+    agree(&ctx.read(&y), &cpu_ref::gemv(&x, &cpu_w, n, k), rel, abs);
 }
 
 #[test]
@@ -332,15 +335,15 @@ fn gemv_bf16_split_segs_divide_k_blocks() {
     let y = ctx.zero(&[n]);
     let mut enc = ctx.backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(enc.as_mut());
+        let mut pass = Commands::begin(&mut enc);
         ctx.backend
             .gemv(&mut pass, Binding::Full(&xb), &wt, Binding::Full(&y))
             .unwrap();
     }
-    ctx.backend.submit(enc).unwrap();
+    ctx.backend.submit(&mut enc).unwrap();
     agree(
         &ctx.read(&y),
-        &cpu::gemv(&x, &w, n as usize, k as usize),
+        &cpu_ref::gemv(&x, &w, n as usize, k as usize),
         2e-2,
         5e-2,
     );
@@ -361,7 +364,7 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
         vec![rows as u32],
         DType::F32,
     );
-    ctx.backend.write_u32(ib.buf.as_ref(), &ids);
+    ctx.backend.write_u32(&ib.buf, &ids);
     let y = ctx.zero(&[16u32, dim as u32]);
     let fallback = ctx.f32(&[1.0], &[1]);
     let w = Weight::plain(tb);
@@ -389,7 +392,7 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
     let got = ctx.read(&y);
     agree(
         &got[..rows * dim],
-        &cpu::embed(&ids, &bf16_round(&table), dim, scale),
+        &cpu_ref::embed(&ids, &bf16_round(&table), dim, scale),
         0.0,
         1e-6,
     );
@@ -444,17 +447,13 @@ fn norm_case(mode: NormMode, rows: usize, dim: usize, w_dim: usize, seed: u64) {
     );
     agree(
         &ctx.read(&y),
-        &cpu::norm(mode, &x, &w, &z, rows, dim, w_dim, 1e-6),
+        &cpu_ref::norm(mode, &x, &w, &z, cpu_ref::NormArgs { rows, dim, w_dim, eps: 1e-6 }),
         1e-4,
         1e-5,
     );
 }
 
-fn norm_rope_cpu(
-    x: &[f32],
-    w: &[f32],
-    cos: &[f32],
-    sin: &[f32],
+struct NormRopeArgs {
     rows: usize,
     dim: usize,
     rot: usize,
@@ -462,7 +461,18 @@ fn norm_rope_cpu(
     pos: usize,
     stride: usize,
     eps: f32,
-) -> Vec<f32> {
+}
+
+fn norm_rope_cpu(x: &[f32], w: &[f32], cos: &[f32], sin: &[f32], spec: NormRopeArgs) -> Vec<f32> {
+    let (rows, dim, rot, heads, pos, stride, eps) = (
+        spec.rows,
+        spec.dim,
+        spec.rot,
+        spec.heads,
+        spec.pos,
+        spec.stride,
+        spec.eps,
+    );
     let half = rot / 2;
     let mut out = vec![0f32; rows * dim];
     for r in 0..rows {
@@ -537,7 +547,21 @@ fn norm_rope_mode4_pos72_repro() {
         [rows as u32, 1, 1],
     );
     let got = ctx.read(&y);
-    let want = norm_rope_cpu(&x, &w, &cos, &sin, rows, dim, rot, heads, pos, half, 1e-6);
+    let want = norm_rope_cpu(
+        &x,
+        &w,
+        &cos,
+        &sin,
+        NormRopeArgs {
+            rows,
+            dim,
+            rot,
+            heads,
+            pos,
+            stride: half,
+            eps: 1e-6,
+        },
+    );
     agree(&got, &want, 1e-3, 1e-4);
     eprintln!("nan in gpu: {}", got.iter().filter(|v| v.is_nan()).count());
     eprintln!("nan in cpu: {}", want.iter().filter(|v| v.is_nan()).count());
@@ -580,7 +604,7 @@ fn add() {
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
     );
-    agree(&ctx.read(&y), &cpu::add(&a, &b), 0.0, 0.0);
+    agree(&ctx.read(&y), &cpu_ref::add(&a, &b), 0.0, 0.0);
 }
 
 #[test]
@@ -600,7 +624,7 @@ fn bias() {
         [1, 1, 1],
     );
     let mut cpu = x.clone();
-    cpu::bias(&mut cpu, &b, dim);
+    cpu_ref::bias(&mut cpu, &b, dim);
     agree(&ctx.read(&xb), &cpu, 0.0, 1e-7);
 }
 
@@ -621,7 +645,7 @@ fn swiglu() {
         &[Binding::Full(&gb), Binding::Full(&ub), Binding::Full(&y)],
         [1, 1, 1],
     );
-    agree(&ctx.read(&y), &cpu::swiglu(&g, &u, Act::Silu), 1e-5, 1e-6);
+    agree(&ctx.read(&y), &cpu_ref::swiglu(&g, &u, Act::Silu), 1e-5, 1e-6);
 }
 
 #[test]
@@ -643,7 +667,7 @@ fn swiglu_gelu_tanh() {
     );
     agree(
         &ctx.read(&y),
-        &cpu::swiglu(&g, &u, Act::GeluTanh),
+        &cpu_ref::swiglu(&g, &u, Act::GeluTanh),
         1e-5,
         1e-6,
     );
@@ -665,7 +689,7 @@ fn softcap() {
         &[Binding::Full(&xb)],
         [1, 1, 1],
     );
-    cpu::softcap(&mut x, 30.0);
+    cpu_ref::softcap(&mut x, 30.0);
     agree(&ctx.read(&xb), &x, 1e-5, 1e-6);
 }
 
@@ -692,7 +716,7 @@ fn mul_broadcast() {
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
     );
-    agree(&ctx.read(&y), &cpu::mul(&a, &b, n, 4), 1e-6, 1e-7);
+    agree(&ctx.read(&y), &cpu_ref::mul(&a, &b, n, 4), 1e-6, 1e-7);
 }
 
 #[test]
@@ -706,7 +730,7 @@ fn expert_gather_scatter() {
     let weights = [0.5f32, 1.5, 2.5, 3.5];
     let xb = ctx.f32(&x, &[4u32, hidden as u32]);
     let rb = Tensor::new(ctx.backend.storage(16), vec![4u32], DType::U32);
-    ctx.backend.write_u32(rb.buf.as_ref(), &rows);
+    ctx.backend.write_u32(&rb.buf, &rows);
     let wb = ctx.f32(&weights, &[4u32]);
     let packed = ctx.zero(&[16u32, hidden as u32]);
     let acc = ctx.zero(&[4u32, hidden as u32]);
@@ -732,9 +756,9 @@ fn expert_gather_scatter() {
         ],
         [1, 1, 1],
     );
-    let gathered = cpu::expert_gather(&x, &rows, 16, hidden);
+    let gathered = cpu_ref::expert_gather(&x, &rows, 16, hidden);
     let mut expect = vec![0f32; 4 * hidden];
-    cpu::expert_scatter(&mut expect, &gathered, &rows, &weights, hidden);
+    cpu_ref::expert_scatter(&mut expect, &gathered, &rows, &weights, hidden);
     agree(&ctx.read(&acc), &expect, 1e-6, 1e-7);
 }
 
@@ -750,7 +774,7 @@ fn zero_rows() {
         [1, 1, 1],
     );
     let mut expect = x.clone();
-    cpu::zero_rows(&mut expect, 3);
+    cpu_ref::zero_rows(&mut expect, 3);
     agree(&ctx.read(&xb), &expect, 0.0, 0.0);
 }
 
@@ -771,7 +795,7 @@ fn sigmoid_mul() {
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
     );
-    agree(&ctx.read(&y), &cpu::sigmoid_mul(&a, &b), 1e-5, 1e-6);
+    agree(&ctx.read(&y), &cpu_ref::sigmoid_mul(&a, &b), 1e-5, 1e-6);
 }
 
 #[test]
@@ -791,7 +815,7 @@ fn concat() {
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
     );
-    agree(&ctx.read(&y), &cpu::concat(&a, &b, rows, d), 0.0, 0.0);
+    agree(&ctx.read(&y), &cpu_ref::concat(&a, &b, rows, d), 0.0, 0.0);
 }
 
 fn rope_case(m: usize, heads: usize, hd: usize, rot: usize, pos: usize, seed: u64) {
@@ -833,7 +857,7 @@ fn rope_case(m: usize, heads: usize, hd: usize, rot: usize, pos: usize, seed: u6
         [m as u32, heads as u32, 1],
     );
     let mut cpu = x.clone();
-    cpu::rope(&mut cpu, &cos, &sin, m, heads, hd, rot, pos);
+    cpu_ref::rope(&mut cpu, &cos, &sin, cpu_ref::RopeArgs { m, heads, hd, rot, pos });
     agree(&ctx.read(&xb), &cpu, 1e-5, 1e-6);
 }
 
@@ -862,7 +886,7 @@ fn conv1d_rolls_state_across_steps() {
     let y = ctx.zero(&[dim as u32]);
 
     for x in &steps {
-        ctx.backend.write_f32(xb.buf.as_ref(), x);
+        ctx.backend.write_f32(&xb.buf, x);
         ctx.dispatch(
             name::CONV1D,
             &[("DIM", dim as f64)],
@@ -874,7 +898,7 @@ fn conv1d_rolls_state_across_steps() {
             ],
             [1, 1, 1],
         );
-        let cpu_y = cpu::conv1d(x, &w, &mut state);
+        let cpu_y = cpu_ref::conv1d(x, &w, &mut state);
         agree(&ctx.read(&y), &cpu_y, 1e-5, 1e-6);
     }
     agree(&ctx.read(&st), &state, 0.0, 1e-6);
@@ -899,11 +923,11 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
     let y = ctx.zero(&[rows as u32, (2 * n_v * kd) as u32]);
 
     let flat: Vec<f32> = x.iter().flatten().copied().collect();
-    ctx.backend.write_f32(xb.buf.as_ref(), &flat);
+    ctx.backend.write_f32(&xb.buf, &flat);
 
     let mut enc = ctx.backend.encoder().unwrap();
     {
-        let mut pass = Pass::begin(enc.as_mut());
+        let mut pass = Commands::begin(&mut enc);
         let row = |t: usize| (t * conv_dim * 4) as u64;
         for t in 0..rows {
             ctx.backend
@@ -925,7 +949,7 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
         let mut conv_cpu = Vec::with_capacity(rows * conv_dim);
         let mut st2 = state.clone();
         for xrow in &x {
-            conv_cpu.extend(cpu::conv1d(xrow, &w, &mut st2));
+            conv_cpu.extend(cpu_ref::conv1d(xrow, &w, &mut st2));
         }
         ctx.backend
             .dispatch(
@@ -947,14 +971,14 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
             )
             .unwrap();
     }
-    ctx.backend.submit(enc).unwrap();
+    ctx.backend.submit(&mut enc).unwrap();
 
     let mut conv_cpu = Vec::with_capacity(rows * conv_dim);
     for xrow in &x {
-        conv_cpu.extend(cpu::conv1d(xrow, &w, &mut state));
+        conv_cpu.extend(cpu_ref::conv1d(xrow, &w, &mut state));
     }
     let mut cpu_y = vec![0f32; rows * 2 * n_v * kd];
-    cpu::repeat_qk(&conv_cpu, &mut cpu_y, rows, n_k, n_v, kd, vd);
+    cpu_ref::repeat_qk(&conv_cpu, &mut cpu_y, rows, n_k, n_v, kd, vd);
     agree(&ctx.read(&y), &cpu_y, 1e-5, 1e-6);
 }
 
@@ -982,7 +1006,7 @@ fn repeat_qk_case(rows: usize, n_k: usize, n_v: usize, kd: usize, vd: usize, see
     );
 
     let mut cpu_y = vec![0f32; rows * out_dim];
-    cpu::repeat_qk(&x, &mut cpu_y, rows, n_k, n_v, kd, vd);
+    cpu_ref::repeat_qk(&x, &mut cpu_y, rows, n_k, n_v, kd, vd);
     agree(&ctx.read(&y), &cpu_y, 0.0, 1e-6);
 }
 
@@ -1006,7 +1030,7 @@ fn repeat_qk_expands_key_heads() {
 fn anchor_repeat_qk() {
     let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
     let mut y = vec![0f32; 8];
-    cpu::repeat_qk(&x, &mut y, 1, 1, 2, 2, 3);
+    cpu_ref::repeat_qk(&x, &mut y, 1, 1, 2, 2, 3);
     assert_eq!(y, [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
 }
 
@@ -1040,7 +1064,7 @@ fn delta_gate_selects_chunk_rows() {
             ],
             [1, 1, 1],
         );
-        let (cb, cg) = cpu::delta_gate(
+        let (cb, cg) = cpu_ref::delta_gate(
             &b[row * heads..(row + 1) * heads],
             &a[row * heads..(row + 1) * heads],
             &alog,
@@ -1087,7 +1111,7 @@ fn delta_recur_case(heads: usize, kd: usize, vd: usize, seed: u64) {
         [heads as u32, 1, 1],
     );
     let mut state = s0.clone();
-    let cpu = cpu::delta_recur(&q, &k, &v, &beta, &g, &mut state, heads, kd, vd);
+    let cpu = cpu_ref::delta_recur(&q, &k, &v, &beta, &g, &mut state, cpu_ref::DeltaRecurArgs { heads, kd, vd });
     agree(&ctx.read(&st), &state, 1e-4, 1e-5);
     agree(&ctx.read(&out), &cpu, 1e-4, 1e-5);
 }
@@ -1102,19 +1126,7 @@ fn delta_recur_asymmetric_dims() {
     delta_recur_case(1, 16, 8, 83);
 }
 
-fn attn_case(
-    m: usize,
-    nq: usize,
-    nkv: usize,
-    max_seq: usize,
-    pos: usize,
-    window: usize,
-    seed: u64,
-) {
-    attn_case_hd(m, nq, nkv, max_seq, pos, window, seed, 64, 0.1);
-}
-
-fn attn_case_k(
+struct AttnCase {
     m: usize,
     nq: usize,
     nkv: usize,
@@ -1123,22 +1135,20 @@ fn attn_case_k(
     window: usize,
     seed: u64,
     k_scale: f32,
-) {
-    attn_case_hd(m, nq, nkv, max_seq, pos, window, seed, 64, k_scale);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn attn_case_hd(
-    m: usize,
-    nq: usize,
-    nkv: usize,
-    max_seq: usize,
-    pos: usize,
-    window: usize,
-    seed: u64,
-    hd: usize,
-    k_scale: f32,
-) {
+fn attn_case(spec: AttnCase) {
+    let AttnCase {
+        m,
+        nq,
+        nkv,
+        max_seq,
+        pos,
+        window,
+        seed,
+        k_scale,
+    } = spec;
+    let hd = 64usize;
     let mut ctx = Ctx::new();
     let mut rng = Rng(seed);
     let q = rng.fill(m * nq * hd);
@@ -1195,7 +1205,7 @@ fn attn_case_hd(
     );
     agree(
         &ctx.read(&y),
-        &cpu::attn(&q, &kc, &vc, m, nq, nkv, hd, max_seq, pos, window),
+        &cpu_ref::attn(&q, &kc, &vc, cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window }),
         1e-2,
         1e-2,
     );
@@ -1283,52 +1293,52 @@ fn kv_store_attn_hd128_gqa2_pos71() {
         }
     }
     let got = ctx.read(&y);
-    let want = cpu::attn(&q, &kc, &vc, m, nq, nkv, hd, max_seq, pos, 0);
+    let want = cpu_ref::attn(&q, &kc, &vc, cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window: 0 });
     agree(&got, &want, 1e-2, 1e-2);
     eprintln!("nan in gpu: {}", got.iter().filter(|v| v.is_nan()).count());
 }
 
 #[test]
 fn attn_gqa_multi_row() {
-    attn_case(3, 2, 1, 16, 5, 0, 91);
+    attn_case(AttnCase { m: 3, nq: 2, nkv: 1, max_seq: 16, pos: 5, window: 0, seed: 91, k_scale: 0.1 });
 }
 
 #[test]
 fn attn_sliding_window() {
-    attn_case(3, 2, 1, 16, 5, 3, 93);
+    attn_case(AttnCase { m: 3, nq: 2, nkv: 1, max_seq: 16, pos: 5, window: 3, seed: 93, k_scale: 0.1 });
 }
 
 #[test]
 fn attn_single_query_per_head() {
-    attn_case(1, 2, 2, 4, 0, 0, 95);
+    attn_case(AttnCase { m: 1, nq: 2, nkv: 2, max_seq: 4, pos: 0, window: 0, seed: 95, k_scale: 0.1 });
 }
 
 #[test]
 fn attn_gqa_4x_multi_chunk() {
-    attn_case(16, 4, 1, 64, 16, 0, 97);
+    attn_case(AttnCase { m: 16, nq: 4, nkv: 1, max_seq: 64, pos: 16, window: 0, seed: 97, k_scale: 0.1 });
 }
 
 #[test]
 fn attn_split_short_prefix() {
-    attn_case(1, 2, 1, 16, 2, 0, 101);
+    attn_case(AttnCase { m: 1, nq: 2, nkv: 1, max_seq: 16, pos: 2, window: 0, seed: 101, k_scale: 0.1 });
 }
 
 #[test]
 fn attn_split_long_prefix() {
-    attn_case(16, 4, 1, 1024, 512, 0, 103);
+    attn_case(AttnCase { m: 16, nq: 4, nkv: 1, max_seq: 1024, pos: 512, window: 0, seed: 103, k_scale: 0.1 });
 }
 
 #[test]
 fn attn_multi_round_boundaries() {
     for kv_len in [65, 127, 128, 191, 192, 255, 256, 257, 511, 512] {
-        attn_case_k(8, 4, 1, 1024, kv_len, 0, 2000 + kv_len as u64, 1.0);
+        attn_case(AttnCase { m: 8, nq: 4, nkv: 1, max_seq: 1024, pos: kv_len, window: 0, seed: 2000 + kv_len as u64, k_scale: 1.0 });
     }
 }
 
 #[test]
 fn attn_multi_round_tail() {
     for kv_len in [66, 129, 193, 258] {
-        attn_case_k(1, 2, 1, 1024, kv_len, 0, 3000 + kv_len as u64, 1.0);
+        attn_case(AttnCase { m: 1, nq: 2, nkv: 1, max_seq: 1024, pos: kv_len, window: 0, seed: 3000 + kv_len as u64, k_scale: 1.0 });
     }
 }
 
@@ -1358,7 +1368,7 @@ fn attn_gemm_coexist() {
     for _ in 0..24 {
         let mut enc = ctx.backend.encoder().unwrap();
         {
-            let mut pass = Pass::begin(enc.as_mut());
+            let mut pass = Commands::begin(&mut enc);
             ctx.backend
                 .dispatch(
                     &mut pass,
@@ -1426,33 +1436,33 @@ fn attn_gemm_coexist() {
                 )
                 .unwrap();
         }
-        ctx.backend.submit(enc).unwrap();
+        ctx.backend.submit(&mut enc).unwrap();
     }
 
     agree(
         &ctx.read(&y),
-        &cpu::attn(&q, &kc, &vc, m, nq, nkv, hd, max_seq, pos, 0),
+        &cpu_ref::attn(&q, &kc, &vc, cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window: 0 }),
         2e-3,
         1e-3,
     );
-    agree(&ctx.read(&yg), &cpu::gemm(&x, &w, m, n2, k2), 2e-2, 5e-2);
+    agree(&ctx.read(&yg), &cpu_ref::gemm(&x, &w, m, n2, k2), 2e-2, 5e-2);
 }
 
 #[test]
 fn attn_single_round_realistic() {
     for kv_len in [1, 32, 63, 64] {
-        attn_case_k(1, 2, 1, 1024, kv_len, 0, 4000 + kv_len as u64, 1.0);
+        attn_case(AttnCase { m: 1, nq: 2, nkv: 1, max_seq: 1024, pos: kv_len, window: 0, seed: 4000 + kv_len as u64, k_scale: 1.0 });
     }
 }
 
 #[test]
 fn attn_split_sliding_window() {
-    attn_case(3, 2, 1, 1024, 700, 128, 105);
+    attn_case(AttnCase { m: 3, nq: 2, nkv: 1, max_seq: 1024, pos: 700, window: 128, seed: 105, k_scale: 0.1 });
 }
 
 #[test]
 fn attn_gqa_8x() {
-    attn_case(2, 8, 1, 64, 10, 0, 107);
+    attn_case(AttnCase { m: 2, nq: 8, nkv: 1, max_seq: 64, pos: 10, window: 0, seed: 107, k_scale: 0.1 });
 }
 
 #[test]
@@ -1475,7 +1485,7 @@ fn split_qg() {
         &[Binding::Full(&xb), Binding::Full(&qb), Binding::Full(&gb)],
         [1, 1, 1],
     );
-    let (cq, cg) = cpu::split_qg(&x, rows, heads, hd);
+    let (cq, cg) = cpu_ref::split_qg(&x, rows, heads, hd);
     agree(&ctx.read(&qb), &cq, 0.0, 1e-7);
     agree(&ctx.read(&gb), &cg, 0.0, 1e-7);
 }
@@ -1511,8 +1521,8 @@ fn kv_store_writes_both_caches() {
     );
     let mut cpu_k = vec![0f32; nkv * max_seq * hd];
     let mut cpu_v = vec![0f32; nkv * max_seq * hd];
-    cpu::kv_store(&k_src, &mut cpu_k, m, nkv, hd, max_seq, pos);
-    cpu::kv_store(&v_src, &mut cpu_v, m, nkv, hd, max_seq, pos);
+    cpu_ref::kv_store(&k_src, &mut cpu_k, m, nkv, hd, max_seq, pos);
+    cpu_ref::kv_store(&v_src, &mut cpu_v, m, nkv, hd, max_seq, pos);
     agree(&ctx.read_bf16(&k_cache), &cpu_k, 0.0, 1e-7);
     agree(&ctx.read_bf16(&v_cache), &cpu_v, 0.0, 1e-7);
 }
@@ -1520,7 +1530,7 @@ fn kv_store_writes_both_caches() {
 #[test]
 fn anchor_gemm() {
     assert_eq!(
-        cpu::gemm(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], 2, 2, 2),
+        cpu_ref::gemm(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], 2, 2, 2),
         vec![17.0, 23.0, 39.0, 53.0]
     );
 }
@@ -1529,7 +1539,7 @@ fn anchor_gemm() {
 fn anchor_embed() {
     let table = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     assert_eq!(
-        cpu::embed(&[2, 0], &table, 2, 2.0),
+        cpu_ref::embed(&[2, 0], &table, 2, 2.0),
         vec![10.0, 12.0, 2.0, 4.0]
     );
 }
@@ -1539,32 +1549,32 @@ fn anchor_norm_modes() {
     let inv = (2.5f32 + 1e-6).sqrt().recip();
     let x = [1.0f32, 2.0];
 
-    let direct = cpu::norm(NormMode::Direct, &x, &[2.0, 3.0], &[], 1, 2, 2, 1e-6);
+    let direct = cpu_ref::norm(NormMode::Direct, &x, &[2.0, 3.0], &[], cpu_ref::NormArgs { rows: 1, dim: 2, w_dim: 2, eps: 1e-6 });
     assert_eq!(direct, vec![inv * 2.0, inv * 6.0]);
 
-    let offset = cpu::norm(NormMode::Offset, &x, &[0.5, -0.25], &[], 1, 2, 2, 1e-6);
+    let offset = cpu_ref::norm(NormMode::Offset, &x, &[0.5, -0.25], &[], cpu_ref::NormArgs { rows: 1, dim: 2, w_dim: 2, eps: 1e-6 });
     assert_eq!(offset, vec![inv * 1.5, inv * 1.5]);
 
     let silu1 = 1.0 / (1.0 + (-1.0f32).exp());
-    let gated = cpu::norm(NormMode::Gated, &x, &[2.0, 3.0], &[0.0, 1.0], 1, 2, 2, 1e-6);
+    let gated = cpu_ref::norm(NormMode::Gated, &x, &[2.0, 3.0], &[0.0, 1.0], cpu_ref::NormArgs { rows: 1, dim: 2, w_dim: 2, eps: 1e-6 });
     assert_eq!(gated[0], 0.0, "silu(0) gates the first element to zero");
     assert!((gated[1] - inv * 6.0 * silu1).abs() < 1e-6);
 }
 
 #[test]
 fn anchor_elementwise() {
-    assert_eq!(cpu::add(&[1.0, 2.0], &[3.0, 4.0]), vec![4.0, 6.0]);
+    assert_eq!(cpu_ref::add(&[1.0, 2.0], &[3.0, 4.0]), vec![4.0, 6.0]);
 
     let mut x = [1.0f32, 2.0, 3.0, 4.0];
-    cpu::bias(&mut x, &[10.0, 20.0], 2);
+    cpu_ref::bias(&mut x, &[10.0, 20.0], 2);
     assert_eq!(x, [11.0, 22.0, 13.0, 24.0]);
 
     let silu1 = 1.0 / (1.0 + (-1.0f32).exp());
-    let swi = cpu::swiglu(&[0.0, 1.0], &[2.0, 3.0], Act::Silu);
+    let swi = cpu_ref::swiglu(&[0.0, 1.0], &[2.0, 3.0], Act::Silu);
     assert_eq!(swi[0], 0.0);
     assert!((swi[1] - silu1 * 3.0).abs() < 1e-6);
 
-    let sm = cpu::sigmoid_mul(&[2.0, -1.0], &[0.0, 1.0]);
+    let sm = cpu_ref::sigmoid_mul(&[2.0, -1.0], &[0.0, 1.0]);
     assert!((sm[0] - 1.0).abs() < 1e-6);
     assert!((sm[1] + silu1).abs() < 1e-6);
 }
@@ -1572,17 +1582,17 @@ fn anchor_elementwise() {
 #[test]
 fn anchor_layout_ops() {
     assert_eq!(
-        cpu::concat(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], 2, 2),
+        cpu_ref::concat(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], 2, 2),
         vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]
     );
 
     let x: Vec<f32> = (0..8).map(|v| v as f32).collect();
-    let (q, g) = cpu::split_qg(&x, 1, 2, 2);
+    let (q, g) = cpu_ref::split_qg(&x, 1, 2, 2);
     assert_eq!(q, vec![0.0, 1.0, 4.0, 5.0]);
     assert_eq!(g, vec![2.0, 3.0, 6.0, 7.0]);
 
     let mut cache = vec![0.0f32; 8];
-    cpu::kv_store(&[1.0, 2.0, 3.0, 4.0], &mut cache, 2, 1, 2, 4, 1);
+    cpu_ref::kv_store(&[1.0, 2.0, 3.0, 4.0], &mut cache, 2, 1, 2, 4, 1);
     assert_eq!(cache, vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
 }
 
@@ -1592,15 +1602,17 @@ fn anchor_rope() {
     let (c0, s0) = (1.0f64.cos() as f32, 1.0f64.sin() as f32);
     let (c1, s1) = (inv1.cos() as f32, inv1.sin() as f32);
     let mut x = [1.0f32, 2.0, 3.0, 4.0];
-    cpu::rope(
+    cpu_ref::rope(
         &mut x,
         &[0.0, 0.0, c0, c1],
         &[0.0, 0.0, s0, s1],
-        1,
-        1,
-        4,
-        4,
-        1,
+        cpu_ref::RopeArgs {
+            m: 1,
+            heads: 1,
+            hd: 4,
+            rot: 4,
+            pos: 1,
+        },
     );
     let want = [
         1.0 * c0 - 3.0 * s0,
@@ -1619,11 +1631,11 @@ fn anchor_attn_causal_and_window() {
     let v = [1.0, 2.0, 3.0, 4.0];
     let q = [1.0, 1.0];
 
-    let full = cpu::attn(&q, &k, &v, 1, 1, 1, 2, 2, 1, 0);
+    let full = cpu_ref::attn(&q, &k, &v, cpu_ref::AttnArgs { m: 1, nq: 1, nkv: 1, hd: 2, max_seq: 2, pos: 1, window: 0 });
     assert!((full[0] - 2.0).abs() < 1e-6);
     assert!((full[1] - 3.0).abs() < 1e-6);
 
-    let win = cpu::attn(&q, &k, &v, 1, 1, 1, 2, 2, 1, 1);
+    let win = cpu_ref::attn(&q, &k, &v, cpu_ref::AttnArgs { m: 1, nq: 1, nkv: 1, hd: 2, max_seq: 2, pos: 1, window: 1 });
     assert!((win[0] - 3.0).abs() < 1e-6);
     assert!((win[1] - 4.0).abs() < 1e-6);
 }
@@ -1631,7 +1643,7 @@ fn anchor_attn_causal_and_window() {
 #[test]
 fn anchor_conv1d() {
     let mut state = [1.0f32, 1.0, 1.0];
-    let y = cpu::conv1d(&[2.0], &[1.0, 2.0, 3.0, 4.0], &mut state);
+    let y = cpu_ref::conv1d(&[2.0], &[1.0, 2.0, 3.0, 4.0], &mut state);
     let v = 14.0f32;
     assert!((y[0] - v / (1.0 + (-v).exp())).abs() < 1e-5);
     assert_eq!(state, [1.0, 1.0, 2.0], "state shifts to [s1, s2, x]");
@@ -1639,7 +1651,7 @@ fn anchor_conv1d() {
 
 #[test]
 fn anchor_delta_gate() {
-    let (beta, g) = cpu::delta_gate(&[0.0], &[0.0], &[2.0f32.ln()], &[0.0]);
+    let (beta, g) = cpu_ref::delta_gate(&[0.0], &[0.0], &[2.0f32.ln()], &[0.0]);
     assert!((beta[0] - 0.5).abs() < 1e-6);
     assert!(
         (g[0] + 2.0 * 2.0f32.ln()).abs() < 1e-5,
@@ -1652,16 +1664,14 @@ fn anchor_delta_recur_two_steps() {
     let mut state = [0.0f32; 4];
     let r2 = 2.0f32.sqrt();
 
-    let out = cpu::delta_recur(
+    let out = cpu_ref::delta_recur(
         &[4.0, 0.0],
         &[3.0, 0.0],
         &[5.0, 7.0],
         &[0.5],
         &[0.0],
         &mut state,
-        1,
-        2,
-        2,
+        cpu_ref::DeltaRecurArgs { heads: 1, kd: 2, vd: 2 },
     );
     for (got, want) in state.iter().zip([2.5, 3.5, 0.0, 0.0]) {
         assert!((got - want).abs() < 1e-5, "{got} vs {want}");
@@ -1669,16 +1679,14 @@ fn anchor_delta_recur_two_steps() {
     assert!((out[0] - 2.5 / r2).abs() < 1e-5);
     assert!((out[1] - 3.5 / r2).abs() < 1e-5);
 
-    let out = cpu::delta_recur(
+    let out = cpu_ref::delta_recur(
         &[0.0, 4.0],
         &[0.0, 2.0],
         &[1.0, 1.0],
         &[1.0],
         &[-2.0f32.ln()],
         &mut state,
-        1,
-        2,
-        2,
+        cpu_ref::DeltaRecurArgs { heads: 1, kd: 2, vd: 2 },
     );
     assert!((state[0] - 1.25).abs() < 1e-5);
     assert!((state[1] - 1.75).abs() < 1e-5);

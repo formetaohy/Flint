@@ -1,13 +1,13 @@
-use flint_backend::{Backend, Binding, Pass};
+﻿use flint_backend::{Backend, Binding, Commands};
 use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::{Error, Result};
-use flint_model::blocks::{SwigluMlp, take_mlp};
-use flint_model::cache::{KvCache, RecurrentState};
-use flint_model::config::{check_gemm_dims, check_head_dim, f64_field, req, u32_field, u32_list};
+use flint_model::cache::KvCache;
+use flint_model::config::{f64_field, req, u32_field, u32_list};
 use flint_model::loader::{self, Plan, Role, WeightSet};
+use flint_model::mlp_weights::{SwigluMlp, take_mlp};
 use flint_model::ops::{self, Act, MlpTiles, NormMode};
-use flint_model::step::{self, MAX_M};
-use flint_model::{ChunkOut, LanguageModel, Speculator};
+use flint_model::step;
+use flint_model::{ChunkOut, LanguageModel, MAX_M, Speculator};
 use flint_tensor::{Tensor, Weight};
 use serde_json::Value;
 
@@ -113,14 +113,14 @@ impl Qwen35Config {
         if !t.q_heads.is_multiple_of(t.kv_heads) {
             return Err(Error::Config("q heads not divisible by kv heads".into()));
         }
-        if t.q_heads / t.kv_heads > step::MAX_GQA {
+        if t.q_heads / t.kv_heads > ops::MAX_GQA {
             return Err(Error::Config(format!(
                 "GQA ratio {} exceeds the attention shader's {} head slots",
                 t.q_heads / t.kv_heads,
-                step::MAX_GQA
+                ops::MAX_GQA
             )));
         }
-        check_head_dim(t.head_dim)?;
+        ops::check_head_dim(t.head_dim)?;
         if !t.rotary_dim().is_multiple_of(2) {
             return Err(Error::Config("rotary_dim must be even".into()));
         }
@@ -136,7 +136,7 @@ impl Qwen35Config {
                 t.lin_val_heads, t.lin_key_heads
             )));
         }
-        check_gemm_dims(&[
+        ops::check_gemm_dims(&[
             (t.vocab, t.hidden),
             (t.conv_dim(), t.hidden),
             (t.value_dim(), t.hidden),
@@ -167,6 +167,30 @@ impl Qwen35Config {
     }
     pub fn rotary_dim(&self) -> u32 {
         (self.head_dim as f64 * self.partial_rotary) as u32
+    }
+}
+
+struct RecurrentState {
+    recur: Tensor,
+    conv: Tensor,
+}
+
+impl RecurrentState {
+    fn new(backend: &Backend, recur_shape: [u32; 3], conv_dim: u32) -> Self {
+        Self {
+            recur: backend.zero_tensor(&recur_shape),
+            conv: backend.zero_tensor(&[conv_dim, 3]),
+        }
+    }
+
+    fn zero(&self, backend: &Backend) {
+        backend.zero_fill(&self.recur);
+        backend.zero_fill(&self.conv);
+    }
+
+    fn copy_from(&self, backend: &Backend, src: &RecurrentState) {
+        backend.copy(&src.recur, &self.recur);
+        backend.copy(&src.conv, &self.conv);
     }
 }
 
@@ -303,9 +327,9 @@ fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
         attn_scratch: z(&[
             MAX_M,
             cfg.kv_heads,
-            step::ATTN_SEGS,
-            step::MAX_GQA,
-            cfg.head_dim + step::ATTN_PAD,
+            ops::ATTN_SEGS,
+            ops::MAX_GQA,
+            cfg.head_dim + ops::ATTN_PAD,
         ]),
         qg: z(&[MAX_M, cfg.q_heads * cfg.head_dim * 2]),
         q: z(&[MAX_M, cfg.q_heads * cfg.head_dim]),
@@ -474,59 +498,64 @@ impl LanguageModel for Qwen35 {
         }
         let mut ids = vec![0u32; MAX_M as usize];
         ids[..tokens.len()].copy_from_slice(tokens);
-        backend.write_u32(self.s.ids.buf.as_ref(), &ids);
+        backend.write_u32(&self.s.ids.buf, &ids);
         step::write_step_args(backend, &self.s.args, self.pos, self.pos + m);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder()?;
         {
-            let mut pass = Pass::begin(enc.as_mut());
+            let mut commands = Commands::begin(&mut enc);
             let s = &self.s;
             ops::embed(
                 backend,
-                &mut pass,
+                &mut commands,
                 &s.ids,
                 &self.embed,
                 Binding::Full(&s.hidden),
-                m,
-                cfg.hidden,
-                1.0,
+                &ops::EmbedSpec {
+                    rows: m,
+                    dim: cfg.hidden,
+                    scale: 1.0,
+                    split: 0,
+                },
             )?;
 
+            let ctx = FullCtx {
+                cfg,
+                s,
+                cos: &self.cos,
+                sin: &self.sin,
+            };
             for layer in &self.layers {
                 match layer {
-                    Layer::Full { w, kv } => full_layer(
-                        backend, &mut pass, cfg, s, &self.cos, &self.sin, w, kv, m, &s.args,
-                    )?,
+                    Layer::Full { w, kv } => {
+                        full_layer(backend, &mut commands, &ctx, w, kv, m, &s.args)?
+                    }
                     Layer::Linear { w, state } => {
-                        linear_layer(backend, &mut pass, cfg, s, w, state, m)?
+                        linear_layer(backend, &mut commands, cfg, s, w, state, m)?
                     }
                 }
             }
 
             ops::norm(
                 backend,
-                &mut pass,
-                NormMode::Offset,
+                &mut commands,
+                &ops::NormSpec::new(NormMode::Offset, m, cfg.hidden, 1e-6),
                 Binding::Full(&s.hidden),
                 &self.norm,
                 Binding::Full(&s.hidden),
                 Binding::Full(&s.normed),
-                m,
-                cfg.hidden,
-                cfg.hidden,
-                1e-6,
             )?;
             ops::gemm(
                 backend,
-                &mut pass,
+                &mut commands,
                 Binding::Full(&s.normed),
                 self.logit_head(),
                 Binding::Full(&s.logits),
                 m,
             )?;
         }
-        backend.submit(enc)?;
+        backend.submit(&mut enc)?;
 
         let out = ChunkOut {
             logits: step::read_rows(backend, &self.s.logits, logit_rows, m, cfg.vocab)?,
@@ -588,54 +617,49 @@ impl Speculator for Qwen35 {
 
         let mut ids = vec![0u32; MAX_M as usize];
         ids[0] = token;
-        backend.write_u32(self.s.ids.buf.as_ref(), &ids);
+        backend.write_u32(&self.s.ids.buf, &ids);
         step::write_step_args(backend, &self.s.args, self.mtp_pos, self.mtp_pos + 1);
-        backend.write_f32(self.s.mtp_hidden.buf.as_ref(), hidden);
+        backend.write_f32(&self.s.mtp_hidden.buf, hidden);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder()?;
         {
-            let mut pass = Pass::begin(enc.as_mut());
+            let mut commands = Commands::begin(&mut enc);
             let s = &self.s;
             ops::embed(
                 backend,
-                &mut pass,
+                &mut commands,
                 &s.ids,
                 &self.embed,
                 Binding::Full(&s.hidden),
-                1,
-                cfg.hidden,
-                1.0,
+                &ops::EmbedSpec {
+                    rows: 1,
+                    dim: cfg.hidden,
+                    scale: 1.0,
+                    split: 0,
+                },
             )?;
             ops::norm(
                 backend,
-                &mut pass,
-                NormMode::Offset,
+                &mut commands,
+                &ops::NormSpec::new(NormMode::Offset, 1, cfg.hidden, 1e-6),
                 Binding::Full(&s.hidden),
                 &mtp.pre_fc_norm_embedding,
                 Binding::Full(&s.hidden),
                 Binding::Full(&s.mtp_emb),
-                1,
-                cfg.hidden,
-                cfg.hidden,
-                1e-6,
             )?;
             ops::norm(
                 backend,
-                &mut pass,
-                NormMode::Offset,
+                &mut commands,
+                &ops::NormSpec::new(NormMode::Offset, 1, cfg.hidden, 1e-6),
                 Binding::Full(&s.mtp_hidden),
                 &mtp.pre_fc_norm_hidden,
                 Binding::Full(&s.mtp_hidden),
                 Binding::Full(&s.normed),
-                1,
-                cfg.hidden,
-                cfg.hidden,
-                1e-6,
             )?;
             ops::concat(
                 backend,
-                &mut pass,
+                &mut commands,
                 Binding::Full(&s.mtp_emb),
                 Binding::Full(&s.normed),
                 Binding::Full(&s.mtp_concat),
@@ -644,42 +668,44 @@ impl Speculator for Qwen35 {
             )?;
             ops::gemm(
                 backend,
-                &mut pass,
+                &mut commands,
                 Binding::Full(&s.mtp_concat),
                 &mtp.fc,
                 Binding::Full(&s.hidden),
                 1,
             )?;
 
+            let ctx = FullCtx {
+                cfg,
+                s,
+                cos: &self.cos,
+                sin: &self.sin,
+            };
             full_layer(
-                backend, &mut pass, cfg, s, &self.cos, &self.sin, &mtp.layer, &mtp.kv, 1, &s.args,
+                backend, &mut commands, &ctx, &mtp.layer, &mtp.kv, 1, &s.args,
             )?;
 
             ops::norm(
                 backend,
-                &mut pass,
-                NormMode::Offset,
+                &mut commands,
+                &ops::NormSpec::new(NormMode::Offset, 1, cfg.hidden, 1e-6),
                 Binding::Full(&s.hidden),
                 &mtp.norm,
                 Binding::Full(&s.hidden),
                 Binding::Full(&s.normed),
-                1,
-                cfg.hidden,
-                cfg.hidden,
-                1e-6,
             )?;
             ops::gemm(
                 backend,
-                &mut pass,
+                &mut commands,
                 Binding::Full(&s.normed),
                 self.logit_head(),
                 Binding::Full(&s.logits),
                 1,
             )?;
         }
-        backend.submit(enc)?;
+        backend.submit(&mut enc)?;
 
-        let logits = backend.read_f32(self.s.logits.buf.as_ref(), 0, cfg.vocab as usize)?;
+        let logits = backend.read_f32(&self.s.logits.buf, 0, cfg.vocab as usize)?;
         self.mtp_pos += 1;
         Ok(logits)
     }
@@ -711,47 +737,47 @@ impl Speculator for Qwen35 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct FullCtx<'a> {
+    cfg: &'a Qwen35Config,
+    s: &'a Scratch,
+    cos: &'a Tensor,
+    sin: &'a Tensor,
+}
+
 fn full_layer(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    cfg: &Qwen35Config,
-    s: &Scratch,
-    cos: &Tensor,
-    sin: &Tensor,
+    commands: &mut Commands<'_>,
+    ctx: &FullCtx<'_>,
     w: &FullLayerW,
     kv: &KvCache,
     m: u32,
     args: &Tensor,
 ) -> Result<()> {
+    let (cfg, s) = (ctx.cfg, ctx.s);
     ops::norm(
         backend,
-        pass,
-        NormMode::Offset,
+        commands,
+        &ops::NormSpec::new(NormMode::Offset, m, cfg.hidden, 1e-6),
         Binding::Full(&s.hidden),
         &w.attn_norm,
         Binding::Full(&s.hidden),
         Binding::Full(&s.normed),
-        m,
-        cfg.hidden,
-        cfg.hidden,
-        1e-6,
     )?;
-    full_attn_block(backend, pass, cfg, s, cos, sin, w, kv, m, args)?;
+    full_attn_block(backend, commands, ctx, w, kv, m, args)?;
     ops::add(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.hidden),
         Binding::Full(&s.mlp.down_out),
         Binding::Full(&s.hidden2),
         m * cfg.hidden,
     )?;
-    post_mlp(backend, pass, cfg, s, &w.mlp, m)
+    post_mlp(backend, commands, cfg, s, &w.mlp, m)
 }
 
 fn linear_layer(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     cfg: &Qwen35Config,
     s: &Scratch,
     w: &LinearLayerW,
@@ -760,47 +786,40 @@ fn linear_layer(
 ) -> Result<()> {
     ops::norm(
         backend,
-        pass,
-        NormMode::Offset,
+        commands,
+        &ops::NormSpec::new(NormMode::Offset, m, cfg.hidden, 1e-6),
         Binding::Full(&s.hidden),
         &w.attn_norm,
         Binding::Full(&s.hidden),
         Binding::Full(&s.normed),
-        m,
-        cfg.hidden,
-        cfg.hidden,
-        1e-6,
     )?;
-    linear_attn_block(backend, pass, cfg, s, w, state, m)?;
+    linear_attn_block(backend, commands, cfg, s, w, state, m)?;
     ops::add(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.hidden),
         Binding::Full(&s.mlp.down_out),
         Binding::Full(&s.hidden2),
         m * cfg.hidden,
     )?;
-    post_mlp(backend, pass, cfg, s, &w.mlp, m)
+    post_mlp(backend, commands, cfg, s, &w.mlp, m)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn full_attn_block(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
-    cfg: &Qwen35Config,
-    s: &Scratch,
-    cos: &Tensor,
-    sin: &Tensor,
+    commands: &mut Commands<'_>,
+    ctx: &FullCtx<'_>,
     w: &FullLayerW,
     kv: &KvCache,
     m: u32,
     args: &Tensor,
 ) -> Result<()> {
+    let (cfg, s) = (ctx.cfg, ctx.s);
     let (nq, nkv, hd) = (cfg.q_heads, cfg.kv_heads, cfg.head_dim);
 
     ops::gemm(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.normed),
         &w.q,
         Binding::Full(&s.qg),
@@ -808,30 +827,28 @@ fn full_attn_block(
     )?;
     ops::split_qg(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.qg),
         Binding::Full(&s.q),
         Binding::Full(&s.gate),
-        m,
-        nq,
-        hd,
+        &ops::SplitQgSpec {
+            rows: m,
+            heads: nq,
+            head_dim: hd,
+        },
     )?;
     ops::norm(
         backend,
-        pass,
-        NormMode::Offset,
+        commands,
+        &ops::NormSpec::new(NormMode::Offset, m * nq, hd, 1e-6),
         Binding::Full(&s.q),
         &w.q_norm,
         Binding::Full(&s.q),
         Binding::Full(&s.q_normed),
-        m * nq,
-        hd,
-        hd,
-        1e-6,
     )?;
     ops::gemm(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.normed),
         &w.k,
         Binding::Full(&s.k_raw),
@@ -839,85 +856,80 @@ fn full_attn_block(
     )?;
     ops::norm(
         backend,
-        pass,
-        NormMode::Offset,
+        commands,
+        &ops::NormSpec::new(NormMode::Offset, m * nkv, hd, 1e-6),
         Binding::Full(&s.k_raw),
         &w.k_norm,
         Binding::Full(&s.k_raw),
         Binding::Full(&s.k_normed),
-        m * nkv,
-        hd,
-        hd,
-        1e-6,
     )?;
     ops::gemm(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.normed),
         &w.v,
         Binding::Full(&s.v_raw),
         m,
     )?;
 
+    let rope = ops::RopeInputs {
+        cos: ctx.cos,
+        sin: ctx.sin,
+        args,
+    };
     ops::rope(
         backend,
-        pass,
-        cos,
-        sin,
+        commands,
         Binding::Full(&s.q_normed),
-        nq,
-        hd,
-        cfg.rotary_dim(),
-        m,
-        args,
+        &rope,
+        &ops::RopeArgs {
+            heads: nq,
+            head_dim: hd,
+            rot: cfg.rotary_dim(),
+            m,
+        },
     )?;
     ops::rope(
         backend,
-        pass,
-        cos,
-        sin,
+        commands,
         Binding::Full(&s.k_normed),
-        nkv,
-        hd,
-        cfg.rotary_dim(),
-        m,
-        args,
+        &rope,
+        &ops::RopeArgs {
+            heads: nkv,
+            head_dim: hd,
+            rot: cfg.rotary_dim(),
+            m,
+        },
     )?;
     ops::kv_store(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.k_normed),
         Binding::Full(&s.v_raw),
-        &kv.k,
-        &kv.v,
-        nkv,
-        hd,
-        kv.max_seq,
-        args,
+        kv,
         m,
+        args,
     )?;
 
     ops::attn(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.q_normed),
-        &kv.k,
-        &kv.v,
+        kv,
         &s.attn_scratch,
         Binding::Full(&s.attn_out),
-        nq,
-        nkv,
-        hd,
-        kv.max_seq,
-        args,
-        m,
-        0,
-        hd + step::ATTN_PAD,
-        (hd as f32).sqrt().recip(),
+        &ops::AttnSpec {
+            q_heads: nq,
+            window: 0,
+            stride: hd + ops::ATTN_PAD,
+            scale: (hd as f32).sqrt().recip(),
+            m,
+            args,
+        },
     )?;
     ops::sigmoid_mul(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.attn_out),
         Binding::Full(&s.gate),
         Binding::Full(&s.attn_gated),
@@ -925,7 +937,7 @@ fn full_attn_block(
     )?;
     ops::gemm(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.attn_gated),
         &w.o,
         Binding::Full(&s.mlp.down_out),
@@ -935,7 +947,7 @@ fn full_attn_block(
 
 fn linear_attn_block(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     cfg: &Qwen35Config,
     s: &Scratch,
     w: &LinearLayerW,
@@ -947,7 +959,7 @@ fn linear_attn_block(
 
     ops::gemm(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.normed),
         &w.in_proj_qkv,
         Binding::Full(&s.qkv_proj),
@@ -955,7 +967,7 @@ fn linear_attn_block(
     )?;
     ops::gemm(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.normed),
         &w.in_proj_z,
         Binding::Full(&s.z),
@@ -963,7 +975,7 @@ fn linear_attn_block(
     )?;
     ops::gemm(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.normed),
         &w.in_proj_b,
         Binding::Full(&s.b),
@@ -971,7 +983,7 @@ fn linear_attn_block(
     )?;
     ops::gemm(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.normed),
         &w.in_proj_a,
         Binding::Full(&s.a),
@@ -982,24 +994,26 @@ fn linear_attn_block(
     for t in 0..m {
         ops::conv1d(
             backend,
-            pass,
+            commands,
             Binding::Slice(&s.qkv_proj, row(t, conv_d), conv_d as u64 * 4),
             &w.conv1d,
             &state.conv,
             Binding::Slice(&s.conv_out, row(t, conv_d), conv_d as u64 * 4),
-            conv_d,
+            &ops::ConvSpec { dim: conv_d },
         )?;
     }
     ops::repeat_qk(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.conv_out),
         Binding::Full(&s.qk_expanded),
-        m,
-        cfg.lin_key_heads,
-        heads,
-        cfg.lin_key_dim,
-        cfg.lin_val_dim,
+        &ops::RepeatQkSpec {
+            rows: m,
+            n_k: cfg.lin_key_heads,
+            n_v: heads,
+            key_dim: cfg.lin_key_dim,
+            val_dim: cfg.lin_val_dim,
+        },
     )?;
     let exp_d = cfg.qk_exp_dim();
 
@@ -1007,51 +1021,51 @@ fn linear_attn_block(
     for t in 0..m {
         ops::delta_gate(
             backend,
-            pass,
-            Binding::Full(&s.b),
-            Binding::Full(&s.a),
-            &w.a_log,
-            &w.dt_bias,
-            Binding::Full(&s.beta),
-            Binding::Full(&s.g),
-            heads,
-            t,
+            commands,
+            &ops::DeltaGate {
+                b: Binding::Full(&s.b),
+                a: Binding::Full(&s.a),
+                a_log: &w.a_log,
+                dt_bias: &w.dt_bias,
+                beta: Binding::Full(&s.beta),
+                g: Binding::Full(&s.g),
+                heads,
+                row: t,
+            },
         )?;
         let ed = row(t, exp_d);
         let (kb, vb) = (key_d as u64 * 4, val_d as u64 * 4);
         ops::delta_recur(
             backend,
-            pass,
-            Binding::Slice(&s.qk_expanded, ed, qkb),
-            Binding::Slice(&s.qk_expanded, ed + qkb, qkb),
-            Binding::Slice(&s.conv_out, row(t, conv_d) + kb * 2, vb),
-            Binding::Full(&s.beta),
-            Binding::Full(&s.g),
-            &state.recur,
-            Binding::Slice(&s.attn_out, row(t, val_d), vb),
-            heads,
-            cfg.lin_key_dim,
-            cfg.lin_val_dim,
+            commands,
+            &ops::DeltaRecur {
+                q: Binding::Slice(&s.qk_expanded, ed, qkb),
+                k: Binding::Slice(&s.qk_expanded, ed + qkb, qkb),
+                v: Binding::Slice(&s.conv_out, row(t, conv_d) + kb * 2, vb),
+                beta: Binding::Full(&s.beta),
+                g: Binding::Full(&s.g),
+                state: &state.recur,
+                y: Binding::Slice(&s.attn_out, row(t, val_d), vb),
+                heads,
+                key_dim: cfg.lin_key_dim,
+                val_dim: cfg.lin_val_dim,
+            },
         )?;
     }
 
     let span = m as u64 * val_d as u64 * 4;
     ops::norm(
         backend,
-        pass,
-        NormMode::Gated,
+        commands,
+        &ops::NormSpec::new(NormMode::Gated, m * heads, cfg.lin_val_dim, 1e-6),
         Binding::Slice(&s.attn_out, 0, span),
         &w.norm,
         Binding::Slice(&s.z, 0, span),
         Binding::Slice(&s.attn_gated, 0, span),
-        m * heads,
-        cfg.lin_val_dim,
-        cfg.lin_val_dim,
-        1e-6,
     )?;
     ops::gemm(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.attn_gated),
         &w.out_proj,
         Binding::Full(&s.mlp.down_out),
@@ -1061,7 +1075,7 @@ fn linear_attn_block(
 
 fn post_mlp(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     cfg: &Qwen35Config,
     s: &Scratch,
     mlp: &SwigluMlp,
@@ -1069,21 +1083,17 @@ fn post_mlp(
 ) -> Result<()> {
     ops::norm(
         backend,
-        pass,
-        NormMode::Offset,
+        commands,
+        &ops::NormSpec::new(NormMode::Offset, m, cfg.hidden, 1e-6),
         Binding::Full(&s.hidden2),
         &mlp.norm,
         Binding::Full(&s.hidden2),
         Binding::Full(&s.normed),
-        m,
-        cfg.hidden,
-        cfg.hidden,
-        1e-6,
     )?;
-    mlp_block(backend, pass, cfg, s, mlp, m)?;
+    mlp_block(backend, commands, cfg, s, mlp, m)?;
     ops::add(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.hidden2),
         Binding::Full(&s.mlp.down_out),
         Binding::Full(&s.hidden),
@@ -1093,7 +1103,7 @@ fn post_mlp(
 
 fn mlp_block(
     backend: &mut Backend,
-    pass: &mut Pass<'_>,
+    commands: &mut Commands<'_>,
     cfg: &Qwen35Config,
     s: &Scratch,
     mlp: &SwigluMlp,
@@ -1101,14 +1111,16 @@ fn mlp_block(
 ) -> Result<()> {
     ops::swiglu_mlp(
         backend,
-        pass,
+        commands,
         Binding::Full(&s.normed),
         mlp,
         &s.mlp,
-        m,
-        cfg.intermediate,
-        Act::Silu,
         Binding::Full(&s.mlp.down_out),
-        false,
+        &ops::MlpSpec {
+            rows: m,
+            intermediate: cfg.intermediate,
+            act: Act::Silu,
+            acc: false,
+        },
     )
 }
