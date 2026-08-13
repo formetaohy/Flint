@@ -41,17 +41,7 @@ We're actively adding support for more models. If there's a model you'd like sup
 
 ## Quick Start
 
-Requires [Rust](https://rustup.rs) and [huggingface cli](https://huggingface.co/docs/huggingface_hub/guides/cli).
-
-```sh
-git clone https://github.com/formetaohy/Flint.git
-
-cd Flint
-
-hf download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
-
-cargo run --release -- --model models/Qwen3.5-0.8B --prompt "What is a tensor?"
-```
+[Examples](examples/README.md): Flint's dedicated, runnable examples — a great way to get hands-on with the engine.
 
 ## Contact
 

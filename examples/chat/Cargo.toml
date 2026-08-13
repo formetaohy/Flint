@@ -1,0 +1,17 @@
+[package]
+name = "chat"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+flint-architectures.workspace = true
+flint-backend.workspace = true
+flint-error.workspace = true
+flint-generate.workspace = true
+flint-onnx.workspace = true
+flint-tokenizer.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+serde_json.workspace = true
+ureq.workspace = true

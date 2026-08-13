@@ -41,17 +41,7 @@ Flint 是用纯 Rust 编写、基于 [WGPU](https://github.com/gfx-rs/wgpu) 的�
 
 ## 快速开始
 
-需要 [Rust](https://rustup.rs) 和 [huggingface cli](https://huggingface.co/docs/huggingface_hub/guides/cli).
-
-```sh
-git clone https://github.com/formetaohy/Flint.git
-
-cd Flint
-
-hf download Qwen/Qwen3.5-0.8B --local-dir models/Qwen3.5-0.8B
-
-cargo run --release -- --model models/Qwen3.5-0.8B --prompt "What is a tensor?"
-```
+[示例](examples/README.md)：Flint 专门设计的可运行示例，可以帮助你快速上手引擎。
 
 ## 联系
 
