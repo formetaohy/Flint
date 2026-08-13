@@ -21,29 +21,6 @@ pub struct GenStats {
     pub decode_secs: f64,
 }
 
-impl GenStats {
-    pub fn summary(&self) -> String {
-        let pp = if self.prefill_secs > 0.0 {
-            self.prefill_tokens as f64 / self.prefill_secs
-        } else {
-            0.0
-        };
-        let tg = if self.decode_secs > 0.0 {
-            self.decode_tokens as f64 / self.decode_secs
-        } else {
-            0.0
-        };
-        format!(
-            "[flint] prefill: {} tok in {:.2}s ({pp:.1} tok/s) | decode: {} tok in {:.2}s ({tg:.1} tok/s) | accepted: {}",
-            self.prefill_tokens,
-            self.prefill_secs,
-            self.decode_tokens,
-            self.decode_secs,
-            self.accepted,
-        )
-    }
-}
-
 pub struct Engine {
     backend: Backend,
     model: Box<dyn LanguageModel>,

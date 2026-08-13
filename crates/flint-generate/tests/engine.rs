@@ -212,25 +212,3 @@ fn stats_account_prefill_and_decode() {
     assert_eq!(tokens.len(), 8);
     assert!(stats.prefill_secs >= 0.0 && stats.decode_secs >= 0.0);
 }
-
-#[test]
-fn stats_summary_format() {
-    let s = GenStats {
-        prefill_tokens: 100,
-        decode_tokens: 50,
-        accepted: 7,
-        prefill_secs: 1.0,
-        decode_secs: 2.0,
-    };
-    let text = s.summary();
-    assert!(text.contains("prefill: 100 tok"), "{text}");
-    assert!(text.contains("decode: 50 tok"), "{text}");
-    assert!(text.contains("accepted: 7"), "{text}");
-
-    let idle = GenStats {
-        prefill_secs: 0.0,
-        decode_secs: 0.0,
-        ..s
-    };
-    assert!(idle.summary().contains("0.0 tok/s"));
-}

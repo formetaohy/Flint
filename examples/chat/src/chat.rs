@@ -3,7 +3,7 @@ use std::path::Path;
 
 use flint_backend::Backend;
 use flint_error::Result;
-use flint_generate::{Engine, Sampler};
+use flint_generate::{Engine, GenStats, Sampler};
 
 const SYSTEM: &str = "You are a helpful assistant.";
 
@@ -34,6 +34,23 @@ pub fn run(dir: &Path, prompt: &str, max_tokens: usize, ctx_size: u32) -> Result
         std::io::stdout().flush().ok();
     }
     println!();
-    eprintln!("{}", stream.stats().summary());
+    eprintln!("{}", stats_summary(stream.stats()));
     Ok(())
+}
+
+fn stats_summary(s: &GenStats) -> String {
+    let pp = if s.prefill_secs > 0.0 {
+        s.prefill_tokens as f64 / s.prefill_secs
+    } else {
+        0.0
+    };
+    let tg = if s.decode_secs > 0.0 {
+        s.decode_tokens as f64 / s.decode_secs
+    } else {
+        0.0
+    };
+    format!(
+        "[flint] prefill: {} tok in {:.2}s ({pp:.1} tok/s) | decode: {} tok in {:.2}s ({tg:.1} tok/s)",
+        s.prefill_tokens, s.prefill_secs, s.decode_tokens, s.decode_secs,
+    )
 }
