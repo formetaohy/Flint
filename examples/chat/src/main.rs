@@ -62,9 +62,15 @@ fn main() -> Result<()> {
 }
 
 fn ensure_assets(hub: &Hub, format: Format, dir: &Path) -> Result<Vec<PathBuf>> {
+    fs::create_dir_all(dir).map_err(|e| Error::Model(format!("mkdir {}: {e}", dir.display())))?;
+    if matches!(format, Format::Gguf)
+        && let Some(local) = find_local_gguf(dir)
+    {
+        eprintln!("[hf] using local {}", local.display());
+        return Ok(vec![local]);
+    }
     let files = hub.files()?;
     let wanted = select(format, &files)?;
-    fs::create_dir_all(dir).map_err(|e| Error::Model(format!("mkdir {}: {e}", dir.display())))?;
     let mut local = vec![];
     for entry in wanted {
         let dest = dir.join(&entry.path);
@@ -86,6 +92,15 @@ fn ensure_assets(hub: &Hub, format: Format, dir: &Path) -> Result<Vec<PathBuf>> 
         local.push(dest);
     }
     Ok(local)
+}
+
+fn find_local_gguf(dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "gguf"))
+        .max_by_key(|p| p.metadata().map(|m| m.len()).unwrap_or(0))
 }
 
 fn select(format: Format, files: &[FileEntry]) -> Result<Vec<FileEntry>> {

@@ -25,6 +25,9 @@ pub struct Device {
     inner: DeviceRef,
     name: String,
     timestamps: bool,
+    subgroup_min_size: u32,
+    subgroup_max_size: u32,
+    cooperative_matrix: Vec<wgpu::CooperativeMatrixProperties>,
 }
 
 impl Device {
@@ -65,10 +68,22 @@ impl Device {
             && adapter
                 .features()
                 .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+        let adapter_features = adapter.features();
         let mut features = wgpu::Features::IMMEDIATES;
         if timestamps {
             features |=
                 wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        }
+        if adapter_features.contains(wgpu::Features::SUBGROUP) {
+            features |= wgpu::Features::SUBGROUP;
+        }
+        let mut experimental = wgpu::ExperimentalFeatures::disabled();
+        if adapter_features.contains(wgpu::Features::SHADER_F16) {
+            features |= wgpu::Features::SHADER_F16;
+        }
+        if adapter_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+            experimental = unsafe { wgpu::ExperimentalFeatures::enabled() };
         }
         let limits = wgpu::Limits {
             max_immediate_size: adapter_limits
@@ -88,7 +103,7 @@ impl Device {
                 label: None,
                 required_features: features,
                 required_limits: limits,
-                experimental_features: wgpu::ExperimentalFeatures::default(),
+                experimental_features: experimental,
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
             }))
@@ -97,11 +112,26 @@ impl Device {
             inner: std::sync::Arc::new(DeviceInner { device, queue }),
             name: info.name,
             timestamps,
+            subgroup_min_size: info.subgroup_min_size,
+            subgroup_max_size: info.subgroup_max_size,
+            cooperative_matrix: adapter.cooperative_matrix_properties(),
         })
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn subgroup_min_size(&self) -> u32 {
+        self.subgroup_min_size
+    }
+
+    pub fn subgroup_max_size(&self) -> u32 {
+        self.subgroup_max_size
+    }
+
+    pub fn cooperative_matrix_properties(&self) -> &[wgpu::CooperativeMatrixProperties] {
+        &self.cooperative_matrix
     }
 
     pub fn timestamp_period_ns(&self) -> f64 {

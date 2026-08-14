@@ -216,6 +216,141 @@ fn gemm_bf16() {
 }
 
 #[test]
+fn gemm_coop_bf16() {
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(7);
+    let (m, n, k) = (16usize, 64usize, 128usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.zero(&[m as u32, n as u32]);
+    let wb = ctx.bf16(&w, &[n as u32, k as u32]);
+    let sb = ctx.f32(&[0.0], &[1]);
+    ctx.dispatch(
+        name::GEMM_COOP,
+        &[
+            ("N", n as f64),
+            ("K", k as f64),
+            ("M", m as f64),
+            ("SEGS", 1.0),
+            ("WDTYPE", 0.0),
+            ("GROUP", 128.0),
+            ("ACC", 0.0),
+            ("Y_STRIDE", n as f64),
+            ("Y_OFF", 0.0),
+        ],
+        &[
+            Binding::Full(&xb),
+            Binding::Full(&wb),
+            Binding::Full(&sb),
+            Binding::Full(&y),
+        ],
+        [n.div_ceil(32) as u32, m.div_ceil(64) as u32, 1],
+    );
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
+        2e-2,
+        5e-2,
+    );
+}
+
+#[test]
+fn gemm_coop_bf16_segs() {
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(77);
+    let (m, n, k) = (16usize, 64usize, 8192usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.zero(&[m as u32, n as u32]);
+    let wb = ctx.bf16(&w, &[n as u32, k as u32]);
+    let sb = ctx.f32(&[0.0], &[1]);
+    let segs = 4u32;
+    let partial = ctx.zero(&[segs * m as u32 * n as u32]);
+    ctx.dispatch(
+        name::GEMM_COOP,
+        &[
+            ("N", n as f64),
+            ("K", k as f64),
+            ("M", m as f64),
+            ("SEGS", segs as f64),
+            ("WDTYPE", 0.0),
+            ("GROUP", 128.0),
+            ("ACC", 0.0),
+            ("Y_STRIDE", n as f64),
+            ("Y_OFF", 0.0),
+        ],
+        &[
+            Binding::Full(&xb),
+            Binding::Full(&wb),
+            Binding::Full(&sb),
+            Binding::Full(&partial),
+        ],
+        [n.div_ceil(32) as u32, m.div_ceil(64) as u32, segs],
+    );
+    ctx.dispatch(
+        name::MERGE_GEMM,
+        &[
+            ("M", m as f64),
+            ("N", n as f64),
+            ("Y_STRIDE", n as f64),
+            ("Y_OFF", 0.0),
+            ("SEGS", segs as f64),
+            ("ACC", 0.0),
+        ],
+        &[Binding::Full(&partial), Binding::Full(&y)],
+        [n.div_ceil(256) as u32, 1, 1],
+    );
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
+        2e-2,
+        5e-2,
+    );
+}
+
+#[test]
+fn gemm_coop_bf16_multi_tile() {
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(29);
+    let (m, n, k) = (80usize, 64usize, 256usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.zero(&[m as u32, n as u32]);
+    let wb = ctx.bf16(&w, &[n as u32, k as u32]);
+    let sb = ctx.f32(&[0.0], &[1]);
+    ctx.dispatch(
+        name::GEMM_COOP,
+        &[
+            ("N", n as f64),
+            ("K", k as f64),
+            ("M", m as f64),
+            ("SEGS", 1.0),
+            ("WDTYPE", 0.0),
+            ("GROUP", 128.0),
+            ("ACC", 0.0),
+            ("Y_STRIDE", n as f64),
+            ("Y_OFF", 0.0),
+        ],
+        &[
+            Binding::Full(&xb),
+            Binding::Full(&wb),
+            Binding::Full(&sb),
+            Binding::Full(&y),
+        ],
+        [n.div_ceil(32) as u32, m.div_ceil(64) as u32, 1],
+    );
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
+        2e-2,
+        5e-2,
+    );
+}
+
+#[test]
 fn gemm_bf16_multi_tile_m() {
     gemm_case(WType::Bf16, 32, 32, 64, 29);
 }

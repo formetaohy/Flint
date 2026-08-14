@@ -51,6 +51,9 @@ struct Args {
     gemm_probe: bool,
 
     #[arg(long)]
+    caps_probe: bool,
+
+    #[arg(long)]
     attn_probe: bool,
 
     #[arg(long)]
@@ -86,6 +89,9 @@ fn main() -> Result<()> {
     }
     if args.gemm_probe {
         return probes::run("gemm");
+    }
+    if args.caps_probe {
+        return probes::run("caps");
     }
     if args.attn_probe {
         return probes::run("attn");

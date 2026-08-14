@@ -1,6 +1,7 @@
 pub mod modes;
 pub mod name {
     pub const GEMM: &str = "gemm";
+    pub const GEMM_COOP: &str = "gemm_coop";
     pub const MERGE_GEMM: &str = "merge_gemm";
     pub const GEMV: &str = "gemv";
     pub const MERGE_GEMV: &str = "merge_gemv";
@@ -60,6 +61,22 @@ const SHADERS: &[ShaderSpec] = &[
     shader!(
         name::GEMM,
         "gemm.wgsl",
+        4,
+        &[
+            ("N", Scalar::U32),
+            ("K", Scalar::U32),
+            ("M", Scalar::U32),
+            ("SEGS", Scalar::U32),
+            ("WDTYPE", Scalar::U32),
+            ("GROUP", Scalar::U32),
+            ("ACC", Scalar::U32),
+            ("Y_STRIDE", Scalar::U32),
+            ("Y_OFF", Scalar::U32),
+        ]
+    ),
+    shader!(
+        name::GEMM_COOP,
+        "gemm_coop.wgsl",
         4,
         &[
             ("N", Scalar::U32),

@@ -69,6 +69,12 @@ impl Backend {
             1
         };
         let gemm_acc = if segs > 1 { 0 } else { acc as u32 };
+        let coop = dtype == DType::Bf16 && n.is_multiple_of(16) && rows.is_multiple_of(16);
+        let kernel = if coop {
+            shader::GEMM_COOP
+        } else {
+            shader::GEMM
+        };
         let consts = [
             ("N", n as f64),
             ("K", k as f64),
@@ -88,13 +94,14 @@ impl Backend {
         };
         let unit_scale = self.unit_scale();
         let bufs = [x, wb, Self::scale_binding(unit_scale, w), yb];
+        let tm = if coop { 64 } else { 32 };
         Self::set(
             &self.kernels,
             commands,
-            shader::GEMM,
+            kernel,
             &consts,
             &bufs,
-            [n.div_ceil(32), rows.div_ceil(32), segs],
+            [n.div_ceil(32), rows.div_ceil(tm), segs],
         )?;
         if segs > 1 {
             let mconsts = [

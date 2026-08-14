@@ -114,14 +114,9 @@ fn attn(
                 sc = dotp * SCALE;
             }
             scs[hl * CHUNK + slot] = sc;
-            red[hl * CHUNK + slot] = sc;
-            workgroupBarrier();
-            if slot < CHUNK / 32 {
-                var mx = NEG_INF;
-                for (var w = 0u; w < 32u; w++) {
-                    mx = max(mx, red[hl * CHUNK + slot * 32 + w]);
-                }
-                red[hl * (CHUNK / 32) + slot] = mx;
+            var mx = subgroupMax(sc);
+            if slot % 32 == 0 {
+                red[hl * (CHUNK / 32) + slot / 32] = mx;
             }
             workgroupBarrier();
             var c_max = NEG_INF;
@@ -165,14 +160,9 @@ fn attn(
                 }
             }
             scs[hl * CHUNK + slot] = e;
-            red[hl * CHUNK + slot] = e;
-            workgroupBarrier();
-            if slot < CHUNK / 32 {
-                var sm = 0.0;
-                for (var w = 0u; w < 32u; w++) {
-                    sm = sm + red[hl * CHUNK + slot * 32 + w];
-                }
-                red[hl * (CHUNK / 32) + slot] = sm;
+            var sm = subgroupAdd(e);
+            if slot % 32 == 0 {
+                red[hl * (CHUNK / 32) + slot / 32] = sm;
             }
             workgroupBarrier();
             var c_sum = 0.0;
