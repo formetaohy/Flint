@@ -1,5 +1,6 @@
 mod matmul;
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use flint_error::{Error, Result};
@@ -47,12 +48,25 @@ impl<'a> Commands<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct Readback {
+    offset: u64,
+    count: usize,
+}
+
+struct Staging {
+    buf: Buffer,
+    cursor: u64,
+}
+
 pub struct Backend {
     device: Rc<Device>,
     kernels: Kernels,
     unit_scale: Tensor,
     gemv_partial: Tensor,
     gemm_partial: Tensor,
+    staging: RefCell<Staging>,
+    drained: bool,
 
     pending: Vec<Submission>,
     retired: Vec<(Tensor, u32)>,
@@ -64,17 +78,22 @@ impl Backend {
             Device::open()
                 .map_err(|e| Error::Gpu(format!("no suitable backend: {e}")))?,
         );
-        let kernels = Kernels::new(device.as_ref())?;
-        Self::warmup(device.as_ref(), &kernels)?;
+        let mut kernels = Kernels::new(device.as_ref())?;
+        Self::warmup(device.as_ref(), &mut kernels)?;
         let unit_scale = Tensor::new(Self::zeroed_buf(device.as_ref(), 4), vec![1], DType::F32);
         let gemv_partial = Self::partial_buf(device.as_ref(), 8 * 65536)?;
         let gemm_partial = Self::partial_buf(device.as_ref(), 4 * 128 * 16384)?;
+        let staging = device
+            .create_buffer(1 << 20, HostAccess::Read, false)
+            .map_err(|e| Error::Gpu(e.to_string()))?;
         Ok(Self {
             device,
             kernels,
             unit_scale,
             gemv_partial,
             gemm_partial,
+            staging: RefCell::new(Staging { buf: staging, cursor: 0 }),
+            drained: false,
             pending: Vec::new(),
             retired: Vec::new(),
         })
@@ -92,8 +111,8 @@ impl Backend {
         self.kernels.get(name)
     }
 
-    pub fn pack_scalars(&self, name: &str, consts: &[(&'static str, f64)]) -> Result<Vec<u8>> {
-        self.kernels.pack_scalars(name, consts)
+    pub fn pack_scalars(&mut self, name: &str, consts: &[(&'static str, f64)]) -> Result<Vec<u8>> {
+        Ok(self.kernels.pack_scalars(name, consts)?.to_vec())
     }
 
     fn zeroed_buf(device: &Device, size: u64) -> Buffer {
@@ -102,7 +121,7 @@ impl Backend {
             .expect("buffer allocation");
         let mut enc = device.encoder().expect("encoder");
         enc.clear(&buf, 0, size).expect("clear");
-        enc.finish().wait().expect("wait");
+        let _ = enc.finish();
         buf
     }
 
@@ -160,7 +179,7 @@ impl Backend {
     pub fn zero_fill(&self, t: &Tensor) {
         let mut enc = self.device.encoder().expect("encoder");
         enc.clear(&t.buf, 0, t.byte_len()).expect("clear");
-        enc.finish().wait().expect("wait");
+        let _ = enc.finish();
     }
 
     pub fn copy(&self, src: &Tensor, dst: &Tensor) {
@@ -168,7 +187,7 @@ impl Backend {
         let mut enc = self.device.encoder().expect("encoder");
         enc.copy(&src.buf, 0, &dst.buf, 0, src.byte_len())
             .expect("copy");
-        enc.finish().wait().expect("wait");
+        let _ = enc.finish();
     }
 
     pub fn tensor_f32(&self, data: &[f32], shape: Vec<u32>) -> Tensor {
@@ -214,28 +233,18 @@ impl Backend {
         let dst = device
             .create_buffer(bytes.len() as u64, HostAccess::None, false)
             .expect("buffer allocation");
-        Self::stage_copy(device, &dst, bytes);
+        dst.write(0, bytes).expect("queue write");
         dst
     }
 
     pub fn write_u32(&self, buf: &Buffer, data: &[u32]) {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        Self::stage_copy(self.device.as_ref(), buf, &bytes);
+        buf.write(0, &bytes).expect("queue write");
     }
 
     pub fn write_f32(&self, buf: &Buffer, data: &[f32]) {
-        Self::stage_copy(self.device.as_ref(), buf, bytemuck::cast_slice(data));
-    }
-
-    fn stage_copy(device: &Device, dst: &Buffer, bytes: &[u8]) {
-        let staging = device
-            .create_buffer(bytes.len() as u64, HostAccess::Write, false)
-            .expect("staging allocation");
-        staging.write(0, bytes).expect("staging write");
-        let mut enc = device.encoder().expect("encoder");
-        enc.copy(&staging, 0, dst, 0, bytes.len() as u64)
-            .expect("upload copy");
-        enc.finish().wait().expect("wait");
+        buf.write(0, bytemuck::cast_slice(data))
+            .expect("queue write");
     }
 
     pub fn encoder(&self) -> Result<Encoder> {
@@ -250,25 +259,25 @@ impl Backend {
         bufs: &[Binding<'_>],
         groups: [u32; 3],
     ) -> Result<()> {
-        Self::set(&self.kernels, commands, name, consts, bufs, groups)
+        Self::set(&mut self.kernels, commands, name, consts, bufs, groups)
     }
 
     fn set(
-        kernels: &Kernels,
+        kernels: &mut Kernels,
         commands: &mut Commands<'_>,
         name: &'static str,
         consts: &[(&'static str, f64)],
         bufs: &[Binding<'_>],
         groups: [u32; 3],
     ) -> Result<()> {
-        let kernel = kernels.get(name)?;
+        let kernel = kernels.get(name)?.clone();
         let bindings: Vec<BindingRef> = bufs
             .iter()
             .enumerate()
             .map(|(i, b)| b.resolve(i as u32))
             .collect();
         let scalars = kernels.pack_scalars(name, consts)?;
-        commands.0.bind(kernel, &bindings)?;
+        commands.0.bind(&kernel, &bindings)?;
         if !scalars.is_empty() {
             commands.0.set_scalars(&scalars)?;
         }
@@ -287,25 +296,86 @@ impl Backend {
             self.settle_retired();
         }
         self.pending.push(encoder.submit_and_reset());
+        self.drained = false;
         Ok(())
     }
 
+    fn ensure_staging(&self, bytes: u64) {
+        let mut staging = self.staging.borrow_mut();
+        if staging.buf.size() < bytes {
+            let size = bytes.next_power_of_two().max(1 << 20);
+            staging.buf = self
+                .device
+                .create_buffer(size, HostAccess::Read, false)
+                .expect("staging growth");
+        }
+    }
+
+    pub fn queue_read(
+        &mut self,
+        commands: &mut Commands<'_>,
+        src: &Buffer,
+        offset: u64,
+        count: usize,
+    ) -> Result<Readback> {
+        let nbytes = count as u64 * 4;
+        let need = self.staging.borrow().cursor + nbytes;
+        self.ensure_staging(need);
+        let mut staging = self.staging.borrow_mut();
+        commands.0.copy(src, offset, &staging.buf, staging.cursor, nbytes)?;
+        let rb = Readback {
+            offset: staging.cursor,
+            count,
+        };
+        staging.cursor += nbytes;
+        Ok(rb)
+    }
+
+    pub fn collect_reads(&mut self, reads: &[Readback]) -> Result<Vec<Vec<f32>>> {
+        if !reads.is_empty() && !self.drained {
+            while let Some(sub) = self.pending.pop() {
+                sub.wait()?;
+                self.settle_retired();
+            }
+            self.drained = true;
+        }
+        let out = {
+            let staging = self.staging.borrow();
+            let mut out = Vec::with_capacity(reads.len());
+            for rb in reads {
+                let mut bytes = vec![0u8; rb.count * 4];
+                staging.buf.read(rb.offset, &mut bytes)?;
+                out.push(
+                    bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                );
+            }
+            out
+        };
+        self.staging.borrow_mut().cursor = 0;
+        Ok(out)
+    }
+
     pub fn read_f32(&self, src: &Buffer, offset: u64, count: usize) -> Result<Vec<f32>> {
-        let staging = self
-            .device
-            .create_buffer(count as u64 * 4, HostAccess::Read, false)?;
+        let nbytes = count as u64 * 4;
+        self.ensure_staging(nbytes);
         let mut enc = self.device.encoder()?;
-        enc.copy(src, offset, &staging, 0, count as u64 * 4)?;
+        {
+            let staging = self.staging.borrow();
+            enc.copy(src, offset, &staging.buf, 0, nbytes)?;
+        }
         enc.finish().wait()?;
         let mut bytes = vec![0u8; count * 4];
-        staging.read(0, &mut bytes)?;
+        self.staging.borrow().buf.read(0, &mut bytes)?;
         Ok(bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
     }
 
-    fn warmup(device: &Device, kernels: &Kernels) -> Result<()> {
+    fn warmup(device: &Device, kernels: &mut Kernels) -> Result<()> {
         let n = 1 << 20;
         let mk = |val: f32| {
             Tensor::new(

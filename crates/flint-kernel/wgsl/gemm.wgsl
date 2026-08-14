@@ -50,6 +50,11 @@ fn gemm(
     var acc1 = 0.0;
     var acc2 = 0.0;
     var acc3 = 0.0;
+    var accs0 = 0.0;
+    var accs1 = 0.0;
+    var accs2 = 0.0;
+    var accs3 = 0.0;
+    let g32 = GROUP / 32;
     for (var i = 0u; i < 4u; i++) {
         let idx = ln + i * 256;
         var v = 0.0;
@@ -65,9 +70,7 @@ fn gemm(
             if WDTYPE == 1 {
                 let kb = (k_lo + idx % 32) / 16;
                 let word = w[(kb * N + n0 + idx / 32) * 4 + ((idx % 32) % 16) / 4];
-                let byte = (word >> ((((idx % 32) % 16) % 4) * 8)) & 255;
-                let sc = scales[(kb / (GROUP / 16)) * N + n0 + idx / 32];
-                v = f32(i32(byte << 24) >> 24) * sc;
+                v = f32(i32(word << (24 - (((idx % 32) % 16) % 4) * 8)) >> 24);
             } else {
                 let word = w[(n0 + idx / 32) * (K / 2) + (k_lo + idx % 32) / 2];
                 if (idx % 32) % 2 == 0 {
@@ -106,6 +109,19 @@ fn gemm(
             acc2 = acc2 + x4 * w0 + x5 * w1 + x6 * w2 + x7 * w3;
             acc3 = acc3 + x4 * w4 + x5 * w5 + x6 * w6 + x7 * w7;
         }
+        if WDTYPE == 1 && ((it + 1) % g32 == 0 || it + 1 == steps) {
+            let g = (k_lo + it * BK) / GROUP;
+            let sc0 = scales[g * N + n0 + c0];
+            let sc1 = scales[g * N + n0 + c0 + 1];
+            accs0 = accs0 + acc0 * sc0;
+            accs1 = accs1 + acc1 * sc1;
+            accs2 = accs2 + acc2 * sc0;
+            accs3 = accs3 + acc3 * sc1;
+            acc0 = 0.0;
+            acc1 = 0.0;
+            acc2 = 0.0;
+            acc3 = 0.0;
+        }
         if it + 1 < steps {
             let p1 = (1 - phase) * 1056;
             let k1 = k_lo + (it + 1) * BK;
@@ -124,9 +140,8 @@ fn gemm(
                     if WDTYPE == 1 {
                         let kb = (k1 + idx % 32) / 16;
                         let word = w[(kb * N + n0 + idx / 32) * 4 + ((idx % 32) % 16) / 4];
-                        let byte = (word >> ((((idx % 32) % 16) % 4) * 8)) & 255;
-                        let sc = scales[(kb / (GROUP / 16)) * N + n0 + idx / 32];
-                        v = f32(i32(byte << 24) >> 24) * sc;
+                        let byte = i32(word << (24 - (((idx % 32) % 16) % 4) * 8)) >> 24;
+                        v = f32(byte);
                     } else {
                         let word = w[(n0 + idx / 32) * (K / 2) + (k1 + idx % 32) / 2];
                         if (idx % 32) % 2 == 0 {
@@ -143,20 +158,24 @@ fn gemm(
         workgroupBarrier();
     }
     let yoff = select(0u, seg * (M * Y_STRIDE), SEGS > 1);
+    let out0 = accs0 + acc0;
+    let out1 = accs1 + acc1;
+    let out2 = accs2 + acc2;
+    let out3 = accs3 + acc3;
     if m0 + r0 < M {
         if n0 + c0 < N {
-            y[yoff + (m0 + r0) * Y_STRIDE + Y_OFF + n0 + c0] = acc0 + f32(ACC) * y[yoff + (m0 + r0) * Y_STRIDE + Y_OFF + n0 + c0];
+            y[yoff + (m0 + r0) * Y_STRIDE + Y_OFF + n0 + c0] = out0 + f32(ACC) * y[yoff + (m0 + r0) * Y_STRIDE + Y_OFF + n0 + c0];
         }
         if n0 + c0 + 1 < N {
-            y[yoff + (m0 + r0) * Y_STRIDE + Y_OFF + n0 + c0 + 1] = acc1 + f32(ACC) * y[yoff + (m0 + r0) * Y_STRIDE + Y_OFF + n0 + c0 + 1];
+            y[yoff + (m0 + r0) * Y_STRIDE + Y_OFF + n0 + c0 + 1] = out1 + f32(ACC) * y[yoff + (m0 + r0) * Y_STRIDE + Y_OFF + n0 + c0 + 1];
         }
     }
     if m0 + r0 + 1 < M {
         if n0 + c0 < N {
-            y[yoff + (m0 + r0 + 1) * Y_STRIDE + Y_OFF + n0 + c0] = acc2 + f32(ACC) * y[yoff + (m0 + r0 + 1) * Y_STRIDE + Y_OFF + n0 + c0];
+            y[yoff + (m0 + r0 + 1) * Y_STRIDE + Y_OFF + n0 + c0] = out2 + f32(ACC) * y[yoff + (m0 + r0 + 1) * Y_STRIDE + Y_OFF + n0 + c0];
         }
         if n0 + c0 + 1 < N {
-            y[yoff + (m0 + r0 + 1) * Y_STRIDE + Y_OFF + n0 + c0 + 1] = acc3 + f32(ACC) * y[yoff + (m0 + r0 + 1) * Y_STRIDE + Y_OFF + n0 + c0 + 1];
+            y[yoff + (m0 + r0 + 1) * Y_STRIDE + Y_OFF + n0 + c0 + 1] = out3 + f32(ACC) * y[yoff + (m0 + r0 + 1) * Y_STRIDE + Y_OFF + n0 + c0 + 1];
         }
     }
 }

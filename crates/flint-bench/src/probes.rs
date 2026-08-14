@@ -94,6 +94,8 @@ fn gemv_probe() -> Result<()> {
         512
     } else if kernel.contains("w128") {
         128
+    } else if kernel.contains("v4") {
+        512
     } else {
         256
     };
@@ -198,7 +200,6 @@ fn cpu_probe() -> Result<()> {
         backend.submit(&mut enc)?;
     }
 
-    let kernel = backend.kernel("gemv")?;
     let mut enc = backend.encoder().unwrap();
     {
         let mut commands = Commands::begin(&mut enc);
@@ -211,6 +212,7 @@ fn cpu_probe() -> Result<()> {
             ("ACC", 0.0),
         ];
         let scalars = backend.pack_scalars("gemv", &consts)?;
+        let kernel = backend.kernel("gemv")?;
         let binds = [
             flint_gpu::BindingRef {
                 index: 0,
@@ -446,7 +448,9 @@ fn attn_probe() -> Result<()> {
 
     let mut backend = Backend::new()?;
     eprintln!("[probe] adapter: {}", backend.adapter_name());
-    let (m, nq, nkv, hd, max_seq, pos) = (128u32, 32u32, 8u32, 128u32, 2048u32, 1024u32);
+    let m: u32 = std::env::var("PROBE_M").map(|v| v.parse().unwrap()).unwrap_or(128);
+    let pos: u32 = std::env::var("PROBE_POS").map(|v| v.parse().unwrap()).unwrap_or(1024);
+    let (nq, nkv, hd, max_seq) = (32u32, 8u32, 128u32, 2048u32);
     let q: Vec<f32> = (0..m * nq * hd)
         .map(|i| ((i as f32) * 0.001 - 0.5) * 0.1)
         .collect();

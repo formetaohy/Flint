@@ -3,6 +3,7 @@ use flint_error::Result;
 use crate::device::KernelSpec;
 use crate::DeviceRef;
 
+#[derive(Clone)]
 pub struct Kernel {
     pub(crate) name: String,
     pub(crate) pipeline: wgpu::ComputePipeline,
@@ -11,7 +12,11 @@ pub struct Kernel {
 }
 
 impl Kernel {
-    pub(crate) fn create(device: &DeviceRef, spec: &KernelSpec<'_>) -> Result<Self> {
+    pub(crate) fn create(
+        device: &DeviceRef,
+        spec: &KernelSpec<'_>,
+        cache: Option<&wgpu::PipelineCache>,
+    ) -> Result<Self> {
         let module = device
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -52,7 +57,7 @@ impl Kernel {
                 module: &module,
                 entry_point: Some(spec.name),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
+                cache,
             });
         Ok(Self {
             name: spec.name.to_string(),

@@ -19,6 +19,10 @@ impl Buffer {
         }
     }
 
+    pub fn size(&self) -> u64 {
+        self.buffer.size()
+    }
+
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());

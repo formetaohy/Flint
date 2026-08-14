@@ -4,6 +4,7 @@ pub mod name {
     pub const GEMM_COOP: &str = "gemm_coop";
     pub const MERGE_GEMM: &str = "merge_gemm";
     pub const GEMV: &str = "gemv";
+    pub const GEMV_V4: &str = "gemv_v4";
     pub const MERGE_GEMV: &str = "merge_gemv";
     pub const EMBED: &str = "embed";
     pub const NORM: &str = "norm";
@@ -106,6 +107,19 @@ const SHADERS: &[ShaderSpec] = &[
     shader!(
         name::GEMV,
         "gemv.wgsl",
+        4,
+        &[
+            ("N", Scalar::U32),
+            ("K", Scalar::U32),
+            ("WDTYPE", Scalar::U32),
+            ("GROUP", Scalar::U32),
+            ("SEGS", Scalar::U32),
+            ("ACC", Scalar::U32),
+        ]
+    ),
+    shader!(
+        name::GEMV_V4,
+        "gemv_v4.wgsl",
         4,
         &[
             ("N", Scalar::U32),
@@ -306,11 +320,18 @@ const SHADERS: &[ShaderSpec] = &[
 
 pub struct Kernels {
     kernels: HashMap<&'static str, Kernel>,
+    packs: HashMap<&'static str, Pack>,
+}
+
+struct Pack {
+    layout: ScalarLayout,
+    bytes: Vec<u8>,
 }
 
 impl Kernels {
     pub fn new(device: &Device) -> Result<Self> {
         let mut kernels = HashMap::new();
+        let mut packs = HashMap::new();
         for spec in SHADERS {
             let layout = scalar_layout(spec.scalars)?;
             let kernel = device.create_kernel(&flint_gpu::KernelSpec {
@@ -320,8 +341,15 @@ impl Kernels {
                 immediate_size: layout.size,
             })?;
             kernels.insert(spec.name, kernel);
+            packs.insert(
+                spec.name,
+                Pack {
+                    bytes: vec![0u8; layout.size as usize],
+                    layout,
+                },
+            );
         }
-        Ok(Self { kernels })
+        Ok(Self { kernels, packs })
     }
 
     pub fn get(&self, name: &str) -> Result<&Kernel> {
@@ -330,21 +358,23 @@ impl Kernels {
             .ok_or_else(|| Error::Gpu(format!("unknown shader {name}")))
     }
 
-    pub fn pack_scalars(&self, name: &str, consts: &[(&'static str, f64)]) -> Result<Vec<u8>> {
-        let layout = SHADERS
-            .iter()
-            .find(|s| s.name == name)
-            .map(|s| scalar_layout(s.scalars).expect("scalar layout is static"))
+    pub fn pack_scalars(
+        &mut self,
+        name: &str,
+        consts: &[(&'static str, f64)],
+    ) -> Result<&[u8]> {
+        let pack = self
+            .packs
+            .get_mut(name)
             .ok_or_else(|| Error::Gpu(format!("unknown shader {name}")))?;
-        if consts.len() != layout.fields.len() {
+        if consts.len() != pack.layout.fields.len() {
             return Err(Error::Gpu(format!(
                 "shader {name}: expected {} constants, got {}",
-                layout.fields.len(),
+                pack.layout.fields.len(),
                 consts.len()
             )));
         }
-        let mut bytes = vec![0u8; layout.size as usize];
-        for field in &layout.fields {
+        for field in &pack.layout.fields {
             let value = consts
                 .iter()
                 .find(|(key, _)| *key == field.name)
@@ -353,9 +383,9 @@ impl Kernels {
                 })?
                 .1;
             let end = (field.offset + field.ty.width()) as usize;
-            encode_scalar(&mut bytes[field.offset as usize..end], field.ty, value);
+            encode_scalar(&mut pack.bytes[field.offset as usize..end], field.ty, value);
         }
-        Ok(bytes)
+        Ok(&pack.bytes)
     }
 }
 

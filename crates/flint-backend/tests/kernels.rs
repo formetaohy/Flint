@@ -371,6 +371,14 @@ fn gemm_i8_group32() {
 }
 
 fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
+    gemv_case_impl(wt, n, k, seed, segs, false);
+}
+
+fn gemv_case_v4(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
+    gemv_case_impl(wt, n, k, seed, segs, true);
+}
+
+fn gemv_case_impl(wt: WType, n: usize, k: usize, seed: u64, segs: u32, v4: bool) {
     let mut ctx = Ctx::new();
     let mut rng = Rng(seed);
     let x = rng.fill(k);
@@ -400,7 +408,7 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
         Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64)
     };
     ctx.dispatch(
-        name::GEMV,
+        if v4 { name::GEMV_V4 } else { name::GEMV },
         &[
             ("N", n as f64),
             ("K", k as f64),
@@ -415,7 +423,11 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
             Binding::Full(&sb),
             out,
         ],
-        [(n.div_ceil(256)) as u32, segs, 1],
+        [
+            n.div_ceil(if v4 { 512 } else { 256 }) as u32,
+            segs,
+            1,
+        ],
     );
     if segs > 1 {
         ctx.dispatch(
@@ -454,6 +466,31 @@ fn gemv_i8_split4() {
 #[test]
 fn gemv_bf16_split8() {
     gemv_case(WType::Bf16, 32, 1024, 47, 8);
+}
+
+#[test]
+fn gemv_v4_bf16() {
+    gemv_case_v4(WType::Bf16, 32, 128, 53, 1);
+}
+
+#[test]
+fn gemv_v4_i8_group128() {
+    gemv_case_v4(WType::I8(128), 64, 256, 59, 1);
+}
+
+#[test]
+fn gemv_v4_i8_split4() {
+    gemv_case_v4(WType::I8(128), 64, 512, 61, 4);
+}
+
+#[test]
+fn gemv_v4_bf16_split8() {
+    gemv_case_v4(WType::Bf16, 32, 1024, 67, 8);
+}
+
+#[test]
+fn gemv_v4_odd_n() {
+    gemv_case_v4(WType::I8(128), 37, 128, 71, 1);
 }
 
 #[test]

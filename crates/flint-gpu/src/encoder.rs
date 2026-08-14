@@ -1,3 +1,5 @@
+use std::hash::Hasher;
+
 use flint_error::{Error, Result};
 
 use crate::buffer::Buffer;
@@ -54,28 +56,50 @@ impl Encoder {
                 kernel.name, kernel.binding_count, bindings.len()
             )));
         }
-        let entries: Vec<wgpu::BindGroupEntry> = bindings
-            .iter()
-            .map(|b| wgpu::BindGroupEntry {
-                binding: b.index,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &b.buffer.buffer,
-                    offset: b.offset,
-                    size: (b.size > 0).then(|| {
-                        wgpu::BufferSize::new(b.size)
-                            .expect("binding size is validated by the caller")
-                    }),
-                }),
-            })
-            .collect();
-        let group = self
-            .inner
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &kernel.bind_group_layout,
-                entries: &entries,
-            });
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&kernel.pipeline, &mut hasher);
+        for b in bindings {
+            std::hash::Hash::hash(&b.index, &mut hasher);
+            std::hash::Hash::hash(&b.buffer.buffer, &mut hasher);
+            std::hash::Hash::hash(&b.offset, &mut hasher);
+            std::hash::Hash::hash(&b.size, &mut hasher);
+        }
+        let key = hasher.finish();
+        let group = {
+            let mut groups = self.inner.bind_groups.lock().expect("bind group cache lock");
+            match groups.get(&key) {
+                Some(group) => group.clone(),
+                None => {
+                    let entries: Vec<wgpu::BindGroupEntry> = bindings
+                        .iter()
+                        .map(|b| wgpu::BindGroupEntry {
+                            binding: b.index,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &b.buffer.buffer,
+                                offset: b.offset,
+                                size: (b.size > 0).then(|| {
+                                    wgpu::BufferSize::new(b.size)
+                                        .expect("binding size is validated by the caller")
+                                }),
+                            }),
+                        })
+                        .collect();
+                    let group = self
+                        .inner
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &kernel.bind_group_layout,
+                            entries: &entries,
+                        });
+                    if groups.len() >= 65536 {
+                        groups.clear();
+                    }
+                    groups.insert(key, group.clone());
+                    group
+                }
+            }
+        };
         let pass = self.ensure_pass();
         pass.set_pipeline(&kernel.pipeline);
         pass.set_bind_group(0, &group, &[]);
