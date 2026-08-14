@@ -117,10 +117,14 @@ fn main() -> Result<()> {
     );
 
     eprintln!("[bench] initializing GPU backend...");
-    let backend = Backend::new()?;
+    let mut backend = Backend::new()?;
     eprintln!("[bench] adapter: {}", backend.adapter_name());
-    let mut profiler = if args.profile {
-        Some(flint_profiler::GpuProfiler::new(backend.device())?)
+    let profiler = if args.profile {
+        let p = std::rc::Rc::new(std::cell::RefCell::new(
+            flint_profiler::GpuProfiler::new(backend.device())?,
+        ));
+        backend.attach_profiler(p.clone());
+        Some(p)
     } else {
         None
     };
@@ -146,8 +150,8 @@ fn main() -> Result<()> {
     let warm_ids: Vec<u32> = (0..16).map(|i| i % (args.vocab - 1) + 1).collect();
     model.forward(&mut backend, &warm_ids, &[], &[])?;
     let _ = backend.read_f32(&backend.unit_scale().buf, 0, 1)?;
-    let prefill_span = match &mut profiler {
-        Some(p) => Some(p.begin_span()?),
+    let prefill_span = match &profiler {
+        Some(p) => Some(p.borrow_mut().begin_span()?),
         None => None,
     };
     let t0 = Instant::now();
@@ -162,8 +166,8 @@ fn main() -> Result<()> {
         let ids: Vec<u32> = (t..t + rem).map(|i| i % (args.vocab - 1) + 1).collect();
         model.forward(&mut backend, &ids, &[], &[])?;
     }
-    if let (Some(p), Some(span)) = (&mut profiler, prefill_span) {
-        p.end_span("prefill", span)?;
+    if let (Some(p), Some(span)) = (&profiler, prefill_span) {
+        p.borrow_mut().end_span("prefill", span)?;
     }
 
     let _ = backend.read_f32(&backend.unit_scale().buf, 0, 1)?;
@@ -177,8 +181,8 @@ fn main() -> Result<()> {
 
     let mut logits: Vec<f32> = Vec::new();
     let mut per_step: Vec<f64> = Vec::new();
-    let decode_span = match &mut profiler {
-        Some(p) => Some(p.begin_span()?),
+    let decode_span = match &profiler {
+        Some(p) => Some(p.borrow_mut().begin_span()?),
         None => None,
     };
     let t0 = Instant::now();
@@ -193,8 +197,8 @@ fn main() -> Result<()> {
         logits = out.logits[0].clone();
     }
     let decode_secs = t0.elapsed().as_secs_f64();
-    if let (Some(p), Some(span)) = (&mut profiler, decode_span) {
-        p.end_span("decode", span)?;
+    if let (Some(p), Some(span)) = (&profiler, decode_span) {
+        p.borrow_mut().end_span("decode", span)?;
     }
     eprintln!(
         "[bench] decode: {} tok in {:.2}s ({:.1} tok/s)",
@@ -211,10 +215,10 @@ fn main() -> Result<()> {
         &logits[..4.min(logits.len())]
     );
 
-    if let Some(p) = &mut profiler {
-        p.flush()?;
+    if let Some(p) = &profiler {
+        p.borrow_mut().flush()?;
         eprintln!("[bench] GPU time breakdown (cumulative over prefill+decode):");
-        eprint!("{}", flint_profiler::breakdown(&p.report()));
+        eprint!("{}", flint_profiler::breakdown(&p.borrow().report()));
     }
     Ok(())
 }

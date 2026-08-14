@@ -13,6 +13,8 @@ const WORKGROUP_SIZE_X: u32 = 512;
 const WORKGROUP_STORAGE_BYTES: u32 = 32 * 1024;
 const STORAGE_BUFFERS_PER_STAGE: u32 = 16;
 
+static OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostAccess {
     None,
@@ -28,12 +30,11 @@ pub struct Device {
     subgroup_min_size: u32,
     subgroup_max_size: u32,
     cooperative_matrix: Vec<wgpu::CooperativeMatrixProperties>,
-    pipeline_cache: Option<wgpu::PipelineCache>,
-    pipeline_cache_path: Option<std::path::PathBuf>,
 }
 
 impl Device {
     pub fn open() -> Result<Self> {
+        let _guard = OPEN_LOCK.lock().expect("device open lock poisoned");
         let backends = if cfg!(any(target_os = "macos", target_os = "ios")) {
             wgpu::Backends::METAL
         } else {
@@ -79,9 +80,6 @@ impl Device {
         if adapter_features.contains(wgpu::Features::SUBGROUP) {
             features |= wgpu::Features::SUBGROUP;
         }
-        if adapter_features.contains(wgpu::Features::PIPELINE_CACHE) {
-            features |= wgpu::Features::PIPELINE_CACHE;
-        }
         let mut experimental = wgpu::ExperimentalFeatures::disabled();
         if adapter_features.contains(wgpu::Features::SHADER_F16) {
             features |= wgpu::Features::SHADER_F16;
@@ -113,44 +111,14 @@ impl Device {
                 trace: wgpu::Trace::Off,
             }))
             .map_err(|e| Error::Gpu(format!("wgpu device request failed: {e}")))?;
-        let cache_path = std::env::temp_dir().join(format!(
-            "flint_pipeline_{:x}_{:x}.bin",
-            info.vendor, info.device
-        ));
-        let cache_data = std::fs::read(&cache_path).ok();
-        let pipeline_cache = if adapter.get_info().backend == wgpu::Backend::Vulkan {
-            Some(unsafe {
-                device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-                    label: Some("flint pipeline cache"),
-                    data: cache_data.as_deref(),
-                    fallback: true,
-                })
-            })
-        } else {
-            None
-        };
         Ok(Self {
-            inner: std::sync::Arc::new(DeviceInner {
-                device,
-                queue,
-                bind_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
-            }),
+            inner: std::sync::Arc::new(DeviceInner { device, queue }),
             name: info.name,
             timestamps,
             subgroup_min_size: info.subgroup_min_size,
             subgroup_max_size: info.subgroup_max_size,
             cooperative_matrix: adapter.cooperative_matrix_properties(),
-            pipeline_cache,
-            pipeline_cache_path: Some(cache_path),
         })
-    }
-
-    fn persist_pipeline_cache(&self) {
-        if let (Some(cache), Some(path)) = (&self.pipeline_cache, &self.pipeline_cache_path) {
-            if let Some(data) = cache.get_data() {
-                let _ = std::fs::write(path, data);
-            }
-        }
     }
 
     pub fn name(&self) -> &str {
@@ -209,7 +177,7 @@ impl Device {
     }
 
     pub fn create_kernel(&self, spec: &KernelSpec<'_>) -> Result<Kernel> {
-        Kernel::create(&self.inner, spec, self.pipeline_cache.as_ref())
+        Kernel::create(&self.inner, spec)
     }
 
     pub fn create_timestamp_set(&self, capacity: u32) -> Result<TimestampSet> {
@@ -231,10 +199,4 @@ pub struct KernelSpec<'a> {
     pub wgsl: &'a str,
     pub bindings: u32,
     pub immediate_size: u32,
-}
-
-impl Drop for Device {
-    fn drop(&mut self) {
-        self.persist_pipeline_cache();
-    }
 }

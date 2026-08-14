@@ -846,17 +846,12 @@ impl LanguageModel for Model {
                 )?;
             }
         }
-        let (logit_reads, hidden_reads) = {
-            let mut commands = Commands::begin(&mut enc);
-            let logit_reads =
-                step::queue_rows(backend, &mut commands, &self.s.logits, logit_rows, m, cfg.vocab)?;
-            let hidden_reads =
-                step::queue_rows(backend, &mut commands, &self.s.hidden, hidden_rows, m, cfg.hidden)?;
-            (logit_reads, hidden_reads)
-        };
         backend.submit(&mut enc)?;
-        let (logits, hidden) = step::collect_rows(backend, &logit_reads, &hidden_reads)?;
-        let out = ChunkOut { logits, hidden };
+
+        let out = ChunkOut {
+            logits: step::read_rows(backend, &self.s.logits, logit_rows, m, cfg.vocab)?,
+            hidden: step::read_rows(backend, &self.s.hidden, hidden_rows, m, cfg.hidden)?,
+        };
         self.pos += m;
         Ok(out)
     }

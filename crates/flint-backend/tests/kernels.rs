@@ -1,4 +1,4 @@
-﻿use flint_backend::{Backend, Binding, Commands};
+use flint_backend::{Backend, Binding, Commands};
 use flint_kernel::{Act, NormMode, name};
 
 mod support;
@@ -205,7 +205,7 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
             Binding::Full(&sb),
             Binding::Full(&y),
         ],
-        [n.div_ceil(32) as u32, m.div_ceil(32) as u32, 1],
+        [n.div_ceil(128) as u32, m.div_ceil(64) as u32, 1],
     );
     agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), rel, abs);
 }
@@ -253,6 +253,43 @@ fn gemm_coop_bf16() {
         2e-2,
         5e-2,
     );
+}
+
+#[test]
+fn gemm_coop_i8_group32() {
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(71);
+    let (m, n, k, group) = (16usize, 64usize, 128usize, 32usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.zero(&[m as u32, n as u32]);
+    let (wq, scales) = quant(&w, n, k, group);
+    let cpu_w = dequant(&wq, &scales, n, k, group);
+    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
+    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
+    ctx.dispatch(
+        name::GEMM_COOP,
+        &[
+            ("N", n as f64),
+            ("K", k as f64),
+            ("M", m as f64),
+            ("SEGS", 1.0),
+            ("WDTYPE", 1.0),
+            ("GROUP", group as f64),
+            ("ACC", 0.0),
+            ("Y_STRIDE", n as f64),
+            ("Y_OFF", 0.0),
+        ],
+        &[
+            Binding::Full(&xb),
+            Binding::Full(&wb),
+            Binding::Full(&sb),
+            Binding::Full(&y),
+        ],
+        [n.div_ceil(32) as u32, m.div_ceil(64) as u32, 1],
+    );
+    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 1e-2, 1e-2);
 }
 
 #[test]
@@ -371,14 +408,6 @@ fn gemm_i8_group32() {
 }
 
 fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
-    gemv_case_impl(wt, n, k, seed, segs, false);
-}
-
-fn gemv_case_v4(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
-    gemv_case_impl(wt, n, k, seed, segs, true);
-}
-
-fn gemv_case_impl(wt: WType, n: usize, k: usize, seed: u64, segs: u32, v4: bool) {
     let mut ctx = Ctx::new();
     let mut rng = Rng(seed);
     let x = rng.fill(k);
@@ -408,7 +437,7 @@ fn gemv_case_impl(wt: WType, n: usize, k: usize, seed: u64, segs: u32, v4: bool)
         Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64)
     };
     ctx.dispatch(
-        if v4 { name::GEMV_V4 } else { name::GEMV },
+        name::GEMV,
         &[
             ("N", n as f64),
             ("K", k as f64),
@@ -423,11 +452,7 @@ fn gemv_case_impl(wt: WType, n: usize, k: usize, seed: u64, segs: u32, v4: bool)
             Binding::Full(&sb),
             out,
         ],
-        [
-            n.div_ceil(if v4 { 512 } else { 256 }) as u32,
-            segs,
-            1,
-        ],
+        [(n.div_ceil(64)) as u32, segs, 1],
     );
     if segs > 1 {
         ctx.dispatch(
@@ -466,31 +491,6 @@ fn gemv_i8_split4() {
 #[test]
 fn gemv_bf16_split8() {
     gemv_case(WType::Bf16, 32, 1024, 47, 8);
-}
-
-#[test]
-fn gemv_v4_bf16() {
-    gemv_case_v4(WType::Bf16, 32, 128, 53, 1);
-}
-
-#[test]
-fn gemv_v4_i8_group128() {
-    gemv_case_v4(WType::I8(128), 64, 256, 59, 1);
-}
-
-#[test]
-fn gemv_v4_i8_split4() {
-    gemv_case_v4(WType::I8(128), 64, 512, 61, 4);
-}
-
-#[test]
-fn gemv_v4_bf16_split8() {
-    gemv_case_v4(WType::Bf16, 32, 1024, 67, 8);
-}
-
-#[test]
-fn gemv_v4_odd_n() {
-    gemv_case_v4(WType::I8(128), 37, 128, 71, 1);
 }
 
 #[test]
@@ -1384,6 +1384,72 @@ fn attn_case(spec: AttnCase) {
 }
 
 #[test]
+fn attn_decode_hd128() {
+    for pos in [1usize, 63, 64, 65, 255, 256, 300, 511, 512, 1024] {
+        let (m, nq, nkv, hd, max_seq) = (1usize, 32usize, 8usize, 128usize, 2048usize);
+        let mut ctx = Ctx::new();
+        let mut rng = Rng(9000 + pos as u64);
+        let q = rng.fill(m * nq * hd);
+        let kc = bf16_round(&rng.fill(nkv * max_seq * hd));
+        let vc = bf16_round(&rng.fill(nkv * max_seq * hd));
+        let qb = ctx.f32(&q, &[m as u32, nq as u32, hd as u32]);
+        let kb = ctx.bf16(&kc, &[nkv as u32, max_seq as u32, hd as u32]);
+        let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
+        let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
+        let scratch = ctx.zero(&[m as u32, nkv as u32, 32, 8, hd as u32 + 2]);
+        let args = ctx.arg(pos, pos + m);
+
+        ctx.dispatch(
+            name::ATTN_DECODE,
+            &[
+                ("N_HEADS", nq as f64),
+                ("KV_HEADS", nkv as f64),
+                ("HEAD_DIM", hd as f64),
+                ("MAX_SEQ", max_seq as f64),
+                ("SCALE", 1.0 / (hd as f64).sqrt()),
+                ("WINDOW", 0.0),
+                ("NQ_PER_KV", (nq / nkv) as f64),
+                ("STRIDE", (hd as u32 + 2) as f64),
+            ],
+            &[
+                Binding::Full(&qb),
+                Binding::Full(&kb),
+                Binding::Full(&vb),
+                Binding::Full(&scratch),
+                Binding::Full(&args),
+            ],
+            [nkv as u32, 32, 1],
+        );
+        ctx.dispatch(
+            name::MERGE_ATTN,
+            &[
+                ("N_HEADS", nq as f64),
+                ("KV_HEADS", nkv as f64),
+                ("HEAD_DIM", hd as f64),
+                ("STRIDE", (hd as u32 + 2) as f64),
+            ],
+            &[
+                Binding::Full(&scratch),
+                Binding::Full(&y),
+                Binding::Full(&args),
+            ],
+            [m as u32, nkv as u32, 1],
+        );
+        agree(
+            &ctx.read(&y),
+            &cpu_ref::attn(
+                &q,
+                &kc,
+                &vc,
+                cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window: 0 },
+            ),
+            1e-2,
+            1e-2,
+        );
+    }
+}
+
+#[test]
 fn kv_store_attn_hd128_gqa2_pos71() {
     let (m, nq, nkv, hd, max_seq, pos) = (2usize, 16usize, 8usize, 128usize, 4096usize, 71usize);
     let mut ctx = Ctx::new();
@@ -1604,7 +1670,7 @@ fn attn_gemm_coexist() {
                         Binding::Full(&sb),
                         Binding::Full(&yg),
                     ],
-                    [n2.div_ceil(32) as u32, m.div_ceil(32) as u32, 1],
+                    [n2.div_ceil(128) as u32, m.div_ceil(64) as u32, 1],
                 )
                 .unwrap();
         }

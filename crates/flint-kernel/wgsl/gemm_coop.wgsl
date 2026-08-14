@@ -27,6 +27,17 @@ var<workgroup> xs: array<f16, 2 * 64 * 32>;
 var<workgroup> ws: array<f16, 2 * 32 * 32>;
 var<workgroup> yt: array<f32, 64 * 32>;
 
+fn sbyte(word: u32, b: u32) -> f32 {
+    return f32(i32(((word >> (b * 8u)) & 255u) << 24u) >> 24);
+}
+
+fn deq2(word: u32) -> vec2<f32> {
+    return vec2<f32>(
+        bitcast<f32>((word & 65535u) << 16),
+        bitcast<f32>((word >> 16) << 16),
+    );
+}
+
 @compute @workgroup_size(256, 1, 1)
 fn gemm_coop(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -36,6 +47,8 @@ fn gemm_coop(
     let N = pc.N;
     let K = pc.K;
     let SEGS = pc.SEGS;
+    let WDTYPE = pc.WDTYPE;
+    let GROUP = pc.GROUP;
     let ACC = pc.ACC;
     let Y_STRIDE = pc.Y_STRIDE;
     let Y_OFF = pc.Y_OFF;
@@ -79,11 +92,14 @@ fn gemm_coop(
         let col = idx % 32;
         var v = 0.0;
         if n0 + row < N && k_lo + col < K {
-            let word = w[(n0 + row) * (K / 2) + (k_lo + col) / 2];
-            if (k_lo + col) % 2 == 0 {
-                v = bitcast<f32>((word & 65535) << 16);
+            if WDTYPE == 1u {
+                let k = k_lo + col;
+                let word = w[((k / 16u) * N + n0 + row) * 4u + (k % 16u) / 4u];
+                v = sbyte(word, (k % 16u) % 4u) * scales[(k / GROUP) * N + n0 + row];
             } else {
-                v = bitcast<f32>((word >> 16) << 16);
+                let k = k_lo + col;
+                let word = w[(n0 + row) * (K / 2u) + k / 2u];
+                v = select(deq2(word).x, deq2(word).y, k % 2u == 1u);
             }
         }
         ws[row * 32 + col] = f16(v);
@@ -114,11 +130,14 @@ fn gemm_coop(
                 let col = idx % 32;
                 var v = 0.0;
                 if n0 + row < N && k1 + col < K {
-                    let word = w[(n0 + row) * (K / 2) + (k1 + col) / 2];
-                    if (k1 + col) % 2 == 0 {
-                        v = bitcast<f32>((word & 65535) << 16);
+                    if WDTYPE == 1u {
+                        let k = k1 + col;
+                        let word = w[((k / 16u) * N + n0 + row) * 4u + (k % 16u) / 4u];
+                        v = sbyte(word, (k % 16u) % 4u) * scales[(k / GROUP) * N + n0 + row];
                     } else {
-                        v = bitcast<f32>((word >> 16) << 16);
+                        let k = k1 + col;
+                        let word = w[(n0 + row) * (K / 2u) + k / 2u];
+                        v = select(deq2(word).x, deq2(word).y, k % 2u == 1u);
                     }
                 }
                 ws[phase * 1024 + row * 32 + col] = f16(v);

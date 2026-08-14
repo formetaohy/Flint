@@ -11,6 +11,10 @@ var<immediate> pc: Pc;
 @group(0) @binding(3) var<storage, read_write> v_cache: array<u32>;
 @group(0) @binding(4) var<storage, read_write> args: array<u32>;
 
+fn pack2(a: f32, b: f32) -> u32 {
+    return (bitcast<u32>(a) >> 16u) | ((bitcast<u32>(b) >> 16u) << 16u);
+}
+
 @compute @workgroup_size(256, 1, 1)
 fn kv_store(
     @builtin(global_invocation_id) gid: vec3<u32>,
@@ -26,7 +30,7 @@ fn kv_store(
         let d2 = gid.x % half_dim;
         let s_base = (m * N_KV + h) * HEAD_DIM + d2 * 2;
         let c_base = (h * MAX_SEQ + args[0] + m) * half_dim + d2;
-        k_cache[c_base] = (bitcast<u32>(k_src[s_base]) >> 16) | ((bitcast<u32>(k_src[s_base + 1]) >> 16) << 16);
-        v_cache[c_base] = (bitcast<u32>(v_src[s_base]) >> 16) | ((bitcast<u32>(v_src[s_base + 1]) >> 16) << 16);
+        k_cache[c_base] = pack2(k_src[s_base], k_src[s_base + 1]);
+        v_cache[c_base] = pack2(v_src[s_base], v_src[s_base + 1]);
     }
 }

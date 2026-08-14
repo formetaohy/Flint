@@ -15,6 +15,17 @@ var<immediate> pc: Pc;
 @group(0) @binding(3) var<storage, read_write> scales: array<f32>;
 @group(0) @binding(4) var<storage, read_write> y: array<f32>;
 
+fn sbyte(word: u32, b: u32) -> f32 {
+    return f32(i32(((word >> (b * 8u)) & 255u) << 24u) >> 24);
+}
+
+fn deq2(word: u32) -> vec2<f32> {
+    return vec2<f32>(
+        bitcast<f32>((word & 65535u) << 16),
+        bitcast<f32>((word >> 16) << 16),
+    );
+}
+
 @compute @workgroup_size(256, 1, 1)
 fn embed(@builtin(global_invocation_id) gid: vec3<u32>) {
     let M = pc.M;
@@ -29,23 +40,16 @@ fn embed(@builtin(global_invocation_id) gid: vec3<u32>) {
         let d = gid.x % DIM;
         if WDTYPE == 1 {
             let word = table0[((d / 16) * ROWS + row) * 4 + (d % 16) / 4];
-            let byte = (word >> (((d % 16) % 4) * 8)) & 255;
-            let v = f32(i32(byte << 24) >> 24) * scales[(d / GROUP) * ROWS + row];
-            y[gid.x] = v * SCALE;
-        } else if row < SPLIT {
-            let p = table0[row * (DIM / 2) + d / 2];
-            if d % 2 == 0 {
-                y[gid.x] = bitcast<f32>((p & 65535) << 16) * SCALE;
-            } else {
-                y[gid.x] = bitcast<f32>((p >> 16) << 16) * SCALE;
-            }
+            y[gid.x] = sbyte(word, (d % 16) % 4) * scales[(d / GROUP) * ROWS + row] * SCALE;
         } else {
-            let p = table1[(row - SPLIT) * (DIM / 2) + d / 2];
-            if d % 2 == 0 {
-                y[gid.x] = bitcast<f32>((p & 65535) << 16) * SCALE;
+            var p = 0u;
+            if row < SPLIT {
+                p = table0[row * (DIM / 2) + d / 2];
             } else {
-                y[gid.x] = bitcast<f32>((p >> 16) << 16) * SCALE;
+                p = table1[(row - SPLIT) * (DIM / 2) + d / 2];
             }
+            let d2 = deq2(p);
+            y[gid.x] = select(d2.x, d2.y, d % 2u == 1u) * SCALE;
         }
     }
 }

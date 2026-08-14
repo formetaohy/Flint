@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "flint-bench"
 version.workspace = true
 license.workspace = true

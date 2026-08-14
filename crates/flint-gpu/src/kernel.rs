@@ -1,22 +1,49 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use flint_error::Result;
 
 use crate::device::KernelSpec;
+use crate::encoder::BindingRef;
 use crate::DeviceRef;
 
-#[derive(Clone)]
+const BIND_CACHE_CAP: usize = 8192;
+const MAX_BINDINGS: usize = 8;
+
+#[derive(PartialEq, Eq, Hash)]
+struct BindKey {
+    entries: [Option<(wgpu::Buffer, u64, u64)>; MAX_BINDINGS],
+    len: u32,
+}
+
+impl BindKey {
+    fn new(bindings: &[BindingRef<'_>]) -> Self {
+        assert!(
+            bindings.len() <= MAX_BINDINGS,
+            "kernel binding count exceeds the cache key capacity"
+        );
+        let mut entries = std::array::from_fn(|_| None);
+        for (i, b) in bindings.iter().enumerate() {
+            entries[i] = Some((b.buffer.buffer.clone(), b.offset, b.size));
+        }
+        Self {
+            entries,
+            len: bindings.len() as u32,
+        }
+    }
+}
+
 pub struct Kernel {
     pub(crate) name: String,
     pub(crate) pipeline: wgpu::ComputePipeline,
     pub(crate) bind_group_layout: wgpu::BindGroupLayout,
     pub(crate) binding_count: u32,
+    device: DeviceRef,
+    bind_groups: Mutex<HashMap<BindKey, wgpu::BindGroup>>,
 }
 
 impl Kernel {
-    pub(crate) fn create(
-        device: &DeviceRef,
-        spec: &KernelSpec<'_>,
-        cache: Option<&wgpu::PipelineCache>,
-    ) -> Result<Self> {
+    pub(crate) fn create(device: &DeviceRef, spec: &KernelSpec<'_>) -> Result<Self> {
         let module = device
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -57,13 +84,53 @@ impl Kernel {
                 module: &module,
                 entry_point: Some(spec.name),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache,
+                cache: None,
             });
         Ok(Self {
             name: spec.name.to_string(),
             pipeline,
             bind_group_layout,
             binding_count: spec.bindings,
+            device: device.clone(),
+            bind_groups: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn bind_group(&self, bindings: &[BindingRef<'_>]) -> wgpu::BindGroup {
+        let key = BindKey::new(bindings);
+        let mut cache = self
+            .bind_groups
+            .lock()
+            .expect("bind group cache lock poisoned");
+        if let Some(group) = cache.get(&key) {
+            return group.clone();
+        }
+        if cache.len() >= BIND_CACHE_CAP {
+            cache.clear();
+        }
+        let entries: Vec<wgpu::BindGroupEntry> = bindings
+            .iter()
+            .map(|b| wgpu::BindGroupEntry {
+                binding: b.index,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &b.buffer.buffer,
+                    offset: b.offset,
+                    size: (b.size > 0).then(|| {
+                        wgpu::BufferSize::new(b.size)
+                            .expect("binding size is validated by the caller")
+                    }),
+                }),
+            })
+            .collect();
+        let group = self
+            .device
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bind_group_layout,
+                entries: &entries,
+            });
+        cache.insert(key, group.clone());
+        group
     }
 }

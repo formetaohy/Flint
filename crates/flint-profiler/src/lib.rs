@@ -68,6 +68,7 @@ pub struct GpuProfiler {
     spans: Vec<Span>,
     totals: HashMap<&'static str, (u64, u64)>,
     period_ns: f64,
+    open: usize,
 }
 
 impl GpuProfiler {
@@ -83,29 +84,32 @@ impl GpuProfiler {
             generations: vec![generation],
             spans: Vec::new(),
             totals: HashMap::new(),
+            open: 0,
         })
     }
 
     fn grow(&mut self) -> Result<()> {
-        let capacity = self
-            .generations
-            .iter()
-            .map(|g| g.capacity)
-            .sum::<u32>()
-            .max(INITIAL_CAPACITY);
         self.generations
-            .push(Generation::new(self.device.as_ref(), capacity)?);
+            .push(Generation::new(self.device.as_ref(), INITIAL_CAPACITY)?);
         Ok(())
     }
 
-    pub fn begin_span(&mut self) -> Result<u32> {
+    pub fn begin_span(&mut self) -> Result<usize> {
         let mut enc = self.device.encoder()?;
         let span = self.begin(&mut enc)?;
         enc.submit_and_reset();
         Ok(span)
     }
 
-    pub fn end_span(&mut self, label: &'static str, span: u32) -> Result<()> {
+    pub fn mark_begin(&mut self, encoder: &mut Encoder) -> Result<usize> {
+        self.begin(encoder)
+    }
+
+    pub fn mark_end(&mut self, encoder: &mut Encoder, label: &'static str, span: usize) -> Result<()> {
+        self.end(encoder, label, span)
+    }
+
+    pub fn end_span(&mut self, label: &'static str, span: usize) -> Result<()> {
         let mut enc = self.device.encoder()?;
         self.end(&mut enc, label, span)?;
         enc.submit_and_reset();
@@ -123,38 +127,41 @@ impl GpuProfiler {
         self.accumulate()
     }
 
-    fn begin(&mut self, encoder: &mut Encoder) -> Result<u32> {
+    fn begin(&mut self, encoder: &mut Encoder) -> Result<usize> {
         let last = self
             .generations
             .last()
             .expect("profiler always has a generation");
-        if last.next + 2 > last.capacity {
+        if last.next + self.open as u32 + 2 > last.capacity {
             self.grow()?;
         }
-        let generation = self
+        let generation = self.generations.len() - 1;
+        let current = self
             .generations
             .last_mut()
             .expect("profiler always has a generation");
-        let start = generation.next;
-        generation.next += 1;
-        encoder.write_timestamp(&generation.set, start)?;
-        Ok(start)
+        let start = current.next;
+        current.next += 1;
+        encoder.write_timestamp(&current.set, start)?;
+        self.spans.push(Span {
+            label: "",
+            generation,
+            start,
+            end: 0,
+        });
+        self.open += 1;
+        Ok(self.spans.len() - 1)
     }
 
-    fn end(&mut self, encoder: &mut Encoder, label: &'static str, span: u32) -> Result<()> {
-        let generation = self
-            .generations
-            .last_mut()
-            .expect("profiler always has a generation");
-        let end = generation.next;
-        generation.next += 1;
-        encoder.write_timestamp(&generation.set, end)?;
-        self.spans.push(Span {
-            label,
-            generation: self.generations.len() - 1,
-            start: span,
-            end,
-        });
+    fn end(&mut self, encoder: &mut Encoder, label: &'static str, span: usize) -> Result<()> {
+        let generation = self.spans[span].generation;
+        let current = &mut self.generations[generation];
+        let end = current.next;
+        current.next += 1;
+        encoder.write_timestamp(&current.set, end)?;
+        self.spans[span].label = label;
+        self.spans[span].end = end;
+        self.open -= 1;
         Ok(())
     }
 
@@ -203,6 +210,9 @@ impl GpuProfiler {
             );
         }
         for span in &self.spans {
+            if span.end == 0 {
+                continue;
+            }
             let ts = &timestamps[span.generation];
             let start = ts[span.start as usize];
             let end = ts[span.end as usize];
@@ -214,6 +224,7 @@ impl GpuProfiler {
         self.generations.truncate(1);
         self.generations[0].next = 0;
         self.spans.clear();
+        self.open = 0;
         Ok(())
     }
 

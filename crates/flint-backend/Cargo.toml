@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "flint-backend"
 version.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ bytemuck.workspace = true
 flint-error.workspace = true
 flint-gpu.workspace = true
 flint-kernel.workspace = true
+flint-profiler.workspace = true
 flint-tensor.workspace = true
 
 [dev-dependencies]

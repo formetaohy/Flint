@@ -32,19 +32,24 @@ pub fn attn(
         spec.q_heads / kv.kv_heads
     );
 
+    let consts = [
+        ("N_HEADS", spec.q_heads as f64),
+        ("KV_HEADS", kv.kv_heads as f64),
+        ("HEAD_DIM", kv.head_dim as f64),
+        ("MAX_SEQ", kv.max_seq as f64),
+        ("SCALE", spec.scale as f64),
+        ("WINDOW", spec.window as f64),
+        ("NQ_PER_KV", (spec.q_heads / kv.kv_heads) as f64),
+        ("STRIDE", spec.stride as f64),
+    ];
+    let decode = spec.m == 1
+        && spec.window == 0
+        && kv.head_dim == 128
+        && spec.q_heads / kv.kv_heads <= 4;
     backend.dispatch(
         commands,
-        shader::ATTN,
-        &[
-            ("N_HEADS", spec.q_heads as f64),
-            ("KV_HEADS", kv.kv_heads as f64),
-            ("HEAD_DIM", kv.head_dim as f64),
-            ("MAX_SEQ", kv.max_seq as f64),
-            ("SCALE", spec.scale as f64),
-            ("WINDOW", spec.window as f64),
-            ("NQ_PER_KV", (spec.q_heads / kv.kv_heads) as f64),
-            ("STRIDE", spec.stride as f64),
-        ],
+        if decode { shader::ATTN_DECODE } else { shader::ATTN },
+        &consts,
         &[
             q,
             Binding::Full(&kv.k),
@@ -52,7 +57,11 @@ pub fn attn(
             Binding::Full(scratch),
             Binding::Full(spec.args),
         ],
-        [spec.m, kv.kv_heads, ATTN_SEGS],
+        if decode {
+            [kv.kv_heads, ATTN_SEGS, 1]
+        } else {
+            [spec.m, kv.kv_heads, ATTN_SEGS]
+        },
     )?;
     backend.dispatch(
         commands,

@@ -21,6 +21,13 @@ var<workgroup> scs: array<f32, 512>;
 var<workgroup> red: array<f32, 512>;
 var<workgroup> segstat: array<f32, 16>;
 
+fn deq2(word: u32) -> vec2<f32> {
+    return vec2<f32>(
+        bitcast<f32>((word & 65535u) << 16),
+        bitcast<f32>((word >> 16) << 16),
+    );
+}
+
 @compute @workgroup_size(512, 1, 1)
 fn attn(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -99,12 +106,8 @@ fn attn(
                             break;
                         }
                         let e = slot * HALF + dd;
-                        let word = kt[slot * 65 + dd / 2];
-                        if e % 2 == 0 {
-                            dotp = dotp + q[qb + dd] * bitcast<f32>((word & 65535) << 16);
-                        } else {
-                            dotp = dotp + q[qb + dd] * bitcast<f32>((word >> 16) << 16);
-                        }
+                        let d = deq2(kt[slot * 65 + dd / 2]);
+                        dotp = dotp + q[qb + dd] * select(d.x, d.y, e % 2u == 1u);
                     }
                 }
                 workgroupBarrier();
@@ -178,43 +181,33 @@ fn attn(
             c_sum = red[16 + hl];
             workgroupBarrier();
             if hl < NQ_PER_KV {
+                let odd = slot % 2u == 1u;
                 for (var kk = 0u; kk < limit; kk++) {
                     let w = scs[hl * CHUNK + kk];
-                    let vk = (cache_plane + (c0 + kk) * HEAD_DIM) / 2;
-                    if slot % 2 == 0 {
-                        o0 = o0 + w * bitcast<f32>((v_cache[vk + slot / 2] & 65535) << 16);
-                        if slot + CHUNK < HEAD_DIM {
-                            o1 = o1 + w * bitcast<f32>((v_cache[vk + CHUNK / 2 + slot / 2] & 65535) << 16);
-                        }
-                        if slot + 2 * CHUNK < HEAD_DIM {
-                            o2 = o2 + w * bitcast<f32>((v_cache[vk + CHUNK + slot / 2] & 65535) << 16);
-                            o3 = o3 + w * bitcast<f32>((v_cache[vk + CHUNK + CHUNK / 2 + slot / 2] & 65535) << 16);
-                        }
-                        if slot + 4 * CHUNK < HEAD_DIM {
-                            o4 = o4 + w * bitcast<f32>((v_cache[vk + 2 * CHUNK + slot / 2] & 65535) << 16);
-                            o5 = o5 + w * bitcast<f32>((v_cache[vk + 2 * CHUNK + CHUNK / 2 + slot / 2] & 65535) << 16);
-                        }
-                        if slot + 6 * CHUNK < HEAD_DIM {
-                            o6 = o6 + w * bitcast<f32>((v_cache[vk + 3 * CHUNK + slot / 2] & 65535) << 16);
-                            o7 = o7 + w * bitcast<f32>((v_cache[vk + 3 * CHUNK + CHUNK / 2 + slot / 2] & 65535) << 16);
-                        }
-                    } else {
-                        o0 = o0 + w * bitcast<f32>((v_cache[vk + slot / 2] >> 16) << 16);
-                        if slot + CHUNK < HEAD_DIM {
-                            o1 = o1 + w * bitcast<f32>((v_cache[vk + CHUNK / 2 + slot / 2] >> 16) << 16);
-                        }
-                        if slot + 2 * CHUNK < HEAD_DIM {
-                            o2 = o2 + w * bitcast<f32>((v_cache[vk + CHUNK + slot / 2] >> 16) << 16);
-                            o3 = o3 + w * bitcast<f32>((v_cache[vk + CHUNK + CHUNK / 2 + slot / 2] >> 16) << 16);
-                        }
-                        if slot + 4 * CHUNK < HEAD_DIM {
-                            o4 = o4 + w * bitcast<f32>((v_cache[vk + 2 * CHUNK + slot / 2] >> 16) << 16);
-                            o5 = o5 + w * bitcast<f32>((v_cache[vk + 2 * CHUNK + CHUNK / 2 + slot / 2] >> 16) << 16);
-                        }
-                        if slot + 6 * CHUNK < HEAD_DIM {
-                            o6 = o6 + w * bitcast<f32>((v_cache[vk + 3 * CHUNK + slot / 2] >> 16) << 16);
-                            o7 = o7 + w * bitcast<f32>((v_cache[vk + 3 * CHUNK + CHUNK / 2 + slot / 2] >> 16) << 16);
-                        }
+                    let vk = (cache_plane + (c0 + kk) * HEAD_DIM) / 2 + slot / 2;
+                    let d0 = deq2(v_cache[vk]);
+                    o0 = o0 + w * select(d0.x, d0.y, odd);
+                    if slot + CHUNK < HEAD_DIM {
+                        let d1 = deq2(v_cache[vk + CHUNK / 2]);
+                        o1 = o1 + w * select(d1.x, d1.y, odd);
+                    }
+                    if slot + 2 * CHUNK < HEAD_DIM {
+                        let d2 = deq2(v_cache[vk + CHUNK]);
+                        let d3 = deq2(v_cache[vk + CHUNK + CHUNK / 2]);
+                        o2 = o2 + w * select(d2.x, d2.y, odd);
+                        o3 = o3 + w * select(d3.x, d3.y, odd);
+                    }
+                    if slot + 4 * CHUNK < HEAD_DIM {
+                        let d4 = deq2(v_cache[vk + 2 * CHUNK]);
+                        let d5 = deq2(v_cache[vk + 2 * CHUNK + CHUNK / 2]);
+                        o4 = o4 + w * select(d4.x, d4.y, odd);
+                        o5 = o5 + w * select(d5.x, d5.y, odd);
+                    }
+                    if slot + 6 * CHUNK < HEAD_DIM {
+                        let d6 = deq2(v_cache[vk + 3 * CHUNK]);
+                        let d7 = deq2(v_cache[vk + 3 * CHUNK + CHUNK / 2]);
+                        o6 = o6 + w * select(d6.x, d6.y, odd);
+                        o7 = o7 + w * select(d7.x, d7.y, odd);
                     }
                 }
             }

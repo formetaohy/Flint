@@ -25,6 +25,19 @@ var<workgroup> red: array<f32, 256>;
 var<workgroup> mean: array<f32, 256>;
 var<workgroup> tile: array<f32, 520>;
 
+fn blend(mode: u32, wv: f32, gv: f32, v: f32) -> f32 {
+    if mode == 0u {
+        return v * (1.0 + wv);
+    }
+    if mode == 1u {
+        return v * wv * (gv / (1.0 + exp(-gv)));
+    }
+    if mode == 3u {
+        return v * wv + gv;
+    }
+    return v * wv;
+}
+
 @compute @workgroup_size(256, 1, 1)
 fn norm(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -152,58 +165,34 @@ fn norm(
                 break;
             }
             let xb = (vbase + i) * 4;
-            let wb = i * 4;
-            let gb = (vbase + i) * 4;
-            var v0 = (x[xb] - center) * inv;
-            var v1 = (x[xb + 1] - center) * inv;
-            var v2 = (x[xb + 2] - center) * inv;
-            var v3 = (x[xb + 3] - center) * inv;
-            if MODE == 0 {
-                v0 = v0 * (1.0 + w[wb]);
-                v1 = v1 * (1.0 + w[wb + 1]);
-                v2 = v2 * (1.0 + w[wb + 2]);
-                v3 = v3 * (1.0 + w[wb + 3]);
-            } else if MODE == 1 {
-                let wdim4 = max(W_DIM / 4, 1);
-                let wbase = (i % wdim4) * 4;
-                let g0 = gate[gb] / (1.0 + exp(-gate[gb]));
-                let g1 = gate[gb + 1] / (1.0 + exp(-gate[gb + 1]));
-                let g2 = gate[gb + 2] / (1.0 + exp(-gate[gb + 2]));
-                let g3 = gate[gb + 3] / (1.0 + exp(-gate[gb + 3]));
-                v0 = v0 * w[wbase] * g0;
-                v1 = v1 * w[wbase + 1] * g1;
-                v2 = v2 * w[wbase + 2] * g2;
-                v3 = v3 * w[wbase + 3] * g3;
-            } else if MODE == 3 {
-                v0 = v0 * w[wb] + gate[wb];
-                v1 = v1 * w[wb + 1] + gate[wb + 1];
-                v2 = v2 * w[wb + 2] + gate[wb + 2];
-                v3 = v3 * w[wb + 3] + gate[wb + 3];
+            let wb = select(i * 4u, (i % max(W_DIM / 4u, 1u)) * 4u, MODE == 1u);
+            if MODE == 3u {
+                y[xb] = blend(MODE, w[wb], gate[wb], (x[xb] - center) * inv);
+                y[xb + 1u] = blend(MODE, w[wb + 1u], gate[wb + 1u], (x[xb + 1u] - center) * inv);
+                y[xb + 2u] = blend(MODE, w[wb + 2u], gate[wb + 2u], (x[xb + 2u] - center) * inv);
+                y[xb + 3u] = blend(MODE, w[wb + 3u], gate[wb + 3u], (x[xb + 3u] - center) * inv);
+            } else if MODE == 1u {
+                y[xb] = blend(MODE, w[wb], gate[xb], (x[xb] - center) * inv);
+                y[xb + 1u] = blend(MODE, w[wb + 1u], gate[xb + 1u], (x[xb + 1u] - center) * inv);
+                y[xb + 2u] = blend(MODE, w[wb + 2u], gate[xb + 2u], (x[xb + 2u] - center) * inv);
+                y[xb + 3u] = blend(MODE, w[wb + 3u], gate[xb + 3u], (x[xb + 3u] - center) * inv);
             } else {
-                v0 = v0 * w[wb];
-                v1 = v1 * w[wb + 1];
-                v2 = v2 * w[wb + 2];
-                v3 = v3 * w[wb + 3];
+                y[xb] = blend(MODE, w[wb], 0.0, (x[xb] - center) * inv);
+                y[xb + 1u] = blend(MODE, w[wb + 1u], 0.0, (x[xb + 1u] - center) * inv);
+                y[xb + 2u] = blend(MODE, w[wb + 2u], 0.0, (x[xb + 2u] - center) * inv);
+                y[xb + 3u] = blend(MODE, w[wb + 3u], 0.0, (x[xb + 3u] - center) * inv);
             }
-            y[xb] = v0;
-            y[xb + 1] = v1;
-            y[xb + 2] = v2;
-            y[xb + 3] = v3;
             i = i + 256;
         }
         if t < tail {
             let e = base + vdim * 4 + t;
-            var v = (x[e] - center) * inv;
-            if MODE == 0 {
-                v = v * (1.0 + w[e]);
-            } else if MODE == 1 {
-                v = v * w[e % W_DIM] * (gate[e] / (1.0 + exp(-gate[e])));
-            } else if MODE == 3 {
-                v = v * w[e] + gate[e];
+            if MODE == 1u {
+                y[e] = blend(MODE, w[e % W_DIM], gate[e], (x[e] - center) * inv);
+            } else if MODE == 3u {
+                y[e] = blend(MODE, w[e], gate[e], (x[e] - center) * inv);
             } else {
-                v = v * w[e];
+                y[e] = blend(MODE, w[e], 0.0, (x[e] - center) * inv);
             }
-            y[e] = v;
         }
     }
 }

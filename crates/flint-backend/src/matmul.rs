@@ -69,12 +69,7 @@ impl Backend {
             1
         };
         let gemm_acc = if segs > 1 { 0 } else { acc as u32 };
-        let coop = dtype == DType::Bf16 && n.is_multiple_of(16) && rows.is_multiple_of(16);
-        let kernel = if coop {
-            shader::GEMM_COOP
-        } else {
-            shader::GEMM
-        };
+        let kernel = shader::GEMM;
         let consts = [
             ("N", n as f64),
             ("K", k as f64),
@@ -92,16 +87,15 @@ impl Backend {
         } else {
             y
         };
-        let unit_scale = &self.unit_scale;
+        let unit_scale = self.unit_scale();
         let bufs = [x, wb, Self::scale_binding(unit_scale, w), yb];
-        let tm = if coop { 64 } else { 32 };
         Self::set(
-            &mut self.kernels,
+            &self.kernels,
             commands,
             kernel,
             &consts,
             &bufs,
-            [n.div_ceil(32), rows.div_ceil(tm), segs],
+            [n.div_ceil(128), rows.div_ceil(64), segs],
         )?;
         if segs > 1 {
             let mconsts = [
@@ -117,7 +111,7 @@ impl Backend {
                 y,
             ];
             Self::set(
-                &mut self.kernels,
+                &self.kernels,
                 commands,
                 shader::MERGE_GEMM,
                 &mconsts,
@@ -147,27 +141,23 @@ impl Backend {
         acc: bool,
     ) -> Result<()> {
         let (n, k, wb, dtype) = Self::weight_io(w);
-        let v4 = k.is_multiple_of(32);
-        let kb = if v4 { k / 32 } else { k / 16 };
-        let base = n.div_ceil(if v4 { 512 } else { 256 });
-        let max_segs = if v4 {
-            if n >= 4096 {
-                16
-            } else {
-                64
-            }
+        assert!(
+            k.is_multiple_of(32),
+            "gemv K {k} is not a multiple of 32"
+        );
+        let base = n.div_ceil(64);
+        let segs: u32 = if base >= 96 {
+            1
         } else {
-            8
+            [8u32, 4, 2, 1]
+                .into_iter()
+                .find(|s| k % (*s * 32) == 0 && base * *s >= 96)
+                .unwrap_or(1)
         };
-        let wgs_target = if v4 { 128 } else { 96 };
-        let segs: u32 = [64u32, 32, 16, 8, 4, 2, 1]
-            .into_iter()
-            .find(|s| *s <= max_segs && kb % *s == 0 && base * *s >= wgs_target)
-            .unwrap_or(1);
         if segs > 1 {
             self.ensure_gemv_partial(n * segs);
         }
-        let unit_scale = &self.unit_scale;
+        let unit_scale = self.unit_scale();
         let scale = Self::scale_binding(unit_scale, w);
         let consts = [
             ("N", n as f64),
@@ -184,9 +174,9 @@ impl Backend {
         };
         let bufs = [x, wb, scale, out];
         Self::set(
-            &mut self.kernels,
+            &self.kernels,
             commands,
-            if v4 { shader::GEMV_V4 } else { shader::GEMV },
+            shader::GEMV,
             &consts,
             &bufs,
             [base, segs, 1],
@@ -197,7 +187,7 @@ impl Backend {
                 y,
             ];
             Self::set(
-                &mut self.kernels,
+                &self.kernels,
                 commands,
                 shader::MERGE_GEMV,
                 &[

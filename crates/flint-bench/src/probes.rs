@@ -94,10 +94,8 @@ fn gemv_probe() -> Result<()> {
         512
     } else if kernel.contains("w128") {
         128
-    } else if kernel.contains("v4") {
-        512
     } else {
-        256
+        64
     };
     let partial = backend.zero_tensor(&[segs * n]);
     let run = |backend: &mut Backend| -> Result<()> {
@@ -194,12 +192,13 @@ fn cpu_probe() -> Result<()> {
                     Binding::Full(&sb),
                     Binding::Full(&partial),
                 ],
-                [n.div_ceil(256), 2, 1],
+                [n.div_ceil(64), 2, 1],
             )?;
         }
         backend.submit(&mut enc)?;
     }
 
+    let kernel = backend.kernel("gemv")?;
     let mut enc = backend.encoder().unwrap();
     {
         let mut commands = Commands::begin(&mut enc);
@@ -212,7 +211,6 @@ fn cpu_probe() -> Result<()> {
             ("ACC", 0.0),
         ];
         let scalars = backend.pack_scalars("gemv", &consts)?;
-        let kernel = backend.kernel("gemv")?;
         let binds = [
             flint_gpu::BindingRef {
                 index: 0,
@@ -318,7 +316,8 @@ fn gemm_probe() -> Result<()> {
             .unwrap_or("gemm".into())
             .into_boxed_str(),
     );
-    let tm: u32 = if kernel_name.contains("coop") { 64 } else { 32 };
+    let tn: u32 = if kernel_name.contains("coop") { 32 } else { 128 };
+    let tm: u32 = 64;
     let y = backend.zero_tensor(&[m, n]);
     let scalars = backend.pack_scalars(kernel_name, &[
         ("N", n as f64),
@@ -366,7 +365,7 @@ fn gemm_probe() -> Result<()> {
                 let k = backend.kernel(kernel_name)?;
                 commands.raw().bind(k, &binds)?;
                 commands.raw().set_scalars(&scalars)?;
-                commands.raw().dispatch([n.div_ceil(32), m.div_ceil(tm), 1])?;
+                commands.raw().dispatch([n.div_ceil(tn), m.div_ceil(tm), 1])?;
             }
             backend.submit(&mut enc).unwrap();
         }
@@ -379,7 +378,7 @@ fn gemm_probe() -> Result<()> {
             commands.raw().bind(k, &binds)?;
             commands.raw().set_scalars(&scalars)?;
             for _ in 0..iters {
-                commands.raw().dispatch([n.div_ceil(32), m.div_ceil(tm), 1])?;
+                commands.raw().dispatch([n.div_ceil(tn), m.div_ceil(tm), 1])?;
             }
         }
         backend.submit(&mut enc).unwrap();
@@ -417,7 +416,7 @@ fn gemm_probe() -> Result<()> {
                     Binding::Full(&sb),
                     Binding::Full(&y),
                 ],
-                [n.div_ceil(32), m.div_ceil(tm), 1],
+                [n.div_ceil(tn), m.div_ceil(tm), 1],
             )?;
         }
         backend.submit(&mut enc).unwrap();
@@ -448,9 +447,7 @@ fn attn_probe() -> Result<()> {
 
     let mut backend = Backend::new()?;
     eprintln!("[probe] adapter: {}", backend.adapter_name());
-    let m: u32 = std::env::var("PROBE_M").map(|v| v.parse().unwrap()).unwrap_or(128);
-    let pos: u32 = std::env::var("PROBE_POS").map(|v| v.parse().unwrap()).unwrap_or(1024);
-    let (nq, nkv, hd, max_seq) = (32u32, 8u32, 128u32, 2048u32);
+    let (m, nq, nkv, hd, max_seq, pos) = (128u32, 32u32, 8u32, 128u32, 2048u32, 1024u32);
     let q: Vec<f32> = (0..m * nq * hd)
         .map(|i| ((i as f32) * 0.001 - 0.5) * 0.1)
         .collect();
@@ -482,13 +479,19 @@ fn attn_probe() -> Result<()> {
         .unwrap_or_else(|_| (pos + m).div_ceil(256).clamp(1, 32));
     let args = step_args(&backend);
     backend.write_u32(&args.buf, &[pos, segs]);
+    let decode = m == 1 && nq / nkv <= 4 && hd == 128;
+    let kernel_name: &'static str = if decode {
+        flint_kernel::name::ATTN_DECODE
+    } else {
+        flint_kernel::name::ATTN
+    };
     let run = |backend: &mut Backend| -> Result<()> {
         let mut enc = backend.encoder().unwrap();
         {
             let mut commands = Commands::begin(&mut enc);
             backend.dispatch(
                 &mut commands,
-                flint_kernel::name::ATTN,
+                kernel_name,
                 &[
                     ("N_HEADS", nq as f64),
                     ("KV_HEADS", nkv as f64),
@@ -506,7 +509,11 @@ fn attn_probe() -> Result<()> {
                     Binding::Full(&scratch),
                     Binding::Full(&args),
                 ],
-                [m, nkv, segs],
+                if decode {
+                    [nkv, segs, 1]
+                } else {
+                    [m, nkv, segs]
+                },
             )?;
         }
         backend.submit(&mut enc).unwrap();
@@ -529,6 +536,7 @@ fn attn_probe() -> Result<()> {
     );
     Ok(())
 }
+
 
 pub fn run(name: &str) -> Result<()> {
     match name {
