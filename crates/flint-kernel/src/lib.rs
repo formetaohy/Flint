@@ -1,4 +1,5 @@
 pub mod modes;
+pub const ATTN_BR: u32 = 8;
 pub mod name {
     pub const GEMM: &str = "gemm";
     pub const GEMM_COOP: &str = "gemm_coop";
@@ -23,8 +24,6 @@ pub mod name {
     pub const REPEAT_QK: &str = "repeat_qk";
     pub const ROPE: &str = "rope";
     pub const ATTN: &str = "attn";
-    pub const ATTN_DECODE: &str = "attn_decode";
-    pub const MERGE_ATTN: &str = "merge_attn";
     pub const KV_STORE: &str = "kv_store";
     pub const SPLIT_QG: &str = "split_qg";
 }
@@ -262,40 +261,13 @@ const SHADERS: &[ShaderSpec] = &[
         "attn.wgsl",
         5,
         &[
+            ("M", Scalar::U32),
             ("N_HEADS", Scalar::U32),
-            ("KV_HEADS", Scalar::U32),
             ("HEAD_DIM", Scalar::U32),
             ("MAX_SEQ", Scalar::U32),
             ("SCALE", Scalar::F32),
             ("WINDOW", Scalar::U32),
             ("NQ_PER_KV", Scalar::U32),
-            ("STRIDE", Scalar::U32),
-        ]
-    ),
-    shader!(
-        name::ATTN_DECODE,
-        "attn_decode.wgsl",
-        5,
-        &[
-            ("N_HEADS", Scalar::U32),
-            ("KV_HEADS", Scalar::U32),
-            ("HEAD_DIM", Scalar::U32),
-            ("MAX_SEQ", Scalar::U32),
-            ("SCALE", Scalar::F32),
-            ("WINDOW", Scalar::U32),
-            ("NQ_PER_KV", Scalar::U32),
-            ("STRIDE", Scalar::U32),
-        ]
-    ),
-    shader!(
-        name::MERGE_ATTN,
-        "merge_attn.wgsl",
-        3,
-        &[
-            ("N_HEADS", Scalar::U32),
-            ("KV_HEADS", Scalar::U32),
-            ("HEAD_DIM", Scalar::U32),
-            ("STRIDE", Scalar::U32),
         ]
     ),
     shader!(
@@ -320,10 +292,12 @@ const SHADERS: &[ShaderSpec] = &[
     ),
 ];
 
+type PackedScalars = HashMap<(String, Vec<u64>), Vec<u8>>;
+
 pub struct Kernels {
     kernels: HashMap<&'static str, Kernel>,
     layouts: HashMap<&'static str, ScalarLayout>,
-    packed: std::cell::RefCell<HashMap<(String, Vec<u64>), Vec<u8>>>,
+    packed: std::cell::RefCell<PackedScalars>,
 }
 
 impl Kernels {

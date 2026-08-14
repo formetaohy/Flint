@@ -36,11 +36,9 @@ impl Ctx {
         self.backend.zero_bf16_tensor(shape)
     }
 
-    fn arg(&self, pos: usize, kv_len: usize) -> Tensor {
-        let segs = kv_len.div_ceil(256).clamp(1, 32);
-        let t = Tensor::new(self.backend.storage(8), vec![2], DType::U32);
-        self.backend
-            .write_u32(&t.buf, &[pos as u32, segs as u32]);
+    fn arg(&self, pos: usize) -> Tensor {
+        let t = Tensor::new(self.backend.storage(4), vec![1], DType::U32);
+        self.backend.write_u32(&t.buf, &[pos as u32]);
         t
     }
 
@@ -690,7 +688,7 @@ fn norm_rope_mode4_pos72_repro() {
     let y = ctx.zero(&[rows as u32, dim as u32]);
     let cb = ctx.f32(&cos, &[4096, half as u32]);
     let sb = ctx.f32(&sin, &[4096, half as u32]);
-    let args = ctx.arg(pos, pos + 1);
+    let args = ctx.arg(pos);
 
     ctx.dispatch(
         name::NORM,
@@ -1010,7 +1008,7 @@ fn rope_case(m: usize, heads: usize, hd: usize, rot: usize, pos: usize, seed: u6
     let xb = ctx.f32(&x, &[m as u32, heads as u32, hd as u32]);
     let cb = ctx.f32(&cos, &[max_seq as u32, half as u32]);
     let sb = ctx.f32(&sin, &[max_seq as u32, half as u32]);
-    let args = ctx.arg(pos, pos + m);
+    let args = ctx.arg(pos);
 
     ctx.dispatch(
         name::ROPE,
@@ -1298,157 +1296,6 @@ fn delta_recur_asymmetric_dims() {
     delta_recur_case(1, 16, 8, 83);
 }
 
-struct AttnCase {
-    m: usize,
-    nq: usize,
-    nkv: usize,
-    max_seq: usize,
-    pos: usize,
-    window: usize,
-    seed: u64,
-    k_scale: f32,
-}
-
-fn attn_case(spec: AttnCase) {
-    let AttnCase {
-        m,
-        nq,
-        nkv,
-        max_seq,
-        pos,
-        window,
-        seed,
-        k_scale,
-    } = spec;
-    let hd = 64usize;
-    let mut ctx = Ctx::new();
-    let mut rng = Rng(seed);
-    let q = rng.fill(m * nq * hd);
-    let kc = rng
-        .fill(nkv * max_seq * hd)
-        .iter()
-        .map(|v| v * k_scale)
-        .collect::<Vec<_>>();
-    let vc = rng.fill(nkv * max_seq * hd);
-    let qb = ctx.f32(&q, &[m as u32, nq as u32, hd as u32]);
-    let kc = bf16_round(&kc);
-    let vc = bf16_round(&vc);
-    let kb = ctx.bf16(&kc, &[nkv as u32, max_seq as u32, hd as u32]);
-    let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
-    let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
-    let scratch = ctx.zero(&[m as u32, nkv as u32, 32, 8, hd as u32 + 2]);
-    let args = ctx.arg(pos, pos + m);
-
-    ctx.dispatch(
-        name::ATTN,
-        &[
-            ("N_HEADS", nq as f64),
-            ("KV_HEADS", nkv as f64),
-            ("HEAD_DIM", hd as f64),
-            ("MAX_SEQ", max_seq as f64),
-            ("SCALE", 1.0 / (hd as f64).sqrt()),
-            ("WINDOW", window as f64),
-            ("NQ_PER_KV", (nq / nkv) as f64),
-            ("STRIDE", (hd as u32 + 2) as f64),
-        ],
-        &[
-            Binding::Full(&qb),
-            Binding::Full(&kb),
-            Binding::Full(&vb),
-            Binding::Full(&scratch),
-            Binding::Full(&args),
-        ],
-        [m as u32, nkv as u32, 32],
-    );
-    ctx.dispatch(
-        name::MERGE_ATTN,
-        &[
-            ("N_HEADS", nq as f64),
-            ("KV_HEADS", nkv as f64),
-            ("HEAD_DIM", hd as f64),
-            ("STRIDE", (hd as u32 + 2) as f64),
-        ],
-        &[
-            Binding::Full(&scratch),
-            Binding::Full(&y),
-            Binding::Full(&args),
-        ],
-        [m as u32, nkv as u32, 1],
-    );
-    agree(
-        &ctx.read(&y),
-        &cpu_ref::attn(&q, &kc, &vc, cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window }),
-        1e-2,
-        1e-2,
-    );
-}
-
-#[test]
-fn attn_decode_hd128() {
-    for pos in [1usize, 63, 64, 65, 255, 256, 300, 511, 512, 1024] {
-        let (m, nq, nkv, hd, max_seq) = (1usize, 32usize, 8usize, 128usize, 2048usize);
-        let mut ctx = Ctx::new();
-        let mut rng = Rng(9000 + pos as u64);
-        let q = rng.fill(m * nq * hd);
-        let kc = bf16_round(&rng.fill(nkv * max_seq * hd));
-        let vc = bf16_round(&rng.fill(nkv * max_seq * hd));
-        let qb = ctx.f32(&q, &[m as u32, nq as u32, hd as u32]);
-        let kb = ctx.bf16(&kc, &[nkv as u32, max_seq as u32, hd as u32]);
-        let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
-        let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
-        let scratch = ctx.zero(&[m as u32, nkv as u32, 32, 8, hd as u32 + 2]);
-        let args = ctx.arg(pos, pos + m);
-
-        ctx.dispatch(
-            name::ATTN_DECODE,
-            &[
-                ("N_HEADS", nq as f64),
-                ("KV_HEADS", nkv as f64),
-                ("HEAD_DIM", hd as f64),
-                ("MAX_SEQ", max_seq as f64),
-                ("SCALE", 1.0 / (hd as f64).sqrt()),
-                ("WINDOW", 0.0),
-                ("NQ_PER_KV", (nq / nkv) as f64),
-                ("STRIDE", (hd as u32 + 2) as f64),
-            ],
-            &[
-                Binding::Full(&qb),
-                Binding::Full(&kb),
-                Binding::Full(&vb),
-                Binding::Full(&scratch),
-                Binding::Full(&args),
-            ],
-            [nkv as u32, 32, 1],
-        );
-        ctx.dispatch(
-            name::MERGE_ATTN,
-            &[
-                ("N_HEADS", nq as f64),
-                ("KV_HEADS", nkv as f64),
-                ("HEAD_DIM", hd as f64),
-                ("STRIDE", (hd as u32 + 2) as f64),
-            ],
-            &[
-                Binding::Full(&scratch),
-                Binding::Full(&y),
-                Binding::Full(&args),
-            ],
-            [m as u32, nkv as u32, 1],
-        );
-        agree(
-            &ctx.read(&y),
-            &cpu_ref::attn(
-                &q,
-                &kc,
-                &vc,
-                cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window: 0 },
-            ),
-            1e-2,
-            1e-2,
-        );
-    }
-}
-
 #[test]
 fn kv_store_attn_hd128_gqa2_pos71() {
     let (m, nq, nkv, hd, max_seq, pos) = (2usize, 16usize, 8usize, 128usize, 4096usize, 71usize);
@@ -1465,8 +1312,7 @@ fn kv_store_attn_hd128_gqa2_pos71() {
     let k_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
     let v_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
     let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
-    let scratch = ctx.zero(&[m as u32, nkv as u32, 32, 8, hd as u32 + 2]);
-    let args = ctx.arg(pos, pos + m);
+    let args = ctx.arg(pos);
 
     ctx.dispatch(
         name::KV_STORE,
@@ -1487,38 +1333,22 @@ fn kv_store_attn_hd128_gqa2_pos71() {
     ctx.dispatch(
         name::ATTN,
         &[
+            ("M", m as f64),
             ("N_HEADS", nq as f64),
-            ("KV_HEADS", nkv as f64),
             ("HEAD_DIM", hd as f64),
             ("MAX_SEQ", max_seq as f64),
             ("SCALE", 1.0 / (hd as f64).sqrt()),
             ("WINDOW", 0.0),
             ("NQ_PER_KV", (nq / nkv) as f64),
-            ("STRIDE", (hd as u32 + 2) as f64),
         ],
         &[
             Binding::Full(&qb),
             Binding::Full(&k_cache),
             Binding::Full(&v_cache),
-            Binding::Full(&scratch),
-            Binding::Full(&args),
-        ],
-        [m as u32, nkv as u32, 32],
-    );
-    ctx.dispatch(
-        name::MERGE_ATTN,
-        &[
-            ("N_HEADS", nq as f64),
-            ("KV_HEADS", nkv as f64),
-            ("HEAD_DIM", hd as f64),
-            ("STRIDE", (hd as u32 + 2) as f64),
-        ],
-        &[
-            Binding::Full(&scratch),
             Binding::Full(&y),
             Binding::Full(&args),
         ],
-        [m as u32, nkv as u32, 1],
+        [(m as u32).div_ceil(flint_kernel::ATTN_BR), nq as u32, 1],
     );
     let mut kc = kc;
     let mut vc = vc;
@@ -1537,50 +1367,6 @@ fn kv_store_attn_hd128_gqa2_pos71() {
 }
 
 #[test]
-fn attn_gqa_multi_row() {
-    attn_case(AttnCase { m: 3, nq: 2, nkv: 1, max_seq: 16, pos: 5, window: 0, seed: 91, k_scale: 0.1 });
-}
-
-#[test]
-fn attn_sliding_window() {
-    attn_case(AttnCase { m: 3, nq: 2, nkv: 1, max_seq: 16, pos: 5, window: 3, seed: 93, k_scale: 0.1 });
-}
-
-#[test]
-fn attn_single_query_per_head() {
-    attn_case(AttnCase { m: 1, nq: 2, nkv: 2, max_seq: 4, pos: 0, window: 0, seed: 95, k_scale: 0.1 });
-}
-
-#[test]
-fn attn_gqa_4x_multi_chunk() {
-    attn_case(AttnCase { m: 16, nq: 4, nkv: 1, max_seq: 64, pos: 16, window: 0, seed: 97, k_scale: 0.1 });
-}
-
-#[test]
-fn attn_split_short_prefix() {
-    attn_case(AttnCase { m: 1, nq: 2, nkv: 1, max_seq: 16, pos: 2, window: 0, seed: 101, k_scale: 0.1 });
-}
-
-#[test]
-fn attn_split_long_prefix() {
-    attn_case(AttnCase { m: 16, nq: 4, nkv: 1, max_seq: 1024, pos: 512, window: 0, seed: 103, k_scale: 0.1 });
-}
-
-#[test]
-fn attn_multi_round_boundaries() {
-    for kv_len in [65, 127, 128, 191, 192, 255, 256, 257, 511, 512] {
-        attn_case(AttnCase { m: 8, nq: 4, nkv: 1, max_seq: 1024, pos: kv_len, window: 0, seed: 2000 + kv_len as u64, k_scale: 1.0 });
-    }
-}
-
-#[test]
-fn attn_multi_round_tail() {
-    for kv_len in [66, 129, 193, 258] {
-        attn_case(AttnCase { m: 1, nq: 2, nkv: 1, max_seq: 1024, pos: kv_len, window: 0, seed: 3000 + kv_len as u64, k_scale: 1.0 });
-    }
-}
-
-#[test]
 fn attn_gemm_coexist() {
     let mut ctx = Ctx::new();
     let mut rng = Rng(2049);
@@ -1592,8 +1378,7 @@ fn attn_gemm_coexist() {
     let kb = ctx.bf16(&kc, &[nkv as u32, max_seq as u32, hd as u32]);
     let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
     let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
-    let scratch = ctx.zero(&[m as u32, nkv as u32, 32, 8, hd as u32 + 2]);
-    let args = ctx.arg(pos, pos + m);
+    let args = ctx.arg(pos);
 
     let (k2, n2) = (96usize, 80usize);
     let x = rng.fill(m * k2);
@@ -1612,41 +1397,22 @@ fn attn_gemm_coexist() {
                     &mut pass,
                     name::ATTN,
                     &[
+                        ("M", m as f64),
                         ("N_HEADS", nq as f64),
-                        ("KV_HEADS", nkv as f64),
                         ("HEAD_DIM", hd as f64),
                         ("MAX_SEQ", max_seq as f64),
                         ("SCALE", 1.0 / (hd as f64).sqrt()),
                         ("WINDOW", 0.0),
                         ("NQ_PER_KV", (nq / nkv) as f64),
-                        ("STRIDE", (hd as u32 + 2) as f64),
                     ],
                     &[
                         Binding::Full(&qb),
                         Binding::Full(&kb),
                         Binding::Full(&vb),
-                        Binding::Full(&scratch),
-                        Binding::Full(&args),
-                    ],
-                    [m as u32, nkv as u32, 32],
-                )
-                .unwrap();
-            ctx.backend
-                .dispatch(
-                    &mut pass,
-                    name::MERGE_ATTN,
-                    &[
-                        ("N_HEADS", nq as f64),
-                        ("KV_HEADS", nkv as f64),
-                        ("HEAD_DIM", hd as f64),
-                        ("STRIDE", (hd as u32 + 2) as f64),
-                    ],
-                    &[
-                        Binding::Full(&scratch),
                         Binding::Full(&y),
                         Binding::Full(&args),
                     ],
-                    [m as u32, nkv as u32, 1],
+                    [(m as u32).div_ceil(flint_kernel::ATTN_BR), nq as u32, 1],
                 )
                 .unwrap();
             ctx.backend
@@ -1687,20 +1453,136 @@ fn attn_gemm_coexist() {
 }
 
 #[test]
-fn attn_single_round_realistic() {
-    for kv_len in [1, 32, 63, 64] {
-        attn_case(AttnCase { m: 1, nq: 2, nkv: 1, max_seq: 1024, pos: kv_len, window: 0, seed: 4000 + kv_len as u64, k_scale: 1.0 });
+fn attn_decode_positions() {
+    for pos in [1usize, 63, 64, 65, 255, 511] {
+        attn_case(AttnCase { m: 1, nq: 8, nkv: 2, hd: 128, max_seq: 1024, pos, window: 0, seed: 7000 + pos as u64, k_scale: 0.1 });
+    }
+}
+struct AttnCase {
+    m: usize,
+    nq: usize,
+    nkv: usize,
+    hd: usize,
+    max_seq: usize,
+    pos: usize,
+    window: usize,
+    seed: u64,
+    k_scale: f32,
+}
+
+fn attn_case(spec: AttnCase) {
+    let AttnCase {
+        m,
+        nq,
+        nkv,
+        hd,
+        max_seq,
+        pos,
+        window,
+        seed,
+        k_scale,
+    } = spec;
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(seed);
+    let q = rng.fill(m * nq * hd);
+    let kc = rng
+        .fill(nkv * max_seq * hd)
+        .iter()
+        .map(|v| v * k_scale)
+        .collect::<Vec<_>>();
+    let vc = rng.fill(nkv * max_seq * hd);
+    let qb = ctx.f32(&q, &[m as u32, nq as u32, hd as u32]);
+    let kc = bf16_round(&kc);
+    let vc = bf16_round(&vc);
+    let kb = ctx.bf16(&kc, &[nkv as u32, max_seq as u32, hd as u32]);
+    let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
+    let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
+    let args = ctx.arg(pos);
+
+    ctx.dispatch(
+        name::ATTN,
+        &[
+            ("M", m as f64),
+            ("N_HEADS", nq as f64),
+            ("HEAD_DIM", hd as f64),
+            ("MAX_SEQ", max_seq as f64),
+            ("SCALE", 1.0 / (hd as f64).sqrt()),
+            ("WINDOW", window as f64),
+            ("NQ_PER_KV", (nq / nkv) as f64),
+        ],
+        &[
+            Binding::Full(&qb),
+            Binding::Full(&kb),
+            Binding::Full(&vb),
+            Binding::Full(&y),
+            Binding::Full(&args),
+        ],
+        [
+            (m as u32).div_ceil(flint_kernel::ATTN_BR),
+            nq as u32,
+            1,
+        ],
+    );
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::attn(
+            &q,
+            &kc,
+            &vc,
+            cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window },
+        ),
+        1e-2,
+        1e-2,
+    );
+}
+
+#[test]
+fn attn_hd64_multi_block() {
+    attn_case(AttnCase { m: 16, nq: 8, nkv: 2, hd: 64, max_seq: 512, pos: 256, window: 0, seed: 501, k_scale: 0.1 });
+}
+
+#[test]
+fn attn_hd128_gqa4() {
+    attn_case(AttnCase { m: 8, nq: 32, nkv: 8, hd: 128, max_seq: 1024, pos: 512, window: 0, seed: 503, k_scale: 0.1 });
+}
+
+#[test]
+fn attn_hd256_kd_segments() {
+    attn_case(AttnCase { m: 4, nq: 8, nkv: 4, hd: 256, max_seq: 512, pos: 300, window: 0, seed: 505, k_scale: 0.1 });
+}
+
+#[test]
+fn attn_hd100_odd_dim_segs() {
+    attn_case(AttnCase { m: 4, nq: 8, nkv: 2, hd: 100, max_seq: 256, pos: 128, window: 0, seed: 507, k_scale: 0.1 });
+}
+
+#[test]
+fn attn_sliding_window() {
+    attn_case(AttnCase { m: 8, nq: 8, nkv: 2, hd: 128, max_seq: 1024, pos: 700, window: 128, seed: 509, k_scale: 0.1 });
+}
+
+#[test]
+fn attn_pos_boundaries() {
+    for pos in [0usize, 1, 31, 32, 33, 63, 64, 65, 127, 255, 511] {
+        attn_case(AttnCase { m: 5, nq: 4, nkv: 2, hd: 64, max_seq: 1024, pos, window: 0, seed: 600 + pos as u64, k_scale: 0.1 });
     }
 }
 
 #[test]
-fn attn_split_sliding_window() {
-    attn_case(AttnCase { m: 3, nq: 2, nkv: 1, max_seq: 1024, pos: 700, window: 128, seed: 105, k_scale: 0.1 });
+fn attn_m_sweep() {
+    for m in [1usize, 2, 7, 8, 9, 15, 16, 17] {
+        attn_case(AttnCase { m, nq: 4, nkv: 2, hd: 128, max_seq: 128, pos: 64, window: 0, seed: 800 + m as u64, k_scale: 0.1 });
+    }
 }
 
 #[test]
 fn attn_gqa_8x() {
-    attn_case(AttnCase { m: 2, nq: 8, nkv: 1, max_seq: 64, pos: 10, window: 0, seed: 107, k_scale: 0.1 });
+    attn_case(AttnCase { m: 2, nq: 16, nkv: 2, hd: 128, max_seq: 64, pos: 32, window: 0, seed: 511, k_scale: 0.1 });
+}
+
+#[test]
+fn attn_full_cache_tail() {
+    attn_case(AttnCase { m: 8, nq: 8, nkv: 2, hd: 128, max_seq: 256, pos: 248, window: 0, seed: 513, k_scale: 1.0 });
 }
 
 #[test]
@@ -1739,7 +1621,7 @@ fn kv_store_writes_both_caches() {
     let vb = ctx.f32(&v_src, &[m as u32, nkv as u32, hd as u32]);
     let k_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
     let v_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
-    let args = ctx.arg(pos, pos + m);
+    let args = ctx.arg(pos);
 
     ctx.dispatch(
         name::KV_STORE,

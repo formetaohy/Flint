@@ -1,17 +1,10 @@
-use flint_backend::{Backend, Binding, Commands, shader};
+use flint_backend::{ATTN_BR, Backend, Binding, Commands, shader};
 use flint_error::Result;
 use flint_tensor::Tensor;
-
-pub const ATTN_SEGS: u32 = 32;
-
-pub const MAX_GQA: u32 = 8;
-
-pub const ATTN_PAD: u32 = 2;
 
 pub struct AttnSpec<'a> {
     pub q_heads: u32,
     pub window: u32,
-    pub stride: u32,
     pub scale: f32,
     pub m: u32,
     pub args: &'a Tensor,
@@ -22,62 +15,29 @@ pub fn attn(
     commands: &mut Commands<'_>,
     q: Binding<'_>,
     kv: &crate::cache::KvCache,
-    scratch: &Tensor,
     y: Binding<'_>,
     spec: &AttnSpec<'_>,
 ) -> Result<()> {
-    assert!(
-        spec.q_heads / kv.kv_heads <= MAX_GQA,
-        "GQA ratio {} exceeds the attention shader's {MAX_GQA} head slots",
-        spec.q_heads / kv.kv_heads
-    );
-
-    let consts = [
-        ("N_HEADS", spec.q_heads as f64),
-        ("KV_HEADS", kv.kv_heads as f64),
-        ("HEAD_DIM", kv.head_dim as f64),
-        ("MAX_SEQ", kv.max_seq as f64),
-        ("SCALE", spec.scale as f64),
-        ("WINDOW", spec.window as f64),
-        ("NQ_PER_KV", (spec.q_heads / kv.kv_heads) as f64),
-        ("STRIDE", spec.stride as f64),
-    ];
-    let decode = spec.m == 1
-        && spec.window == 0
-        && kv.head_dim == 128
-        && spec.q_heads / kv.kv_heads <= 4;
     backend.dispatch(
         commands,
-        if decode { shader::ATTN_DECODE } else { shader::ATTN },
-        &consts,
+        shader::ATTN,
+        &[
+            ("M", spec.m as f64),
+            ("N_HEADS", spec.q_heads as f64),
+            ("HEAD_DIM", kv.head_dim as f64),
+            ("MAX_SEQ", kv.max_seq as f64),
+            ("SCALE", spec.scale as f64),
+            ("WINDOW", spec.window as f64),
+            ("NQ_PER_KV", (spec.q_heads / kv.kv_heads) as f64),
+        ],
         &[
             q,
             Binding::Full(&kv.k),
             Binding::Full(&kv.v),
-            Binding::Full(scratch),
-            Binding::Full(spec.args),
-        ],
-        if decode {
-            [kv.kv_heads, ATTN_SEGS, 1]
-        } else {
-            [spec.m, kv.kv_heads, ATTN_SEGS]
-        },
-    )?;
-    backend.dispatch(
-        commands,
-        shader::MERGE_ATTN,
-        &[
-            ("N_HEADS", spec.q_heads as f64),
-            ("KV_HEADS", kv.kv_heads as f64),
-            ("HEAD_DIM", kv.head_dim as f64),
-            ("STRIDE", spec.stride as f64),
-        ],
-        &[
-            Binding::Full(scratch),
             y,
             Binding::Full(spec.args),
         ],
-        [spec.m, kv.kv_heads, 1],
+        [spec.m.div_ceil(ATTN_BR), spec.q_heads, 1],
     )
 }
 

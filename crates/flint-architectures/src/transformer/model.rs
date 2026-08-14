@@ -1,4 +1,4 @@
-﻿use flint_backend::{Backend, Binding, Commands};
+use flint_backend::{Backend, Binding, Commands};
 use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
 use flint_model::cache::KvCache;
@@ -428,7 +428,7 @@ impl LanguageModel for Model {
         let mut ids = vec![0u32; MAX_M as usize];
         ids[..tokens.len()].copy_from_slice(tokens);
         backend.write_u32(&self.s.ids.buf, &ids);
-        step::write_step_args(backend, &self.s.args, self.pos, self.pos + m);
+        step::write_step_args(backend, &self.s.args, self.pos);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder()?;
@@ -632,12 +632,10 @@ impl LanguageModel for Model {
                     &mut commands,
                     Binding::Full(q_src),
                     kv,
-                    &s.attn_scratch,
                     Binding::Full(&lw.attn_out),
                     &ops::AttnSpec {
                         q_heads: nq,
                         window: cfg.window(l as u32),
-                        stride: s.attn_stride,
                         scale: cfg.attn_scale.unwrap_or_else(|| (hd as f32).sqrt().recip()),
                         m,
                         args: &self.s.args,

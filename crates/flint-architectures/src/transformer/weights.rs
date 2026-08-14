@@ -3,7 +3,7 @@ use flint_error::Result;
 use flint_model::MAX_M;
 use flint_model::loader::{Plan, Role, WeightSet};
 use flint_model::mlp_weights::{MlpBlock, take_mlp, take_moe};
-use flint_model::ops::{self, ATTN_PAD, ATTN_SEGS, MAX_GQA, MlpTiles, MoeTiles};
+use flint_model::ops::{self, MlpTiles, MoeTiles};
 use flint_model::step;
 use flint_tensor::{Tensor, Weight};
 
@@ -169,9 +169,6 @@ pub(crate) struct Scratch {
     pub(crate) hidden2: Tensor,
     pub(crate) normed: Tensor,
 
-    pub(crate) attn_scratch: Tensor,
-
-    pub(crate) attn_stride: u32,
     pub(crate) mlp: MlpTiles,
 
     pub(crate) moe: Option<MoeTiles>,
@@ -186,7 +183,6 @@ pub(crate) struct Scratch {
 }
 
 pub(crate) fn alloc_scratch(cfg: &Config, backend: &Backend) -> Scratch {
-    let max_hd = *cfg.head_dims.iter().max().unwrap();
     let mlp_w = cfg.max_mlp_width();
     let moe = cfg.moe.map(|m| {
         ops::MoeTiles::new(
@@ -208,14 +204,6 @@ pub(crate) fn alloc_scratch(cfg: &Config, backend: &Backend) -> Scratch {
         hidden: backend.zero_tensor(&[MAX_M, cfg.hidden]),
         hidden2: backend.zero_tensor(&[MAX_M, cfg.hidden]),
         normed: backend.zero_tensor(&[MAX_M, cfg.hidden]),
-        attn_scratch: backend.zero_tensor(&[
-            MAX_M,
-            cfg.kv_heads,
-            ATTN_SEGS,
-            MAX_GQA,
-            max_hd + ATTN_PAD,
-        ]),
-        attn_stride: max_hd + ATTN_PAD,
         mlp: MlpTiles {
             gate_out: backend.zero_tensor(&[MAX_M, mlp_w]),
             up_out: backend.zero_tensor(&[MAX_M, mlp_w]),

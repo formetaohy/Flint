@@ -1,25 +1,28 @@
 struct Pc {
+    M: u32,
     N_HEADS: u32,
-    KV_HEADS: u32,
     HEAD_DIM: u32,
     MAX_SEQ: u32,
     SCALE: f32,
     WINDOW: u32,
     NQ_PER_KV: u32,
-    STRIDE: u32,
 }
 var<immediate> pc: Pc;
 
 @group(0) @binding(0) var<storage, read_write> q: array<f32>;
 @group(0) @binding(1) var<storage, read_write> k_cache: array<u32>;
-@group(0) @binding(2) var<storage, read_write> v_cache: array<u32>;
-@group(0) @binding(3) var<storage, read_write> scratch: array<f32>;
+@group(0) @binding(2) var<storage, read_write> v_cache: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
 @group(0) @binding(4) var<storage, read_write> args: array<u32>;
 
-var<workgroup> kt: array<u32, 4160>;
-var<workgroup> scs: array<f32, 512>;
-var<workgroup> red: array<f32, 512>;
-var<workgroup> segstat: array<f32, 16>;
+const BR: u32 = 8;
+const BC: u32 = 128;
+const KD: u32 = 32;
+const COLS: u32 = 4;
+const LANES: u32 = 32;
+const NEG_INF: f32 = -3.4e38;
+
+var<workgroup> kt: array<f32, 2 * BC * KD>;
 
 fn deq2(word: u32) -> vec2<f32> {
     return vec2<f32>(
@@ -28,228 +31,283 @@ fn deq2(word: u32) -> vec2<f32> {
     );
 }
 
-@compute @workgroup_size(512, 1, 1)
+@compute @workgroup_size(256, 1, 1)
 fn attn(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) grid: vec3<u32>,
 ) {
-    const CHUNK: u32 = 64;
-    const SEGS: u32 = 32;
-    const HALF: u32 = 128;
-    const NEG_INF: f32 = -3.4e38;
+    let M = pc.M;
     let N_HEADS = pc.N_HEADS;
-    let KV_HEADS = pc.KV_HEADS;
     let HEAD_DIM = pc.HEAD_DIM;
     let MAX_SEQ = pc.MAX_SEQ;
     let SCALE = pc.SCALE;
     let WINDOW = pc.WINDOW;
     let NQ_PER_KV = pc.NQ_PER_KV;
-    let STRIDE = pc.STRIDE;
     let pos = args[0];
-    let segs = min(SEGS, max(1u, args[1]));
-    let m = grid.x;
-    let kvh = grid.y;
-    let seg = grid.z;
-    if seg < segs {
-        let qpos = pos + m;
-        let kv_len = qpos + 1;
-        var win_start = 0u;
-        if WINDOW != 0 && kv_len > WINDOW {
-            win_start = kv_len - WINDOW;
+    let t = lid.x;
+    let row = t / LANES;
+    let lane = t % LANES;
+    let m0 = grid.x * BR;
+    let qh = grid.y;
+    let kvh = qh / NQ_PER_KV;
+    let mi = m0 + row;
+    let half_dim = HEAD_DIM / 2;
+    let cache_plane = kvh * MAX_SEQ * half_dim;
+    let qb = (mi * N_HEADS + qh) * HEAD_DIM;
+    let qpos = pos + mi;
+    var win_start = 0u;
+    if WINDOW != 0 && qpos + 1 > WINDOW {
+        win_start = qpos + 1 - WINDOW;
+    }
+    let k_segs = (HEAD_DIM + KD - 1) / KD;
+    let kv_len = pos + min(m0 + BR, M);
+
+    var m_old = NEG_INF;
+    var s_old = 0.0;
+    var o = array<f32, 16>();
+    var c0 = 0u;
+    var w = t;
+    loop {
+        if w >= BC * min(KD, HEAD_DIM) / 2 {
+            break;
         }
-        let seg_len = (kv_len + segs - 1) / segs;
-        let seg_lo = seg * seg_len;
-        let seg_hi = min(seg_lo + seg_len, kv_len);
-        let q0 = (m * N_HEADS + kvh * NQ_PER_KV) * HEAD_DIM;
-        let cache_plane = kvh * MAX_SEQ * HEAD_DIM;
-        let t = lid.x;
-        let hl = t / CHUNK;
-        let slot = t % CHUNK;
-        var o0 = 0.0;
-        var o1 = 0.0;
-        var o2 = 0.0;
-        var o3 = 0.0;
-        var o4 = 0.0;
-        var o5 = 0.0;
-        var o6 = 0.0;
-        var o7 = 0.0;
-        var c0 = seg_lo;
-        loop {
-            if c0 >= seg_hi {
-                break;
+        let j2 = w / (min(KD, HEAD_DIM) / 2);
+        let d2 = w % (min(KD, HEAD_DIM) / 2);
+        var kd2 = vec2<f32>(0.0, 0.0);
+        if j2 < kv_len {
+            kd2 = deq2(k_cache[cache_plane + j2 * half_dim + d2]);
+        }
+        kt[d2 * 2 * BC + j2] = kd2.x;
+        kt[(d2 * 2 + 1) * BC + j2] = kd2.y;
+        w = w + 256;
+    }
+    workgroupBarrier();
+    loop {
+        if c0 >= kv_len {
+            break;
+        }
+        var s = array<f32, COLS>();
+        let limit = min(BC, kv_len - c0);
+        for (var ds = 0u; ds < k_segs; ds++) {
+            let buf = ds % 2;
+            let d_base = ds * KD;
+            let seg_w = min(KD, HEAD_DIM - d_base);
+            if ds + 1 < k_segs {
+                let nb = (ds + 1) % 2;
+                let nb_base = (ds + 1) * KD;
+                let nb_w = min(KD, HEAD_DIM - nb_base);
+                let words = BC * nb_w / 2;
+                var w = t;
+                loop {
+                    if w >= words {
+                        break;
+                    }
+                    let j2 = w / (nb_w / 2);
+                    let d2 = w % (nb_w / 2);
+                    var kd2 = vec2<f32>(0.0, 0.0);
+                    if c0 + j2 < kv_len {
+                        kd2 = deq2(
+                            k_cache[cache_plane + (c0 + j2) * half_dim + nb_base / 2 + d2],
+                        );
+                    }
+                    kt[nb * BC * KD + d2 * 2 * BC + j2] = kd2.x;
+                    kt[nb * BC * KD + (d2 * 2 + 1) * BC + j2] = kd2.y;
+                    w = w + 256;
+                }
             }
-            if c0 == seg_lo && slot == 0 && hl < 8 {
-                segstat[hl * 2] = NEG_INF;
-                segstat[hl * 2 + 1] = 0.0;
+            for (var d = 0u; d < seg_w; d++) {
+                var qd = 0.0;
+                if mi < M {
+                    qd = q[qb + d_base + d];
+                }
+                for (var c = 0u; c < COLS; c++) {
+                    s[c] = s[c] + qd * kt[buf * BC * KD + d * BC + lane * COLS + c];
+                }
             }
             workgroupBarrier();
-            let limit = min(CHUNK, seg_hi - c0);
-            var dotp = 0.0;
-            let halves = (HEAD_DIM + HALF - 1) / HALF;
-            for (var half = 0u; half < halves; half++) {
-                for (var j = 0u; j < 8u; j++) {
-                    let e = t + j * 512;
-                    let key = e / 64;
-                    let d2 = e % 64;
-                    if key < limit && half * HALF + d2 * 2 < HEAD_DIM {
-                        let ckey = cache_plane + (c0 + key) * HEAD_DIM + half * HALF + d2 * 2;
-                        kt[key * 65 + d2] = k_cache[ckey / 2];
-                    } else {
-                        kt[key * 65 + d2] = 0;
-                    }
+        }
+        var m_cur = NEG_INF;
+        for (var c = 0u; c < COLS; c++) {
+            let col = c0 + lane * COLS + c;
+            var sc = s[c] * SCALE;
+            if col > qpos || col < win_start {
+                sc = NEG_INF;
+            }
+            s[c] = sc;
+            m_cur = max(m_cur, sc);
+        }
+        let m_row = subgroupMax(m_cur);
+        let m_new = max(m_old, m_row);
+        let r = exp(m_old - m_new);
+        var s_cur = 0.0;
+        for (var c = 0u; c < COLS; c++) {
+            let e = select(exp(s[c] - m_new), 0.0, s[c] == NEG_INF);
+            s[c] = e;
+            s_cur = s_cur + e;
+        }
+        let s_row = subgroupAdd(s_cur);
+        s_old = s_old * r + s_row;
+        if HEAD_DIM <= 128 {
+            let d8 = lane % 16 * 8;
+            for (var i8 = 0u; i8 < 8u; i8++) {
+                if d8 + i8 < HEAD_DIM {
+                    o[i8] = o[i8] * r;
                 }
-                workgroupBarrier();
-                if hl < NQ_PER_KV && c0 + slot >= win_start && c0 + slot < seg_hi {
-                    let qb = q0 + hl * HEAD_DIM + half * HALF;
-                    for (var dd = 0u; dd < 128u; dd++) {
-                        if half * HALF + dd >= HEAD_DIM {
+            }
+        } else {
+            var nb0 = 0u;
+            loop {
+                let d8 = lane * 8 + nb0 * LANES * 8;
+                if d8 >= HEAD_DIM {
+                    break;
+                }
+                for (var i8 = 0u; i8 < 8u; i8++) {
+                    o[nb0 * 8 + i8] = o[nb0 * 8 + i8] * r;
+                }
+                nb0 = nb0 + 1;
+            }
+        }
+        for (var c = 0u; c < COLS; c++) {
+            kt[row * BC + lane * COLS + c] = s[c];
+        }
+        workgroupBarrier();
+        if HEAD_DIM <= 128 {
+            let col_lo = (lane / 16) * 64;
+            for (var col = 0u; col < 64u; col++) {
+                let gcol = c0 + col_lo + col;
+                if gcol >= kv_len {
+                    break;
+                }
+                let e = kt[row * BC + col_lo + col];
+                let d8 = lane % 16 * 8;
+                if d8 + 8 <= HEAD_DIM && (gcol * half_dim + d8 / 2) % 4 == 0 {
+                    let vw = v_cache[cache_plane / 4 + (gcol * half_dim + d8 / 2) / 4];
+                    let v0 = deq2(vw.x);
+                    let v1 = deq2(vw.y);
+                    let v2 = deq2(vw.z);
+                    let v3 = deq2(vw.w);
+                    o[0] = o[0] + e * v0.x;
+                    o[1] = o[1] + e * v0.y;
+                    o[2] = o[2] + e * v1.x;
+                    o[3] = o[3] + e * v1.y;
+                    o[4] = o[4] + e * v2.x;
+                    o[5] = o[5] + e * v2.y;
+                    o[6] = o[6] + e * v3.x;
+                    o[7] = o[7] + e * v3.y;
+                } else {
+                    for (var i8 = 0u; i8 < 8u; i8++) {
+                        let d = d8 + i8;
+                        if d >= HEAD_DIM {
                             break;
                         }
-                        let e = slot * HALF + dd;
-                        let d = deq2(kt[slot * 65 + dd / 2]);
-                        dotp = dotp + q[qb + dd] * select(d.x, d.y, e % 2u == 1u);
+                        let col_u32 = gcol * half_dim;
+                        let u32idx = col_u32 + d / 2;
+                        let v4 = min(u32idx / 4, (col_u32 + half_dim - 1) / 4);
+                        let vw = v_cache[cache_plane / 4 + v4];
+                        let word = select(
+                            select(vw.x, vw.y, u32idx - v4 * 4 == 1),
+                            select(vw.z, vw.w, u32idx - v4 * 4 == 3),
+                            u32idx - v4 * 4 >= 2,
+                        );
+                        let dd = deq2(word);
+                        let v = select(dd.x, dd.y, d % 2 == 1);
+                        o[i8] = o[i8] + e * v;
                     }
                 }
-                workgroupBarrier();
             }
-            var sc = NEG_INF;
-            if hl < NQ_PER_KV && c0 + slot >= win_start && c0 + slot < seg_hi {
-                sc = dotp * SCALE;
-            }
-            scs[hl * CHUNK + slot] = sc;
-            var mx = subgroupMax(sc);
-            if slot % 32 == 0 {
-                red[hl * (CHUNK / 32) + slot / 32] = mx;
-            }
-            workgroupBarrier();
-            var c_max = NEG_INF;
-            if slot == 0 {
-                var cm = NEG_INF;
-                for (var w = 0u; w < (CHUNK / 32); w++) {
-                    cm = max(cm, red[hl * (CHUNK / 32) + w]);
-                }
-                c_max = cm;
-                red[16 + hl] = c_max;
-            }
-            workgroupBarrier();
-            c_max = red[16 + hl];
-            workgroupBarrier();
-            var prev_max = NEG_INF;
-            var align = 1.0;
-            if hl < NQ_PER_KV && c0 != seg_lo {
-                prev_max = segstat[hl * 2];
-                if prev_max > NEG_INF / 2.0 {
-                    if c_max > prev_max {
-                        let r = exp(prev_max - c_max);
-                        o0 = o0 * r;
-                        o1 = o1 * r;
-                        o2 = o2 * r;
-                        o3 = o3 * r;
-                        o4 = o4 * r;
-                        o5 = o5 * r;
-                        o6 = o6 * r;
-                        o7 = o7 * r;
+        } else {
+            for (var col = 0u; col < limit; col++) {
+                let e = kt[row * BC + col];
+                var nb = 0u;
+                loop {
+                    let d8 = lane * 8 + nb * LANES * 8;
+                    if d8 >= HEAD_DIM {
+                        break;
+                    }
+                    if d8 + 8 <= HEAD_DIM && ((c0 + col) * half_dim + d8 / 2) % 4 == 0 {
+                        let vw = v_cache[cache_plane / 4 + ((c0 + col) * half_dim + d8 / 2) / 4];
+                        let v0 = deq2(vw.x);
+                        let v1 = deq2(vw.y);
+                        let v2 = deq2(vw.z);
+                        let v3 = deq2(vw.w);
+                        o[nb * 8] = o[nb * 8] + e * v0.x;
+                        o[nb * 8 + 1] = o[nb * 8 + 1] + e * v0.y;
+                        o[nb * 8 + 2] = o[nb * 8 + 2] + e * v1.x;
+                        o[nb * 8 + 3] = o[nb * 8 + 3] + e * v1.y;
+                        o[nb * 8 + 4] = o[nb * 8 + 4] + e * v2.x;
+                        o[nb * 8 + 5] = o[nb * 8 + 5] + e * v2.y;
+                        o[nb * 8 + 6] = o[nb * 8 + 6] + e * v3.x;
+                        o[nb * 8 + 7] = o[nb * 8 + 7] + e * v3.y;
                     } else {
-                        align = exp(c_max - prev_max);
+                        for (var i8 = 0u; i8 < 8u; i8++) {
+                            let d = d8 + i8;
+                            if d >= HEAD_DIM {
+                                break;
+                            }
+                            let col_u32 = (c0 + col) * half_dim;
+                            let u32idx = col_u32 + d / 2;
+                            let v4 = min(u32idx / 4, (col_u32 + half_dim - 1) / 4);
+                            let vw = v_cache[cache_plane / 4 + v4];
+                            let word = select(
+                                select(vw.x, vw.y, u32idx - v4 * 4 == 1),
+                                select(vw.z, vw.w, u32idx - v4 * 4 == 3),
+                                u32idx - v4 * 4 >= 2,
+                            );
+                            let dd = deq2(word);
+                            let v = select(dd.x, dd.y, d % 2 == 1);
+                            o[nb * 8 + i8] = o[nb * 8 + i8] + e * v;
+                        }
                     }
+                    nb = nb + 1;
                 }
             }
-            workgroupBarrier();
-            var e = 0.0;
-            if hl < NQ_PER_KV && c0 + slot >= win_start && c0 + slot < seg_hi {
-                e = exp(sc - c_max) * align;
-                if sc == NEG_INF {
-                    e = 0.0;
-                }
-            }
-            scs[hl * CHUNK + slot] = e;
-            var sm = subgroupAdd(e);
-            if slot % 32 == 0 {
-                red[hl * (CHUNK / 32) + slot / 32] = sm;
-            }
-            workgroupBarrier();
-            var c_sum = 0.0;
-            if slot == 0 {
-                var cs = 0.0;
-                for (var w = 0u; w < (CHUNK / 32); w++) {
-                    cs = cs + red[hl * (CHUNK / 32) + w];
-                }
-                c_sum = cs;
-                red[16 + hl] = c_sum;
-            }
-            workgroupBarrier();
-            c_sum = red[16 + hl];
-            workgroupBarrier();
-            if hl < NQ_PER_KV {
-                let odd = slot % 2u == 1u;
-                for (var kk = 0u; kk < limit; kk++) {
-                    let w = scs[hl * CHUNK + kk];
-                    let vk = (cache_plane + (c0 + kk) * HEAD_DIM) / 2 + slot / 2;
-                    let d0 = deq2(v_cache[vk]);
-                    o0 = o0 + w * select(d0.x, d0.y, odd);
-                    if slot + CHUNK < HEAD_DIM {
-                        let d1 = deq2(v_cache[vk + CHUNK / 2]);
-                        o1 = o1 + w * select(d1.x, d1.y, odd);
-                    }
-                    if slot + 2 * CHUNK < HEAD_DIM {
-                        let d2 = deq2(v_cache[vk + CHUNK]);
-                        let d3 = deq2(v_cache[vk + CHUNK + CHUNK / 2]);
-                        o2 = o2 + w * select(d2.x, d2.y, odd);
-                        o3 = o3 + w * select(d3.x, d3.y, odd);
-                    }
-                    if slot + 4 * CHUNK < HEAD_DIM {
-                        let d4 = deq2(v_cache[vk + 2 * CHUNK]);
-                        let d5 = deq2(v_cache[vk + 2 * CHUNK + CHUNK / 2]);
-                        o4 = o4 + w * select(d4.x, d4.y, odd);
-                        o5 = o5 + w * select(d5.x, d5.y, odd);
-                    }
-                    if slot + 6 * CHUNK < HEAD_DIM {
-                        let d6 = deq2(v_cache[vk + 3 * CHUNK]);
-                        let d7 = deq2(v_cache[vk + 3 * CHUNK + CHUNK / 2]);
-                        o6 = o6 + w * select(d6.x, d6.y, odd);
-                        o7 = o7 + w * select(d7.x, d7.y, odd);
-                    }
-                }
-            }
-            if hl < NQ_PER_KV && slot == 0 {
-                let prev_max = segstat[hl * 2];
-                let prev_sum = segstat[hl * 2 + 1];
-                if prev_max == NEG_INF {
-                    segstat[hl * 2] = c_max;
-                    segstat[hl * 2 + 1] = c_sum;
-                } else if c_max > prev_max {
-                    segstat[hl * 2 + 1] = prev_sum * exp(prev_max - c_max) + c_sum;
-                    segstat[hl * 2] = c_max;
-                } else if c_max > NEG_INF / 2.0 {
-                    segstat[hl * 2 + 1] = prev_sum + c_sum;
-                }
-            }
-            workgroupBarrier();
-            c0 = c0 + CHUNK;
         }
-        if hl < NQ_PER_KV {
-            let sbase = ((m * KV_HEADS + kvh) * SEGS + seg) * (8 * STRIDE);
-            if slot < HEAD_DIM {
-                scratch[sbase + hl * STRIDE + slot] = o0;
+        workgroupBarrier();
+        m_old = m_new;
+        c0 = c0 + BC;
+        if c0 < kv_len {
+            let words = BC * min(KD, HEAD_DIM) / 2;
+            var w = t;
+            loop {
+                if w >= words {
+                    break;
+                }
+                let j2 = w / (min(KD, HEAD_DIM) / 2);
+                let d2 = w % (min(KD, HEAD_DIM) / 2);
+                var kd2 = vec2<f32>(0.0, 0.0);
+                if c0 + j2 < kv_len {
+                    kd2 = deq2(k_cache[cache_plane + (c0 + j2) * half_dim + d2]);
+                }
+                kt[d2 * 2 * BC + j2] = kd2.x;
+                kt[(d2 * 2 + 1) * BC + j2] = kd2.y;
+                w = w + 256;
             }
-            if slot + CHUNK < HEAD_DIM {
-                scratch[sbase + hl * STRIDE + slot + CHUNK] = o1;
+        }
+        workgroupBarrier();
+    }
+    if mi < M {
+        let ob = qb;
+        if HEAD_DIM <= 128 {
+            let d8 = lane % 16 * 8;
+            for (var i8 = 0u; i8 < 8u; i8++) {
+                if d8 + i8 < HEAD_DIM {
+                    y[ob + d8 + i8] =
+                        (o[i8] + subgroupShuffleXor(o[i8], 16u)) / s_old;
+                }
             }
-            if slot + 2 * CHUNK < HEAD_DIM {
-                scratch[sbase + hl * STRIDE + slot + 2 * CHUNK] = o2;
-                scratch[sbase + hl * STRIDE + slot + 3 * CHUNK] = o3;
-            }
-            if slot + 4 * CHUNK < HEAD_DIM {
-                scratch[sbase + hl * STRIDE + slot + 4 * CHUNK] = o4;
-                scratch[sbase + hl * STRIDE + slot + 5 * CHUNK] = o5;
-            }
-            if slot + 6 * CHUNK < HEAD_DIM {
-                scratch[sbase + hl * STRIDE + slot + 6 * CHUNK] = o6;
-                scratch[sbase + hl * STRIDE + slot + 7 * CHUNK] = o7;
-            }
-            if slot == 0 {
-                scratch[sbase + hl * STRIDE + HEAD_DIM] = segstat[hl * 2];
-                scratch[sbase + hl * STRIDE + HEAD_DIM + 1] = segstat[hl * 2 + 1];
+        } else {
+            var nb = 0u;
+            loop {
+                let d8 = lane * 8 + nb * LANES * 8;
+                if d8 >= HEAD_DIM {
+                    break;
+                }
+                for (var i8 = 0u; i8 < 8u; i8++) {
+                    if d8 + i8 < HEAD_DIM {
+                        y[ob + d8 + i8] = o[nb * 8 + i8] / s_old;
+                    }
+                }
+                nb = nb + 1;
             }
         }
     }

@@ -8,7 +8,7 @@ use flint_kernel::Kernels;
 use flint_tensor::{DType, Tensor};
 
 pub use flint_kernel::name as shader;
-pub use flint_kernel::{Act, NormMode};
+pub use flint_kernel::{Act, ATTN_BR, NormMode};
 
 #[derive(Clone, Copy)]
 pub enum Binding<'a> {

@@ -441,13 +441,27 @@ fn gemm_probe() -> Result<()> {
     Ok(())
 }
 
+
 fn attn_probe() -> Result<()> {
     use flint_backend::{Binding, Commands};
     use flint_model::step::step_args;
 
+    let env = |k: &str, d: u32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (m, nq, nkv, hd, max_seq, pos) = (
+        env("PROBE_M", 128),
+        env("PROBE_Q_HEADS", 32),
+        env("PROBE_KV_HEADS", 8),
+        env("PROBE_HD", 128),
+        env("PROBE_MAX_SEQ", 2048),
+        env("PROBE_POS", 1024),
+    );
     let mut backend = Backend::new()?;
     eprintln!("[probe] adapter: {}", backend.adapter_name());
-    let (m, nq, nkv, hd, max_seq, pos) = (128u32, 32u32, 8u32, 128u32, 2048u32, 1024u32);
     let q: Vec<f32> = (0..m * nq * hd)
         .map(|i| ((i as f32) * 0.001 - 0.5) * 0.1)
         .collect();
@@ -473,70 +487,54 @@ fn attn_probe() -> Result<()> {
         .tensor_bf16(&vbytes, vec![nkv, max_seq, hd])
         .unwrap();
     let y = backend.zero_tensor(&[m, nq, hd]);
-    let scratch = backend.zero_tensor(&[m, nkv, 32, 8, hd + 2]);
-    let segs = std::env::var("PROBE_SEGS")
-        .map(|v| v.parse().unwrap())
-        .unwrap_or_else(|_| (pos + m).div_ceil(256).clamp(1, 32));
     let args = step_args(&backend);
-    backend.write_u32(&args.buf, &[pos, segs]);
-    let decode = m == 1 && nq / nkv <= 4 && hd == 128;
-    let kernel_name: &'static str = if decode {
-        flint_kernel::name::ATTN_DECODE
-    } else {
-        flint_kernel::name::ATTN
-    };
-    let run = |backend: &mut Backend| -> Result<()> {
+    backend.write_u32(&args.buf, &[pos]);
+    let run_flash = |backend: &mut Backend| -> Result<()> {
         let mut enc = backend.encoder().unwrap();
         {
             let mut commands = Commands::begin(&mut enc);
             backend.dispatch(
                 &mut commands,
-                kernel_name,
+                flint_kernel::name::ATTN,
                 &[
+                    ("M", m as f64),
                     ("N_HEADS", nq as f64),
-                    ("KV_HEADS", nkv as f64),
                     ("HEAD_DIM", hd as f64),
                     ("MAX_SEQ", max_seq as f64),
                     ("SCALE", 1.0 / (hd as f64).sqrt()),
                     ("WINDOW", 0.0),
                     ("NQ_PER_KV", (nq / nkv) as f64),
-                    ("STRIDE", (hd + 2) as f64),
                 ],
                 &[
                     Binding::Full(&qb),
                     Binding::Full(&kb),
                     Binding::Full(&vb),
-                    Binding::Full(&scratch),
+                    Binding::Full(&y),
                     Binding::Full(&args),
                 ],
-                if decode {
-                    [nkv, segs, 1]
-                } else {
-                    [m, nkv, segs]
-                },
+                [m.div_ceil(flint_model::ops::ATTN_BR), nq, 1],
             )?;
         }
         backend.submit(&mut enc).unwrap();
         Ok(())
     };
     for _ in 0..10 {
-        run(&mut backend)?;
+        run_flash(&mut backend)?;
     }
     let t0 = std::time::Instant::now();
-    let iters = 20;
+    let iters = 50;
     for _ in 0..iters {
-        run(&mut backend)?;
+        run_flash(&mut backend)?;
     }
     let _ = backend.read_f32(&y.buf, 0, 1)?;
     let secs = t0.elapsed().as_secs_f64();
     eprintln!(
-        "[probe] attn M={} kv={pos} segs={segs}: {:.2} ms/call",
-        pos + m,
-        secs / iters as f64 * 1e3
+        "[probe] attn: {:.2} ms/call (M={m} kv={} hd={hd} nq={nq} nkv={nkv})",
+        secs / iters as f64 * 1e3,
+        pos + m
     );
     Ok(())
 }
-
 
 pub fn run(name: &str) -> Result<()> {
     match name {

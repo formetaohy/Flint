@@ -1,6 +1,6 @@
 use flint_error::{Error, Result};
 use flint_model::config::{f64_field, u32_field, u32_list};
-use flint_model::ops::{Act, MAX_GQA, RopeScaling, check_gemm_dims, check_head_dim};
+use flint_model::ops::{Act, RopeScaling, check_gemm_dims, check_head_dim};
 use flint_model::routing::RouteKind;
 use serde_json::Value;
 
@@ -156,12 +156,6 @@ impl Config {
         let t = self;
         if !t.q_heads.is_multiple_of(t.kv_heads) {
             return Err(Error::Config("q heads not divisible by kv heads".into()));
-        }
-        if t.q_heads / t.kv_heads > MAX_GQA {
-            return Err(Error::Config(format!(
-                "GQA ratio {} exceeds the attention shader's {MAX_GQA} head slots",
-                t.q_heads / t.kv_heads
-            )));
         }
         if t.head_dims.len() != t.layers as usize {
             return Err(Error::Config("head_dims length mismatch".into()));

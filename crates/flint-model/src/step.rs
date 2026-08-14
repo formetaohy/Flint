@@ -3,19 +3,17 @@ use flint_error::Result;
 use flint_tensor::{DType, Tensor};
 
 use crate::model::MAX_M;
-use crate::ops::ATTN_SEGS;
 
 pub fn token_ids(backend: &Backend) -> Tensor {
     Tensor::new(backend.storage(MAX_M as u64 * 4), vec![MAX_M], DType::U32)
 }
 
 pub fn step_args(backend: &Backend) -> Tensor {
-    Tensor::new(backend.storage(8), vec![2], DType::U32)
+    Tensor::new(backend.storage(4), vec![1], DType::U32)
 }
 
-pub fn write_step_args(backend: &Backend, args: &Tensor, pos: u32, kv_len: u32) {
-    let segs = kv_len.div_ceil(256).clamp(1, ATTN_SEGS);
-    backend.write_u32(&args.buf, &[pos, segs]);
+pub fn write_step_args(backend: &Backend, args: &Tensor, pos: u32) {
+    backend.write_u32(&args.buf, &[pos]);
 }
 
 pub fn read_rows(

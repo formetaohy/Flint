@@ -1,4 +1,4 @@
-﻿use flint_backend::{Backend, Binding, Commands};
+use flint_backend::{Backend, Binding, Commands};
 use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::{Error, Result};
 use flint_model::cache::KvCache;
@@ -112,13 +112,6 @@ impl Qwen35Config {
         }
         if !t.q_heads.is_multiple_of(t.kv_heads) {
             return Err(Error::Config("q heads not divisible by kv heads".into()));
-        }
-        if t.q_heads / t.kv_heads > ops::MAX_GQA {
-            return Err(Error::Config(format!(
-                "GQA ratio {} exceeds the attention shader's {} head slots",
-                t.q_heads / t.kv_heads,
-                ops::MAX_GQA
-            )));
         }
         ops::check_head_dim(t.head_dim)?;
         if !t.rotary_dim().is_multiple_of(2) {
@@ -289,7 +282,6 @@ struct Scratch {
     attn_out: Tensor,
     attn_gated: Tensor,
 
-    attn_scratch: Tensor,
     qg: Tensor,
     q: Tensor,
     q_normed: Tensor,
@@ -324,13 +316,6 @@ fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
         g: z(&[cfg.lin_val_heads]),
         attn_out: z(&[MAX_M, cfg.value_dim()]),
         attn_gated: z(&[MAX_M, cfg.value_dim()]),
-        attn_scratch: z(&[
-            MAX_M,
-            cfg.kv_heads,
-            ops::ATTN_SEGS,
-            ops::MAX_GQA,
-            cfg.head_dim + ops::ATTN_PAD,
-        ]),
         qg: z(&[MAX_M, cfg.q_heads * cfg.head_dim * 2]),
         q: z(&[MAX_M, cfg.q_heads * cfg.head_dim]),
         q_normed: z(&[MAX_M, cfg.q_heads * cfg.head_dim]),
@@ -499,7 +484,7 @@ impl LanguageModel for Qwen35 {
         let mut ids = vec![0u32; MAX_M as usize];
         ids[..tokens.len()].copy_from_slice(tokens);
         backend.write_u32(&self.s.ids.buf, &ids);
-        step::write_step_args(backend, &self.s.args, self.pos, self.pos + m);
+        step::write_step_args(backend, &self.s.args, self.pos);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder()?;
@@ -618,7 +603,7 @@ impl Speculator for Qwen35 {
         let mut ids = vec![0u32; MAX_M as usize];
         ids[0] = token;
         backend.write_u32(&self.s.ids.buf, &ids);
-        step::write_step_args(backend, &self.s.args, self.mtp_pos, self.mtp_pos + 1);
+        step::write_step_args(backend, &self.s.args, self.mtp_pos);
         backend.write_f32(&self.s.mtp_hidden.buf, hidden);
 
         let cfg = &self.cfg;
@@ -916,12 +901,10 @@ fn full_attn_block(
         commands,
         Binding::Full(&s.q_normed),
         kv,
-        &s.attn_scratch,
         Binding::Full(&s.attn_out),
         &ops::AttnSpec {
             q_heads: nq,
             window: 0,
-            stride: hd + ops::ATTN_PAD,
             scale: (hd as f32).sqrt().recip(),
             m,
             args,
