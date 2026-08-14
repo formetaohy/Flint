@@ -452,13 +452,14 @@ fn attn_probe() -> Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(d)
     };
-    let (m, nq, nkv, hd, max_seq, pos) = (
+    let (m, nq, nkv, hd, max_seq, pos, window) = (
         env("PROBE_M", 128),
         env("PROBE_Q_HEADS", 32),
         env("PROBE_KV_HEADS", 8),
         env("PROBE_HD", 128),
         env("PROBE_MAX_SEQ", 2048),
         env("PROBE_POS", 1024),
+        env("PROBE_WINDOW", 0),
     );
     let mut backend = Backend::new()?;
     eprintln!("[probe] adapter: {}", backend.adapter_name());
@@ -502,7 +503,7 @@ fn attn_probe() -> Result<()> {
                     ("HEAD_DIM", hd as f64),
                     ("MAX_SEQ", max_seq as f64),
                     ("SCALE", 1.0 / (hd as f64).sqrt()),
-                    ("WINDOW", 0.0),
+                    ("WINDOW", window as f64),
                     ("NQ_PER_KV", (nq / nkv) as f64),
                 ],
                 &[

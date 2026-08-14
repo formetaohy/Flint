@@ -65,6 +65,10 @@ fn attn(
     var m_old = NEG_INF;
     var s_old = 0.0;
     var o = array<f32, 16>();
+    var first_win_start = 0u;
+    if WINDOW != 0 && pos + m0 + 1 > WINDOW {
+        first_win_start = pos + m0 + 1 - WINDOW;
+    }
     var c0 = 0u;
     var w = t;
     loop {
@@ -88,6 +92,7 @@ fn attn(
         }
         var s = array<f32, COLS>();
         let limit = min(BC, kv_len - c0);
+        let block_dead = WINDOW != 0 && c0 + limit - 1 < first_win_start;
         for (var ds = 0u; ds < k_segs; ds++) {
             let buf = ds % 2;
             let d_base = ds * KD;
@@ -137,41 +142,53 @@ fn attn(
             m_cur = max(m_cur, sc);
         }
         let m_row = subgroupMax(m_cur);
-        let m_new = max(m_old, m_row);
-        let r = exp(m_old - m_new);
         var s_cur = 0.0;
-        for (var c = 0u; c < COLS; c++) {
-            let e = select(exp(s[c] - m_new), 0.0, s[c] == NEG_INF);
-            s[c] = e;
-            s_cur = s_cur + e;
+        if m_row > m_old {
+            let r = exp(m_old - m_row);
+            s_old = s_old * r;
+            if HEAD_DIM <= 128 {
+                let d8 = lane % 16 * 8;
+                for (var i8 = 0u; i8 < 8u; i8++) {
+                    if d8 + i8 < HEAD_DIM {
+                        o[i8] = o[i8] * r;
+                    }
+                }
+            } else {
+                var nb0 = 0u;
+                loop {
+                    let d8 = lane * 8 + nb0 * LANES * 8;
+                    if d8 >= HEAD_DIM {
+                        break;
+                    }
+                    for (var i8 = 0u; i8 < 8u; i8++) {
+                        o[nb0 * 8 + i8] = o[nb0 * 8 + i8] * r;
+                    }
+                    nb0 = nb0 + 1;
+                }
+            }
+            for (var c = 0u; c < COLS; c++) {
+                let e = select(exp(s[c] - m_row), 0.0, s[c] == NEG_INF);
+                s[c] = e;
+                s_cur = s_cur + e;
+            }
+            m_old = m_row;
+        } else {
+            for (var c = 0u; c < COLS; c++) {
+                let e = select(exp(s[c] - m_old), 0.0, s[c] == NEG_INF);
+                s[c] = e;
+                s_cur = s_cur + e;
+            }
         }
         let s_row = subgroupAdd(s_cur);
-        s_old = s_old * r + s_row;
-        if HEAD_DIM <= 128 {
-            let d8 = lane % 16 * 8;
-            for (var i8 = 0u; i8 < 8u; i8++) {
-                if d8 + i8 < HEAD_DIM {
-                    o[i8] = o[i8] * r;
-                }
+        s_old = s_old + s_row;
+        if !block_dead {
+            for (var c = 0u; c < COLS; c++) {
+                kt[row * BC + lane * COLS + c] = s[c];
             }
-        } else {
-            var nb0 = 0u;
-            loop {
-                let d8 = lane * 8 + nb0 * LANES * 8;
-                if d8 >= HEAD_DIM {
-                    break;
-                }
-                for (var i8 = 0u; i8 < 8u; i8++) {
-                    o[nb0 * 8 + i8] = o[nb0 * 8 + i8] * r;
-                }
-                nb0 = nb0 + 1;
-            }
-        }
-        for (var c = 0u; c < COLS; c++) {
-            kt[row * BC + lane * COLS + c] = s[c];
         }
         workgroupBarrier();
-        if HEAD_DIM <= 128 {
+        if !block_dead {
+            if HEAD_DIM <= 128 {
             let col_lo = (lane / 16) * 64;
             for (var col = 0u; col < 64u; col++) {
                 let gcol = c0 + col_lo + col;
@@ -262,8 +279,8 @@ fn attn(
                 }
             }
         }
+        }
         workgroupBarrier();
-        m_old = m_new;
         c0 = c0 + BC;
         if c0 < kv_len {
             let words = BC * min(KD, HEAD_DIM) / 2;
