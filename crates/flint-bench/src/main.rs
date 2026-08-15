@@ -5,7 +5,7 @@ use clap::Parser;
 use flint_architectures::transformer::{Config, Model, plan};
 use flint_backend::Backend;
 use flint_error::Result;
-use flint_model::LanguageModel;
+use flint_model::{LanguageModel, SeqChunk};
 use serde_json::json;
 
 use flint_bench::synth::{BenchSpec, SynthCheckpoint};
@@ -135,7 +135,7 @@ fn main() -> Result<()> {
     let cfg = config(&spec);
     let plan = plan(false);
     let mut backend = backend;
-    let mut model = Model::load(&source, cfg, &plan, args.max_seq, &backend)?;
+    let mut model = Model::load(&source, cfg, &plan, &[args.max_seq], None, &backend)?;
     eprintln!(
         "[bench] weights loaded in {:.1}s",
         t0.elapsed().as_secs_f64()
@@ -148,7 +148,15 @@ fn main() -> Result<()> {
     let mut t = 0u32;
 
     let warm_ids: Vec<u32> = (0..16).map(|i| i % (args.vocab - 1) + 1).collect();
-    model.forward(&mut backend, &warm_ids, &[], &[])?;
+    let _ = model.forward(
+        &mut backend,
+        &[SeqChunk {
+            tokens: &warm_ids,
+            slot: 0,
+            logit_rows: &[],
+            hidden_rows: &[],
+        }],
+    )?;
     let _ = backend.read_f32(&backend.unit_scale().buf, 0, 1)?;
     let prefill_span = match &profiler {
         Some(p) => Some(p.borrow_mut().begin_span()?),
@@ -159,12 +167,28 @@ fn main() -> Result<()> {
         let ids: Vec<u32> = (t..t + flint_model::MAX_M)
             .map(|i| i % (args.vocab - 1) + 1)
             .collect();
-        model.forward(&mut backend, &ids, &[], &[])?;
+        let _ = model.forward(
+            &mut backend,
+            &[SeqChunk {
+                tokens: &ids,
+                slot: 0,
+                logit_rows: &[],
+                hidden_rows: &[],
+            }],
+        )?;
         t += flint_model::MAX_M;
     }
     if rem > 0 {
         let ids: Vec<u32> = (t..t + rem).map(|i| i % (args.vocab - 1) + 1).collect();
-        model.forward(&mut backend, &ids, &[], &[])?;
+        let _ = model.forward(
+            &mut backend,
+            &[SeqChunk {
+                tokens: &ids,
+                slot: 0,
+                logit_rows: &[],
+                hidden_rows: &[],
+            }],
+        )?;
     }
     if let (Some(p), Some(span)) = (&profiler, prefill_span) {
         p.borrow_mut().end_span("prefill", span)?;
@@ -189,12 +213,20 @@ fn main() -> Result<()> {
     for (i, tok) in (0..args.decode_tokens).enumerate() {
         let ids = [tok % (args.vocab - 1) + 1];
         let s0 = Instant::now();
-        let out = model.forward(&mut backend, &ids, &[0], &[])?;
+        let out = model.forward(
+            &mut backend,
+            &[SeqChunk {
+                tokens: &ids,
+                slot: 0,
+                logit_rows: &[0],
+                hidden_rows: &[],
+            }],
+        )?;
         per_step.push(s0.elapsed().as_secs_f64() * 1000.0);
         if args.verbose && i < 12 {
             eprintln!("[bench] step {i}: {:.2} ms", per_step.last().unwrap());
         }
-        logits = out.logits[0].clone();
+        logits = out[0].logits[0].clone();
     }
     let decode_secs = t0.elapsed().as_secs_f64();
     if let (Some(p), Some(span)) = (&profiler, decode_span) {

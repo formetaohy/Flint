@@ -41,6 +41,15 @@ impl Tokenizer {
         self.inner.token_to_id(token)
     }
 
+    pub fn vocab_size(&self) -> u32 {
+        self.inner.get_vocab_size(true) as u32
+    }
+
+    pub fn decode_id(&self, id: u32) -> Option<Vec<u8>> {
+        let text = self.inner.decode(&[id], true).ok()?;
+        (!text.is_empty()).then(|| text.into_bytes())
+    }
+
     pub fn stream_decoder(&self) -> StreamDecoder {
         StreamDecoder {
             ids: Vec::new(),

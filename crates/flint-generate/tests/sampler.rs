@@ -33,7 +33,7 @@ fn logits(n: usize, seed: u64, scale: f32) -> Vec<f32> {
 fn greedy_transform_is_penalized_argmax() {
     let s = Sampler::greedy(1);
     let logits = [0.1f32, 5.0, -2.0, 4.9];
-    assert_eq!(s.transform(&logits, &[]), Dist::Greedy(1));
+    assert_eq!(s.transform(&logits, &[], None), Dist::Greedy(1));
 
     let penalized = Sampler::new(
         SamplingParams {
@@ -43,7 +43,7 @@ fn greedy_transform_is_penalized_argmax() {
         },
         1,
     );
-    assert_eq!(penalized.transform(&logits, &[1, 1, 1]), Dist::Greedy(3));
+    assert_eq!(penalized.transform(&logits, &[1, 1, 1], None), Dist::Greedy(3));
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn stochastic_transform_renormalizes_over_the_kept_set() {
         },
         0,
     );
-    let d = s.transform(&logits, &[]);
+    let d = s.transform(&logits, &[], None);
     let p = probs(&d);
     assert_eq!(p.len(), 10);
     let nonzero: Vec<u32> = p
@@ -98,7 +98,7 @@ fn top_p_keeps_only_the_nucleus() {
         },
         0,
     );
-    let d = s.transform(&logits, &[]);
+    let d = s.transform(&logits, &[], None);
     let p = probs(&d);
     for (i, &v) in p.iter().enumerate() {
         assert!(
@@ -118,7 +118,7 @@ fn min_p_drops_tokens_below_the_relative_floor() {
         },
         0,
     );
-    let d = s.transform(&logits, &[]);
+    let d = s.transform(&logits, &[], None);
     let p = probs(&d);
     assert!(p[0] > 0.99, "dominant token survives");
     assert!(
@@ -139,8 +139,8 @@ fn draw_is_deterministic_per_seed() {
     };
     let mut a = Sampler::new(params, 99);
     let mut b = Sampler::new(params, 99);
-    let da = a.transform(&logits, &[]);
-    let db = b.transform(&logits, &[]);
+    let da = a.transform(&logits, &[], None);
+    let db = b.transform(&logits, &[], None);
     for _ in 0..20 {
         assert_eq!(a.draw(&da), b.draw(&db));
     }
@@ -204,7 +204,7 @@ fn softmax_sums_to_one_and_sharpens() {
 }
 
 fn transformed(s: &Sampler, logits: &[f32]) -> Dist {
-    s.transform(logits, &[])
+    s.transform(logits, &[], None)
 }
 
 #[test]
@@ -263,8 +263,8 @@ fn verify_output_distribution_equals_target() {
     let draft_logits = logits(VOCAB, 29, 3.0);
 
     let mut s = Sampler::new(params, 1234);
-    let pt = s.transform(&target_logits, &context);
-    let pd = s.transform(&draft_logits, &context);
+    let pt = s.transform(&target_logits, &context, None);
+    let pd = s.transform(&draft_logits, &context, None);
     let pt = probs(&pt);
     let pd = probs(&pd);
 
@@ -321,17 +321,31 @@ fn greedy_spec_sequence_matches_plain_greedy() {
     let mut plain = Sampler::greedy(9);
     let plain_tokens: Vec<u32> = target
         .iter()
-        .map(|l| plain.draw(&plain.transform(l, &[])))
+        .map(|l| plain.draw(&plain.transform(l, &[], None)))
         .collect();
 
     let mut spec = Sampler::greedy(9);
     let mut spec_tokens = Vec::new();
     for i in 0..STEPS {
-        let pd = spec.transform(&draft[i], &[]);
+        let pd = spec.transform(&draft[i], &[], None);
         let d = spec.draw(&pd);
-        let pt = spec.transform(&target[i], &[]);
+        let pt = spec.transform(&target[i], &[], None);
         let (_, tok) = spec.verify(&pt, &pd, d);
         spec_tokens.push(tok);
     }
     assert_eq!(spec_tokens, plain_tokens);
+}
+
+#[test]
+fn mask_zeroes_banned_tokens_in_both_modes() {
+    let logits = [0.1f32, 5.0, -2.0, 4.9];
+    let mask = [1.0, 0.0, 1.0, 0.0];
+    let s = Sampler::greedy(1);
+    assert_eq!(s.transform(&logits, &[], Some(&mask)), Dist::Greedy(0));
+    let st = Sampler::new(params(), 1);
+    let d = st.transform(&logits, &[], Some(&mask));
+    let p = probs(&d);
+    assert_eq!(p[1], 0.0);
+    assert_eq!(p[3], 0.0);
+    assert!(p[0] > 0.0 && p[2] > 0.0);
 }

@@ -264,10 +264,12 @@ const SHADERS: &[ShaderSpec] = &[
             ("M", Scalar::U32),
             ("N_HEADS", Scalar::U32),
             ("HEAD_DIM", Scalar::U32),
-            ("MAX_SEQ", Scalar::U32),
+            ("POOL_LEN", Scalar::U32),
             ("SCALE", Scalar::F32),
             ("WINDOW", Scalar::U32),
             ("NQ_PER_KV", Scalar::U32),
+            ("SLOT", Scalar::U32),
+            ("CAUSAL", Scalar::U32),
         ]
     ),
     shader!(
@@ -277,7 +279,7 @@ const SHADERS: &[ShaderSpec] = &[
         &[
             ("N_KV", Scalar::U32),
             ("HEAD_DIM", Scalar::U32),
-            ("MAX_SEQ", Scalar::U32),
+            ("POOL_LEN", Scalar::U32),
         ]
     ),
     shader!(

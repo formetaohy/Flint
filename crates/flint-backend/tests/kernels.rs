@@ -1,9 +1,17 @@
+use std::sync::{Mutex, MutexGuard};
+
 use flint_backend::{Backend, Binding, Commands};
 use flint_kernel::{Act, NormMode, name};
 
 mod support;
 use support::cpu_ref;
 use flint_tensor::{DType, Tensor, Weight};
+
+static GPU: Mutex<()> = Mutex::new(());
+
+fn gpu() -> MutexGuard<'static, ()> {
+    GPU.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 struct Ctx {
     backend: Backend,
@@ -36,9 +44,18 @@ impl Ctx {
         self.backend.zero_bf16_tensor(shape)
     }
 
-    fn arg(&self, pos: usize) -> Tensor {
-        let t = Tensor::new(self.backend.storage(4), vec![1], DType::U32);
-        self.backend.write_u32(&t.buf, &[pos as u32]);
+    fn rows(&self, pos: usize, m: usize) -> Tensor {
+        let t = Tensor::new(
+            self.backend.storage(m as u64 * 8),
+            vec![2 * m as u32],
+            DType::U32,
+        );
+        let mut data = Vec::with_capacity(2 * m);
+        for i in 0..m {
+            data.push(pos as u32 + i as u32);
+            data.push(0);
+        }
+        self.backend.write_u32(&t.buf, &data);
         t
     }
 
@@ -210,11 +227,13 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
 
 #[test]
 fn gemm_bf16() {
+    let _g = gpu();
     gemm_case(WType::Bf16, 16, 64, 128, 7);
 }
 
 #[test]
 fn gemm_coop_bf16() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let mut rng = Rng(7);
     let (m, n, k) = (16usize, 64usize, 128usize);
@@ -255,6 +274,7 @@ fn gemm_coop_bf16() {
 
 #[test]
 fn gemm_coop_i8_group32() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let mut rng = Rng(71);
     let (m, n, k, group) = (16usize, 64usize, 128usize, 32usize);
@@ -292,6 +312,7 @@ fn gemm_coop_i8_group32() {
 
 #[test]
 fn gemm_coop_bf16_segs() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let mut rng = Rng(77);
     let (m, n, k) = (16usize, 64usize, 8192usize);
@@ -347,6 +368,7 @@ fn gemm_coop_bf16_segs() {
 
 #[test]
 fn gemm_coop_bf16_multi_tile() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let mut rng = Rng(29);
     let (m, n, k) = (80usize, 64usize, 256usize);
@@ -387,21 +409,25 @@ fn gemm_coop_bf16_multi_tile() {
 
 #[test]
 fn gemm_bf16_multi_tile_m() {
+    let _g = gpu();
     gemm_case(WType::Bf16, 32, 32, 64, 29);
 }
 
 #[test]
 fn gemm_i8_group128() {
+    let _g = gpu();
     gemm_case(WType::I8(128), 16, 256, 256, 17);
 }
 
 #[test]
 fn gemm_i8_group64() {
+    let _g = gpu();
     gemm_case(WType::I8(64), 16, 64, 960, 19);
 }
 
 #[test]
 fn gemm_i8_group32() {
+    let _g = gpu();
     gemm_case(WType::I8(32), 16, 32, 192, 23);
 }
 
@@ -468,31 +494,37 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
 
 #[test]
 fn gemv_bf16() {
+    let _g = gpu();
     gemv_case(WType::Bf16, 32, 128, 31, 1);
 }
 
 #[test]
 fn gemv_i8_group128() {
+    let _g = gpu();
     gemv_case(WType::I8(128), 64, 256, 37, 1);
 }
 
 #[test]
 fn gemv_i8_partial_chunk() {
+    let _g = gpu();
     gemv_case(WType::I8(32), 32, 192, 41, 1);
 }
 
 #[test]
 fn gemv_i8_split4() {
+    let _g = gpu();
     gemv_case(WType::I8(128), 64, 512, 43, 4);
 }
 
 #[test]
 fn gemv_bf16_split8() {
+    let _g = gpu();
     gemv_case(WType::Bf16, 32, 1024, 47, 8);
 }
 
 #[test]
 fn gemv_bf16_split_segs_divide_k_blocks() {
+    let _g = gpu();
     let k = 1088u32;
     let n = 5120u32;
     let mut ctx = Ctx::new();
@@ -570,11 +602,13 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
 
 #[test]
 fn embed_unit_scale() {
+    let _g = gpu();
     embed_case(4, 16, 1.0, 11);
 }
 
 #[test]
 fn embed_gemma_scale() {
+    let _g = gpu();
     embed_case(3, 16, 4.0, 13);
 }
 
@@ -667,6 +701,7 @@ fn norm_rope_cpu(x: &[f32], w: &[f32], cos: &[f32], sin: &[f32], spec: NormRopeA
 
 #[test]
 fn norm_rope_mode4_pos72_repro() {
+    let _g = gpu();
     let (rows, dim, rot, heads, pos) = (32usize, 128usize, 128usize, 16usize, 72usize);
     let mut ctx = Ctx::new();
     let mut rng = Rng(1234);
@@ -688,7 +723,7 @@ fn norm_rope_mode4_pos72_repro() {
     let y = ctx.zero(&[rows as u32, dim as u32]);
     let cb = ctx.f32(&cos, &[4096, half as u32]);
     let sb = ctx.f32(&sin, &[4096, half as u32]);
-    let args = ctx.arg(pos);
+    let args = ctx.rows(pos, rows / heads);
 
     ctx.dispatch(
         name::NORM,
@@ -739,26 +774,31 @@ fn norm_rope_mode4_pos72_repro() {
 
 #[test]
 fn norm_layer() {
+    let _g = gpu();
     norm_case(NormMode::Layer, 4, 64, 64, 29);
 }
 
 #[test]
 fn norm_offset() {
+    let _g = gpu();
     norm_case(NormMode::Offset, 3, 64, 64, 21);
 }
 
 #[test]
 fn norm_gated_weight_repeats_across_row() {
+    let _g = gpu();
     norm_case(NormMode::Gated, 4, 64, 8, 31);
 }
 
 #[test]
 fn norm_direct() {
+    let _g = gpu();
     norm_case(NormMode::Direct, 2, 32, 32, 27);
 }
 
 #[test]
 fn add() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let n = 100usize;
     let mut rng = Rng(33);
@@ -779,6 +819,7 @@ fn add() {
 
 #[test]
 fn bias() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let (rows, dim) = (3usize, 16usize);
     let mut rng = Rng(35);
@@ -800,6 +841,7 @@ fn bias() {
 
 #[test]
 fn swiglu() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let n = 100usize;
     let mut rng = Rng(41);
@@ -820,6 +862,7 @@ fn swiglu() {
 
 #[test]
 fn swiglu_gelu_tanh() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let n = 100usize;
     let mut rng = Rng(47);
@@ -845,6 +888,7 @@ fn swiglu_gelu_tanh() {
 
 #[test]
 fn softcap() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let n = 100usize;
     let mut rng = Rng(53);
@@ -865,6 +909,7 @@ fn softcap() {
 
 #[test]
 fn mul_broadcast() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let n = 160usize;
     let mut rng = Rng(59);
@@ -891,6 +936,7 @@ fn mul_broadcast() {
 
 #[test]
 fn expert_gather_scatter() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let hidden = 32usize;
     let mut rng = Rng(61);
@@ -934,6 +980,7 @@ fn expert_gather_scatter() {
 
 #[test]
 fn zero_rows() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let x = vec![1.0f32, 2.0, 3.0, 4.0];
     let xb = ctx.f32(&x, &[4u32]);
@@ -950,6 +997,7 @@ fn zero_rows() {
 
 #[test]
 fn sigmoid_mul() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let n = 100usize;
     let mut rng = Rng(43);
@@ -970,6 +1018,7 @@ fn sigmoid_mul() {
 
 #[test]
 fn concat() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let (rows, d) = (2usize, 8usize);
     let mut rng = Rng(37);
@@ -1008,7 +1057,7 @@ fn rope_case(m: usize, heads: usize, hd: usize, rot: usize, pos: usize, seed: u6
     let xb = ctx.f32(&x, &[m as u32, heads as u32, hd as u32]);
     let cb = ctx.f32(&cos, &[max_seq as u32, half as u32]);
     let sb = ctx.f32(&sin, &[max_seq as u32, half as u32]);
-    let args = ctx.arg(pos);
+    let args = ctx.rows(pos, m);
 
     ctx.dispatch(
         name::ROPE,
@@ -1033,16 +1082,19 @@ fn rope_case(m: usize, heads: usize, hd: usize, rot: usize, pos: usize, seed: u6
 
 #[test]
 fn rope_partial_rotation_multi_row() {
+    let _g = gpu();
     rope_case(2, 2, 32, 16, 2, 51);
 }
 
 #[test]
 fn rope_full_rotation() {
+    let _g = gpu();
     rope_case(1, 1, 32, 32, 0, 53);
 }
 
 #[test]
 fn conv1d_rolls_state_across_steps() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let dim = 8usize;
     let mut rng = Rng(61);
@@ -1076,6 +1128,7 @@ fn conv1d_rolls_state_across_steps() {
 
 #[test]
 fn repeat_qk_sees_convd_writes_in_same_pass() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
 
     let (n_k, n_v, kd, vd) = (2usize, 2usize, 16usize, 64usize);
@@ -1182,22 +1235,26 @@ fn repeat_qk_case(rows: usize, n_k: usize, n_v: usize, kd: usize, vd: usize, see
 
 #[test]
 fn repeat_qk_production_dims() {
+    let _g = gpu();
     repeat_qk_case(2, 16, 16, 8, 8, 211);
 }
 
 #[test]
 fn repeat_qk_identity_ratio_one() {
+    let _g = gpu();
     repeat_qk_case(3, 4, 4, 8, 16, 91);
 }
 
 #[test]
 fn repeat_qk_expands_key_heads() {
+    let _g = gpu();
     repeat_qk_case(2, 2, 4, 8, 16, 93);
     repeat_qk_case(3, 1, 3, 16, 8, 97);
 }
 
 #[test]
 fn anchor_repeat_qk() {
+    let _g = gpu();
     let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
     let mut y = vec![0f32; 8];
     cpu_ref::repeat_qk(&x, &mut y, 1, 1, 2, 2, 3);
@@ -1206,6 +1263,7 @@ fn anchor_repeat_qk() {
 
 #[test]
 fn delta_gate_selects_chunk_rows() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let (rows, heads) = (3usize, 4usize);
     let mut rng = Rng(71);
@@ -1288,16 +1346,19 @@ fn delta_recur_case(heads: usize, kd: usize, vd: usize, seed: u64) {
 
 #[test]
 fn delta_recur_symmetric_dims() {
+    let _g = gpu();
     delta_recur_case(2, 8, 8, 81);
 }
 
 #[test]
 fn delta_recur_asymmetric_dims() {
+    let _g = gpu();
     delta_recur_case(1, 16, 8, 83);
 }
 
 #[test]
 fn kv_store_attn_hd128_gqa2_pos71() {
+    let _g = gpu();
     let (m, nq, nkv, hd, max_seq, pos) = (2usize, 16usize, 8usize, 128usize, 4096usize, 71usize);
     let mut ctx = Ctx::new();
     let mut rng = Rng(4321);
@@ -1312,14 +1373,14 @@ fn kv_store_attn_hd128_gqa2_pos71() {
     let k_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
     let v_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
     let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
-    let args = ctx.arg(pos);
+    let args = ctx.rows(pos, m);
 
     ctx.dispatch(
         name::KV_STORE,
         &[
             ("N_KV", nkv as f64),
             ("HEAD_DIM", hd as f64),
-            ("MAX_SEQ", max_seq as f64),
+            ("POOL_LEN", max_seq as f64),
         ],
         &[
             Binding::Full(&kb),
@@ -1336,10 +1397,12 @@ fn kv_store_attn_hd128_gqa2_pos71() {
             ("M", m as f64),
             ("N_HEADS", nq as f64),
             ("HEAD_DIM", hd as f64),
-            ("MAX_SEQ", max_seq as f64),
+            ("POOL_LEN", max_seq as f64),
             ("SCALE", 1.0 / (hd as f64).sqrt()),
             ("WINDOW", 0.0),
             ("NQ_PER_KV", (nq / nkv) as f64),
+            ("SLOT", 0.0),
+            ("CAUSAL", 1.0),
         ],
         &[
             Binding::Full(&qb),
@@ -1361,13 +1424,14 @@ fn kv_store_attn_hd128_gqa2_pos71() {
         }
     }
     let got = ctx.read(&y);
-    let want = cpu_ref::attn(&q, &kc, &vc, cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window: 0 });
+    let want = cpu_ref::attn(&q, &kc, &vc, cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window: 0, causal: true });
     agree(&got, &want, 1e-2, 1e-2);
     eprintln!("nan in gpu: {}", got.iter().filter(|v| v.is_nan()).count());
 }
 
 #[test]
 fn attn_gemm_coexist() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let mut rng = Rng(2049);
     let (m, nq, nkv, max_seq, pos, hd) = (4usize, 4usize, 2usize, 256usize, 130usize, 64usize);
@@ -1378,7 +1442,7 @@ fn attn_gemm_coexist() {
     let kb = ctx.bf16(&kc, &[nkv as u32, max_seq as u32, hd as u32]);
     let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
     let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
-    let args = ctx.arg(pos);
+    let args = ctx.rows(pos, m);
 
     let (k2, n2) = (96usize, 80usize);
     let x = rng.fill(m * k2);
@@ -1400,10 +1464,12 @@ fn attn_gemm_coexist() {
                         ("M", m as f64),
                         ("N_HEADS", nq as f64),
                         ("HEAD_DIM", hd as f64),
-                        ("MAX_SEQ", max_seq as f64),
+                        ("POOL_LEN", max_seq as f64),
                         ("SCALE", 1.0 / (hd as f64).sqrt()),
                         ("WINDOW", 0.0),
                         ("NQ_PER_KV", (nq / nkv) as f64),
+            ("SLOT", 0.0),
+            ("CAUSAL", 1.0),
                     ],
                     &[
                         Binding::Full(&qb),
@@ -1445,7 +1511,7 @@ fn attn_gemm_coexist() {
 
     agree(
         &ctx.read(&y),
-        &cpu_ref::attn(&q, &kc, &vc, cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window: 0 }),
+        &cpu_ref::attn(&q, &kc, &vc, cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window: 0, causal: true }),
         2e-3,
         1e-3,
     );
@@ -1454,8 +1520,9 @@ fn attn_gemm_coexist() {
 
 #[test]
 fn attn_decode_positions() {
+    let _g = gpu();
     for pos in [1usize, 63, 64, 65, 255, 511] {
-        attn_case(AttnCase { m: 1, nq: 8, nkv: 2, hd: 128, max_seq: 1024, pos, window: 0, seed: 7000 + pos as u64, k_scale: 0.1 });
+        attn_case(AttnCase { m: 1, nq: 8, nkv: 2, hd: 128, max_seq: 1024, pos, window: 0, seed: 7000 + pos as u64, k_scale: 0.1, causal: true });
     }
 }
 struct AttnCase {
@@ -1468,6 +1535,7 @@ struct AttnCase {
     window: usize,
     seed: u64,
     k_scale: f32,
+    causal: bool,
 }
 
 fn attn_case(spec: AttnCase) {
@@ -1481,6 +1549,7 @@ fn attn_case(spec: AttnCase) {
         window,
         seed,
         k_scale,
+        causal,
     } = spec;
     let mut ctx = Ctx::new();
     let mut rng = Rng(seed);
@@ -1497,7 +1566,7 @@ fn attn_case(spec: AttnCase) {
     let kb = ctx.bf16(&kc, &[nkv as u32, max_seq as u32, hd as u32]);
     let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
     let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
-    let args = ctx.arg(pos);
+    let args = ctx.rows(pos, m);
 
     ctx.dispatch(
         name::ATTN,
@@ -1505,10 +1574,12 @@ fn attn_case(spec: AttnCase) {
             ("M", m as f64),
             ("N_HEADS", nq as f64),
             ("HEAD_DIM", hd as f64),
-            ("MAX_SEQ", max_seq as f64),
+            ("POOL_LEN", max_seq as f64),
             ("SCALE", 1.0 / (hd as f64).sqrt()),
             ("WINDOW", window as f64),
             ("NQ_PER_KV", (nq / nkv) as f64),
+            ("SLOT", 0.0),
+            ("CAUSAL", causal as u32 as f64),
         ],
         &[
             Binding::Full(&qb),
@@ -1529,7 +1600,7 @@ fn attn_case(spec: AttnCase) {
             &q,
             &kc,
             &vc,
-            cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window },
+            cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window, causal },
         ),
         1e-2,
         1e-2,
@@ -1538,55 +1609,73 @@ fn attn_case(spec: AttnCase) {
 
 #[test]
 fn attn_hd64_multi_block() {
-    attn_case(AttnCase { m: 16, nq: 8, nkv: 2, hd: 64, max_seq: 512, pos: 256, window: 0, seed: 501, k_scale: 0.1 });
+    let _g = gpu();
+    attn_case(AttnCase { m: 16, nq: 8, nkv: 2, hd: 64, max_seq: 512, pos: 256, window: 0, seed: 501, k_scale: 0.1, causal: true });
 }
 
 #[test]
 fn attn_hd128_gqa4() {
-    attn_case(AttnCase { m: 8, nq: 32, nkv: 8, hd: 128, max_seq: 1024, pos: 512, window: 0, seed: 503, k_scale: 0.1 });
+    let _g = gpu();
+    attn_case(AttnCase { m: 8, nq: 32, nkv: 8, hd: 128, max_seq: 1024, pos: 512, window: 0, seed: 503, k_scale: 0.1, causal: true });
 }
 
 #[test]
 fn attn_hd256_kd_segments() {
-    attn_case(AttnCase { m: 4, nq: 8, nkv: 4, hd: 256, max_seq: 512, pos: 300, window: 0, seed: 505, k_scale: 0.1 });
+    let _g = gpu();
+    attn_case(AttnCase { m: 4, nq: 8, nkv: 4, hd: 256, max_seq: 512, pos: 300, window: 0, seed: 505, k_scale: 0.1, causal: true });
 }
 
 #[test]
 fn attn_hd100_odd_dim_segs() {
-    attn_case(AttnCase { m: 4, nq: 8, nkv: 2, hd: 100, max_seq: 256, pos: 128, window: 0, seed: 507, k_scale: 0.1 });
+    let _g = gpu();
+    attn_case(AttnCase { m: 4, nq: 8, nkv: 2, hd: 100, max_seq: 256, pos: 128, window: 0, seed: 507, k_scale: 0.1, causal: true });
 }
 
 #[test]
 fn attn_sliding_window() {
-    attn_case(AttnCase { m: 8, nq: 8, nkv: 2, hd: 128, max_seq: 1024, pos: 700, window: 128, seed: 509, k_scale: 0.1 });
+    let _g = gpu();
+    attn_case(AttnCase { m: 8, nq: 8, nkv: 2, hd: 128, max_seq: 1024, pos: 700, window: 128, seed: 509, k_scale: 0.1, causal: true });
 }
 
 #[test]
 fn attn_pos_boundaries() {
+    let _g = gpu();
     for pos in [0usize, 1, 31, 32, 33, 63, 64, 65, 127, 255, 511] {
-        attn_case(AttnCase { m: 5, nq: 4, nkv: 2, hd: 64, max_seq: 1024, pos, window: 0, seed: 600 + pos as u64, k_scale: 0.1 });
+        attn_case(AttnCase { m: 5, nq: 4, nkv: 2, hd: 64, max_seq: 1024, pos, window: 0, seed: 600 + pos as u64, k_scale: 0.1, causal: true });
     }
 }
 
 #[test]
 fn attn_m_sweep() {
+    let _g = gpu();
     for m in [1usize, 2, 7, 8, 9, 15, 16, 17] {
-        attn_case(AttnCase { m, nq: 4, nkv: 2, hd: 128, max_seq: 128, pos: 64, window: 0, seed: 800 + m as u64, k_scale: 0.1 });
+        attn_case(AttnCase { m, nq: 4, nkv: 2, hd: 128, max_seq: 128, pos: 64, window: 0, seed: 800 + m as u64, k_scale: 0.1, causal: true });
     }
 }
 
 #[test]
 fn attn_gqa_8x() {
-    attn_case(AttnCase { m: 2, nq: 16, nkv: 2, hd: 128, max_seq: 64, pos: 32, window: 0, seed: 511, k_scale: 0.1 });
+    let _g = gpu();
+    attn_case(AttnCase { m: 2, nq: 16, nkv: 2, hd: 128, max_seq: 64, pos: 32, window: 0, seed: 511, k_scale: 0.1, causal: true });
 }
 
 #[test]
 fn attn_full_cache_tail() {
-    attn_case(AttnCase { m: 8, nq: 8, nkv: 2, hd: 128, max_seq: 256, pos: 248, window: 0, seed: 513, k_scale: 1.0 });
+    let _g = gpu();
+    attn_case(AttnCase { m: 8, nq: 8, nkv: 2, hd: 128, max_seq: 256, pos: 248, window: 0, seed: 513, k_scale: 1.0, causal: true });
+}
+
+#[test]
+fn attn_bidirectional_encoder_style() {
+    let _g = gpu();
+    for (m, pos) in [(4usize, 0usize), (8, 32), (1, 10), (16, 64)] {
+        attn_case(AttnCase { m, nq: 8, nkv: 2, hd: 64, max_seq: 128, pos, window: 0, seed: 900 + pos as u64, k_scale: 0.1, causal: false });
+    }
 }
 
 #[test]
 fn split_qg() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let (rows, heads, hd) = (2usize, 2usize, 4usize);
     let mut rng = Rng(101);
@@ -1612,6 +1701,7 @@ fn split_qg() {
 
 #[test]
 fn kv_store_writes_both_caches() {
+    let _g = gpu();
     let mut ctx = Ctx::new();
     let (m, nkv, hd, max_seq, pos) = (3usize, 2usize, 4usize, 8usize, 3usize);
     let mut rng = Rng(111);
@@ -1621,14 +1711,14 @@ fn kv_store_writes_both_caches() {
     let vb = ctx.f32(&v_src, &[m as u32, nkv as u32, hd as u32]);
     let k_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
     let v_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
-    let args = ctx.arg(pos);
+    let args = ctx.rows(pos, m);
 
     ctx.dispatch(
         name::KV_STORE,
         &[
             ("N_KV", nkv as f64),
             ("HEAD_DIM", hd as f64),
-            ("MAX_SEQ", max_seq as f64),
+            ("POOL_LEN", max_seq as f64),
         ],
         &[
             Binding::Full(&kb),
@@ -1649,6 +1739,7 @@ fn kv_store_writes_both_caches() {
 
 #[test]
 fn anchor_gemm() {
+    let _g = gpu();
     assert_eq!(
         cpu_ref::gemm(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], 2, 2, 2),
         vec![17.0, 23.0, 39.0, 53.0]
@@ -1657,6 +1748,7 @@ fn anchor_gemm() {
 
 #[test]
 fn anchor_embed() {
+    let _g = gpu();
     let table = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     assert_eq!(
         cpu_ref::embed(&[2, 0], &table, 2, 2.0),
@@ -1666,6 +1758,7 @@ fn anchor_embed() {
 
 #[test]
 fn anchor_norm_modes() {
+    let _g = gpu();
     let inv = (2.5f32 + 1e-6).sqrt().recip();
     let x = [1.0f32, 2.0];
 
@@ -1683,6 +1776,7 @@ fn anchor_norm_modes() {
 
 #[test]
 fn anchor_elementwise() {
+    let _g = gpu();
     assert_eq!(cpu_ref::add(&[1.0, 2.0], &[3.0, 4.0]), vec![4.0, 6.0]);
 
     let mut x = [1.0f32, 2.0, 3.0, 4.0];
@@ -1701,6 +1795,7 @@ fn anchor_elementwise() {
 
 #[test]
 fn anchor_layout_ops() {
+    let _g = gpu();
     assert_eq!(
         cpu_ref::concat(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], 2, 2),
         vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]
@@ -1718,6 +1813,7 @@ fn anchor_layout_ops() {
 
 #[test]
 fn anchor_rope() {
+    let _g = gpu();
     let inv1 = 1.0 / 10000f64.powf(2.0 / 4.0);
     let (c0, s0) = (1.0f64.cos() as f32, 1.0f64.sin() as f32);
     let (c1, s1) = (inv1.cos() as f32, inv1.sin() as f32);
@@ -1747,21 +1843,23 @@ fn anchor_rope() {
 
 #[test]
 fn anchor_attn_causal_and_window() {
+    let _g = gpu();
     let k = [1.0, 0.0, 0.0, 1.0];
     let v = [1.0, 2.0, 3.0, 4.0];
     let q = [1.0, 1.0];
 
-    let full = cpu_ref::attn(&q, &k, &v, cpu_ref::AttnArgs { m: 1, nq: 1, nkv: 1, hd: 2, max_seq: 2, pos: 1, window: 0 });
+    let full = cpu_ref::attn(&q, &k, &v, cpu_ref::AttnArgs { m: 1, nq: 1, nkv: 1, hd: 2, max_seq: 2, pos: 1, window: 0, causal: true });
     assert!((full[0] - 2.0).abs() < 1e-6);
     assert!((full[1] - 3.0).abs() < 1e-6);
 
-    let win = cpu_ref::attn(&q, &k, &v, cpu_ref::AttnArgs { m: 1, nq: 1, nkv: 1, hd: 2, max_seq: 2, pos: 1, window: 1 });
+    let win = cpu_ref::attn(&q, &k, &v, cpu_ref::AttnArgs { m: 1, nq: 1, nkv: 1, hd: 2, max_seq: 2, pos: 1, window: 1, causal: true });
     assert!((win[0] - 3.0).abs() < 1e-6);
     assert!((win[1] - 4.0).abs() < 1e-6);
 }
 
 #[test]
 fn anchor_conv1d() {
+    let _g = gpu();
     let mut state = [1.0f32, 1.0, 1.0];
     let y = cpu_ref::conv1d(&[2.0], &[1.0, 2.0, 3.0, 4.0], &mut state);
     let v = 14.0f32;
@@ -1771,6 +1869,7 @@ fn anchor_conv1d() {
 
 #[test]
 fn anchor_delta_gate() {
+    let _g = gpu();
     let (beta, g) = cpu_ref::delta_gate(&[0.0], &[0.0], &[2.0f32.ln()], &[0.0]);
     assert!((beta[0] - 0.5).abs() < 1e-6);
     assert!(
@@ -1781,6 +1880,7 @@ fn anchor_delta_gate() {
 
 #[test]
 fn anchor_delta_recur_two_steps() {
+    let _g = gpu();
     let mut state = [0.0f32; 4];
     let r2 = 2.0f32.sqrt();
 
@@ -1818,10 +1918,12 @@ fn anchor_delta_recur_two_steps() {
 
 #[test]
 fn gemv_bf16_wide() {
+    let _g = gpu();
     gemv_case(WType::Bf16, 256, 2560, 99, 1);
 }
 
 #[test]
 fn gemm_i8_9728() {
+    let _g = gpu();
     gemm_case(WType::I8(128), 16, 2560, 9728, 77);
 }

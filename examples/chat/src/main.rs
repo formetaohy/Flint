@@ -1,6 +1,6 @@
 mod chat;
+mod embed;
 mod hub;
-mod onnx;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,22 +39,16 @@ enum Format {
     #[value(alias = "safetensor")]
     Safetensors,
     Gguf,
-    Onnx,
+    Embed,
 }
 
 fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
     let dir = PathBuf::from("temp").join(args.model.replace('/', "--"));
-    let assets = ensure_assets(&Hub::new(&args.model), args.format, &dir)?;
+    ensure_assets(&Hub::new(&args.model), args.format, &dir)?;
     match args.format {
-        Format::Onnx => {
-            let model_file = assets
-                .iter()
-                .find(|p| p.extension().is_some_and(|x| x == "onnx"))
-                .ok_or_else(|| Error::Model(format!("no .onnx file in {}", dir.display())))?;
-            onnx::run(model_file, &dir, &args.prompt)
-        }
+        Format::Embed => embed::run(&dir, &args.prompt),
         Format::Safetensors | Format::Gguf => {
             chat::run(&dir, &args.prompt, args.max_tokens, args.ctx_size)
         }
@@ -105,9 +99,8 @@ fn find_local_gguf(dir: &Path) -> Option<PathBuf> {
 
 fn select(format: Format, files: &[FileEntry]) -> Result<Vec<FileEntry>> {
     match format {
-        Format::Safetensors => select_safetensors(files),
+        Format::Safetensors | Format::Embed => select_safetensors(files),
         Format::Gguf => select_single(files, "gguf"),
-        Format::Onnx => select_single(files, "onnx"),
     }
 }
 

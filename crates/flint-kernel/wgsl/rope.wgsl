@@ -29,8 +29,8 @@ fn rope(
     workgroupBarrier();
     if lid.x < ROT {
         let half = ROT / 2;
-        let c = cos_tbl[(args[0] + grid.x) * COS_STRIDE + lid.x % half];
-        let s = sin_tbl[(args[0] + grid.x) * COS_STRIDE + lid.x % half];
+        let c = cos_tbl[args[2 * grid.x] * COS_STRIDE + lid.x % half];
+        let s = sin_tbl[args[2 * grid.x] * COS_STRIDE + lid.x % half];
         if lid.x < half {
             x[head_base + lid.x] = tile[lid.x] * c - tile[lid.x + half] * s;
         } else {

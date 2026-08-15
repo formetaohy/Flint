@@ -2,13 +2,14 @@ use std::sync::{Mutex, MutexGuard};
 
 use flint_backend::Backend;
 use flint_error::Result;
-use flint_generate::{Engine, GenStats, Sampler};
-use flint_model::{ChunkOut, LanguageModel, MAX_M};
+use flint_generate::{Engine, GenStats, Grammar, Piece, SamplingParams, SessionId};
+use flint_model::{ChunkOut, LanguageModel, MAX_M, SeqChunk, Speculator};
 use flint_tokenizer::Tokenizer;
+use serde_json::json;
 
 const VOCAB: u32 = 32;
 const EOS: u32 = 31;
-const MAX_SEQ: u32 = 512;
+const SLOT_LEN: u32 = 512;
 
 static GPU: Mutex<()> = Mutex::new(());
 
@@ -17,13 +18,18 @@ fn gpu() -> MutexGuard<'static, ()> {
 }
 
 struct FakeModel {
-    pos: u32,
+    pos: Vec<u32>,
+    saved: Vec<u32>,
     eos_at: Option<u32>,
 }
 
 impl FakeModel {
     fn new(eos_at: Option<u32>) -> Self {
-        Self { pos: 0, eos_at }
+        Self {
+            pos: vec![0; 2],
+            saved: vec![0; 2],
+            eos_at,
+        }
     }
 
     fn next_token(&self, pos: u32) -> u32 {
@@ -45,34 +51,46 @@ impl LanguageModel for FakeModel {
     fn forward(
         &mut self,
         _backend: &mut Backend,
-        tokens: &[u32],
-        logit_rows: &[u32],
-        hidden_rows: &[u32],
-    ) -> Result<ChunkOut> {
-        let m = tokens.len() as u32;
+        batch: &[SeqChunk],
+    ) -> Result<Vec<ChunkOut>> {
+        let m: u32 = batch.iter().map(SeqChunk::len).sum();
         assert!(m > 0 && m <= MAX_M, "chunk size {m} outside [1, {MAX_M}]");
-        assert!(self.pos + m <= MAX_SEQ, "context overflow");
-        let base = self.pos;
-        let logits = logit_rows
-            .iter()
-            .map(|&r| self.logits_for(base + r))
-            .collect();
-        let hidden = hidden_rows
-            .iter()
-            .map(|&r| vec![(base + r) as f32; 4])
-            .collect();
-        self.pos += m;
-        Ok(ChunkOut { logits, hidden })
+        let mut outs = Vec::with_capacity(batch.len());
+        for chunk in batch {
+            let s = chunk.slot as usize;
+            assert!(
+                self.pos[s] + chunk.len() <= SLOT_LEN,
+                "context overflow in slot {s}"
+            );
+            let base = self.pos[s];
+            let logits = chunk
+                .logit_rows
+                .iter()
+                .map(|&r| self.logits_for(base + r))
+                .collect();
+            let hidden = chunk
+                .hidden_rows
+                .iter()
+                .map(|&r| vec![(base + r) as f32; 4])
+                .collect();
+            self.pos[s] += chunk.len();
+            outs.push(ChunkOut { logits, hidden });
+        }
+        Ok(outs)
     }
 
-    fn reset(&mut self, _backend: &Backend) {
-        self.pos = 0;
+    fn reset(&mut self, _backend: &Backend, slot: u32) -> Result<()> {
+        self.pos[slot as usize] = 0;
+        Ok(())
     }
-    fn pos(&self) -> u32 {
-        self.pos
+    fn pos(&self, slot: u32) -> u32 {
+        self.pos[slot as usize]
     }
-    fn max_seq(&self) -> u32 {
-        MAX_SEQ
+    fn slot_len(&self, _slot: u32) -> u32 {
+        SLOT_LEN
+    }
+    fn slot_count(&self) -> u32 {
+        self.pos.len() as u32
     }
     fn vocab(&self) -> u32 {
         VOCAB
@@ -80,15 +98,61 @@ impl LanguageModel for FakeModel {
     fn eos(&self) -> &[u32] {
         &[EOS]
     }
+
+    fn speculator(&mut self) -> Option<&mut dyn Speculator> {
+        Some(self as &mut dyn Speculator)
+    }
+}
+
+impl Speculator for FakeModel {
+    fn draft(
+        &mut self,
+        _backend: &mut Backend,
+        _slot: u32,
+        _token: u32,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>> {
+        Ok(self.logits_for(hidden[0] as u32 + 1))
+    }
+
+    fn prime(&mut self, _slot: u32) {}
+
+    fn snapshot(&mut self, _backend: &Backend, slot: u32) {
+        self.saved[slot as usize] = self.pos[slot as usize];
+    }
+
+    fn restore(&mut self, _backend: &Backend, slot: u32) {
+        self.pos[slot as usize] = self.saved[slot as usize] + 1;
+    }
 }
 
 fn tokenizer() -> Tokenizer {
-    let dir = std::env::temp_dir().join(format!("flint-gen-tok-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
     let vocab: Vec<String> = (0..VOCAB)
         .map(|i| format!("[\"t{i}\", -{}]", i as f64 + 1.0))
         .collect();
+    tokenizer_with_vocab(vocab)
+}
+
+fn json_tokenizer() -> Tokenizer {
+    let mut vocab: Vec<String> = ["{", "\"", "m", "o", "v", "e", ":", "n", "r", "t", "h", "}"]
+        .iter()
+        .map(|s| format!("[{}, -1.0]", serde_json::to_string(s).unwrap()))
+        .collect();
+    for i in 0..(VOCAB - 12) {
+        vocab.push(format!("[\"x{i}\", -{}]", i as f64 + 2.0));
+    }
+    tokenizer_with_vocab(vocab)
+}
+
+fn tokenizer_with_vocab(vocab: Vec<String>) -> Tokenizer {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "flint-gen-tok-{}-{n}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
     let json = format!(
         r#"{{
             "version": "1.0",
@@ -114,35 +178,50 @@ fn tokenizer() -> Tokenizer {
     tok
 }
 
-fn run(prompt: &str, max_tokens: usize, eos_after: Option<u32>) -> (Vec<u32>, GenStats, u32) {
-    let _g = gpu();
+fn new_engine(
+    eos_at: Option<u32>,
+    sampling: SamplingParams,
+    speculate: bool,
+) -> Engine {
     let backend = Backend::new().unwrap();
-    let tok = tokenizer();
-    let n = tok.encode(prompt).unwrap().len() as u32;
-    let eos_at = eos_after.map(|k| n - 1 + k);
-    let mut engine = Engine::new(
+    Engine::new(
         backend,
         Box::new(FakeModel::new(eos_at)),
-        tok,
-        Sampler::greedy(1),
+        tokenizer(),
+        sampling,
+        1,
         vec![EOS],
-        false,
-    );
+        speculate,
+    )
+}
+
+fn drain(engine: &mut Engine, id: SessionId) -> Vec<u32> {
     let mut tokens = Vec::new();
-    let mut stream = engine.stream(prompt, max_tokens).unwrap();
-    for piece in stream.by_ref() {
-        tokens.push(piece.unwrap().token);
-    }
-    let stats = {
-        let s = stream.stats();
-        GenStats {
-            prefill_tokens: s.prefill_tokens,
-            decode_tokens: s.decode_tokens,
-            accepted: s.accepted,
-            prefill_secs: s.prefill_secs,
-            decode_secs: s.decode_secs,
+    loop {
+        engine.step().unwrap();
+        for p in engine.poll(id) {
+            tokens.push(p.token);
         }
-    };
+        if engine.finished(id) {
+            break;
+        }
+        assert!(tokens.len() <= 4096, "runaway generation");
+    }
+    tokens
+}
+
+fn run(
+    prompt: &str,
+    max_tokens: usize,
+    eos_after: Option<u32>,
+) -> (Vec<u32>, GenStats, u32) {
+    let _g = gpu();
+    let n = tokenizer().encode(prompt).unwrap().len() as u32;
+    let eos_at = eos_after.map(|k| n - 1 + k);
+    let mut engine = new_engine(eos_at, SamplingParams::default(), false);
+    let id = engine.create(prompt, max_tokens, None).unwrap();
+    let tokens = drain(&mut engine, id);
+    let stats = engine.stats(id).unwrap();
     (tokens, stats, n)
 }
 
@@ -176,18 +255,16 @@ fn token_budget_terminates_without_eos() {
 #[test]
 fn multi_turn_reset_reproduces_output() {
     let _g = gpu();
-    let backend = Backend::new().unwrap();
-    let mut engine = Engine::new(
-        backend,
-        Box::new(FakeModel::new(None)),
-        tokenizer(),
-        Sampler::greedy(1),
-        vec![EOS],
-        false,
-    );
+    let params = SamplingParams {
+        temperature: 0.0,
+        ..Default::default()
+    };
+    let mut engine = new_engine(None, params, false);
     let collect = |engine: &mut Engine| -> Vec<u32> {
-        let mut stream = engine.stream("t0 t1 t2", 8).unwrap();
-        stream.by_ref().map(|p| p.unwrap().token).collect()
+        let id = engine.create("t0 t1 t2", 8, None).unwrap();
+        let tokens = drain(engine, id);
+        engine.close(id).unwrap();
+        tokens
     };
     let first = collect(&mut engine);
     assert!(!first.is_empty(), "first turn generated tokens");
@@ -195,6 +272,97 @@ fn multi_turn_reset_reproduces_output() {
     assert_eq!(
         second, first,
         "reset must restore position so the second turn replays identically"
+    );
+}
+
+#[test]
+fn concurrent_sessions_share_the_engine_without_interference() {
+    let _g = gpu();
+    let mut engine = new_engine(None, SamplingParams::default(), false);
+    let a = engine.create("t0 t1 t2", 6, None).unwrap();
+    let b = engine.create("t3 t4", 6, None).unwrap();
+    let mut got_a = Vec::new();
+    let mut got_b = Vec::new();
+    loop {
+        engine.step().unwrap();
+        got_a.extend(engine.poll(a).into_iter().map(|p| p.token));
+        got_b.extend(engine.poll(b).into_iter().map(|p| p.token));
+        if engine.finished(a) && engine.finished(b) {
+            break;
+        }
+        assert!(got_a.len() <= 64 && got_b.len() <= 64, "runaway batch");
+    }
+    assert_eq!(got_a.len(), 6);
+    assert_eq!(got_b.len(), 6);
+    assert_ne!(got_a, got_b, "sessions must stay independent");
+    engine.close(a).unwrap();
+    engine.close(b).unwrap();
+}
+
+#[test]
+fn session_slot_exhaustion_fails_fast() {
+    let _g = gpu();
+    let mut engine = new_engine(None, SamplingParams::default(), false);
+    let a = engine.create("t0", 8, None).unwrap();
+    let b = engine.create("t1", 8, None).unwrap();
+    let err = engine.create("t2", 8, None).err().unwrap();
+    assert!(err.to_string().contains("no free slot"), "{err}");
+    let _ = (a, b);
+}
+
+#[test]
+fn greedy_speculation_matches_plain_greedy() {
+    let _g = gpu();
+    let params = SamplingParams {
+        temperature: 0.0,
+        ..Default::default()
+    };
+    let plain = {
+        let mut engine = new_engine(None, params, false);
+        let id = engine.create("t0 t1", 24, None).unwrap();
+        drain(&mut engine, id)
+    };
+    let spec = {
+        let mut engine = new_engine(None, params, true);
+        let id = engine.create("t0 t1", 24, None).unwrap();
+        drain(&mut engine, id)
+    };
+    assert_eq!(spec, plain, "speculative decode must not alter greedy output");
+}
+
+#[test]
+fn grammar_forces_the_schema_literal() {
+    let _g = gpu();
+    let backend = Backend::new().unwrap();
+    let mut engine = Engine::new(
+        backend,
+        Box::new(FakeModel::new(None)),
+        json_tokenizer(),
+        SamplingParams::default(),
+        1,
+        vec![EOS],
+        false,
+    );
+    let grammar = Grammar::from_schema(&json!({
+        "type": "object",
+        "required": ["move"],
+        "properties": {"move": {"type": "string", "enum": ["north"]}}
+    }))
+    .unwrap();
+    let id = engine.create("t0", 64, Some(grammar)).unwrap();
+    let mut tokens = Vec::new();
+    loop {
+        engine.step().unwrap();
+        tokens.extend(engine.poll(id).into_iter().map(|p| p.token));
+        if engine.finished(id) {
+            break;
+        }
+        assert!(tokens.len() < 4096, "runaway constrained generation");
+    }
+    let want: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 1, 6, 1, 7, 3, 8, 9, 10, 1, 11];
+    assert_eq!(
+        tokens, want,
+        "the grammar must force the exact JSON literal"
     );
 }
 
@@ -211,4 +379,18 @@ fn stats_account_prefill_and_decode() {
     assert_eq!(stats.decode_tokens, 8);
     assert_eq!(tokens.len(), 8);
     assert!(stats.prefill_secs >= 0.0 && stats.decode_secs >= 0.0);
+}
+
+#[test]
+fn poll_drains_pieces_and_finished_holds_until_empty() {
+    let _g = gpu();
+    let mut engine = new_engine(None, SamplingParams::default(), false);
+    let id = engine.create("t0", 3, None).unwrap();
+    let mut all: Vec<Piece> = Vec::new();
+    while !engine.finished(id) {
+        engine.step().unwrap();
+        all.extend(engine.poll(id));
+    }
+    assert_eq!(all.len(), 3);
+    assert!(engine.poll(id).is_empty(), "poll must drain");
 }

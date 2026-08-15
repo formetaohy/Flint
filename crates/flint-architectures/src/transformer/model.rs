@@ -1,13 +1,13 @@
 use flint_backend::{Backend, Binding, Commands};
 use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
-use flint_model::cache::KvCache;
 use flint_model::loader::{self, Plan};
 use flint_model::mlp_weights::MlpBlock;
 use flint_model::ops::{self, NormMode, NormSpec, RopeArgs, RopeInputs};
+use flint_model::pool::KvPool;
 use flint_model::routing::Routing;
 use flint_model::step;
-use flint_model::{ChunkOut, LanguageModel, MAX_M};
+use flint_model::{ChunkOut, LanguageModel, MAX_M, SeqChunk, Speculator};
 use flint_tensor::{Tensor, Weight};
 
 use crate::transformer::config::Config;
@@ -15,8 +15,11 @@ use crate::transformer::weights::{LayerW, Scratch, alloc_scratch, take_layer};
 
 pub struct Model {
     cfg: Config,
-    max_seq: u32,
-    pos: u32,
+    slot_lens: Vec<u32>,
+    slot_bases: Vec<u32>,
+    pos: Vec<u32>,
+    saved_pos: Vec<u32>,
+    spec_depth: u32,
     embed: Weight,
 
     head: Option<Weight>,
@@ -26,11 +29,12 @@ pub struct Model {
     norm_bias: Option<Tensor>,
     layers: Vec<LayerW>,
 
-    kv: Vec<KvCache>,
+    kv: Vec<KvPool>,
     kv_src: Vec<usize>,
 
     ones: Tensor,
     s: Scratch,
+    capture: Tensor,
 
     cos: Vec<Tensor>,
     sin: Vec<Tensor>,
@@ -48,10 +52,11 @@ impl Model {
         source: &dyn Checkpoint,
         cfg: Config,
         plan: &Plan,
-        max_seq: u32,
+        slot_lens: &[u32],
+        spec_depth: Option<u32>,
         backend: &Backend,
     ) -> Result<Self> {
-        Self::load_extra(source, cfg, plan, Vec::new(), max_seq, backend)
+        Self::load_extra(source, cfg, plan, Vec::new(), slot_lens, spec_depth, backend)
     }
 
     pub fn load_extra(
@@ -59,10 +64,14 @@ impl Model {
         cfg: Config,
         plan: &Plan,
         extra: Vec<(String, Weight)>,
-        max_seq: u32,
+        slot_lens: &[u32],
+        spec_depth: Option<u32>,
         backend: &Backend,
     ) -> Result<Self> {
         cfg.validate()?;
+        if slot_lens.is_empty() || slot_lens.contains(&0) {
+            return Err(Error::Model("slot lengths must be non-empty and positive".into()));
+        }
         let mut w = loader::load_weights(backend, source, plan)?;
         for (key, weight) in extra {
             w.insert(key, weight);
@@ -107,16 +116,24 @@ impl Model {
                 kv_src[l] = last_by_class[class].expect("KV-shared layer without a source");
             } else {
                 let idx = kv.len();
-                kv.push(KvCache::new(
+                kv.push(KvPool::new(
                     backend,
                     cfg.kv_heads,
-                    max_seq,
+                    slot_lens,
                     cfg.head_dim(l as u32),
                 ));
                 kv_src[l] = idx;
                 last_by_class[(cfg.window(l as u32) > 0) as usize] = Some(idx);
             }
         }
+
+        let mut slot_bases = Vec::with_capacity(slot_lens.len());
+        let mut base = 0u32;
+        for &len in slot_lens {
+            slot_bases.push(base);
+            base += len;
+        }
+        let spec_depth = spec_depth.unwrap_or(cfg.layers / 2).clamp(1, cfg.layers);
 
         let max_hd = *cfg.head_dims.iter().max().unwrap();
         let ones = backend.tensor_f32(&vec![1.0; max_hd as usize], vec![max_hd]);
@@ -125,12 +142,13 @@ impl Model {
         let per_layer_combine_scale =
             backend.tensor_f32(&[std::f32::consts::SQRT_2.recip()], vec![1]);
         let s = alloc_scratch(&cfg, backend);
+        let capture = backend.zero_tensor(&[MAX_M, cfg.hidden]);
         let mut cos = Vec::new();
         let mut sin = Vec::new();
         for r in &cfg.rope {
             let (c, s) = ops::rope_tables(
                 backend,
-                max_seq,
+                base,
                 r.dim,
                 r.freq_dim,
                 r.theta,
@@ -142,8 +160,11 @@ impl Model {
         }
         Ok(Self {
             cfg,
-            max_seq,
-            pos: 0,
+            slot_lens: slot_lens.to_vec(),
+            slot_bases,
+            pos: vec![0; slot_lens.len()],
+            saved_pos: vec![0; slot_lens.len()],
+            spec_depth,
             embed,
             head,
             lm_bias,
@@ -154,6 +175,7 @@ impl Model {
             kv_src,
             ones,
             s,
+            capture,
             cos,
             sin,
             per_layer_emb,
@@ -372,6 +394,24 @@ impl Model {
         }
         Ok(())
     }
+
+    fn capture_hidden(&self, commands: &mut Commands<'_>, batch: &[SeqChunk]) -> Result<()> {
+        let size = self.cfg.hidden as u64 * 4;
+        let mut base = 0u32;
+        for chunk in batch {
+            for &r in chunk.hidden_rows {
+                commands.raw().copy(
+                    &self.s.hidden.buf,
+                    (base + r) as u64 * size,
+                    &self.capture.buf,
+                    (base + r) as u64 * size,
+                    size,
+                )?;
+            }
+            base += chunk.len();
+        }
+        Ok(())
+    }
 }
 
 struct ResidualSpec<'a> {
@@ -411,24 +451,33 @@ impl LanguageModel for Model {
     fn forward(
         &mut self,
         backend: &mut Backend,
-        tokens: &[u32],
-        logit_rows: &[u32],
-        hidden_rows: &[u32],
-    ) -> Result<ChunkOut> {
-        let m = tokens.len() as u32;
+        batch: &[SeqChunk],
+    ) -> Result<Vec<ChunkOut>> {
+        let m: u32 = batch.iter().map(SeqChunk::len).sum();
         if m == 0 || m > MAX_M {
             return Err(Error::Model(format!("chunk size {m} outside [1, {MAX_M}]")));
         }
-        if self.pos + m > self.max_seq {
-            return Err(Error::Model(format!(
-                "context limit {} reached",
-                self.max_seq
-            )));
-        }
         let mut ids = vec![0u32; MAX_M as usize];
-        ids[..tokens.len()].copy_from_slice(tokens);
+        let mut positions = vec![0u32; MAX_M as usize];
+        let mut slots = vec![0u32; MAX_M as usize];
+        let mut hidden_wanted = false;
+        let mut row = 0usize;
+        for chunk in batch {
+            let s = chunk.slot as usize;
+            let (slot_len, slot_base) = (self.slot_lens[s], self.slot_bases[s]);
+            if self.pos[s] + chunk.len() > slot_len {
+                return Err(Error::Model(format!("context limit {slot_len} reached")));
+            }
+            for i in 0..chunk.tokens.len() {
+                ids[row + i] = chunk.tokens[i];
+                positions[row + i] = self.pos[s] + i as u32;
+                slots[row + i] = slot_base;
+            }
+            row += chunk.tokens.len();
+            hidden_wanted |= !chunk.hidden_rows.is_empty();
+        }
         backend.write_u32(&self.s.ids.buf, &ids);
-        step::write_step_args(backend, &self.s.args, self.pos);
+        step::write_row_meta(backend, &self.s.meta, &positions, &slots, m);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder()?;
@@ -524,7 +573,7 @@ impl LanguageModel for Model {
                         let rope = RopeInputs {
                             cos,
                             sin,
-                            args: &self.s.args,
+                            args: &s.meta,
                         };
                         ops::norm_rope(
                             backend,
@@ -550,7 +599,7 @@ impl LanguageModel for Model {
                         let rope = RopeInputs {
                             cos,
                             sin,
-                            args: &self.s.args,
+                            args: &s.meta,
                         };
                         ops::norm_rope(
                             backend,
@@ -583,7 +632,7 @@ impl LanguageModel for Model {
                     let rope = RopeInputs {
                         cos,
                         sin,
-                        args: &self.s.args,
+                        args: &s.meta,
                     };
                     ops::rope(
                         backend,
@@ -623,24 +672,33 @@ impl LanguageModel for Model {
                         Binding::Full(if cfg.v_norm { &lw.v_normed } else { &lw.v_out }),
                         kv,
                         m,
-                        &self.s.args,
+                        &s.meta,
                     )?;
                 }
 
-                ops::attn(
-                    backend,
-                    &mut commands,
-                    Binding::Full(q_src),
-                    kv,
-                    Binding::Full(&lw.attn_out),
-                    &ops::AttnSpec {
-                        q_heads: nq,
-                        window: cfg.window(l as u32),
-                        scale: cfg.attn_scale.unwrap_or_else(|| (hd as f32).sqrt().recip()),
-                        m,
-                        args: &self.s.args,
-                    },
-                )?;
+                let qw = nq * hd;
+                let mut row_off = 0u32;
+                for chunk in batch {
+                    let m_s = chunk.len();
+                    let span = m_s as u64 * qw as u64 * 4;
+                    ops::attn(
+                        backend,
+                        &mut commands,
+                        Binding::Slice(q_src, row_off as u64 * qw as u64 * 4, span),
+                        kv,
+                        Binding::Slice(&lw.attn_out, row_off as u64 * qw as u64 * 4, span),
+                        &ops::AttnSpec {
+                            q_heads: nq,
+                            window: cfg.window(l as u32),
+                            scale: cfg.attn_scale.unwrap_or_else(|| (hd as f32).sqrt().recip()),
+                            m: m_s,
+                            causal: true,
+                            slot: self.slot_bases[chunk.slot as usize],
+                            args: Binding::Slice(&s.meta, row_off as u64 * 8, m_s as u64 * 8),
+                        },
+                    )?;
+                    row_off += m_s;
+                }
 
                 let attn_fused = lw.post_attn_norm.is_none();
                 ops::gemm_acc(
@@ -805,6 +863,10 @@ impl LanguageModel for Model {
                 }
 
                 self.per_layer_step(backend, &mut commands, s, lw, l, m)?;
+
+                if l as u32 + 1 == self.spec_depth && hidden_wanted {
+                    self.capture_hidden(&mut commands, batch)?;
+                }
             }
 
             ops::norm(
@@ -846,31 +908,117 @@ impl LanguageModel for Model {
         }
         backend.submit(&mut enc)?;
 
-        let out = ChunkOut {
-            logits: step::read_rows(backend, &self.s.logits, logit_rows, m, cfg.vocab)?,
-            hidden: step::read_rows(backend, &self.s.hidden, hidden_rows, m, cfg.hidden)?,
-        };
-        self.pos += m;
-        Ok(out)
-    }
-
-    fn reset(&mut self, backend: &Backend) {
-        for kv in &self.kv {
-            kv.zero(backend);
+        let mut outs = Vec::with_capacity(batch.len());
+        let mut base = 0u32;
+        for chunk in batch {
+            let m_s = chunk.len();
+            let s = chunk.slot as usize;
+            outs.push(ChunkOut {
+                logits: step::read_rows(backend, &self.s.logits, chunk.logit_rows, m_s, cfg.vocab, base)?,
+                hidden: step::read_rows(backend, &self.capture, chunk.hidden_rows, m_s, cfg.hidden, base)?,
+            });
+            base += m_s;
+            self.pos[s] += m_s;
         }
-        self.pos = 0;
+        Ok(outs)
     }
 
-    fn pos(&self) -> u32 {
-        self.pos
+    fn reset(&mut self, backend: &Backend, slot: u32) -> Result<()> {
+        for kv in &self.kv {
+            kv.reset(backend, slot)?;
+        }
+        self.pos[slot as usize] = 0;
+        self.saved_pos[slot as usize] = 0;
+        Ok(())
     }
-    fn max_seq(&self) -> u32 {
-        self.max_seq
+
+    fn pos(&self, slot: u32) -> u32 {
+        self.pos[slot as usize]
+    }
+    fn slot_len(&self, slot: u32) -> u32 {
+        self.slot_lens[slot as usize]
+    }
+    fn slot_count(&self) -> u32 {
+        self.slot_lens.len() as u32
     }
     fn vocab(&self) -> u32 {
         self.cfg.vocab
     }
     fn eos(&self) -> &[u32] {
         &self.cfg.eos
+    }
+
+    fn speculator(&mut self) -> Option<&mut dyn Speculator> {
+        (self.spec_depth < self.cfg.layers).then_some(self as &mut dyn Speculator)
+    }
+}
+
+impl Speculator for Model {
+    fn draft(
+        &mut self,
+        backend: &mut Backend,
+        _slot: u32,
+        _token: u32,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>> {
+        assert_eq!(
+            hidden.len(),
+            self.cfg.hidden as usize,
+            "hidden size mismatch"
+        );
+        backend.write_f32(&self.s.hidden.buf, hidden);
+        let cfg = &self.cfg;
+        let mut enc = backend.encoder()?;
+        {
+            let mut commands = Commands::begin(&mut enc);
+            ops::norm(
+                backend,
+                &mut commands,
+                &NormSpec::new(self.norm_mode(), 1, cfg.hidden, cfg.norm_eps),
+                Binding::Full(&self.s.hidden),
+                &self.norm,
+                self.norm_bias(self.norm_bias.as_ref()),
+                Binding::Full(&self.s.normed),
+            )?;
+            ops::gemm(
+                backend,
+                &mut commands,
+                Binding::Full(&self.s.normed),
+                self.head_weight(),
+                Binding::Full(&self.s.logits),
+                1,
+            )?;
+            if let Some(lb) = &self.lm_bias {
+                ops::bias(
+                    backend,
+                    &mut commands,
+                    Binding::Full(&self.s.logits),
+                    lb,
+                    1,
+                    cfg.vocab,
+                )?;
+            }
+            if let Some(cap) = cfg.softcap {
+                ops::softcap(
+                    backend,
+                    &mut commands,
+                    Binding::Full(&self.s.logits),
+                    cfg.vocab,
+                    cap,
+                )?;
+            }
+        }
+        backend.submit(&mut enc)?;
+        backend.read_f32(&self.s.logits.buf, 0, cfg.vocab as usize)
+    }
+
+    fn prime(&mut self, _slot: u32) {}
+
+    fn snapshot(&mut self, _backend: &Backend, slot: u32) {
+        self.saved_pos[slot as usize] = self.pos[slot as usize];
+    }
+
+    fn restore(&mut self, _backend: &Backend, slot: u32) {
+        self.pos[slot as usize] = self.saved_pos[slot as usize] + 1;
     }
 }

@@ -164,7 +164,7 @@ pub(crate) fn take_layer(
 pub(crate) struct Scratch {
     pub(crate) ids: Tensor,
 
-    pub(crate) args: Tensor,
+    pub(crate) meta: Tensor,
     pub(crate) hidden: Tensor,
     pub(crate) hidden2: Tensor,
     pub(crate) normed: Tensor,
@@ -200,7 +200,7 @@ pub(crate) fn alloc_scratch(cfg: &Config, backend: &Backend) -> Scratch {
     let alloc = |shape: &[u32]| per_layer_dim.map(|_| backend.zero_tensor(shape));
     Scratch {
         ids: step::token_ids(backend),
-        args: step::step_args(backend),
+        meta: step::row_meta(backend),
         hidden: backend.zero_tensor(&[MAX_M, cfg.hidden]),
         hidden2: backend.zero_tensor(&[MAX_M, cfg.hidden]),
         normed: backend.zero_tensor(&[MAX_M, cfg.hidden]),

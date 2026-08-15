@@ -1,7 +1,7 @@
 struct Pc {
     N_KV: u32,
     HEAD_DIM: u32,
-    MAX_SEQ: u32,
+    POOL_LEN: u32,
 }
 var<immediate> pc: Pc;
 
@@ -22,14 +22,14 @@ fn kv_store(
 ) {
     let N_KV = pc.N_KV;
     let HEAD_DIM = pc.HEAD_DIM;
-    let MAX_SEQ = pc.MAX_SEQ;
+    let POOL_LEN = pc.POOL_LEN;
     let half_dim = HEAD_DIM / 2;
     if gid.x < N_KV * half_dim {
         let m = grid.y;
         let h = gid.x / half_dim;
         let d2 = gid.x % half_dim;
         let s_base = (m * N_KV + h) * HEAD_DIM + d2 * 2;
-        let c_base = (h * MAX_SEQ + args[0] + m) * half_dim + d2;
+        let c_base = (h * POOL_LEN + args[2 * m] + args[2 * m + 1]) * half_dim + d2;
         k_cache[c_base] = pack2(k_src[s_base], k_src[s_base + 1]);
         v_cache[c_base] = pack2(v_src[s_base], v_src[s_base + 1]);
     }

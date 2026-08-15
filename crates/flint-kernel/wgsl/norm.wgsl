@@ -138,7 +138,7 @@ fn norm(
             tile[vdim * 4 + t] = (x[e] - center) * inv * w[e];
         }
         workgroupBarrier();
-        let pos_m = args[0] + row / HEADS;
+        let pos_m = args[2 * (row / HEADS)];
         let half = ROT / 2;
         var wt = t;
         loop {

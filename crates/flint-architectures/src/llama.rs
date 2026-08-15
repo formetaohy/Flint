@@ -19,7 +19,8 @@ pub fn parse_config(v: &Value) -> Result<Config> {
 pub fn load(
     source: &dyn Checkpoint,
     v: &Value,
-    max_seq: u32,
+    slot_lens: &[u32],
+    spec_depth: Option<u32>,
     backend: &Backend,
 ) -> Result<Model> {
     let mut cfg = parse_config(v)?;
@@ -41,7 +42,8 @@ pub fn load(
         source,
         cfg,
         &plan(source.kind() == CheckpointKind::Gguf),
-        max_seq,
+        slot_lens,
+        spec_depth,
         backend,
     )
 }

@@ -20,7 +20,6 @@ flint-model = { path = "crates/flint-model" }
 flint-architectures = { path = "crates/flint-architectures" }
 flint-tokenizer = { path = "crates/flint-tokenizer" }
 flint-generate = { path = "crates/flint-generate" }
-flint-onnx = { path = "crates/flint-onnx" }
 flint-profiler = { path = "crates/flint-profiler" }
 
 ahash = "0.8.12"

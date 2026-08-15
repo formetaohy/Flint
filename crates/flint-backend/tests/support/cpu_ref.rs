@@ -220,6 +220,7 @@ pub struct AttnArgs {
     pub max_seq: usize,
     pub pos: usize,
     pub window: usize,
+    pub causal: bool,
 }
 
 pub fn attn(q: &[f32], k_cache: &[f32], v_cache: &[f32], spec: AttnArgs) -> Vec<f32> {
@@ -228,7 +229,7 @@ pub fn attn(q: &[f32], k_cache: &[f32], v_cache: &[f32], spec: AttnArgs) -> Vec<
     let scale = (hd as f32).sqrt().recip();
     let mut out = vec![0f32; m * nq * hd];
     for mi in 0..m {
-        let kv_len = pos + mi + 1;
+        let kv_len = if spec.causal { pos + mi + 1 } else { pos + m };
         let win_start = if window != 0 && kv_len > window {
             kv_len - window
         } else {

@@ -9,3 +9,4 @@ flint-backend.workspace = true
 flint-error.workspace = true
 flint-model.workspace = true
 flint-tokenizer.workspace = true
+serde_json.workspace = true

@@ -444,7 +444,6 @@ fn gemm_probe() -> Result<()> {
 
 fn attn_probe() -> Result<()> {
     use flint_backend::{Binding, Commands};
-    use flint_model::step::step_args;
 
     let env = |k: &str, d: u32| {
         std::env::var(k)
@@ -488,8 +487,13 @@ fn attn_probe() -> Result<()> {
         .tensor_bf16(&vbytes, vec![nkv, max_seq, hd])
         .unwrap();
     let y = backend.zero_tensor(&[m, nq, hd]);
-    let args = step_args(&backend);
-    backend.write_u32(&args.buf, &[pos]);
+    let args = flint_model::step::row_meta(&backend);
+    let mut meta = Vec::with_capacity(2 * m as usize);
+    for i in 0..m {
+        meta.push(pos + i);
+        meta.push(0);
+    }
+    backend.write_u32(&args.buf, &meta);
     let run_flash = |backend: &mut Backend| -> Result<()> {
         let mut enc = backend.encoder().unwrap();
         {
@@ -501,10 +505,12 @@ fn attn_probe() -> Result<()> {
                     ("M", m as f64),
                     ("N_HEADS", nq as f64),
                     ("HEAD_DIM", hd as f64),
-                    ("MAX_SEQ", max_seq as f64),
+                    ("POOL_LEN", max_seq as f64),
                     ("SCALE", 1.0 / (hd as f64).sqrt()),
                     ("WINDOW", window as f64),
                     ("NQ_PER_KV", (nq / nkv) as f64),
+                    ("SLOT", 0.0),
+                    ("CAUSAL", 1.0),
                 ],
                 &[
                     Binding::Full(&qb),
@@ -513,7 +519,7 @@ fn attn_probe() -> Result<()> {
                     Binding::Full(&y),
                     Binding::Full(&args),
                 ],
-                [m.div_ceil(flint_model::ops::ATTN_BR), nq, 1],
+                [m.div_ceil(flint_kernel::ATTN_BR), nq, 1],
             )?;
         }
         backend.submit(&mut enc).unwrap();

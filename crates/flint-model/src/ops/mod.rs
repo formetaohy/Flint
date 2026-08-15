@@ -9,7 +9,6 @@ mod rope;
 mod ssm;
 
 pub use attn::{AttnSpec, attn, check_head_dim, kv_store, repeat_qk, RepeatQkSpec};
-pub use flint_backend::ATTN_BR;
 pub use elementwise::{RowMulSpec, add, bias, concat, mul, row_mul, sigmoid_mul};
 pub use embed::{EmbedSpec, embed, embed_split};
 pub use gemm::{QkvSpec, check_gemm_dims, gemm, gemm_acc, gemm_qkv, gemv};

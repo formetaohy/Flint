@@ -8,12 +8,27 @@ pub fn token_ids(backend: &Backend) -> Tensor {
     Tensor::new(backend.storage(MAX_M as u64 * 4), vec![MAX_M], DType::U32)
 }
 
-pub fn step_args(backend: &Backend) -> Tensor {
-    Tensor::new(backend.storage(4), vec![1], DType::U32)
+pub fn row_meta(backend: &Backend) -> Tensor {
+    Tensor::new(backend.storage(2 * MAX_M as u64 * 4), vec![2 * MAX_M], DType::U32)
 }
 
-pub fn write_step_args(backend: &Backend, args: &Tensor, pos: u32) {
-    backend.write_u32(&args.buf, &[pos]);
+pub fn write_row_meta(
+    backend: &Backend,
+    meta: &Tensor,
+    positions: &[u32],
+    slots: &[u32],
+    m: u32,
+) {
+    assert!(
+        positions.len() >= m as usize && slots.len() >= m as usize,
+        "row meta arrays must cover the chunk size"
+    );
+    let mut data = vec![0u32; 2 * MAX_M as usize];
+    for i in 0..m as usize {
+        data[2 * i] = positions[i];
+        data[2 * i + 1] = slots[i];
+    }
+    backend.write_u32(&meta.buf, &data);
 }
 
 pub fn read_rows(
@@ -22,11 +37,16 @@ pub fn read_rows(
     rows: &[u32],
     m: u32,
     count: u32,
+    base: u32,
 ) -> Result<Vec<Vec<f32>>> {
     let mut out = Vec::with_capacity(rows.len());
     for &r in rows {
         assert!(r < m, "row {r} outside chunk");
-        out.push(backend.read_f32(&t.buf, r as u64 * count as u64 * 4, count as usize)?);
+        out.push(backend.read_f32(
+            &t.buf,
+            (base + r) as u64 * count as u64 * 4,
+            count as usize,
+        )?);
     }
     Ok(out)
 }

@@ -11,7 +11,7 @@ pub fn conv1d(
     commands: &mut Commands<'_>,
     x: Binding<'_>,
     weight: &Tensor,
-    state: &Tensor,
+    state: Binding<'_>,
     y: Binding<'_>,
     spec: &ConvSpec,
 ) -> Result<()> {
@@ -19,7 +19,7 @@ pub fn conv1d(
         commands,
         shader::CONV1D,
         &[("DIM", spec.dim as f64)],
-        &[x, Binding::Full(weight), Binding::Full(state), y],
+        &[x, Binding::Full(weight), state, y],
         [spec.dim.div_ceil(256), 1, 1],
     )
 }
@@ -58,7 +58,7 @@ pub struct DeltaRecur<'a> {
     pub v: Binding<'a>,
     pub beta: Binding<'a>,
     pub g: Binding<'a>,
-    pub state: &'a Tensor,
+    pub state: Binding<'a>,
     pub y: Binding<'a>,
     pub heads: u32,
     pub key_dim: u32,
@@ -80,7 +80,7 @@ pub fn delta_recur(backend: &mut Backend, commands: &mut Commands<'_>, spec: &De
             spec.v,
             spec.beta,
             spec.g,
-            Binding::Full(spec.state),
+            spec.state,
             spec.y,
         ],
         [spec.heads, 1, 1],

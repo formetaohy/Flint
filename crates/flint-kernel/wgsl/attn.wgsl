@@ -2,10 +2,12 @@ struct Pc {
     M: u32,
     N_HEADS: u32,
     HEAD_DIM: u32,
-    MAX_SEQ: u32,
+    POOL_LEN: u32,
     SCALE: f32,
     WINDOW: u32,
     NQ_PER_KV: u32,
+    SLOT: u32,
+    CAUSAL: u32,
 }
 var<immediate> pc: Pc;
 
@@ -39,11 +41,12 @@ fn attn(
     let M = pc.M;
     let N_HEADS = pc.N_HEADS;
     let HEAD_DIM = pc.HEAD_DIM;
-    let MAX_SEQ = pc.MAX_SEQ;
+    let POOL_LEN = pc.POOL_LEN;
     let SCALE = pc.SCALE;
     let WINDOW = pc.WINDOW;
     let NQ_PER_KV = pc.NQ_PER_KV;
-    let pos = args[0];
+    let SLOT = pc.SLOT;
+    let CAUSAL = pc.CAUSAL;
     let t = lid.x;
     let row = t / LANES;
     let lane = t % LANES;
@@ -52,22 +55,26 @@ fn attn(
     let kvh = qh / NQ_PER_KV;
     let mi = m0 + row;
     let half_dim = HEAD_DIM / 2;
-    let cache_plane = kvh * MAX_SEQ * half_dim;
+    let cache_plane = kvh * POOL_LEN * half_dim + SLOT * half_dim;
     let qb = (mi * N_HEADS + qh) * HEAD_DIM;
-    let qpos = pos + mi;
+    let qpos = args[2 * min(mi, M - 1)];
     var win_start = 0u;
-    if WINDOW != 0 && qpos + 1 > WINDOW {
+    if CAUSAL != 0u && WINDOW != 0u && qpos + 1 > WINDOW {
         win_start = qpos + 1 - WINDOW;
     }
     let k_segs = (HEAD_DIM + KD - 1) / KD;
-    let kv_len = pos + min(m0 + BR, M);
+    let kv_len = select(
+        args[2 * (M - 1)] + 1,
+        args[2 * (min(m0 + BR, M) - 1)] + 1,
+        CAUSAL != 0u,
+    );
 
     var m_old = NEG_INF;
     var s_old = 0.0;
     var o = array<f32, 16>();
     var first_win_start = 0u;
-    if WINDOW != 0 && pos + m0 + 1 > WINDOW {
-        first_win_start = pos + m0 + 1 - WINDOW;
+    if CAUSAL != 0u && WINDOW != 0u && args[2 * m0] + 1 > WINDOW {
+        first_win_start = args[2 * m0] + 1 - WINDOW;
     }
     var c0 = 0u;
     var w = t;
@@ -92,7 +99,7 @@ fn attn(
         }
         var s = array<f32, COLS>();
         let limit = min(BC, kv_len - c0);
-        let block_dead = WINDOW != 0 && c0 + limit - 1 < first_win_start;
+        let block_dead = CAUSAL != 0u && WINDOW != 0u && c0 + limit - 1 < first_win_start;
         for (var ds = 0u; ds < k_segs; ds++) {
             let buf = ds % 2;
             let d_base = ds * KD;
@@ -135,7 +142,7 @@ fn attn(
         for (var c = 0u; c < COLS; c++) {
             let col = c0 + lane * COLS + c;
             var sc = s[c] * SCALE;
-            if col > qpos || col < win_start {
+            if (CAUSAL != 0u && col > qpos) || col < win_start || col >= kv_len {
                 sc = NEG_INF;
             }
             s[c] = sc;

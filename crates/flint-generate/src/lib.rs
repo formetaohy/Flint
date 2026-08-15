@@ -1,5 +1,7 @@
-pub mod engine;
-pub mod sampler;
+mod engine;
+mod grammar;
+mod sampler;
 
-pub use engine::{Engine, GenStats, Piece, Stream};
+pub use engine::{Engine, GenStats, Piece, SessionId};
+pub use grammar::{Grammar, Matcher, TokenTrie};
 pub use sampler::{Dist, Sampler, SamplingParams, apply_repeat_penalty, softmax};

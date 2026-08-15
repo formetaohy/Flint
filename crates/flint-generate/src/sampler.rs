@@ -53,9 +53,17 @@ impl Sampler {
         }
     }
 
-    pub fn transform(&self, logits: &[f32], context: &[u32]) -> Dist {
+    pub fn transform(&self, logits: &[f32], context: &[u32], mask: Option<&[f32]>) -> Dist {
         let p = self.params;
         let mut scores = logits.to_vec();
+        if let Some(mask) = mask {
+            assert_eq!(mask.len(), scores.len(), "mask must span the vocab");
+            for (s, m) in scores.iter_mut().zip(mask) {
+                if *m == 0.0 {
+                    *s = f32::NEG_INFINITY;
+                }
+            }
+        }
         apply_repeat_penalty(&mut scores, context, p.repeat_penalty, p.repeat_last_n);
         if p.temperature <= 0.0 {
             return Dist::Greedy(argmax(&scores));

@@ -148,7 +148,8 @@ fn phi_plan(gguf: bool) -> Plan {
 pub fn load(
     source: &dyn Checkpoint,
     v: &Value,
-    max_seq: u32,
+    slot_lens: &[u32],
+    spec_depth: Option<u32>,
     backend: &Backend,
 ) -> Result<Model> {
     let cfg = parse_transformer(v)?;
@@ -158,7 +159,7 @@ pub fn load(
     } else {
         hf_split_fused(backend, source, &cfg, phi_role)?
     };
-    Model::load_extra(source, cfg, &phi_plan(gguf), extra, max_seq, backend)
+    Model::load_extra(source, cfg, &phi_plan(gguf), extra, slot_lens, spec_depth, backend)
 }
 
 fn hf_split_fused(
@@ -225,7 +226,8 @@ fn hf_key_moe(name: &str) -> Option<String> {
 pub fn load_moe(
     source: &dyn Checkpoint,
     v: &Value,
-    max_seq: u32,
+    slot_lens: &[u32],
+    spec_depth: Option<u32>,
     backend: &Backend,
 ) -> Result<Model> {
     let cfg = parse_moe(v)?;
@@ -248,7 +250,7 @@ pub fn load_moe(
         shared: false,
     };
     let extra = load_moe_experts(backend, source, &moe_plan, dense_role)?;
-    Model::load_extra(source, cfg, &plan, extra, max_seq, backend)
+    Model::load_extra(source, cfg, &plan, extra, slot_lens, spec_depth, backend)
 }
 
 fn f32_list(v: &Value, key: &str) -> Result<Vec<f32>> {
