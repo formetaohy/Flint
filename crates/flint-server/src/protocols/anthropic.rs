@@ -7,7 +7,7 @@ use flint_error::{Error, Result};
 use flint_generate::{GenStats, Piece, SamplingParams};
 use serde_json::{Value, json};
 
-use crate::hub::{GenerateRequest, RequestDefaults, ToolChoice};
+use crate::generator::{GenerateRequest, RequestDefaults, ToolChoice};
 use crate::protocols::{
     Chat, DecisionSink, Part, SseFrame, StreamSink, collect, json_response, length_hit, next_id,
     split_reasoning, stream_response,
@@ -32,13 +32,13 @@ pub async fn handle(State(state): State<AppState>, body: Bytes) -> Response {
             );
         }
     };
-    let parsed = match parse(&body, &state.hub.defaults()) {
+    let parsed = match parse(&body, &state.generator.defaults()) {
         Ok(p) => p,
         Err(e) => {
             return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
         }
     };
-    let generation = match state.hub.generate(&parsed.req).await {
+    let generation = match state.generator.generate(&parsed.req).await {
         Ok(g) => g,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e.to_string()),
     };
@@ -77,13 +77,13 @@ pub async fn handle_count_tokens(State(state): State<AppState>, body: Bytes) -> 
             );
         }
     };
-    let parsed = match parse(&body, &state.hub.defaults()) {
+    let parsed = match parse(&body, &state.generator.defaults()) {
         Ok(p) => p,
         Err(e) => {
             return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
         }
     };
-    match state.hub.count_tokens(&parsed.req) {
+    match state.generator.count_tokens(&parsed.req) {
         Ok(n) => json_response(json!({"input_tokens": n})).into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e.to_string()),
     }

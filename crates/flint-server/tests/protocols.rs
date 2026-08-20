@@ -1,4 +1,4 @@
-use flint_server::hub::RequestDefaults;
+use flint_server::generator::RequestDefaults;
 use flint_server::protocols::anthropic;
 use flint_server::protocols::gemini;
 use flint_server::protocols::openai_chat;

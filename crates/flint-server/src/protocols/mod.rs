@@ -15,7 +15,7 @@ use flint_generate::{GenStats, Piece};
 use futures_util::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::engine_hub::{Client, CloseGuard, Event};
+use crate::engine_worker::{Client, CloseGuard, Event};
 use crate::protocols::decision::DecisionParser;
 use crate::protocols::reasoning::ReasoningParser;
 use flint_architectures::chat::ThinkMode;

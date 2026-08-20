@@ -9,12 +9,12 @@ use flint_error::{Error, Result};
 use serde_json::{Value, json};
 use tower_http::cors::CorsLayer;
 
-use crate::hub::Hub;
+use crate::generator::Generator;
 use crate::protocols;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub(crate) hub: Hub,
+    pub(crate) generator: Generator,
     api_key: Option<String>,
 }
 
@@ -24,18 +24,18 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
 }
 
-pub fn serve(cfg: ServerConfig, hub: Hub) -> Result<()> {
+pub fn serve(cfg: ServerConfig, generator: Generator) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| Error::Model(format!("build the tokio runtime: {e}")))?;
-    runtime.block_on(serve_async(cfg, hub))
+    runtime.block_on(serve_async(cfg, generator))
 }
 
-async fn serve_async(cfg: ServerConfig, hub: Hub) -> Result<()> {
-    let model_id = hub.model_id().to_string();
+async fn serve_async(cfg: ServerConfig, generator: Generator) -> Result<()> {
+    let model_id = generator.model_id().to_string();
     let state = AppState {
-        hub,
+        generator,
         api_key: cfg.api_key,
     };
     let app = Router::new()
@@ -98,9 +98,9 @@ fn authorized(headers: &HeaderMap, api_key: Option<&str>) -> bool {
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let anthropic = headers.contains_key("x-api-key") || headers.contains_key("anthropic-version");
     let body = if anthropic {
-        anthropic_models_json(&state.hub)
+        anthropic_models_json(&state.generator)
     } else {
-        models_json(&state.hub)
+        models_json(&state.generator)
     };
     protocols::json_response(body).into_response()
 }
@@ -126,21 +126,21 @@ async fn gemini(State(state): State<AppState>, Path(path): Path<String>, body: B
     protocols::gemini::handle(State(state), body, stream).await
 }
 
-fn models_json(hub: &Hub) -> Value {
+fn models_json(generator: &Generator) -> Value {
     json!({
         "object": "list",
         "data": [{
-            "id": hub.model_id(),
+            "id": generator.model_id(),
             "object": "model",
             "created": protocols::now_secs(),
             "owned_by": "flint",
-            "context_length": hub.context_len(),
+            "context_length": generator.context_len(),
         }]
     })
 }
 
-fn anthropic_models_json(hub: &Hub) -> Value {
-    let id = hub.model_id();
+fn anthropic_models_json(generator: &Generator) -> Value {
+    let id = generator.model_id();
     json!({
         "data": [{
             "type": "model",

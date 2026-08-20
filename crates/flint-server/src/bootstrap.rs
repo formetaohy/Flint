@@ -5,7 +5,7 @@ use flint_backend::Backend;
 use flint_error::Result;
 use flint_generate::Engine;
 
-use crate::hub::Hub;
+use crate::generator::Generator;
 use crate::server::{ServerConfig, serve};
 
 pub struct ServeOptions {
@@ -21,18 +21,18 @@ pub struct ServeOptions {
 }
 
 pub fn serve_from(opts: ServeOptions) -> Result<()> {
-    let hub = load_hub(&opts)?;
+    let generator = load_generator(&opts)?;
     serve(
         ServerConfig {
             host: opts.host,
             port: opts.port,
             api_key: opts.api_key,
         },
-        hub,
+        generator,
     )
 }
 
-pub fn load_hub(opts: &ServeOptions) -> Result<Hub> {
+pub fn load_generator(opts: &ServeOptions) -> Result<Generator> {
     eprintln!("[flint] initializing GPU backend...");
     let backend = Backend::new()?;
     eprintln!("[flint] adapter: {}", backend.adapter_name());
@@ -59,7 +59,7 @@ pub fn load_hub(opts: &ServeOptions) -> Result<Hub> {
         chat_model.stop,
         opts.speculate,
     );
-    Ok(Hub::new(
+    Ok(Generator::new(
         engine,
         chat_model.chat,
         chat_model.tokenizer,

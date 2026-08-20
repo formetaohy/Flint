@@ -7,7 +7,7 @@ use flint_error::{Error, Result};
 use flint_generate::{GenStats, Piece, SamplingParams};
 use serde_json::{Value, json};
 
-use crate::hub::{GenerateRequest, ToolChoice};
+use crate::generator::{GenerateRequest, ToolChoice};
 use crate::protocols::{
     Chat, DecisionSink, Part, SseFrame, StreamSink, collect, json_response, length_hit, next_id,
     now_secs, split_reasoning, stream_response,
@@ -33,13 +33,13 @@ pub async fn handle(State(state): State<AppState>, body: Bytes) -> Response {
             );
         }
     };
-    let parsed = match parse(&body, &state.hub.defaults()) {
+    let parsed = match parse(&body, &state.generator.defaults()) {
         Ok(p) => p,
         Err(e) => {
             return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
         }
     };
-    let generation = match state.hub.generate(&parsed.req).await {
+    let generation = match state.generator.generate(&parsed.req).await {
         Ok(g) => g,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
     };
@@ -68,7 +68,7 @@ fn error(status: StatusCode, kind: &str, message: String) -> Response {
         .into_response()
 }
 
-pub fn parse(body: &Value, defaults: &crate::hub::RequestDefaults) -> Result<Parsed> {
+pub fn parse(body: &Value, defaults: &crate::generator::RequestDefaults) -> Result<Parsed> {
     let stream = body["stream"].as_bool().unwrap_or(false);
     let stream_options_usage = body["stream_options"]["include_usage"]
         .as_bool()

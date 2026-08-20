@@ -6,7 +6,7 @@ use flint_generate::{Engine, Grammar, SamplingParams, SessionId};
 use flint_tokenizer::Tokenizer;
 use serde_json::{Value, json};
 
-use crate::engine_hub::{Client, Command, EngineHandle, Event};
+use crate::engine_worker::{Client, Command, EngineHandle, Event};
 use crate::tools::{Tool, tool_instruction, wrapper_schema};
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -42,7 +42,7 @@ pub struct RequestDefaults {
 }
 
 #[derive(Clone)]
-pub struct Hub {
+pub struct Generator {
     inner: Arc<Inner>,
 }
 
@@ -55,7 +55,7 @@ struct Inner {
     default_max_tokens: usize,
 }
 
-impl Hub {
+impl Generator {
     pub fn new(
         engine: Engine,
         chat: Box<dyn ChatFormat + Send + Sync>,
@@ -66,7 +66,7 @@ impl Hub {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                engine: crate::engine_hub::spawn(engine),
+                engine: crate::engine_worker::spawn(engine),
                 chat,
                 tokenizer,
                 model_id,

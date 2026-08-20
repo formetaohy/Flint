@@ -7,7 +7,7 @@ use flint_error::{Error, Result};
 use flint_generate::{GenStats, Piece, SamplingParams};
 use serde_json::{Value, json};
 
-use crate::hub::{GenerateRequest, RequestDefaults, ToolChoice};
+use crate::generator::{GenerateRequest, RequestDefaults, ToolChoice};
 use crate::protocols::{
     Chat, DecisionSink, Part, SseFrame, StreamSink, collect, json_response, length_hit,
     stream_response,
@@ -26,13 +26,13 @@ pub async fn handle(State(state): State<AppState>, body: Bytes, stream: bool) ->
             );
         }
     };
-    let parsed = match parse(&body, &state.hub.defaults()) {
+    let parsed = match parse(&body, &state.generator.defaults()) {
         Ok(p) => p,
         Err(e) => {
             return error(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", e.to_string());
         }
     };
-    let generation = match state.hub.generate(&parsed.req).await {
+    let generation = match state.generator.generate(&parsed.req).await {
         Ok(g) => g,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e.to_string()),
     };
