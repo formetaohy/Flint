@@ -33,6 +33,13 @@ impl<'a> Binding<'a> {
             },
         }
     }
+
+    fn sub_slice(&self, off: u64, size: u64) -> Binding<'a> {
+        match self {
+            Binding::Full(t) => Binding::Slice(t, off, size),
+            Binding::Slice(t, base, _) => Binding::Slice(t, base + off, size),
+        }
+    }
 }
 
 pub struct Commands<'a>(pub(crate) &'a mut Encoder);
@@ -53,6 +60,7 @@ pub struct Backend {
     unit_scale: Tensor,
     gemv_partial: Tensor,
     gemm_partial: Tensor,
+    gemm_xf16: Tensor,
     read_staging: std::cell::RefCell<(Buffer, u64)>,
     profiler: Option<Rc<std::cell::RefCell<flint_profiler::GpuProfiler>>>,
 
@@ -71,6 +79,7 @@ impl Backend {
         let unit_scale = Tensor::new(Self::zeroed_buf(device.as_ref(), 4), vec![1], DType::F32);
         let gemv_partial = Self::partial_buf(device.as_ref(), 8 * 65536)?;
         let gemm_partial = Self::partial_buf(device.as_ref(), 4 * 128 * 16384)?;
+        let gemm_xf16 = Self::partial_f16_buf(device.as_ref(), 128 * 8192)?;
         let read_staging = device
             .create_buffer(1 << 20, HostAccess::Read, false)
             .map_err(|e| Error::Gpu(e.to_string()))?;
@@ -80,6 +89,7 @@ impl Backend {
             unit_scale,
             gemv_partial,
             gemm_partial,
+            gemm_xf16,
             read_staging: std::cell::RefCell::new((read_staging, 1 << 20)),
             profiler: None,
             pending: Vec::new(),
@@ -123,6 +133,16 @@ impl Backend {
         ))
     }
 
+    fn partial_f16_buf(device: &Device, words: usize) -> Result<Tensor> {
+        Ok(Tensor::new(
+            device
+                .create_buffer(words as u64 * 2, HostAccess::None, false)
+                .map_err(|e| Error::Gpu(e.to_string()))?,
+            vec![words as u32],
+            DType::F16,
+        ))
+    }
+
     fn retire(&mut self, tensor: Tensor) {
         let refs = self.pending.len() as u32 + 1;
         self.retired.push((tensor, refs));
@@ -161,6 +181,15 @@ impl Backend {
             Self::zeroed_buf(self.device.as_ref(), numel * 2),
             shape.to_vec(),
             DType::Bf16,
+        )
+    }
+
+    pub fn zero_f16_tensor(&self, shape: &[u32]) -> Tensor {
+        let numel: u64 = shape.iter().map(|d| *d as u64).product();
+        Tensor::new(
+            Self::zeroed_buf(self.device.as_ref(), numel * 2),
+            shape.to_vec(),
+            DType::F16,
         )
     }
 

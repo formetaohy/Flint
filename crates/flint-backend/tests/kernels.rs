@@ -231,18 +231,30 @@ fn gemm_bf16() {
     gemm_case(WType::Bf16, 16, 64, 128, 7);
 }
 
-#[test]
-fn gemm_coop_bf16() {
-    let _g = gpu();
-    let mut ctx = Ctx::new();
-    let mut rng = Rng(7);
-    let (m, n, k) = (16usize, 64usize, 128usize);
-    let x = rng.fill(m * k);
-    let w = rng.fill(n * k);
-    let xb = ctx.f32(&x, &[m as u32, k as u32]);
-    let y = ctx.zero(&[m as u32, n as u32]);
-    let wb = ctx.bf16(&w, &[n as u32, k as u32]);
-    let sb = ctx.f32(&[0.0], &[1]);
+fn coop_gemm(
+    ctx: &mut Ctx,
+    x: &Tensor,
+    w: &Weight,
+    y: &Tensor,
+    m: u32,
+    n: u32,
+    k: u32,
+    acc: bool,
+) {
+    let xf = ctx.backend.zero_f16_tensor(&[m * k]);
+    ctx.dispatch(
+        name::TO_F16,
+        &[("N_ELEM", (m * k) as f64)],
+        &[Binding::Full(x), Binding::Full(&xf)],
+        [(m * k / 4).div_ceil(256), 1, 1],
+    );
+    let unit = ctx.f32(&[1.0], &[1]);
+    let scale = match w.scale() {
+        Some(s) => Binding::Full(s),
+        None => Binding::Full(&unit),
+    };
+    let wdtype = if w.scale().is_some() { 1.0 } else { 0.0 };
+    let group = w.group().unwrap_or(128) as f64;
     ctx.dispatch(
         name::GEMM_COOP,
         &[
@@ -250,20 +262,35 @@ fn gemm_coop_bf16() {
             ("K", k as f64),
             ("M", m as f64),
             ("SEGS", 1.0),
-            ("WDTYPE", 0.0),
-            ("GROUP", 128.0),
-            ("ACC", 0.0),
+            ("WDTYPE", wdtype),
+            ("GROUP", group),
+            ("ACC", acc as u32 as f64),
             ("Y_STRIDE", n as f64),
             ("Y_OFF", 0.0),
         ],
         &[
-            Binding::Full(&xb),
-            Binding::Full(&wb),
-            Binding::Full(&sb),
-            Binding::Full(&y),
+            Binding::Full(&xf),
+            Binding::Full(w.tensor()),
+            scale,
+            Binding::Full(y),
         ],
-        [n.div_ceil(32) as u32, m.div_ceil(64) as u32, 1],
+        [n.div_ceil(128), m.div_ceil(128), 1],
     );
+}
+
+#[test]
+fn gemm_coop_bf16() {
+    let _g = gpu();
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(7);
+    let (m, n, k) = (128usize, 128usize, 256usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.zero(&[m as u32, n as u32]);
+    let wb = ctx.bf16(&w, &[n as u32, k as u32]);
+    let weight = Weight::plain(wb);
+    coop_gemm(&mut ctx, &xb, &weight, &y, m as u32, n as u32, k as u32, false);
     agree(
         &ctx.read(&y),
         &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
@@ -277,7 +304,7 @@ fn gemm_coop_i8_group32() {
     let _g = gpu();
     let mut ctx = Ctx::new();
     let mut rng = Rng(71);
-    let (m, n, k, group) = (16usize, 64usize, 128usize, 32usize);
+    let (m, n, k, group) = (128usize, 128usize, 256usize, 32usize);
     let x = rng.fill(m * k);
     let w = rng.fill(n * k);
     let xb = ctx.f32(&x, &[m as u32, k as u32]);
@@ -286,84 +313,30 @@ fn gemm_coop_i8_group32() {
     let cpu_w = dequant(&wq, &scales, n, k, group);
     let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
     let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
-    ctx.dispatch(
-        name::GEMM_COOP,
-        &[
-            ("N", n as f64),
-            ("K", k as f64),
-            ("M", m as f64),
-            ("SEGS", 1.0),
-            ("WDTYPE", 1.0),
-            ("GROUP", group as f64),
-            ("ACC", 0.0),
-            ("Y_STRIDE", n as f64),
-            ("Y_OFF", 0.0),
-        ],
-        &[
-            Binding::Full(&xb),
-            Binding::Full(&wb),
-            Binding::Full(&sb),
-            Binding::Full(&y),
-        ],
-        [n.div_ceil(32) as u32, m.div_ceil(64) as u32, 1],
-    );
+    let weight = Weight::quant(wb, sb, group as u32);
+    coop_gemm(&mut ctx, &xb, &weight, &y, m as u32, n as u32, k as u32, false);
     agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 1e-2, 1e-2);
 }
 
 #[test]
-fn gemm_coop_bf16_segs() {
+fn gemm_coop_bf16_acc() {
     let _g = gpu();
     let mut ctx = Ctx::new();
-    let mut rng = Rng(77);
-    let (m, n, k) = (16usize, 64usize, 8192usize);
+    let mut rng = Rng(13);
+    let (m, n, k) = (128usize, 128usize, 256usize);
     let x = rng.fill(m * k);
     let w = rng.fill(n * k);
+    let y0 = rng.fill(m * n);
     let xb = ctx.f32(&x, &[m as u32, k as u32]);
-    let y = ctx.zero(&[m as u32, n as u32]);
+    let y = ctx.f32(&y0, &[m as u32, n as u32]);
     let wb = ctx.bf16(&w, &[n as u32, k as u32]);
-    let sb = ctx.f32(&[0.0], &[1]);
-    let segs = 4u32;
-    let partial = ctx.zero(&[segs * m as u32 * n as u32]);
-    ctx.dispatch(
-        name::GEMM_COOP,
-        &[
-            ("N", n as f64),
-            ("K", k as f64),
-            ("M", m as f64),
-            ("SEGS", segs as f64),
-            ("WDTYPE", 0.0),
-            ("GROUP", 128.0),
-            ("ACC", 0.0),
-            ("Y_STRIDE", n as f64),
-            ("Y_OFF", 0.0),
-        ],
-        &[
-            Binding::Full(&xb),
-            Binding::Full(&wb),
-            Binding::Full(&sb),
-            Binding::Full(&partial),
-        ],
-        [n.div_ceil(32) as u32, m.div_ceil(64) as u32, segs],
-    );
-    ctx.dispatch(
-        name::MERGE_GEMM,
-        &[
-            ("M", m as f64),
-            ("N", n as f64),
-            ("Y_STRIDE", n as f64),
-            ("Y_OFF", 0.0),
-            ("SEGS", segs as f64),
-            ("ACC", 0.0),
-        ],
-        &[Binding::Full(&partial), Binding::Full(&y)],
-        [n.div_ceil(256) as u32, 1, 1],
-    );
-    agree(
-        &ctx.read(&y),
-        &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
-        2e-2,
-        5e-2,
-    );
+    let weight = Weight::plain(wb);
+    coop_gemm(&mut ctx, &xb, &weight, &y, m as u32, n as u32, k as u32, true);
+    let mut expect = cpu_ref::gemm(&x, &bf16_round(&w), m, n, k);
+    for i in 0..expect.len() {
+        expect[i] += y0[i];
+    }
+    agree(&ctx.read(&y), &expect, 2e-2, 5e-2);
 }
 
 #[test]
@@ -371,40 +344,191 @@ fn gemm_coop_bf16_multi_tile() {
     let _g = gpu();
     let mut ctx = Ctx::new();
     let mut rng = Rng(29);
-    let (m, n, k) = (80usize, 64usize, 256usize);
+    let (m, n, k) = (128usize, 256usize, 1024usize);
     let x = rng.fill(m * k);
     let w = rng.fill(n * k);
     let xb = ctx.f32(&x, &[m as u32, k as u32]);
     let y = ctx.zero(&[m as u32, n as u32]);
     let wb = ctx.bf16(&w, &[n as u32, k as u32]);
-    let sb = ctx.f32(&[0.0], &[1]);
-    ctx.dispatch(
-        name::GEMM_COOP,
-        &[
-            ("N", n as f64),
-            ("K", k as f64),
-            ("M", m as f64),
-            ("SEGS", 1.0),
-            ("WDTYPE", 0.0),
-            ("GROUP", 128.0),
-            ("ACC", 0.0),
-            ("Y_STRIDE", n as f64),
-            ("Y_OFF", 0.0),
-        ],
-        &[
-            Binding::Full(&xb),
-            Binding::Full(&wb),
-            Binding::Full(&sb),
-            Binding::Full(&y),
-        ],
-        [n.div_ceil(32) as u32, m.div_ceil(64) as u32, 1],
-    );
+    let weight = Weight::plain(wb);
+    coop_gemm(&mut ctx, &xb, &weight, &y, m as u32, n as u32, k as u32, false);
     agree(
         &ctx.read(&y),
         &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
         2e-2,
         5e-2,
     );
+}
+
+#[test]
+fn gemm_acc_coop_full() {
+    let _g = gpu();
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(31);
+    let (m, n, k, group) = (128usize, 128usize, 256usize, 32usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.zero(&[m as u32, n as u32]);
+    let (wq, scales) = quant(&w, n, k, group);
+    let cpu_w = dequant(&wq, &scales, n, k, group);
+    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
+    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
+    let weight = Weight::quant(wb, sb, group as u32);
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut commands = Commands::begin(&mut enc);
+        ctx.backend
+            .gemm_acc(
+                &mut commands,
+                Binding::Full(&xb),
+                &weight,
+                Binding::Full(&y),
+                m as u32,
+                false,
+            )
+            .unwrap();
+    }
+    ctx.backend.submit(&mut enc).unwrap();
+    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 1e-2, 1e-2);
+}
+
+#[test]
+fn gemm_acc_coop_tail() {
+    let _g = gpu();
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(37);
+    let (m, n, k, group) = (144usize, 128usize, 256usize, 32usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let y0 = rng.fill(m * n);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.f32(&y0, &[m as u32, n as u32]);
+    let (wq, scales) = quant(&w, n, k, group);
+    let cpu_w = dequant(&wq, &scales, n, k, group);
+    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
+    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
+    let weight = Weight::quant(wb, sb, group as u32);
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut commands = Commands::begin(&mut enc);
+        ctx.backend
+            .gemm_acc(
+                &mut commands,
+                Binding::Full(&xb),
+                &weight,
+                Binding::Full(&y),
+                m as u32,
+                false,
+            )
+            .unwrap();
+    }
+    ctx.backend.submit(&mut enc).unwrap();
+    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 1e-2, 1e-2);
+}
+
+#[test]
+fn gemm_acc_coop_tail_accumulates() {
+    let _g = gpu();
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(39);
+    let (m, n, k, group) = (144usize, 128usize, 256usize, 32usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let y0 = rng.fill(m * n);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.f32(&y0, &[m as u32, n as u32]);
+    let (wq, scales) = quant(&w, n, k, group);
+    let cpu_w = dequant(&wq, &scales, n, k, group);
+    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
+    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
+    let weight = Weight::quant(wb, sb, group as u32);
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut commands = Commands::begin(&mut enc);
+        ctx.backend
+            .gemm_acc(
+                &mut commands,
+                Binding::Full(&xb),
+                &weight,
+                Binding::Full(&y),
+                m as u32,
+                true,
+            )
+            .unwrap();
+    }
+    ctx.backend.submit(&mut enc).unwrap();
+    let mut expect = cpu_ref::gemm(&x, &cpu_w, m, n, k);
+    for i in 0..expect.len() {
+        expect[i] += y0[i];
+    }
+    agree(&ctx.read(&y), &expect, 1e-2, 1e-2);
+}
+
+#[test]
+fn gemm_acc_coop_long_k() {
+    let _g = gpu();
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(41);
+    let (m, n, k, group) = (128usize, 128usize, 8192usize, 32usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.zero(&[m as u32, n as u32]);
+    let (wq, scales) = quant(&w, n, k, group);
+    let cpu_w = dequant(&wq, &scales, n, k, group);
+    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
+    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
+    let weight = Weight::quant(wb, sb, group as u32);
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut commands = Commands::begin(&mut enc);
+        ctx.backend
+            .gemm_acc(
+                &mut commands,
+                Binding::Full(&xb),
+                &weight,
+                Binding::Full(&y),
+                m as u32,
+                false,
+            )
+            .unwrap();
+    }
+    ctx.backend.submit(&mut enc).unwrap();
+    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 2e-2, 3e-2);
+}
+
+#[test]
+fn gemm_classic_segs_long_k() {
+    let _g = gpu();
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(43);
+    let (m, n, k, group) = (64usize, 64usize, 8192usize, 32usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.zero(&[m as u32, n as u32]);
+    let (wq, scales) = quant(&w, n, k, group);
+    let cpu_w = dequant(&wq, &scales, n, k, group);
+    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
+    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
+    let weight = Weight::quant(wb, sb, group as u32);
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut commands = Commands::begin(&mut enc);
+        ctx.backend
+            .gemm_acc(
+                &mut commands,
+                Binding::Full(&xb),
+                &weight,
+                Binding::Full(&y),
+                m as u32,
+                false,
+            )
+            .unwrap();
+    }
+    ctx.backend.submit(&mut enc).unwrap();
+    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 1e-2, 1e-2);
 }
 
 #[test]

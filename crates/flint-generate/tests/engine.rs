@@ -134,7 +134,7 @@ fn tokenizer() -> Tokenizer {
 }
 
 fn json_tokenizer() -> Tokenizer {
-    let mut vocab: Vec<String> = ["{", "\"", "m", "o", "v", "e", ":", "n", "r", "t", "h", "}"]
+    let mut vocab: Vec<String> = ["{", "\"", "m", "o", "d", "e", ":", "f", "a", "s", "t", "}"]
         .iter()
         .map(|s| format!("[{}, -1.0]", serde_json::to_string(s).unwrap()))
         .collect();
@@ -345,8 +345,8 @@ fn grammar_forces_the_schema_literal() {
     );
     let grammar = Grammar::from_schema(&json!({
         "type": "object",
-        "required": ["move"],
-        "properties": {"move": {"type": "string", "enum": ["north"]}}
+        "required": ["mode"],
+        "properties": {"mode": {"type": "string", "enum": ["fast"]}}
     }))
     .unwrap();
     let id = engine.create("t0", 64, Some(grammar)).unwrap();
@@ -359,7 +359,7 @@ fn grammar_forces_the_schema_literal() {
         }
         assert!(tokens.len() < 4096, "runaway constrained generation");
     }
-    let want: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 1, 6, 1, 7, 3, 8, 9, 10, 1, 11];
+    let want: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 1, 6, 1, 7, 8, 9, 10, 1, 11];
     assert_eq!(
         tokens, want,
         "the grammar must force the exact JSON literal"

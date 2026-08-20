@@ -18,6 +18,7 @@ fn caps_probe() -> Result<()> {
             p.m_size, p.n_size, p.k_size, p.ab_type, p.cr_type, p.saturating_accumulation
         );
     }
+    eprintln!("[probe] gemm coop variant: {:?}", device.coop_gemm());
     Ok(())
 }
 
@@ -283,9 +284,15 @@ fn gemm_probe() -> Result<()> {
 
     let mut backend = Backend::new()?;
     eprintln!("[probe] adapter: {}", backend.adapter_name());
-    let m = 128u32;
-    let n = 14336u32;
-    let k = 4096u32;
+    let env = |k: &str, d: u32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let m = env("PROBE_M", 128);
+    let n = env("PROBE_N", 14336);
+    let k = env("PROBE_K", 4096);
     let x: Vec<f32> = (0..m * k)
         .map(|i| ((i as f32) * 0.001 - 2.0) * 0.5)
         .collect();
@@ -316,9 +323,28 @@ fn gemm_probe() -> Result<()> {
             .unwrap_or("gemm".into())
             .into_boxed_str(),
     );
-    let tn: u32 = if kernel_name.contains("coop") { 32 } else { 128 };
-    let tm: u32 = 64;
+    let coop = kernel_name.contains("coop");
+    let tn: u32 = 128;
+    let tm: u32 = if coop { 128 } else { 64 };
     let y = backend.zero_tensor(&[m, n]);
+    let xf16 = if coop {
+        let xf = backend.zero_f16_tensor(&[m * k]);
+        let mut enc = backend.encoder().unwrap();
+        {
+            let mut commands = Commands::begin(&mut enc);
+            backend.dispatch(
+                &mut commands,
+                flint_kernel::name::TO_F16,
+                &[("N_ELEM", (m * k) as f64)],
+                &[Binding::Full(&xb), Binding::Full(&xf)],
+                [(m * k / 4).div_ceil(256), 1, 1],
+            )?;
+        }
+        backend.submit(&mut enc)?;
+        Some(xf)
+    } else {
+        None
+    };
     let scalars = backend.pack_scalars(kernel_name, &[
         ("N", n as f64),
         ("K", k as f64),
@@ -333,7 +359,7 @@ fn gemm_probe() -> Result<()> {
     let binds = [
         flint_gpu::BindingRef {
             index: 0,
-            buffer: &xb.buf,
+            buffer: &xf16.as_ref().unwrap_or(&xb).buf,
             offset: 0,
             size: 0,
         },
@@ -396,6 +422,15 @@ fn gemm_probe() -> Result<()> {
         let mut enc = backend.encoder().unwrap();
         {
             let mut commands = Commands::begin(&mut enc);
+            if let Some(xf) = &xf16 {
+                backend.dispatch(
+                    &mut commands,
+                    flint_kernel::name::TO_F16,
+                    &[("N_ELEM", (m * k) as f64)],
+                    &[Binding::Full(&xb), Binding::Full(xf)],
+                    [(m * k / 4).div_ceil(256), 1, 1],
+                )?;
+            }
             backend.dispatch(
                 &mut commands,
                 kernel_name,
@@ -411,7 +446,7 @@ fn gemm_probe() -> Result<()> {
                     ("Y_OFF", 0.0),
                 ],
                 &[
-                    Binding::Full(&xb),
+                    Binding::Full(xf16.as_ref().unwrap_or(&xb)),
                     Binding::Full(&wb),
                     Binding::Full(&sb),
                     Binding::Full(&y),

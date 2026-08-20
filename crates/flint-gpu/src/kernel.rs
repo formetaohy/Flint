@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use flint_error::Result;
 
-use crate::device::KernelSpec;
+use crate::device::{BindingMode, KernelSpec};
 use crate::encoder::BindingRef;
 use crate::DeviceRef;
 
@@ -50,12 +50,17 @@ impl Kernel {
                 label: Some(spec.name),
                 source: wgpu::ShaderSource::Wgsl(spec.wgsl.into()),
             });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..spec.bindings)
-            .map(|i| wgpu::BindGroupLayoutEntry {
-                binding: i,
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = spec
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(i, mode)| wgpu::BindGroupLayoutEntry {
+                binding: i as u32,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    ty: wgpu::BufferBindingType::Storage {
+                        read_only: *mode == BindingMode::ReadOnly,
+                    },
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
@@ -90,7 +95,7 @@ impl Kernel {
             name: spec.name.to_string(),
             pipeline,
             bind_group_layout,
-            binding_count: spec.bindings,
+            binding_count: spec.bindings.len() as u32,
             device: device.clone(),
             bind_groups: Mutex::new(HashMap::new()),
         })

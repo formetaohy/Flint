@@ -1,4 +1,5 @@
 use flint_error::Result;
+use flint_gpu::CoopVariant;
 use flint_tensor::{DType, Weight};
 
 use crate::{Backend, Binding, Commands, shader};
@@ -10,6 +11,17 @@ impl Backend {
                 &mut self.gemm_partial,
                 Self::partial_buf(self.device.as_ref(), words as usize)
                     .expect("gemm partial growth"),
+            );
+            self.retire(old);
+        }
+    }
+
+    fn ensure_gemm_xf16(&mut self, words: u32) {
+        if words > self.gemm_xf16.numel() as u32 {
+            let old = std::mem::replace(
+                &mut self.gemm_xf16,
+                Self::partial_f16_buf(self.device.as_ref(), words as usize)
+                    .expect("gemm f16 staging growth"),
             );
             self.retire(old);
         }
@@ -35,7 +47,7 @@ impl Backend {
         let (n, k) = (w.tensor().shape[0], w.tensor().shape[1]);
         let dtype = match w.tensor().dtype {
             DType::Bf16 | DType::I8 => w.tensor().dtype,
-            DType::F32 | DType::U32 => {
+            DType::F32 | DType::U32 | DType::F16 => {
                 unreachable!("gemm operands are weights, never index tensors")
             }
         };
@@ -63,13 +75,73 @@ impl Backend {
             k.is_multiple_of(32),
             "gemm K {k} is not a multiple of the BK=32 tile"
         );
+        let main = rows - rows % 128;
+        let coop = if main > 0 && n.is_multiple_of(128) {
+            self.device.coop_gemm().map(|v| match v {
+                CoopVariant::M16 => shader::GEMM_COOP,
+                CoopVariant::M8 => shader::GEMM_COOP8,
+            })
+        } else {
+            None
+        };
+        if let Some(kernel) = coop {
+            self.ensure_gemm_xf16(main * k);
+            let xf = Binding::Slice(&self.gemm_xf16, 0, main as u64 * k as u64 * 2);
+            Self::set(
+                &self.kernels,
+                commands,
+                shader::TO_F16,
+                &[("N_ELEM", (main * k) as f64)],
+                &[x, xf],
+                [(main * k / 4).div_ceil(256), 1, 1],
+            )?;
+            let unit_scale = self.unit_scale();
+            let consts = [
+                ("N", n as f64),
+                ("K", k as f64),
+                ("M", main as f64),
+                ("SEGS", 1.0),
+                ("WDTYPE", dtype_flag(dtype)),
+                ("GROUP", group_const(w)),
+                ("ACC", acc as u32 as f64),
+                ("Y_STRIDE", n as f64),
+                ("Y_OFF", 0.0),
+            ];
+            Self::set(
+                &self.kernels,
+                commands,
+                kernel,
+                &consts,
+                &[xf, wb, Self::scale_binding(unit_scale, w), y],
+                [n.div_ceil(128), main.div_ceil(128), 1],
+            )?;
+            if rows > main {
+                let tail = rows - main;
+                let xt = x.sub_slice(main as u64 * k as u64 * 4, tail as u64 * k as u64 * 4);
+                let yt = y.sub_slice(main as u64 * n as u64 * 4, tail as u64 * n as u64 * 4);
+                self.classic_gemm(commands, xt, w, yt, tail, acc)?;
+            }
+            return Ok(());
+        }
+        self.classic_gemm(commands, x, w, y, rows, acc)
+    }
+
+    fn classic_gemm(
+        &mut self,
+        commands: &mut Commands<'_>,
+        x: Binding<'_>,
+        w: &Weight,
+        y: Binding<'_>,
+        rows: u32,
+        acc: bool,
+    ) -> Result<()> {
+        let (n, k, wb, dtype) = Self::weight_io(w);
         let segs = if rows > 1 && k >= 8192 && k.is_multiple_of(128) {
             4
         } else {
             1
         };
         let gemm_acc = if segs > 1 { 0 } else { acc as u32 };
-        let kernel = shader::GEMM;
         let consts = [
             ("N", n as f64),
             ("K", k as f64),
@@ -92,7 +164,7 @@ impl Backend {
         Self::set(
             &self.kernels,
             commands,
-            kernel,
+            shader::GEMM,
             &consts,
             &bufs,
             [n.div_ceil(128), rows.div_ceil(64), segs],
@@ -207,7 +279,9 @@ fn dtype_flag(dtype: DType) -> f64 {
     match dtype {
         DType::Bf16 => 0.0,
         DType::I8 => 1.0,
-        DType::F32 | DType::U32 => unreachable!("gemm weights are bf16-packed or i8"),
+        DType::F32 | DType::U32 | DType::F16 => {
+            unreachable!("gemm weights are bf16-packed or i8")
+        }
     }
 }
 

@@ -1,72 +1,28 @@
-mod chat;
-mod embed;
-mod hub;
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, ValueEnum};
-
+use clap::ValueEnum;
 use flint_error::{Error, Result};
 
-use hub::{FileEntry, Hub};
-
-#[derive(Parser)]
-#[command(
-    name = "chat",
-    version,
-    about = "download a Hugging Face model into temp/ and run inference"
-)]
-struct Args {
-    #[arg(long)]
-    model: String,
-
-    #[arg(long)]
-    prompt: String,
-
-    #[arg(long, value_enum)]
-    format: Format,
-
-    #[arg(long, default_value_t = 8192)]
-    max_tokens: usize,
-
-    #[arg(long, default_value_t = 32768)]
-    ctx_size: u32,
-}
+use crate::hub::{FileEntry, Hub};
 
 #[derive(Clone, Copy, ValueEnum)]
-enum Format {
+pub enum Format {
     #[value(alias = "safetensor")]
     Safetensors,
     Gguf,
-    Embed,
 }
 
-fn main() -> Result<()> {
-    env_logger::init();
-    let args = Args::parse();
-    let dir = PathBuf::from("temp").join(args.model.replace('/', "--"));
-    ensure_assets(&Hub::new(&args.model), args.format, &dir)?;
-    match args.format {
-        Format::Embed => embed::run(&dir, &args.prompt),
-        Format::Safetensors | Format::Gguf => {
-            chat::run(&dir, &args.prompt, args.max_tokens, args.ctx_size)
-        }
-    }
-}
-
-fn ensure_assets(hub: &Hub, format: Format, dir: &Path) -> Result<Vec<PathBuf>> {
+pub fn ensure(hub: &Hub, format: Format, dir: &Path) -> Result<()> {
     fs::create_dir_all(dir).map_err(|e| Error::Model(format!("mkdir {}: {e}", dir.display())))?;
     if matches!(format, Format::Gguf)
         && let Some(local) = find_local_gguf(dir)
     {
         eprintln!("[hf] using local {}", local.display());
-        return Ok(vec![local]);
+        return Ok(());
     }
     let files = hub.files()?;
-    let wanted = select(format, &files)?;
-    let mut local = vec![];
-    for entry in wanted {
+    for entry in select(format, &files)? {
         let dest = dir.join(&entry.path);
         let complete = dest
             .metadata()
@@ -83,9 +39,8 @@ fn ensure_assets(hub: &Hub, format: Format, dir: &Path) -> Result<Vec<PathBuf>> 
                 )));
             }
         }
-        local.push(dest);
     }
-    Ok(local)
+    Ok(())
 }
 
 fn find_local_gguf(dir: &Path) -> Option<PathBuf> {
@@ -99,7 +54,7 @@ fn find_local_gguf(dir: &Path) -> Option<PathBuf> {
 
 fn select(format: Format, files: &[FileEntry]) -> Result<Vec<FileEntry>> {
     match format {
-        Format::Safetensors | Format::Embed => select_safetensors(files),
+        Format::Safetensors => select_safetensors(files),
         Format::Gguf => select_single(files, "gguf"),
     }
 }

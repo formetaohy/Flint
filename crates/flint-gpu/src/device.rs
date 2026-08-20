@@ -13,6 +13,18 @@ const WORKGROUP_SIZE_X: u32 = 512;
 const WORKGROUP_STORAGE_BYTES: u32 = 32 * 1024;
 const STORAGE_BUFFERS_PER_STAGE: u32 = 16;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BindingMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoopVariant {
+    M16,
+    M8,
+}
+
 static OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +149,25 @@ impl Device {
         &self.cooperative_matrix
     }
 
+    pub fn coop_gemm(&self) -> Option<CoopVariant> {
+        let has = |m, n, k| {
+            self.cooperative_matrix.iter().any(|p| {
+                p.m_size == m
+                    && p.n_size == n
+                    && p.k_size == k
+                    && p.ab_type == wgpu::CooperativeScalarType::F16
+                    && p.cr_type == wgpu::CooperativeScalarType::F32
+            })
+        };
+        if has(16, 16, 16) {
+            Some(CoopVariant::M16)
+        } else if has(8, 8, 8) {
+            Some(CoopVariant::M8)
+        } else {
+            None
+        }
+    }
+
     pub fn timestamp_period_ns(&self) -> f64 {
         self.inner.queue.get_timestamp_period() as f64
     }
@@ -197,6 +228,6 @@ impl Device {
 pub struct KernelSpec<'a> {
     pub name: &'a str,
     pub wgsl: &'a str,
-    pub bindings: u32,
+    pub bindings: &'a [BindingMode],
     pub immediate_size: u32,
 }

@@ -238,21 +238,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
-name = "chat"
-version = "0.1.0"
-dependencies = [
- "clap",
- "env_logger",
- "flint-architectures",
- "flint-backend",
- "flint-error",
- "flint-generate",
- "flint-tokenizer",
- "serde_json",
- "ureq",
-]
-
-[[package]]
 name = "clap"
 version = "4.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -650,6 +635,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "flint-examples"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "flint-architectures",
+ "flint-backend",
+ "flint-error",
+ "flint-generate",
+ "flint-tokenizer",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "flint-generate"
 version = "0.1.0"
 dependencies = [
@@ -675,6 +675,7 @@ version = "0.1.0"
 dependencies = [
  "flint-error",
  "flint-gpu",
+ "naga",
 ]
 
 [[package]]

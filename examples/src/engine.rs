@@ -1,11 +1,19 @@
 use std::io::Write as _;
 use std::path::Path;
 
+use flint_architectures::LoadOptions;
 use flint_backend::Backend;
 use flint_error::Result;
-use flint_generate::{Engine, GenStats};
+use flint_generate::{Engine, GenStats, Grammar, SessionId};
 
-pub fn run(dir: &Path, prompt: &str, max_tokens: usize, ctx_size: u32) -> Result<()> {
+pub fn spawn(
+    dir: &Path,
+    system: &str,
+    prompt: &str,
+    max_tokens: usize,
+    ctx_size: u32,
+    grammar: Option<Grammar>,
+) -> Result<(Engine, SessionId)> {
     eprintln!("[flint] initializing GPU backend...");
     let backend = Backend::new()?;
     eprintln!("[flint] adapter: {}", backend.adapter_name());
@@ -14,7 +22,7 @@ pub fn run(dir: &Path, prompt: &str, max_tokens: usize, ctx_size: u32) -> Result
     let load_t = std::time::Instant::now();
     let chat_model = flint_architectures::load(
         dir,
-        &flint_architectures::LoadOptions {
+        &LoadOptions {
             slots: vec![ctx_size],
             spec_depth: None,
         },
@@ -22,6 +30,7 @@ pub fn run(dir: &Path, prompt: &str, max_tokens: usize, ctx_size: u32) -> Result
     )?;
     eprintln!("[flint] loaded in {:.1}s", load_t.elapsed().as_secs_f64());
 
+    let text = chat_model.chat.render(system, &[], prompt);
     let mut engine = Engine::new(
         backend,
         chat_model.model,
@@ -31,20 +40,23 @@ pub fn run(dir: &Path, prompt: &str, max_tokens: usize, ctx_size: u32) -> Result
         chat_model.stop,
         false,
     );
-    let text = chat_model.chat.render(SYSTEM, &[], prompt);
-    let session = engine.create(&text, max_tokens, None)?;
+    let id = engine.create(&text, max_tokens, grammar)?;
+    Ok((engine, id))
+}
+
+pub fn stream(engine: &mut Engine, id: SessionId) -> Result<()> {
     loop {
         engine.step()?;
-        for piece in engine.poll(session) {
+        for piece in engine.poll(id) {
             print!("{}", piece.text);
             std::io::stdout().flush().ok();
         }
-        if engine.finished(session) {
+        if engine.finished(id) {
             break;
         }
     }
     println!();
-    if let Some(s) = engine.stats(session) {
+    if let Some(s) = engine.stats(id) {
         eprintln!("{}", stats_summary(&s));
     }
     Ok(())
@@ -66,5 +78,3 @@ fn stats_summary(s: &GenStats) -> String {
         s.prefill_tokens, s.prefill_secs, s.decode_tokens, s.decode_secs,
     )
 }
-
-const SYSTEM: &str = "You are a helpful assistant.";

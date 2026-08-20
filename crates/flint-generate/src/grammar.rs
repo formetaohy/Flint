@@ -588,17 +588,17 @@ mod tests {
         let t = trie(
             &[
                 ("{", 0),
-                ("\"action\"", 1),
+                ("\"status\"", 1),
                 (":", 2),
-                ("\"attack\"", 3),
-                ("\"flee\"", 4),
+                ("\"ok\"", 3),
+                ("\"error\"", 4),
                 ("}", 5),
             ],
             6,
         );
         let mut m = matcher(
             json!({"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["attack", "flee"]}
+                "status": {"type": "string", "enum": ["ok", "error"]}
             }}),
             &t,
         );

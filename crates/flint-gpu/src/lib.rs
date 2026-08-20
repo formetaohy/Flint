@@ -5,7 +5,7 @@ pub mod kernel;
 pub mod query;
 
 pub use buffer::Buffer;
-pub use device::{Device, HostAccess, KernelSpec};
+pub use device::{BindingMode, CoopVariant, Device, HostAccess, KernelSpec};
 pub use encoder::{BindingRef, Encoder, Submission};
 pub use kernel::Kernel;
 pub use query::TimestampSet;

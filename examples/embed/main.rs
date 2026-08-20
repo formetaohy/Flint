@@ -1,9 +1,34 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use clap::Parser;
 use flint_backend::Backend;
 use flint_error::Result;
+use flint_examples::assets::{self, Format};
+use flint_examples::hub::Hub;
 
-pub fn run(dir: &Path, prompt: &str) -> Result<()> {
+#[derive(Parser)]
+#[command(
+    name = "embed",
+    version,
+    about = "download a Hugging Face embedding model into temp/ and print the embedding of a prompt"
+)]
+struct Args {
+    #[arg(long)]
+    model: String,
+
+    #[arg(long)]
+    prompt: String,
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+    let args = Args::parse();
+    let dir = PathBuf::from("temp").join(args.model.replace('/', "--"));
+    assets::ensure(&Hub::new(&args.model), Format::Safetensors, &dir)?;
+    run(&dir, &args.prompt)
+}
+
+fn run(dir: &Path, prompt: &str) -> Result<()> {
     let tokenizer_file = dir.join("tokenizer.json");
     if !tokenizer_file.exists() {
         return Err(flint_error::Error::Model(format!(

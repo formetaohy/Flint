@@ -3,6 +3,8 @@ pub const ATTN_BR: u32 = 8;
 pub mod name {
     pub const GEMM: &str = "gemm";
     pub const GEMM_COOP: &str = "gemm_coop";
+    pub const GEMM_COOP8: &str = "gemm_coop8";
+    pub const TO_F16: &str = "to_f16";
     pub const MERGE_GEMM: &str = "merge_gemm";
     pub const GEMV: &str = "gemv";
     pub const MERGE_GEMV: &str = "merge_gemv";
@@ -31,7 +33,7 @@ pub mod name {
 use std::collections::HashMap;
 
 use flint_error::{Error, Result};
-use flint_gpu::{Device, Kernel};
+use flint_gpu::{BindingMode, Device, Kernel};
 
 mod scalar;
 
@@ -42,15 +44,15 @@ pub use modes::{Act, NormMode};
 struct ShaderSpec {
     name: &'static str,
     wgsl: &'static str,
-    bindings: u32,
+    bindings: &'static [BindingMode],
     scalars: &'static [(&'static str, Scalar)],
 }
 
 macro_rules! shader {
-    ($name:expr, $file:literal, $bindings:expr, $scalars:expr) => {
+    ($name:expr, [$($file:literal),+ $(,)?], $bindings:expr, $scalars:expr) => {
         ShaderSpec {
             name: $name,
-            wgsl: include_str!(concat!("../wgsl/", $file)),
+            wgsl: concat!($(include_str!(concat!("../wgsl/", $file))),+),
             bindings: $bindings,
             scalars: $scalars,
         }
@@ -60,8 +62,8 @@ macro_rules! shader {
 const SHADERS: &[ShaderSpec] = &[
     shader!(
         name::GEMM,
-        "gemm.wgsl",
-        4,
+        ["gemm.wgsl"],
+        &[BindingMode::ReadWrite; 4],
         &[
             ("N", Scalar::U32),
             ("K", Scalar::U32),
@@ -76,8 +78,8 @@ const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         name::GEMM_COOP,
-        "gemm_coop.wgsl",
-        4,
+        ["gemm_coop_common.wgsl", "gemm_coop.wgsl"],
+        &[BindingMode::ReadOnly, BindingMode::ReadOnly, BindingMode::ReadOnly, BindingMode::ReadWrite],
         &[
             ("N", Scalar::U32),
             ("K", Scalar::U32),
@@ -91,9 +93,26 @@ const SHADERS: &[ShaderSpec] = &[
         ]
     ),
     shader!(
+        name::GEMM_COOP8,
+        ["gemm_coop_common.wgsl", "gemm_coop8.wgsl"],
+        &[BindingMode::ReadOnly, BindingMode::ReadOnly, BindingMode::ReadOnly, BindingMode::ReadWrite],
+        &[
+            ("N", Scalar::U32),
+            ("K", Scalar::U32),
+            ("M", Scalar::U32),
+            ("SEGS", Scalar::U32),
+            ("WDTYPE", Scalar::U32),
+            ("GROUP", Scalar::U32),
+            ("ACC", Scalar::U32),
+            ("Y_STRIDE", Scalar::U32),
+            ("Y_OFF", Scalar::U32),
+        ]
+    ),
+    shader!(name::TO_F16, ["to_f16.wgsl"], &[BindingMode::ReadOnly, BindingMode::ReadWrite], &[("N_ELEM", Scalar::U32)]),
+    shader!(
         name::MERGE_GEMM,
-        "merge_gemm.wgsl",
-        2,
+        ["merge_gemm.wgsl"],
+        &[BindingMode::ReadWrite; 2],
         &[
             ("M", Scalar::U32),
             ("N", Scalar::U32),
@@ -105,8 +124,8 @@ const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         name::GEMV,
-        "gemv.wgsl",
-        4,
+        ["gemv.wgsl"],
+        &[BindingMode::ReadWrite; 4],
         &[
             ("N", Scalar::U32),
             ("K", Scalar::U32),
@@ -118,14 +137,14 @@ const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         name::MERGE_GEMV,
-        "merge_gemv.wgsl",
-        2,
+        ["merge_gemv.wgsl"],
+        &[BindingMode::ReadWrite; 2],
         &[("N", Scalar::U32), ("SEGS", Scalar::U32), ("ACC", Scalar::U32)]
     ),
     shader!(
         name::EMBED,
-        "embed.wgsl",
-        5,
+        ["embed.wgsl"],
+        &[BindingMode::ReadWrite; 5],
         &[
             ("M", Scalar::U32),
             ("DIM", Scalar::U32),
@@ -138,8 +157,8 @@ const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         name::NORM,
-        "norm.wgsl",
-        7,
+        ["norm.wgsl"],
+        &[BindingMode::ReadWrite; 7],
         &[
             ("MODE", Scalar::U32),
             ("DIM", Scalar::U32),
@@ -154,35 +173,35 @@ const SHADERS: &[ShaderSpec] = &[
             ("PLE_STRIDE", Scalar::U32),
         ]
     ),
-    shader!(name::ADD, "add.wgsl", 3, &[("N_ELEM", Scalar::U32)]),
+    shader!(name::ADD, ["add.wgsl"], &[BindingMode::ReadWrite; 3], &[("N_ELEM", Scalar::U32)]),
     shader!(
         name::BIAS,
-        "bias.wgsl",
-        2,
+        ["bias.wgsl"],
+        &[BindingMode::ReadWrite; 2],
         &[("N_ELEM", Scalar::U32), ("DIM", Scalar::U32)]
     ),
     shader!(
         name::CONCAT,
-        "concat.wgsl",
-        3,
+        ["concat.wgsl"],
+        &[BindingMode::ReadWrite; 3],
         &[("ROWS", Scalar::U32), ("D", Scalar::U32)]
     ),
     shader!(
         name::SWIGLU,
-        "swiglu.wgsl",
-        3,
+        ["swiglu.wgsl"],
+        &[BindingMode::ReadWrite; 3],
         &[("N_ELEM", Scalar::U32), ("MODE", Scalar::U32)]
     ),
     shader!(
         name::SOFTCAP,
-        "softcap.wgsl",
-        1,
+        ["softcap.wgsl"],
+        &[BindingMode::ReadWrite; 1],
         &[("N_ELEM", Scalar::U32), ("CAP", Scalar::F32)]
     ),
     shader!(
         name::MUL,
-        "mul.wgsl",
-        3,
+        ["mul.wgsl"],
+        &[BindingMode::ReadWrite; 3],
         &[
             ("N", Scalar::U32),
             ("M", Scalar::U32),
@@ -193,39 +212,39 @@ const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         name::EXPERT_GATHER,
-        "expert_gather.wgsl",
-        3,
+        ["expert_gather.wgsl"],
+        &[BindingMode::ReadWrite; 3],
         &[("HIDDEN", Scalar::U32), ("COUNT", Scalar::U32)]
     ),
     shader!(
         name::EXPERT_SCATTER,
-        "expert_scatter.wgsl",
-        4,
+        ["expert_scatter.wgsl"],
+        &[BindingMode::ReadWrite; 4],
         &[("HIDDEN", Scalar::U32), ("COUNT", Scalar::U32)]
     ),
     shader!(
         name::ZERO_ROWS,
-        "zero_rows.wgsl",
-        1,
+        ["zero_rows.wgsl"],
+        &[BindingMode::ReadWrite; 1],
         &[("N_ELEM", Scalar::U32)]
     ),
     shader!(
         name::SIGMOID_MUL,
-        "sigmoid_mul.wgsl",
-        3,
+        ["sigmoid_mul.wgsl"],
+        &[BindingMode::ReadWrite; 3],
         &[("N_ELEM", Scalar::U32)]
     ),
     shader!(
         name::DELTA_GATE,
-        "delta_gate.wgsl",
-        6,
+        ["delta_gate.wgsl"],
+        &[BindingMode::ReadWrite; 6],
         &[("HEADS", Scalar::U32), ("ROW_T", Scalar::U32)]
     ),
-    shader!(name::CONV1D, "conv1d.wgsl", 4, &[("DIM", Scalar::U32)]),
+    shader!(name::CONV1D, ["conv1d.wgsl"], &[BindingMode::ReadWrite; 4], &[("DIM", Scalar::U32)]),
     shader!(
         name::DELTA_RECUR,
-        "delta_recur.wgsl",
-        7,
+        ["delta_recur.wgsl"],
+        &[BindingMode::ReadWrite; 7],
         &[
             ("HEADS", Scalar::U32),
             ("K_DIM", Scalar::U32),
@@ -234,8 +253,8 @@ const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         name::REPEAT_QK,
-        "repeat_qk.wgsl",
-        2,
+        ["repeat_qk.wgsl"],
+        &[BindingMode::ReadWrite; 2],
         &[
             ("ROWS", Scalar::U32),
             ("N_K", Scalar::U32),
@@ -247,8 +266,8 @@ const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         name::ROPE,
-        "rope.wgsl",
-        4,
+        ["rope.wgsl"],
+        &[BindingMode::ReadWrite; 4],
         &[
             ("HEADS", Scalar::U32),
             ("HEAD_DIM", Scalar::U32),
@@ -258,8 +277,8 @@ const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         name::ATTN,
-        "attn.wgsl",
-        5,
+        ["attn.wgsl"],
+        &[BindingMode::ReadWrite; 5],
         &[
             ("M", Scalar::U32),
             ("N_HEADS", Scalar::U32),
@@ -274,8 +293,8 @@ const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         name::KV_STORE,
-        "kv_store.wgsl",
-        5,
+        ["kv_store.wgsl"],
+        &[BindingMode::ReadWrite; 5],
         &[
             ("N_KV", Scalar::U32),
             ("HEAD_DIM", Scalar::U32),
@@ -284,8 +303,8 @@ const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         name::SPLIT_QG,
-        "split_qg.wgsl",
-        3,
+        ["split_qg.wgsl"],
+        &[BindingMode::ReadWrite; 3],
         &[
             ("ROWS", Scalar::U32),
             ("HEADS", Scalar::U32),
@@ -295,6 +314,14 @@ const SHADERS: &[ShaderSpec] = &[
 ];
 
 type PackedScalars = HashMap<(String, Vec<u64>), Vec<u8>>;
+
+fn coop_variant_of(name: &str) -> Option<flint_gpu::CoopVariant> {
+    match name {
+        name::GEMM_COOP => Some(flint_gpu::CoopVariant::M16),
+        name::GEMM_COOP8 => Some(flint_gpu::CoopVariant::M8),
+        _ => None,
+    }
+}
 
 pub struct Kernels {
     kernels: HashMap<&'static str, Kernel>,
@@ -307,6 +334,9 @@ impl Kernels {
         let mut kernels = HashMap::new();
         let mut layouts = HashMap::new();
         for spec in SHADERS {
+            if coop_variant_of(spec.name).is_some_and(|v| device.coop_gemm() != Some(v)) {
+                continue;
+            }
             let layout = scalar_layout(spec.scalars)?;
             let kernel = device.create_kernel(&flint_gpu::KernelSpec {
                 name: spec.name,
@@ -382,4 +412,32 @@ fn scalar_layout(scalars: &[(&'static str, Scalar)]) -> Result<ScalarLayout> {
 
 fn encode_scalar(out: &mut [u8], ty: Scalar, value: f64) {
     out.copy_from_slice(&ty.encode(value)[..ty.width() as usize]);
+}
+
+#[cfg(test)]
+mod compile_tests {
+    #[test]
+    fn every_shader_compiles_to_spirv() {
+        for spec in super::SHADERS {
+            let module = match naga::front::wgsl::parse_str(spec.wgsl) {
+                Ok(m) => m,
+                Err(e) => panic!("shader {}: WGSL parse failed: {e}", spec.name),
+            };
+            let mut validator = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            );
+            let info = match validator.validate(&module) {
+                Ok(i) => i,
+                Err(e) => panic!("shader {}: validation failed: {e}", spec.name),
+            };
+            naga::back::spv::write_vec(
+                &module,
+                &info,
+                &naga::back::spv::Options::default(),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("shader {}: SPIR-V codegen failed: {e}", spec.name));
+        }
+    }
 }
