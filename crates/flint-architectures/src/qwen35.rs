@@ -5,7 +5,7 @@ use flint_model::config::{f64_field, req, u32_field, u32_list};
 use flint_model::loader::{self, Plan, Role, WeightSet};
 use flint_model::mlp_weights::{SwigluMlp, take_mlp};
 use flint_model::ops::{self, Act, MlpTiles, NormMode};
-use flint_model::pool::KvPool;
+use flint_model::pool::{ArenaSpec, KvArena, KvPool};
 use flint_model::step;
 use flint_model::{ChunkOut, LanguageModel, MAX_M, SeqChunk, Speculator};
 use flint_tensor::{Tensor, Weight};
@@ -173,11 +173,11 @@ struct RecurrentPool {
 }
 
 impl RecurrentPool {
-    fn new(backend: &Backend, slots: u32, recur_shape: [u32; 3], conv_dim: u32) -> Self {
+    fn new(backend: &Backend, seqs: u32, recur_shape: [u32; 3], conv_dim: u32) -> Self {
         let [heads, key_dim, val_dim] = recur_shape;
         Self {
-            recur: backend.zero_tensor(&[slots * heads, key_dim, val_dim]),
-            conv: backend.zero_tensor(&[slots, conv_dim, 3]),
+            recur: backend.zero_tensor(&[seqs * heads, key_dim, val_dim]),
+            conv: backend.zero_tensor(&[seqs, conv_dim, 3]),
             heads,
             key_dim,
             val_dim,
@@ -185,46 +185,46 @@ impl RecurrentPool {
         }
     }
 
-    fn zero(&self, backend: &Backend, slot: u32) -> Result<()> {
+    fn zero(&self, backend: &Backend, seq: u32) -> Result<()> {
         let recur_span = self.heads as u64 * self.key_dim as u64 * self.val_dim as u64 * 4;
         let conv_span = self.conv_dim as u64 * 12;
         let mut enc = backend.encoder()?;
-        enc.clear(&self.recur.buf, slot as u64 * recur_span, recur_span)?;
-        enc.clear(&self.conv.buf, slot as u64 * conv_span, conv_span)?;
+        enc.clear(&self.recur.buf, seq as u64 * recur_span, recur_span)?;
+        enc.clear(&self.conv.buf, seq as u64 * conv_span, conv_span)?;
         enc.finish().wait()?;
         Ok(())
     }
 
-    fn copy_slot(&self, backend: &Backend, src: &RecurrentPool, slot: u32) -> Result<()> {
+    fn copy_seq(&self, backend: &Backend, src: &RecurrentPool, seq: u32) -> Result<()> {
         let recur_span = self.heads as u64 * self.key_dim as u64 * self.val_dim as u64 * 4;
         let conv_span = self.conv_dim as u64 * 12;
         let mut enc = backend.encoder()?;
         enc.copy(
             &src.recur.buf,
-            slot as u64 * recur_span,
+            seq as u64 * recur_span,
             &self.recur.buf,
-            slot as u64 * recur_span,
+            seq as u64 * recur_span,
             recur_span,
         )?;
         enc.copy(
             &src.conv.buf,
-            slot as u64 * conv_span,
+            seq as u64 * conv_span,
             &self.conv.buf,
-            slot as u64 * conv_span,
+            seq as u64 * conv_span,
             conv_span,
         )?;
         enc.finish().wait()?;
         Ok(())
     }
 
-    fn recur_slice(&self, slot: u32) -> Binding<'_> {
+    fn recur_slice(&self, seq: u32) -> Binding<'_> {
         let span = self.heads as u64 * self.key_dim as u64 * self.val_dim as u64 * 4;
-        Binding::Slice(&self.recur, slot as u64 * span, span)
+        Binding::Slice(&self.recur, seq as u64 * span, span)
     }
 
-    fn conv_slice(&self, slot: u32) -> Binding<'_> {
+    fn conv_slice(&self, seq: u32) -> Binding<'_> {
         let span = self.conv_dim as u64 * 12;
-        Binding::Slice(&self.conv, slot as u64 * span, span)
+        Binding::Slice(&self.conv, seq as u64 * span, span)
     }
 }
 
@@ -379,8 +379,7 @@ fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
 
 pub struct Qwen35 {
     cfg: Qwen35Config,
-    slot_lens: Vec<u32>,
-    slot_bases: Vec<u32>,
+    arena: KvArena,
     pos: Vec<u32>,
     saved_pos: Vec<u32>,
     mtp_pos: Vec<u32>,
@@ -405,15 +404,13 @@ impl Qwen35 {
     pub fn load(
         source: &dyn Checkpoint,
         v: &Value,
-        slot_lens: &[u32],
+        arena_spec: &ArenaSpec,
         backend: &Backend,
     ) -> Result<Self> {
         if source.kind() == CheckpointKind::Gguf {
             return Err(Error::Model("Qwen3.5 has no GGUF representation".into()));
         }
-        if slot_lens.is_empty() || slot_lens.contains(&0) {
-            return Err(Error::Model("slot lengths must be non-empty and positive".into()));
-        }
+        let arena = KvArena::new(arena_spec)?;
         let cfg = Qwen35Config::parse(v)?;
         let mut w = loader::load_weights(backend, source, &PLAN)?;
         if cfg.has_mtp != w.has("mtp.fc.weight") {
@@ -429,7 +426,7 @@ impl Qwen35 {
         };
         let norm = w.take_tensor("norm.weight")?;
 
-        let slots = slot_lens.len() as u32;
+        let seqs = arena.seqs();
         let mut layers = Vec::with_capacity(cfg.layers as usize);
         let mut linear_layers = 0usize;
         for (i, kind) in cfg.layer_types.iter().enumerate() {
@@ -437,7 +434,14 @@ impl Qwen35 {
             match kind {
                 LayerKind::Full => layers.push(Layer::Full {
                     w: take_full_layer(&mut w, &p)?,
-                    kv: KvPool::new(backend, cfg.kv_heads, slot_lens, cfg.head_dim),
+                    kv: KvPool::new(
+                        backend,
+                        cfg.kv_heads,
+                        cfg.head_dim,
+                        seqs,
+                        arena.max_pages(),
+                        arena.pages(),
+                    ),
                 }),
                 LayerKind::Linear => {
                     linear_layers += 1;
@@ -445,7 +449,7 @@ impl Qwen35 {
                         w: take_linear_layer(&mut w, &p)?,
                         state: RecurrentPool::new(
                             backend,
-                            slots,
+                            seqs,
                             [cfg.lin_val_heads, cfg.lin_key_dim, cfg.lin_val_dim],
                             cfg.conv_dim(),
                         ),
@@ -461,7 +465,14 @@ impl Qwen35 {
                 fc: w.take("mtp.fc.weight")?,
                 layer: take_full_layer(&mut w, "mtp.layers.0")?,
                 norm: w.take_tensor("mtp.norm.weight")?,
-                kv: KvPool::new(backend, cfg.kv_heads, slot_lens, cfg.head_dim),
+                kv: KvPool::new(
+                    backend,
+                    cfg.kv_heads,
+                    cfg.head_dim,
+                    seqs,
+                    arena.max_pages(),
+                    arena.pages(),
+                ),
             })
         } else {
             None
@@ -472,7 +483,7 @@ impl Qwen35 {
                 .map(|_| {
                     RecurrentPool::new(
                         backend,
-                        slots,
+                        seqs,
                         [cfg.lin_val_heads, cfg.lin_key_dim, cfg.lin_val_dim],
                         cfg.conv_dim(),
                     )
@@ -482,30 +493,23 @@ impl Qwen35 {
             Vec::new()
         };
 
-        let mut slot_bases = Vec::with_capacity(slot_lens.len());
-        let mut base = 0u32;
-        for &len in slot_lens {
-            slot_bases.push(base);
-            base += len;
-        }
-
         let s = alloc_scratch(&cfg, backend);
         let (cos, sin) = ops::rope_tables(
             backend,
-            base,
+            *arena_spec.seq_lens.iter().max().expect("budgets are non-empty"),
             cfg.rotary_dim(),
             cfg.rotary_dim(),
             cfg.rope_theta,
             None,
             None,
         );
+        let seqs = arena.seqs();
         Ok(Self {
             cfg,
-            slot_lens: slot_lens.to_vec(),
-            slot_bases,
-            pos: vec![0; slot_lens.len()],
-            saved_pos: vec![0; slot_lens.len()],
-            mtp_pos: vec![0; slot_lens.len()],
+            arena,
+            pos: vec![0; seqs as usize],
+            saved_pos: vec![0; seqs as usize],
+            mtp_pos: vec![0; seqs as usize],
             embed,
             lm_head,
             norm,
@@ -531,25 +535,30 @@ impl LanguageModel for Qwen35 {
         }
         let mut ids = vec![0u32; MAX_M as usize];
         let mut positions = vec![0u32; MAX_M as usize];
-        let mut slots = vec![0u32; MAX_M as usize];
+        let mut seqs = vec![0u32; MAX_M as usize];
         let mut row = 0usize;
         for chunk in batch {
-            let s = chunk.slot as usize;
-            if self.pos[s] + chunk.len() > self.slot_lens[s] {
+            let s = chunk.seq as usize;
+            let limit = self.arena.seq_len(chunk.seq);
+            if self.pos[s] + chunk.len() > limit {
                 return Err(Error::Model(format!(
                     "context limit {} reached",
-                    self.slot_lens[s]
+                    limit
                 )));
             }
+            assert!(
+                self.arena.covers(chunk.seq, self.pos[s] + chunk.len()),
+                "pages must cover the chunk"
+            );
             for i in 0..chunk.tokens.len() {
                 ids[row + i] = chunk.tokens[i];
                 positions[row + i] = self.pos[s] + i as u32;
-                slots[row + i] = self.slot_bases[s];
+                seqs[row + i] = chunk.seq;
             }
             row += chunk.tokens.len();
         }
         backend.write_u32(&self.s.ids.buf, &ids);
-        step::write_row_meta(backend, &self.s.meta, &positions, &slots, m);
+        step::write_row_meta(backend, &self.s.meta, &positions, &seqs, m);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder()?;
@@ -575,7 +584,6 @@ impl LanguageModel for Qwen35 {
                 s,
                 cos: &self.cos,
                 sin: &self.sin,
-                slot_bases: &self.slot_bases,
             };
             for layer in &self.layers {
                 match layer {
@@ -612,7 +620,7 @@ impl LanguageModel for Qwen35 {
         let mut base = 0u32;
         for chunk in batch {
             let m_s = chunk.len();
-            let s = chunk.slot as usize;
+            let s = chunk.seq as usize;
             outs.push(ChunkOut {
                 logits: step::read_rows(backend, &self.s.logits, chunk.logit_rows, m_s, cfg.vocab, base)?,
                 hidden: step::read_rows(backend, &self.s.hidden, chunk.hidden_rows, m_s, cfg.hidden, base)?,
@@ -623,30 +631,28 @@ impl LanguageModel for Qwen35 {
         Ok(outs)
     }
 
-    fn reset(&mut self, backend: &Backend, slot: u32) -> Result<()> {
+    fn reset(&mut self, backend: &Backend, seq: u32) -> Result<()> {
+        self.arena.free_seq(seq);
+        self.upload_tables(backend);
         for layer in &self.layers {
-            match layer {
-                Layer::Full { kv, .. } => kv.reset(backend, slot)?,
-                Layer::Linear { state, .. } => state.zero(backend, slot)?,
+            if let Layer::Linear { state, .. } = layer {
+                state.zero(backend, seq)?;
             }
         }
-        if let Some(mtp) = &self.mtp {
-            mtp.kv.reset(backend, slot)?;
-        }
-        self.pos[slot as usize] = 0;
-        self.saved_pos[slot as usize] = 0;
-        self.mtp_pos[slot as usize] = 0;
+        self.pos[seq as usize] = 0;
+        self.saved_pos[seq as usize] = 0;
+        self.mtp_pos[seq as usize] = 0;
         Ok(())
     }
 
-    fn pos(&self, slot: u32) -> u32 {
-        self.pos[slot as usize]
+    fn pos(&self, seq: u32) -> u32 {
+        self.pos[seq as usize]
     }
-    fn slot_len(&self, slot: u32) -> u32 {
-        self.slot_lens[slot as usize]
+    fn context_limit(&self, seq: u32) -> u32 {
+        self.arena.seq_len(seq)
     }
-    fn slot_count(&self) -> u32 {
-        self.slot_lens.len() as u32
+    fn seq_count(&self) -> u32 {
+        self.arena.seqs()
     }
     fn vocab(&self) -> u32 {
         self.cfg.vocab
@@ -655,8 +661,40 @@ impl LanguageModel for Qwen35 {
         &self.cfg.eos
     }
 
+    fn alloc_pages(&mut self, backend: &Backend, seq: u32, tokens: u32) -> Result<()> {
+        self.arena.alloc(seq, self.pos[seq as usize], tokens)?;
+        self.upload_tables(backend);
+        Ok(())
+    }
+
+    fn free_pages(&mut self, backend: &Backend, seq: u32) -> Result<()> {
+        self.arena.free_seq(seq);
+        self.upload_tables(backend);
+        Ok(())
+    }
+
+    fn truncate_pages(&mut self, backend: &Backend, seq: u32, keep_tokens: u32) -> Result<()> {
+        self.arena.truncate(seq, keep_tokens);
+        self.upload_tables(backend);
+        Ok(())
+    }
+
     fn speculator(&mut self) -> Option<&mut dyn Speculator> {
         self.mtp.is_some().then_some(self as &mut dyn Speculator)
+    }
+}
+
+impl Qwen35 {
+    fn upload_tables(&self, backend: &Backend) {
+        let table = self.arena.table();
+        for layer in &self.layers {
+            if let Layer::Full { kv, .. } = layer {
+                kv.upload(backend, &table);
+            }
+        }
+        if let Some(mtp) = &self.mtp {
+            mtp.kv.upload(backend, &table);
+        }
     }
 }
 
@@ -664,7 +702,7 @@ impl Speculator for Qwen35 {
     fn draft(
         &mut self,
         backend: &mut Backend,
-        slot: u32,
+        seq: u32,
         token: u32,
         hidden: &[f32],
     ) -> Result<Vec<f32>> {
@@ -677,15 +715,19 @@ impl Speculator for Qwen35 {
             "hidden size mismatch"
         );
         assert!(
-            self.mtp_pos[slot as usize] <= self.pos[slot as usize],
+            self.mtp_pos[seq as usize] <= self.pos[seq as usize],
             "draft head ran past the target"
         );
-        if self.mtp_pos[slot as usize] >= self.slot_lens[slot as usize] {
+        let limit = self.arena.seq_len(seq);
+        if self.mtp_pos[seq as usize] >= limit {
             return Err(Error::Model(format!(
-                "context limit {} reached",
-                self.slot_lens[slot as usize]
+                "context limit {limit} reached"
             )));
         }
+        assert!(
+            self.arena.covers(seq, self.mtp_pos[seq as usize] + 1),
+            "pages must cover the draft"
+        );
 
         let mut ids = vec![0u32; MAX_M as usize];
         ids[0] = token;
@@ -693,8 +735,8 @@ impl Speculator for Qwen35 {
         step::write_row_meta(
             backend,
             &self.s.meta,
-            &[self.mtp_pos[slot as usize]],
-            &[self.slot_bases[slot as usize]],
+            &[self.mtp_pos[seq as usize]],
+            &[seq],
             1,
         );
         backend.write_f32(&self.s.mtp_hidden.buf, hidden);
@@ -702,7 +744,7 @@ impl Speculator for Qwen35 {
         let cfg = &self.cfg;
         let chunk = SeqChunk {
             tokens: &ids[..1],
-            slot,
+            seq,
             logit_rows: &[],
             hidden_rows: &[],
         };
@@ -764,7 +806,6 @@ impl Speculator for Qwen35 {
                 s,
                 cos: &self.cos,
                 sin: &self.sin,
-                slot_bases: &self.slot_bases,
             };
             full_layer(
                 backend, &mut commands, &ctx, &mtp.layer, &mtp.kv, 1, std::slice::from_ref(&chunk),
@@ -791,44 +832,44 @@ impl Speculator for Qwen35 {
         backend.submit(&mut enc)?;
 
         let logits = backend.read_f32(&self.s.logits.buf, 0, cfg.vocab as usize)?;
-        self.mtp_pos[slot as usize] += 1;
+        self.mtp_pos[seq as usize] += 1;
         Ok(logits)
     }
 
     fn advance(
         &mut self,
         backend: &mut Backend,
-        slot: u32,
+        seq: u32,
         token: u32,
         hidden: &[f32],
     ) -> Result<()> {
-        self.draft(backend, slot, token, hidden).map(|_| ())
+        self.draft(backend, seq, token, hidden).map(|_| ())
     }
 
-    fn prime(&mut self, slot: u32) {
-        self.mtp_pos[slot as usize] = self.pos[slot as usize];
+    fn prime(&mut self, seq: u32) {
+        self.mtp_pos[seq as usize] = self.pos[seq as usize];
     }
 
-    fn snapshot(&mut self, backend: &Backend, slot: u32) {
-        self.saved_pos[slot as usize] = self.pos[slot as usize];
+    fn snapshot(&mut self, backend: &Backend, seq: u32) {
+        self.saved_pos[seq as usize] = self.pos[seq as usize];
         let mut si = 0;
         for layer in &self.layers {
             if let Layer::Linear { state, .. } = layer {
                 self.snap[si]
-                    .copy_slot(backend, state, slot)
+                    .copy_seq(backend, state, seq)
                     .expect("snapshot copy");
                 si += 1;
             }
         }
     }
 
-    fn restore(&mut self, backend: &Backend, slot: u32) {
-        self.pos[slot as usize] = self.saved_pos[slot as usize] + 1;
+    fn restore(&mut self, backend: &Backend, seq: u32) {
+        self.pos[seq as usize] = self.saved_pos[seq as usize] + 1;
         let mut si = 0;
         for layer in &self.layers {
             if let Layer::Linear { state, .. } = layer {
                 state
-                    .copy_slot(backend, &self.snap[si], slot)
+                    .copy_seq(backend, &self.snap[si], seq)
                     .expect("restore copy");
                 si += 1;
             }
@@ -841,7 +882,6 @@ struct FullCtx<'a> {
     s: &'a Scratch,
     cos: &'a Tensor,
     sin: &'a Tensor,
-    slot_bases: &'a [u32],
 }
 
 fn full_layer(
@@ -1029,8 +1069,8 @@ fn full_attn_block(
                 scale: (hd as f32).sqrt().recip(),
                 m: m_s,
                 causal: true,
-                slot: ctx.slot_bases[chunk.slot as usize],
-                args: Binding::Slice(&s.meta, row_off as u64 * 8, m_s as u64 * 8),
+                seq: chunk.seq,
+                args: Binding::Slice(&s.meta, row_off as u64 * 32, m_s as u64 * 32),
             },
         )?;
         row_off += m_s;
@@ -1102,7 +1142,7 @@ fn linear_attn_block(
     let row = |t: u32, stride: u32| t as u64 * stride as u64 * 4;
     let mut t_off = 0u32;
     for chunk in batch {
-        let slot = chunk.slot;
+        let seq = chunk.seq;
         for _ in 0..chunk.len() {
             let t = t_off;
             ops::conv1d(
@@ -1110,7 +1150,7 @@ fn linear_attn_block(
                 commands,
                 Binding::Slice(&s.qkv_proj, row(t, conv_d), conv_d as u64 * 4),
                 &w.conv1d,
-                state.conv_slice(slot),
+                state.conv_slice(seq),
                 Binding::Slice(&s.conv_out, row(t, conv_d), conv_d as u64 * 4),
                 &ops::ConvSpec { dim: conv_d },
             )?;
@@ -1135,7 +1175,7 @@ fn linear_attn_block(
     let qkb = exp_d as u64 * 2;
     let mut t_off = 0u32;
     for chunk in batch {
-        let slot = chunk.slot;
+        let seq = chunk.seq;
         for _ in 0..chunk.len() {
             let t = t_off;
             ops::delta_gate(
@@ -1163,7 +1203,7 @@ fn linear_attn_block(
                     v: Binding::Slice(&s.conv_out, row(t, conv_d) + kb * 2, vb),
                     beta: Binding::Full(&s.beta),
                     g: Binding::Full(&s.g),
-                    state: state.recur_slice(slot),
+                    state: state.recur_slice(seq),
                     y: Binding::Slice(&s.attn_out, row(t, val_d), vb),
                     heads,
                     key_dim: cfg.lin_key_dim,

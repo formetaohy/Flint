@@ -6,8 +6,9 @@ struct Pc {
     SCALE: f32,
     WINDOW: u32,
     NQ_PER_KV: u32,
-    SLOT: u32,
+    SEQ: u32,
     CAUSAL: u32,
+    MAX_PAGES: u32,
 }
 var<immediate> pc: Pc;
 
@@ -16,6 +17,7 @@ var<immediate> pc: Pc;
 @group(0) @binding(2) var<storage, read_write> v_cache: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 @group(0) @binding(4) var<storage, read_write> args: array<u32>;
+@group(0) @binding(5) var<storage, read_write> block_table: array<u32>;
 
 const BR: u32 = 8;
 const BC: u32 = 128;
@@ -23,6 +25,10 @@ const KD: u32 = 32;
 const COLS: u32 = 4;
 const LANES: u32 = 32;
 const NEG_INF: f32 = -3.4e38;
+const PAGE_LEN: u32 = 32;
+const PAGE_SHIFT: u32 = 5;
+const PAGE_MASK: u32 = PAGE_LEN - 1;
+const PAGES_PER_BLOCK: u32 = BC / PAGE_LEN;
 
 var<workgroup> kt: array<f32, 2 * BC * KD>;
 
@@ -31,6 +37,17 @@ fn deq2(word: u32) -> vec2<f32> {
         bitcast<f32>((word & 65535u) << 16),
         bitcast<f32>((word >> 16) << 16),
     );
+}
+
+fn block_pages(c0: u32, bt_base: u32, pages_total: u32) -> array<u32, PAGES_PER_BLOCK> {
+    var pgbase: array<u32, PAGES_PER_BLOCK>;
+    let lp0 = c0 >> PAGE_SHIFT;
+    for (var p = 0u; p < PAGES_PER_BLOCK; p++) {
+        let lp = lp0 + p;
+        let li = min(lp, pages_total - 1);
+        pgbase[p] = select(block_table[bt_base + li], 0u, lp >= pages_total) * PAGE_LEN;
+    }
+    return pgbase;
 }
 
 @compute @workgroup_size(256, 1, 1)
@@ -45,8 +62,9 @@ fn attn(
     let SCALE = pc.SCALE;
     let WINDOW = pc.WINDOW;
     let NQ_PER_KV = pc.NQ_PER_KV;
-    let SLOT = pc.SLOT;
+    let SEQ = pc.SEQ;
     let CAUSAL = pc.CAUSAL;
+    let MAX_PAGES = pc.MAX_PAGES;
     let t = lid.x;
     let row = t / LANES;
     let lane = t % LANES;
@@ -55,26 +73,30 @@ fn attn(
     let kvh = qh / NQ_PER_KV;
     let mi = m0 + row;
     let half_dim = HEAD_DIM / 2;
-    let cache_plane = kvh * POOL_LEN * half_dim + SLOT * half_dim;
+    let kv_plane = kvh * POOL_LEN * half_dim;
     let qb = (mi * N_HEADS + qh) * HEAD_DIM;
-    let qpos = args[2 * min(mi, M - 1)];
+    let qpos = args[8 * min(mi, M - 1)];
     var win_start = 0u;
     if CAUSAL != 0u && WINDOW != 0u && qpos + 1 > WINDOW {
         win_start = qpos + 1 - WINDOW;
     }
     let k_segs = (HEAD_DIM + KD - 1) / KD;
     let kv_len = select(
-        args[2 * (M - 1)] + 1,
-        args[2 * (min(m0 + BR, M) - 1)] + 1,
+        args[8 * (M - 1)] + 1,
+        args[8 * (min(m0 + BR, M) - 1)] + 1,
         CAUSAL != 0u,
     );
+    let bt_base = SEQ * MAX_PAGES;
+    let pages_total = (kv_len + PAGE_LEN - 1) >> PAGE_SHIFT;
+
+    var pgbase = block_pages(0u, bt_base, pages_total);
 
     var m_old = NEG_INF;
     var s_old = 0.0;
     var o = array<f32, 16>();
     var first_win_start = 0u;
-    if CAUSAL != 0u && WINDOW != 0u && args[2 * m0] + 1 > WINDOW {
-        first_win_start = args[2 * m0] + 1 - WINDOW;
+    if CAUSAL != 0u && WINDOW != 0u && args[8 * m0] + 1 > WINDOW {
+        first_win_start = args[8 * m0] + 1 - WINDOW;
     }
     var c0 = 0u;
     var w = t;
@@ -86,7 +108,8 @@ fn attn(
         let d2 = w % (min(KD, HEAD_DIM) / 2);
         var kd2 = vec2<f32>(0.0, 0.0);
         if j2 < kv_len {
-            kd2 = deq2(k_cache[cache_plane + j2 * half_dim + d2]);
+            let jpos = pgbase[j2 >> PAGE_SHIFT] + (j2 & PAGE_MASK);
+            kd2 = deq2(k_cache[kv_plane + jpos * half_dim + d2]);
         }
         kt[d2 * 2 * BC + j2] = kd2.x;
         kt[(d2 * 2 + 1) * BC + j2] = kd2.y;
@@ -118,8 +141,9 @@ fn attn(
                     let d2 = w % (nb_w / 2);
                     var kd2 = vec2<f32>(0.0, 0.0);
                     if c0 + j2 < kv_len {
+                        let jpos = pgbase[j2 >> PAGE_SHIFT] + (j2 & PAGE_MASK);
                         kd2 = deq2(
-                            k_cache[cache_plane + (c0 + j2) * half_dim + nb_base / 2 + d2],
+                            k_cache[kv_plane + jpos * half_dim + nb_base / 2 + d2],
                         );
                     }
                     kt[nb * BC * KD + d2 * 2 * BC + j2] = kd2.x;
@@ -204,8 +228,9 @@ fn attn(
                 }
                 let e = kt[row * BC + col_lo + col];
                 let d8 = lane % 16 * 8;
-                if d8 + 8 <= HEAD_DIM && (gcol * half_dim + d8 / 2) % 4 == 0 {
-                    let vw = v_cache[cache_plane / 4 + (gcol * half_dim + d8 / 2) / 4];
+                let gpos = pgbase[(gcol - c0) >> PAGE_SHIFT] + (gcol & PAGE_MASK);
+                if d8 + 8 <= HEAD_DIM && (gpos * half_dim + d8 / 2) % 4 == 0 {
+                    let vw = v_cache[kv_plane / 4 + (gpos * half_dim + d8 / 2) / 4];
                     let v0 = deq2(vw.x);
                     let v1 = deq2(vw.y);
                     let v2 = deq2(vw.z);
@@ -224,10 +249,10 @@ fn attn(
                         if d >= HEAD_DIM {
                             break;
                         }
-                        let col_u32 = gcol * half_dim;
+                        let col_u32 = gpos * half_dim;
                         let u32idx = col_u32 + d / 2;
                         let v4 = min(u32idx / 4, (col_u32 + half_dim - 1) / 4);
-                        let vw = v_cache[cache_plane / 4 + v4];
+                        let vw = v_cache[kv_plane / 4 + v4];
                         let word = select(
                             select(vw.x, vw.y, u32idx - v4 * 4 == 1),
                             select(vw.z, vw.w, u32idx - v4 * 4 == 3),
@@ -242,14 +267,15 @@ fn attn(
         } else {
             for (var col = 0u; col < limit; col++) {
                 let e = kt[row * BC + col];
+                let gpos = pgbase[col >> PAGE_SHIFT] + (col & PAGE_MASK);
                 var nb = 0u;
                 loop {
                     let d8 = lane * 8 + nb * LANES * 8;
                     if d8 >= HEAD_DIM {
                         break;
                     }
-                    if d8 + 8 <= HEAD_DIM && ((c0 + col) * half_dim + d8 / 2) % 4 == 0 {
-                        let vw = v_cache[cache_plane / 4 + ((c0 + col) * half_dim + d8 / 2) / 4];
+                    if d8 + 8 <= HEAD_DIM && (gpos * half_dim + d8 / 2) % 4 == 0 {
+                        let vw = v_cache[kv_plane / 4 + (gpos * half_dim + d8 / 2) / 4];
                         let v0 = deq2(vw.x);
                         let v1 = deq2(vw.y);
                         let v2 = deq2(vw.z);
@@ -268,10 +294,10 @@ fn attn(
                             if d >= HEAD_DIM {
                                 break;
                             }
-                            let col_u32 = (c0 + col) * half_dim;
+                            let col_u32 = gpos * half_dim;
                             let u32idx = col_u32 + d / 2;
                             let v4 = min(u32idx / 4, (col_u32 + half_dim - 1) / 4);
-                            let vw = v_cache[cache_plane / 4 + v4];
+                            let vw = v_cache[kv_plane / 4 + v4];
                             let word = select(
                                 select(vw.x, vw.y, u32idx - v4 * 4 == 1),
                                 select(vw.z, vw.w, u32idx - v4 * 4 == 3),
@@ -290,6 +316,7 @@ fn attn(
         workgroupBarrier();
         c0 = c0 + BC;
         if c0 < kv_len {
+            pgbase = block_pages(c0, bt_base, pages_total);
             let words = BC * min(KD, HEAD_DIM) / 2;
             var w = t;
             loop {
@@ -300,7 +327,8 @@ fn attn(
                 let d2 = w % (min(KD, HEAD_DIM) / 2);
                 var kd2 = vec2<f32>(0.0, 0.0);
                 if c0 + j2 < kv_len {
-                    kd2 = deq2(k_cache[cache_plane + (c0 + j2) * half_dim + d2]);
+                    let jpos = pgbase[j2 >> PAGE_SHIFT] + (j2 & PAGE_MASK);
+                    kd2 = deq2(k_cache[kv_plane + jpos * half_dim + d2]);
                 }
                 kt[d2 * 2 * BC + j2] = kd2.x;
                 kt[(d2 * 2 + 1) * BC + j2] = kd2.y;

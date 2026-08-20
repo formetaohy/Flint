@@ -612,6 +612,7 @@ dependencies = [
  "flint-kernel",
  "flint-model",
  "flint-profiler",
+ "flint-tensor",
  "serde_json",
 ]
 

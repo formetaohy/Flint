@@ -19,7 +19,7 @@ fn unsupported_formats_fail_fast() {
     )
     .unwrap();
     std::fs::write(dir.join("config.json"), r#"{"model_type": "bert"}"#).unwrap();
-    let err = flint_architectures::load(&dir, &flint_architectures::LoadOptions { slots: vec![64], spec_depth: None }, &backend).err().unwrap();
+    let err = flint_architectures::load(&dir, &flint_architectures::LoadOptions { seqs: vec![64], pages: None, spec_depth: None }, &backend).err().unwrap();
     assert!(err.to_string().contains("unsupported model_type"), "{err}");
 
     let gguf_dir = std::env::temp_dir().join(format!("flint-badarch-{}", std::process::id()));
@@ -28,7 +28,7 @@ fn unsupported_formats_fail_fast() {
     let mut w = GgufWriter::new(32);
     w.kv_u32("llama.block_count", 1);
     std::fs::write(gguf_dir.join("model.gguf"), w.finish()).unwrap();
-    let err = flint_architectures::load(&gguf_dir, &flint_architectures::LoadOptions { slots: vec![64], spec_depth: None }, &backend)
+    let err = flint_architectures::load(&gguf_dir, &flint_architectures::LoadOptions { seqs: vec![64], pages: None, spec_depth: None }, &backend)
         .err()
         .unwrap();
     assert!(

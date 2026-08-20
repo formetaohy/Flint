@@ -14,6 +14,7 @@ use std::path::Path;
 use flint_backend::Backend;
 use flint_checkpoint::{Checkpoint, CheckpointKind, open_checkpoint};
 use flint_error::{Error, Result};
+use flint_model::pool::ArenaSpec;
 use flint_model::{LanguageModel, TextEmbedder};
 use flint_tokenizer::Tokenizer;
 use serde_json::Value;
@@ -33,14 +34,16 @@ pub struct ChatModel {
 }
 
 pub struct LoadOptions {
-    pub slots: Vec<u32>,
+    pub seqs: Vec<u32>,
+    pub pages: Option<u32>,
     pub spec_depth: Option<u32>,
 }
 
 impl Default for LoadOptions {
     fn default() -> Self {
         Self {
-            slots: vec![4096],
+            seqs: vec![4096],
+            pages: None,
             spec_depth: None,
         }
     }
@@ -106,45 +109,44 @@ pub fn load(model_dir: &Path, opts: &LoadOptions, backend: &Backend) -> Result<C
     let source = open_checkpoint(model_dir)?;
     let family = family_of(source.as_ref())?;
     let config = config_for(source.as_ref(), family)?;
+    let arena = ArenaSpec {
+        seq_lens: opts.seqs.clone(),
+        pages: opts.pages,
+    };
     let model: Box<dyn LanguageModel> = match family {
-        Family::Qwen35 => Box::new(Qwen35::load(
-            source.as_ref(),
-            &config,
-            &opts.slots,
-            backend,
-        )?),
+        Family::Qwen35 => Box::new(Qwen35::load(source.as_ref(), &config, &arena, backend)?),
         Family::Llama => Box::new(llama::load(
             source.as_ref(),
             &config,
-            &opts.slots,
+            &arena,
             opts.spec_depth,
             backend,
         )?),
         Family::Gemma => Box::new(gemma::load(
             source.as_ref(),
             &config,
-            &opts.slots,
+            &arena,
             opts.spec_depth,
             backend,
         )?),
         Family::Phi => Box::new(phi::load(
             source.as_ref(),
             &config,
-            &opts.slots,
+            &arena,
             opts.spec_depth,
             backend,
         )?),
         Family::PhiMoe => Box::new(phi::load_moe(
             source.as_ref(),
             &config,
-            &opts.slots,
+            &arena,
             opts.spec_depth,
             backend,
         )?),
         Family::Gemma4 => Box::new(gemma4::load(
             source.as_ref(),
             &config,
-            &opts.slots,
+            &arena,
             opts.spec_depth,
             backend,
         )?),

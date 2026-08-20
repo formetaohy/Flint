@@ -13,6 +13,7 @@ flint-gpu.workspace = true
 flint-kernel.workspace = true
 flint-model.workspace = true
 flint-profiler.workspace = true
+flint-tensor.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 

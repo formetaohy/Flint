@@ -57,6 +57,9 @@ struct Args {
     attn_probe: bool,
 
     #[arg(long)]
+    paged_probe: bool,
+
+    #[arg(long)]
     profile: bool,
 }
 
@@ -95,6 +98,9 @@ fn main() -> Result<()> {
     }
     if args.attn_probe {
         return probes::run("attn");
+    }
+    if args.paged_probe {
+        return probes::run("paged");
     }
     let spec = BenchSpec {
         hidden: args.hidden,
@@ -135,7 +141,12 @@ fn main() -> Result<()> {
     let cfg = config(&spec);
     let plan = plan(false);
     let mut backend = backend;
-    let mut model = Model::load(&source, cfg, &plan, &[args.max_seq], None, &backend)?;
+    let arena = flint_model::pool::ArenaSpec {
+        seq_lens: vec![args.max_seq],
+        pages: None,
+    };
+    let mut model = Model::load(&source, cfg, &plan, &arena, None, &backend)?;
+    model.alloc_pages(&backend, 0, args.prefill_tokens + args.decode_tokens + 16)?;
     eprintln!(
         "[bench] weights loaded in {:.1}s",
         t0.elapsed().as_secs_f64()
@@ -152,7 +163,7 @@ fn main() -> Result<()> {
         &mut backend,
         &[SeqChunk {
             tokens: &warm_ids,
-            slot: 0,
+            seq: 0,
             logit_rows: &[],
             hidden_rows: &[],
         }],
@@ -171,7 +182,7 @@ fn main() -> Result<()> {
             &mut backend,
             &[SeqChunk {
                 tokens: &ids,
-                slot: 0,
+                seq: 0,
                 logit_rows: &[],
                 hidden_rows: &[],
             }],
@@ -184,7 +195,7 @@ fn main() -> Result<()> {
             &mut backend,
             &[SeqChunk {
                 tokens: &ids,
-                slot: 0,
+                seq: 0,
                 logit_rows: &[],
                 hidden_rows: &[],
             }],
@@ -217,7 +228,7 @@ fn main() -> Result<()> {
             &mut backend,
             &[SeqChunk {
                 tokens: &ids,
-                slot: 0,
+                seq: 0,
                 logit_rows: &[0],
                 hidden_rows: &[],
             }],

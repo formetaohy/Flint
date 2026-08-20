@@ -46,16 +46,27 @@ impl Ctx {
 
     fn rows(&self, pos: usize, m: usize) -> Tensor {
         let t = Tensor::new(
-            self.backend.storage(m as u64 * 8),
-            vec![2 * m as u32],
+            self.backend.storage(8 * m as u64 * 4),
+            vec![8 * m as u32],
             DType::U32,
         );
-        let mut data = Vec::with_capacity(2 * m);
+        let mut data = vec![0u32; 8 * m];
         for i in 0..m {
-            data.push(pos as u32 + i as u32);
-            data.push(0);
+            data[8 * i] = pos as u32 + i as u32;
+            data[8 * i + 1] = 0;
         }
         self.backend.write_u32(&t.buf, &data);
+        t
+    }
+
+    fn block_table(&self, max_seq: usize) -> Tensor {
+        let pages = max_seq.div_ceil(flint_kernel::PAGE_LEN as usize);
+        let t = Tensor::new(
+            self.backend.storage(pages as u64 * 4),
+            vec![pages as u32],
+            DType::U32,
+        );
+        self.backend.write_u32(&t.buf, &(0..pages as u32).collect::<Vec<_>>());
         t
     }
 
@@ -291,6 +302,7 @@ fn gemm_coop_bf16() {
     let wb = ctx.bf16(&w, &[n as u32, k as u32]);
     let weight = Weight::plain(wb);
     coop_gemm(&mut ctx, &xb, &weight, &y, m as u32, n as u32, k as u32, false);
+    
     agree(
         &ctx.read(&y),
         &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
@@ -352,6 +364,7 @@ fn gemm_coop_bf16_multi_tile() {
     let wb = ctx.bf16(&w, &[n as u32, k as u32]);
     let weight = Weight::plain(wb);
     coop_gemm(&mut ctx, &xb, &weight, &y, m as u32, n as u32, k as u32, false);
+    
     agree(
         &ctx.read(&y),
         &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
@@ -667,6 +680,7 @@ fn gemv_bf16_split_segs_divide_k_blocks() {
             .unwrap();
     }
     ctx.backend.submit(&mut enc).unwrap();
+    
     agree(
         &ctx.read(&y),
         &cpu_ref::gemv(&x, &w, n as usize, k as usize),
@@ -773,6 +787,7 @@ fn norm_case(mode: NormMode, rows: usize, dim: usize, w_dim: usize, seed: u64) {
         ],
         [rows as u32, 1, 1],
     );
+    
     agree(
         &ctx.read(&y),
         &cpu_ref::norm(mode, &x, &w, &z, cpu_ref::NormArgs { rows, dim, w_dim, eps: 1e-6 }),
@@ -1002,6 +1017,7 @@ fn swiglu_gelu_tanh() {
         &[Binding::Full(&gb), Binding::Full(&ub), Binding::Full(&y)],
         [1, 1, 1],
     );
+    
     agree(
         &ctx.read(&y),
         &cpu_ref::swiglu(&g, &u, Act::GeluTanh),
@@ -1498,6 +1514,7 @@ fn kv_store_attn_hd128_gqa2_pos71() {
     let v_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
     let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
     let args = ctx.rows(pos, m);
+    let bt = ctx.block_table(max_seq);
 
     ctx.dispatch(
         name::KV_STORE,
@@ -1505,6 +1522,7 @@ fn kv_store_attn_hd128_gqa2_pos71() {
             ("N_KV", nkv as f64),
             ("HEAD_DIM", hd as f64),
             ("POOL_LEN", max_seq as f64),
+            ("MAX_PAGES", max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64),
         ],
         &[
             Binding::Full(&kb),
@@ -1512,6 +1530,7 @@ fn kv_store_attn_hd128_gqa2_pos71() {
             Binding::Full(&k_cache),
             Binding::Full(&v_cache),
             Binding::Full(&args),
+            Binding::Full(&bt),
         ],
         [(nkv * hd / 2) as u32, m as u32, 1],
     );
@@ -1525,8 +1544,9 @@ fn kv_store_attn_hd128_gqa2_pos71() {
             ("SCALE", 1.0 / (hd as f64).sqrt()),
             ("WINDOW", 0.0),
             ("NQ_PER_KV", (nq / nkv) as f64),
-            ("SLOT", 0.0),
+            ("SEQ", 0.0),
             ("CAUSAL", 1.0),
+            ("MAX_PAGES", max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64),
         ],
         &[
             Binding::Full(&qb),
@@ -1534,6 +1554,7 @@ fn kv_store_attn_hd128_gqa2_pos71() {
             Binding::Full(&v_cache),
             Binding::Full(&y),
             Binding::Full(&args),
+            Binding::Full(&bt),
         ],
         [(m as u32).div_ceil(flint_kernel::ATTN_BR), nq as u32, 1],
     );
@@ -1567,6 +1588,7 @@ fn attn_gemm_coexist() {
     let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
     let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
     let args = ctx.rows(pos, m);
+    let bt = ctx.block_table(max_seq);
 
     let (k2, n2) = (96usize, 80usize);
     let x = rng.fill(m * k2);
@@ -1592,8 +1614,9 @@ fn attn_gemm_coexist() {
                         ("SCALE", 1.0 / (hd as f64).sqrt()),
                         ("WINDOW", 0.0),
                         ("NQ_PER_KV", (nq / nkv) as f64),
-            ("SLOT", 0.0),
+            ("SEQ", 0.0),
             ("CAUSAL", 1.0),
+            ("MAX_PAGES", max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64),
                     ],
                     &[
                         Binding::Full(&qb),
@@ -1601,6 +1624,7 @@ fn attn_gemm_coexist() {
                         Binding::Full(&vb),
                         Binding::Full(&y),
                         Binding::Full(&args),
+                        Binding::Full(&bt),
                     ],
                     [(m as u32).div_ceil(flint_kernel::ATTN_BR), nq as u32, 1],
                 )
@@ -1633,6 +1657,7 @@ fn attn_gemm_coexist() {
         ctx.backend.submit(&mut enc).unwrap();
     }
 
+    
     agree(
         &ctx.read(&y),
         &cpu_ref::attn(&q, &kc, &vc, cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window: 0, causal: true }),
@@ -1691,6 +1716,7 @@ fn attn_case(spec: AttnCase) {
     let vb = ctx.bf16(&vc, &[nkv as u32, max_seq as u32, hd as u32]);
     let y = ctx.zero(&[m as u32, nq as u32, hd as u32]);
     let args = ctx.rows(pos, m);
+    let bt = ctx.block_table(max_seq);
 
     ctx.dispatch(
         name::ATTN,
@@ -1702,8 +1728,9 @@ fn attn_case(spec: AttnCase) {
             ("SCALE", 1.0 / (hd as f64).sqrt()),
             ("WINDOW", window as f64),
             ("NQ_PER_KV", (nq / nkv) as f64),
-            ("SLOT", 0.0),
+            ("SEQ", 0.0),
             ("CAUSAL", causal as u32 as f64),
+            ("MAX_PAGES", max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64),
         ],
         &[
             Binding::Full(&qb),
@@ -1711,6 +1738,7 @@ fn attn_case(spec: AttnCase) {
             Binding::Full(&vb),
             Binding::Full(&y),
             Binding::Full(&args),
+            Binding::Full(&bt),
         ],
         [
             (m as u32).div_ceil(flint_kernel::ATTN_BR),
@@ -1718,6 +1746,7 @@ fn attn_case(spec: AttnCase) {
             1,
         ],
     );
+    
     agree(
         &ctx.read(&y),
         &cpu_ref::attn(
@@ -1836,6 +1865,7 @@ fn kv_store_writes_both_caches() {
     let k_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
     let v_cache = ctx.zero_bf16(&[nkv as u32, max_seq as u32, hd as u32]);
     let args = ctx.rows(pos, m);
+    let bt = ctx.block_table(max_seq);
 
     ctx.dispatch(
         name::KV_STORE,
@@ -1843,6 +1873,7 @@ fn kv_store_writes_both_caches() {
             ("N_KV", nkv as f64),
             ("HEAD_DIM", hd as f64),
             ("POOL_LEN", max_seq as f64),
+            ("MAX_PAGES", max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64),
         ],
         &[
             Binding::Full(&kb),
@@ -1850,6 +1881,7 @@ fn kv_store_writes_both_caches() {
             Binding::Full(&k_cache),
             Binding::Full(&v_cache),
             Binding::Full(&args),
+            Binding::Full(&bt),
         ],
         [1, m as u32, 1],
     );

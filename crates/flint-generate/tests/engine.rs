@@ -9,7 +9,7 @@ use serde_json::json;
 
 const VOCAB: u32 = 32;
 const EOS: u32 = 31;
-const SLOT_LEN: u32 = 512;
+const SEQ_LEN: u32 = 512;
 
 static GPU: Mutex<()> = Mutex::new(());
 
@@ -57,10 +57,10 @@ impl LanguageModel for FakeModel {
         assert!(m > 0 && m <= MAX_M, "chunk size {m} outside [1, {MAX_M}]");
         let mut outs = Vec::with_capacity(batch.len());
         for chunk in batch {
-            let s = chunk.slot as usize;
+            let s = chunk.seq as usize;
             assert!(
-                self.pos[s] + chunk.len() <= SLOT_LEN,
-                "context overflow in slot {s}"
+                self.pos[s] + chunk.len() <= SEQ_LEN,
+                "context overflow in seq {s}"
             );
             let base = self.pos[s];
             let logits = chunk
@@ -79,17 +79,17 @@ impl LanguageModel for FakeModel {
         Ok(outs)
     }
 
-    fn reset(&mut self, _backend: &Backend, slot: u32) -> Result<()> {
-        self.pos[slot as usize] = 0;
+    fn reset(&mut self, _backend: &Backend, seq: u32) -> Result<()> {
+        self.pos[seq as usize] = 0;
         Ok(())
     }
-    fn pos(&self, slot: u32) -> u32 {
-        self.pos[slot as usize]
+    fn pos(&self, seq: u32) -> u32 {
+        self.pos[seq as usize]
     }
-    fn slot_len(&self, _slot: u32) -> u32 {
-        SLOT_LEN
+    fn context_limit(&self, _seq: u32) -> u32 {
+        SEQ_LEN
     }
-    fn slot_count(&self) -> u32 {
+    fn seq_count(&self) -> u32 {
         self.pos.len() as u32
     }
     fn vocab(&self) -> u32 {
@@ -97,6 +97,27 @@ impl LanguageModel for FakeModel {
     }
     fn eos(&self) -> &[u32] {
         &[EOS]
+    }
+
+    fn alloc_pages(&mut self, _backend: &Backend, seq: u32, tokens: u32) -> Result<()> {
+        assert!(
+            self.pos[seq as usize] + tokens <= SEQ_LEN,
+            "context overflow in seq {seq}"
+        );
+        Ok(())
+    }
+
+    fn free_pages(&mut self, _backend: &Backend, _seq: u32) -> Result<()> {
+        Ok(())
+    }
+
+    fn truncate_pages(
+        &mut self,
+        _backend: &Backend,
+        _seq: u32,
+        _keep_tokens: u32,
+    ) -> Result<()> {
+        Ok(())
     }
 
     fn speculator(&mut self) -> Option<&mut dyn Speculator> {
@@ -108,21 +129,21 @@ impl Speculator for FakeModel {
     fn draft(
         &mut self,
         _backend: &mut Backend,
-        _slot: u32,
+        _seq: u32,
         _token: u32,
         hidden: &[f32],
     ) -> Result<Vec<f32>> {
         Ok(self.logits_for(hidden[0] as u32 + 1))
     }
 
-    fn prime(&mut self, _slot: u32) {}
+    fn prime(&mut self, _seq: u32) {}
 
-    fn snapshot(&mut self, _backend: &Backend, slot: u32) {
-        self.saved[slot as usize] = self.pos[slot as usize];
+    fn snapshot(&mut self, _backend: &Backend, seq: u32) {
+        self.saved[seq as usize] = self.pos[seq as usize];
     }
 
-    fn restore(&mut self, _backend: &Backend, slot: u32) {
-        self.pos[slot as usize] = self.saved[slot as usize] + 1;
+    fn restore(&mut self, _backend: &Backend, seq: u32) {
+        self.pos[seq as usize] = self.saved[seq as usize] + 1;
     }
 }
 
@@ -300,13 +321,13 @@ fn concurrent_sessions_share_the_engine_without_interference() {
 }
 
 #[test]
-fn session_slot_exhaustion_fails_fast() {
+fn session_exhaustion_fails_fast() {
     let _g = gpu();
     let mut engine = new_engine(None, SamplingParams::default(), false);
     let a = engine.create("t0", 8, None).unwrap();
     let b = engine.create("t1", 8, None).unwrap();
     let err = engine.create("t2", 8, None).err().unwrap();
-    assert!(err.to_string().contains("no free slot"), "{err}");
+    assert!(err.to_string().contains("no free sequence"), "{err}");
     let _ = (a, b);
 }
 

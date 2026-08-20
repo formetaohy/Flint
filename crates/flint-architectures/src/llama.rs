@@ -4,6 +4,7 @@ use flint_error::Result;
 use serde_json::Value;
 
 use crate::transformer::{Config, Model, plan};
+use flint_model::pool::ArenaSpec;
 
 pub fn parse_config(v: &Value) -> Result<Config> {
     let mut cfg = Config::parse(v, false)?;
@@ -19,7 +20,7 @@ pub fn parse_config(v: &Value) -> Result<Config> {
 pub fn load(
     source: &dyn Checkpoint,
     v: &Value,
-    slot_lens: &[u32],
+    arena: &ArenaSpec,
     spec_depth: Option<u32>,
     backend: &Backend,
 ) -> Result<Model> {
@@ -42,7 +43,7 @@ pub fn load(
         source,
         cfg,
         &plan(source.kind() == CheckpointKind::Gguf),
-        slot_lens,
+        arena,
         spec_depth,
         backend,
     )

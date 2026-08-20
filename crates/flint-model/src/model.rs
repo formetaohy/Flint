@@ -11,7 +11,7 @@ pub struct ChunkOut {
 
 pub struct SeqChunk<'a> {
     pub tokens: &'a [u32],
-    pub slot: u32,
+    pub seq: u32,
     pub logit_rows: &'a [u32],
     pub hidden_rows: &'a [u32],
 }
@@ -29,12 +29,16 @@ impl SeqChunk<'_> {
 pub trait LanguageModel {
     fn forward(&mut self, backend: &mut Backend, batch: &[SeqChunk]) -> Result<Vec<ChunkOut>>;
 
-    fn reset(&mut self, backend: &Backend, slot: u32) -> Result<()>;
-    fn pos(&self, slot: u32) -> u32;
-    fn slot_len(&self, slot: u32) -> u32;
-    fn slot_count(&self) -> u32;
+    fn reset(&mut self, backend: &Backend, seq: u32) -> Result<()>;
+    fn pos(&self, seq: u32) -> u32;
+    fn context_limit(&self, seq: u32) -> u32;
+    fn seq_count(&self) -> u32;
     fn vocab(&self) -> u32;
     fn eos(&self) -> &[u32];
+
+    fn alloc_pages(&mut self, backend: &Backend, seq: u32, tokens: u32) -> Result<()>;
+    fn free_pages(&mut self, backend: &Backend, seq: u32) -> Result<()>;
+    fn truncate_pages(&mut self, backend: &Backend, seq: u32, keep_tokens: u32) -> Result<()>;
 
     fn speculator(&mut self) -> Option<&mut dyn Speculator> {
         None
@@ -45,7 +49,7 @@ pub trait Speculator {
     fn draft(
         &mut self,
         backend: &mut Backend,
-        slot: u32,
+        seq: u32,
         token: u32,
         hidden: &[f32],
     ) -> Result<Vec<f32>>;
@@ -53,19 +57,19 @@ pub trait Speculator {
     fn advance(
         &mut self,
         backend: &mut Backend,
-        slot: u32,
+        seq: u32,
         token: u32,
         hidden: &[f32],
     ) -> Result<()> {
-        let _ = (backend, slot, token, hidden);
+        let _ = (backend, seq, token, hidden);
         Ok(())
     }
 
-    fn prime(&mut self, slot: u32);
+    fn prime(&mut self, seq: u32);
 
-    fn snapshot(&mut self, backend: &Backend, slot: u32);
+    fn snapshot(&mut self, backend: &Backend, seq: u32);
 
-    fn restore(&mut self, backend: &Backend, slot: u32);
+    fn restore(&mut self, backend: &Backend, seq: u32);
 }
 
 pub trait TextEmbedder {

@@ -42,7 +42,7 @@ enum Phase {
 }
 
 struct Session {
-    slot: u32,
+    seq: u32,
     sampler: Sampler,
     decoder: StreamDecoder,
     context: Vec<u32>,
@@ -65,7 +65,7 @@ pub struct Engine {
     seed: u64,
     stop: Vec<u32>,
     speculate: bool,
-    free_slots: Vec<u32>,
+    free_seqs: Vec<u32>,
     next_id: u32,
     sessions: HashMap<u32, Session>,
     trie: Option<TokenTrie>,
@@ -81,8 +81,8 @@ impl Engine {
         stop: Vec<u32>,
         speculate: bool,
     ) -> Self {
-        let mut free_slots: Vec<u32> = (0..model.slot_count()).collect();
-        free_slots.reverse();
+        let mut free_seqs: Vec<u32> = (0..model.seq_count()).collect();
+        free_seqs.reverse();
         Self {
             backend,
             model,
@@ -91,7 +91,7 @@ impl Engine {
             seed,
             stop,
             speculate,
-            free_slots,
+            free_seqs,
             next_id: 0,
             sessions: HashMap::new(),
             trie: None,
@@ -117,15 +117,17 @@ impl Engine {
             }
             None => None,
         };
-        let slot = self.alloc_slot(&prompt_ids)?;
-        self.model.reset(&self.backend, slot)?;
+        let seq = self.alloc_seq(&prompt_ids)?;
+        self.model.reset(&self.backend, seq)?;
+        self.model
+            .alloc_pages(&self.backend, seq, prompt_ids.len() as u32)?;
         self.seed = self.seed.wrapping_add(1);
         let id = self.next_id;
         self.next_id += 1;
         self.sessions.insert(
             id,
             Session {
-                slot,
+                seq,
                 sampler: Sampler::new(self.sampling, self.seed),
                 decoder: self.tokenizer.stream_decoder(),
                 context: Vec::new(),
@@ -149,14 +151,14 @@ impl Engine {
         Ok(SessionId(id))
     }
 
-    fn alloc_slot(&mut self, prompt: &[u32]) -> Result<u32> {
-        for i in (0..self.free_slots.len()).rev() {
-            if (prompt.len() as u32) < self.model.slot_len(self.free_slots[i]) {
-                return Ok(self.free_slots.swap_remove(i));
+    fn alloc_seq(&mut self, prompt: &[u32]) -> Result<u32> {
+        for i in (0..self.free_seqs.len()).rev() {
+            if (prompt.len() as u32) < self.model.context_limit(self.free_seqs[i]) {
+                return Ok(self.free_seqs.swap_remove(i));
             }
         }
         Err(Error::Model(format!(
-            "prompt of {} tokens fits no free slot",
+            "prompt of {} tokens fits no free sequence",
             prompt.len()
         )))
     }
@@ -172,7 +174,7 @@ impl Engine {
                     self.model
                         .speculator()
                         .expect("speculate implies a speculator")
-                        .snapshot(&self.backend, s.slot);
+                        .snapshot(&self.backend, s.seq);
                 }
             }
         }
@@ -181,11 +183,15 @@ impl Engine {
         if plan.is_empty() {
             return Ok(());
         }
+        for p in &plan {
+            self.model
+                .alloc_pages(&self.backend, p.seq, p.tokens.len() as u32)?;
+        }
         let batch: Vec<SeqChunk> = plan
             .iter()
             .map(|p| SeqChunk {
                 tokens: &p.tokens,
-                slot: p.slot,
+                seq: p.seq,
                 logit_rows: &p.logit_rows,
                 hidden_rows: &p.hidden_rows,
             })
@@ -238,7 +244,7 @@ impl Engine {
                         (last && speculate).then_some(take as u32 - 1).into_iter().collect();
                     Some(Plan {
                         id: *id,
-                        slot: s.slot,
+                        seq: s.seq,
                         tokens: s.prompt[*done..end].to_vec(),
                         logit_rows,
                         hidden_rows,
@@ -247,7 +253,7 @@ impl Engine {
                 }
                 Phase::Plain { pending } => Some(Plan {
                     id: *id,
-                    slot: s.slot,
+                    seq: s.seq,
                     tokens: vec![*pending],
                     logit_rows: vec![0],
                     hidden_rows: Vec::new(),
@@ -263,7 +269,7 @@ impl Engine {
                     }
                     Some(Plan {
                         id: *id,
-                        slot: s.slot,
+                        seq: s.seq,
                         tokens: vec![*pending, *draft_token],
                         logit_rows: vec![0, 1],
                         hidden_rows: vec![0, 1],
@@ -313,15 +319,15 @@ impl Engine {
         let Some(s) = self.sessions.remove(&id.0) else {
             return Ok(());
         };
-        self.model.reset(&self.backend, s.slot)?;
-        self.free_slots.push(s.slot);
+        self.model.free_pages(&self.backend, s.seq)?;
+        self.free_seqs.push(s.seq);
         Ok(())
     }
 }
 
 struct Plan {
     id: u32,
-    slot: u32,
+    seq: u32,
     tokens: Vec<u32>,
     logit_rows: Vec<u32>,
     hidden_rows: Vec<u32>,
@@ -370,8 +376,8 @@ impl Resolver<'_> {
                 .model
                 .speculator()
                 .expect("speculate implies a speculator");
-            spec.prime(s.slot);
-            let draft_logits = spec.draft(self.backend, s.slot, pending, &out.hidden[0])?;
+            spec.prime(s.seq);
+            let draft_logits = spec.draft(self.backend, s.seq, pending, &out.hidden[0])?;
             let draft_dist = dist_after(self.trie, s, pending, &draft_logits)?;
             let draft_token = s.sampler.draw(&draft_dist);
             s.phase = Phase::Spec {
@@ -431,8 +437,8 @@ impl Resolver<'_> {
                 .model
                 .speculator()
                 .expect("spec phase implies a speculator");
-            spec.advance(self.backend, s.slot, draft_token, &out.hidden[0])?;
-            let draft_logits = spec.draft(self.backend, s.slot, bonus, &out.hidden[1])?;
+            spec.advance(self.backend, s.seq, draft_token, &out.hidden[0])?;
+            let draft_logits = spec.draft(self.backend, s.seq, bonus, &out.hidden[1])?;
             let next_dist = dist_after(self.trie, s, bonus, &draft_logits)?;
             let next_draft = s.sampler.draw(&next_dist);
             s.phase = Phase::Spec {
@@ -446,7 +452,10 @@ impl Resolver<'_> {
         self.model
             .speculator()
             .expect("spec phase implies a speculator")
-            .restore(self.backend, s.slot);
+            .restore(self.backend, s.seq);
+        let keep = self.model.pos(s.seq);
+        self.model.truncate_pages(self.backend, s.seq, keep)?;
+        self.model.alloc_pages(self.backend, s.seq, 1)?;
         let p1 = s.piece(self.tokenizer, self.trie, pending)?;
         s.queue.push_back(p1);
         if s.halted(chosen) {
@@ -457,7 +466,7 @@ impl Resolver<'_> {
             self.backend,
             &[SeqChunk {
                 tokens: &[chosen],
-                slot: s.slot,
+                seq: s.seq,
                 logit_rows: &[],
                 hidden_rows: &[0],
             }],
@@ -466,7 +475,7 @@ impl Resolver<'_> {
             .model
             .speculator()
             .expect("spec phase implies a speculator");
-        let draft_logits = spec.draft(self.backend, s.slot, chosen, &out2[0].hidden[0])?;
+        let draft_logits = spec.draft(self.backend, s.seq, chosen, &out2[0].hidden[0])?;
         let next_dist = dist_after(self.trie, s, chosen, &draft_logits)?;
         let next_draft = s.sampler.draw(&next_dist);
         s.phase = Phase::Spec {

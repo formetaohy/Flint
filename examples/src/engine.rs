@@ -23,7 +23,8 @@ pub fn spawn(
     let chat_model = flint_architectures::load(
         dir,
         &LoadOptions {
-            slots: vec![ctx_size],
+            seqs: vec![ctx_size],
+            pages: None,
             spec_depth: None,
         },
         &backend,

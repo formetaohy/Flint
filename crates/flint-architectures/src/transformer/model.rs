@@ -4,7 +4,7 @@ use flint_error::{Error, Result};
 use flint_model::loader::{self, Plan};
 use flint_model::mlp_weights::MlpBlock;
 use flint_model::ops::{self, NormMode, NormSpec, RopeArgs, RopeInputs};
-use flint_model::pool::KvPool;
+use flint_model::pool::{ArenaSpec, KvArena, KvPool};
 use flint_model::routing::Routing;
 use flint_model::step;
 use flint_model::{ChunkOut, LanguageModel, MAX_M, SeqChunk, Speculator};
@@ -15,8 +15,7 @@ use crate::transformer::weights::{LayerW, Scratch, alloc_scratch, take_layer};
 
 pub struct Model {
     cfg: Config,
-    slot_lens: Vec<u32>,
-    slot_bases: Vec<u32>,
+    arena: KvArena,
     pos: Vec<u32>,
     saved_pos: Vec<u32>,
     spec_depth: u32,
@@ -52,11 +51,11 @@ impl Model {
         source: &dyn Checkpoint,
         cfg: Config,
         plan: &Plan,
-        slot_lens: &[u32],
+        arena: &ArenaSpec,
         spec_depth: Option<u32>,
         backend: &Backend,
     ) -> Result<Self> {
-        Self::load_extra(source, cfg, plan, Vec::new(), slot_lens, spec_depth, backend)
+        Self::load_extra(source, cfg, plan, Vec::new(), arena, spec_depth, backend)
     }
 
     pub fn load_extra(
@@ -64,14 +63,12 @@ impl Model {
         cfg: Config,
         plan: &Plan,
         extra: Vec<(String, Weight)>,
-        slot_lens: &[u32],
+        arena_spec: &ArenaSpec,
         spec_depth: Option<u32>,
         backend: &Backend,
     ) -> Result<Self> {
         cfg.validate()?;
-        if slot_lens.is_empty() || slot_lens.contains(&0) {
-            return Err(Error::Model("slot lengths must be non-empty and positive".into()));
-        }
+        let arena = KvArena::new(arena_spec)?;
         let mut w = loader::load_weights(backend, source, plan)?;
         for (key, weight) in extra {
             w.insert(key, weight);
@@ -119,20 +116,16 @@ impl Model {
                 kv.push(KvPool::new(
                     backend,
                     cfg.kv_heads,
-                    slot_lens,
                     cfg.head_dim(l as u32),
+                    arena.seqs(),
+                    arena.max_pages(),
+                    arena.pages(),
                 ));
                 kv_src[l] = idx;
                 last_by_class[(cfg.window(l as u32) > 0) as usize] = Some(idx);
             }
         }
 
-        let mut slot_bases = Vec::with_capacity(slot_lens.len());
-        let mut base = 0u32;
-        for &len in slot_lens {
-            slot_bases.push(base);
-            base += len;
-        }
         let spec_depth = spec_depth.unwrap_or(cfg.layers / 2).clamp(1, cfg.layers);
 
         let max_hd = *cfg.head_dims.iter().max().unwrap();
@@ -148,7 +141,7 @@ impl Model {
         for r in &cfg.rope {
             let (c, s) = ops::rope_tables(
                 backend,
-                base,
+                *arena_spec.seq_lens.iter().max().expect("budgets are non-empty"),
                 r.dim,
                 r.freq_dim,
                 r.theta,
@@ -158,12 +151,12 @@ impl Model {
             cos.push(c);
             sin.push(s);
         }
+        let seqs = arena.seqs();
         Ok(Self {
             cfg,
-            slot_lens: slot_lens.to_vec(),
-            slot_bases,
-            pos: vec![0; slot_lens.len()],
-            saved_pos: vec![0; slot_lens.len()],
+            arena,
+            pos: vec![0; seqs as usize],
+            saved_pos: vec![0; seqs as usize],
             spec_depth,
             embed,
             head,
@@ -412,6 +405,17 @@ impl Model {
         }
         Ok(())
     }
+
+    fn upload_tables(&self, backend: &Backend) {
+        let table = self.arena.table();
+        for kv in &self.kv {
+            kv.upload(backend, &table);
+        }
+    }
+
+    pub fn used_pages(&self) -> u32 {
+        self.arena.used()
+    }
 }
 
 struct ResidualSpec<'a> {
@@ -459,25 +463,29 @@ impl LanguageModel for Model {
         }
         let mut ids = vec![0u32; MAX_M as usize];
         let mut positions = vec![0u32; MAX_M as usize];
-        let mut slots = vec![0u32; MAX_M as usize];
+        let mut seqs = vec![0u32; MAX_M as usize];
         let mut hidden_wanted = false;
         let mut row = 0usize;
         for chunk in batch {
-            let s = chunk.slot as usize;
-            let (slot_len, slot_base) = (self.slot_lens[s], self.slot_bases[s]);
-            if self.pos[s] + chunk.len() > slot_len {
-                return Err(Error::Model(format!("context limit {slot_len} reached")));
+            let s = chunk.seq as usize;
+            let limit = self.arena.seq_len(chunk.seq);
+            if self.pos[s] + chunk.len() > limit {
+                return Err(Error::Model(format!("context limit {limit} reached")));
             }
+            assert!(
+                self.arena.covers(chunk.seq, self.pos[s] + chunk.len()),
+                "pages must cover the chunk"
+            );
             for i in 0..chunk.tokens.len() {
                 ids[row + i] = chunk.tokens[i];
                 positions[row + i] = self.pos[s] + i as u32;
-                slots[row + i] = slot_base;
+                seqs[row + i] = chunk.seq;
             }
             row += chunk.tokens.len();
             hidden_wanted |= !chunk.hidden_rows.is_empty();
         }
         backend.write_u32(&self.s.ids.buf, &ids);
-        step::write_row_meta(backend, &self.s.meta, &positions, &slots, m);
+        step::write_row_meta(backend, &self.s.meta, &positions, &seqs, m);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder()?;
@@ -693,8 +701,8 @@ impl LanguageModel for Model {
                             scale: cfg.attn_scale.unwrap_or_else(|| (hd as f32).sqrt().recip()),
                             m: m_s,
                             causal: true,
-                            slot: self.slot_bases[chunk.slot as usize],
-                            args: Binding::Slice(&s.meta, row_off as u64 * 8, m_s as u64 * 8),
+                            seq: chunk.seq,
+                            args: Binding::Slice(&s.meta, row_off as u64 * 32, m_s as u64 * 32),
                         },
                     )?;
                     row_off += m_s;
@@ -912,7 +920,7 @@ impl LanguageModel for Model {
         let mut base = 0u32;
         for chunk in batch {
             let m_s = chunk.len();
-            let s = chunk.slot as usize;
+            let s = chunk.seq as usize;
             outs.push(ChunkOut {
                 logits: step::read_rows(backend, &self.s.logits, chunk.logit_rows, m_s, cfg.vocab, base)?,
                 hidden: step::read_rows(backend, &self.capture, chunk.hidden_rows, m_s, cfg.hidden, base)?,
@@ -923,29 +931,46 @@ impl LanguageModel for Model {
         Ok(outs)
     }
 
-    fn reset(&mut self, backend: &Backend, slot: u32) -> Result<()> {
-        for kv in &self.kv {
-            kv.reset(backend, slot)?;
-        }
-        self.pos[slot as usize] = 0;
-        self.saved_pos[slot as usize] = 0;
+    fn reset(&mut self, backend: &Backend, seq: u32) -> Result<()> {
+        self.arena.free_seq(seq);
+        self.upload_tables(backend);
+        self.pos[seq as usize] = 0;
+        self.saved_pos[seq as usize] = 0;
         Ok(())
     }
 
-    fn pos(&self, slot: u32) -> u32 {
-        self.pos[slot as usize]
+    fn pos(&self, seq: u32) -> u32 {
+        self.pos[seq as usize]
     }
-    fn slot_len(&self, slot: u32) -> u32 {
-        self.slot_lens[slot as usize]
+    fn context_limit(&self, seq: u32) -> u32 {
+        self.arena.seq_len(seq)
     }
-    fn slot_count(&self) -> u32 {
-        self.slot_lens.len() as u32
+    fn seq_count(&self) -> u32 {
+        self.arena.seqs()
     }
     fn vocab(&self) -> u32 {
         self.cfg.vocab
     }
     fn eos(&self) -> &[u32] {
         &self.cfg.eos
+    }
+
+    fn alloc_pages(&mut self, backend: &Backend, seq: u32, tokens: u32) -> Result<()> {
+        self.arena.alloc(seq, self.pos[seq as usize], tokens)?;
+        self.upload_tables(backend);
+        Ok(())
+    }
+
+    fn free_pages(&mut self, backend: &Backend, seq: u32) -> Result<()> {
+        self.arena.free_seq(seq);
+        self.upload_tables(backend);
+        Ok(())
+    }
+
+    fn truncate_pages(&mut self, backend: &Backend, seq: u32, keep_tokens: u32) -> Result<()> {
+        self.arena.truncate(seq, keep_tokens);
+        self.upload_tables(backend);
+        Ok(())
     }
 
     fn speculator(&mut self) -> Option<&mut dyn Speculator> {
@@ -957,7 +982,7 @@ impl Speculator for Model {
     fn draft(
         &mut self,
         backend: &mut Backend,
-        _slot: u32,
+        _seq: u32,
         _token: u32,
         hidden: &[f32],
     ) -> Result<Vec<f32>> {
@@ -1012,13 +1037,13 @@ impl Speculator for Model {
         backend.read_f32(&self.s.logits.buf, 0, cfg.vocab as usize)
     }
 
-    fn prime(&mut self, _slot: u32) {}
+    fn prime(&mut self, _seq: u32) {}
 
-    fn snapshot(&mut self, _backend: &Backend, slot: u32) {
-        self.saved_pos[slot as usize] = self.pos[slot as usize];
+    fn snapshot(&mut self, _backend: &Backend, seq: u32) {
+        self.saved_pos[seq as usize] = self.pos[seq as usize];
     }
 
-    fn restore(&mut self, _backend: &Backend, slot: u32) {
-        self.pos[slot as usize] = self.saved_pos[slot as usize] + 1;
+    fn restore(&mut self, _backend: &Backend, seq: u32) {
+        self.pos[seq as usize] = self.saved_pos[seq as usize] + 1;
     }
 }

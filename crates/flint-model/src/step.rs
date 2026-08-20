@@ -9,24 +9,24 @@ pub fn token_ids(backend: &Backend) -> Tensor {
 }
 
 pub fn row_meta(backend: &Backend) -> Tensor {
-    Tensor::new(backend.storage(2 * MAX_M as u64 * 4), vec![2 * MAX_M], DType::U32)
+    Tensor::new(backend.storage(8 * MAX_M as u64 * 4), vec![8 * MAX_M], DType::U32)
 }
 
 pub fn write_row_meta(
     backend: &Backend,
     meta: &Tensor,
     positions: &[u32],
-    slots: &[u32],
+    seqs: &[u32],
     m: u32,
 ) {
     assert!(
-        positions.len() >= m as usize && slots.len() >= m as usize,
+        positions.len() >= m as usize && seqs.len() >= m as usize,
         "row meta arrays must cover the chunk size"
     );
-    let mut data = vec![0u32; 2 * MAX_M as usize];
+    let mut data = vec![0u32; 8 * MAX_M as usize];
     for i in 0..m as usize {
-        data[2 * i] = positions[i];
-        data[2 * i + 1] = slots[i];
+        data[8 * i] = positions[i];
+        data[8 * i + 1] = seqs[i];
     }
     backend.write_u32(&meta.buf, &data);
 }

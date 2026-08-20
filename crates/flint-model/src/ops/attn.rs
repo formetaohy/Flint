@@ -10,7 +10,7 @@ pub struct AttnSpec<'a> {
     pub scale: f32,
     pub m: u32,
     pub causal: bool,
-    pub slot: u32,
+    pub seq: u32,
     pub args: Binding<'a>,
 }
 
@@ -33,8 +33,9 @@ pub fn attn(
             ("SCALE", spec.scale as f64),
             ("WINDOW", spec.window as f64),
             ("NQ_PER_KV", (spec.q_heads / kv.kv_heads) as f64),
-            ("SLOT", spec.slot as f64),
+            ("SEQ", spec.seq as f64),
             ("CAUSAL", spec.causal as u32 as f64),
+            ("MAX_PAGES", kv.max_pages as f64),
         ],
         &[
             q,
@@ -42,6 +43,7 @@ pub fn attn(
             Binding::Full(&kv.v),
             y,
             spec.args,
+            Binding::Full(&kv.block_table),
         ],
         [spec.m.div_ceil(ATTN_BR), spec.q_heads, 1],
     )
@@ -63,6 +65,7 @@ pub fn kv_store(
             ("N_KV", kv.kv_heads as f64),
             ("HEAD_DIM", kv.head_dim as f64),
             ("POOL_LEN", kv.capacity as f64),
+            ("MAX_PAGES", kv.max_pages as f64),
         ],
         &[
             k_src,
@@ -70,6 +73,7 @@ pub fn kv_store(
             Binding::Full(&kv.k),
             Binding::Full(&kv.v),
             Binding::Full(meta),
+            Binding::Full(&kv.block_table),
         ],
         [(kv.kv_heads * (kv.head_dim / 2)).div_ceil(256), m, 1],
     )

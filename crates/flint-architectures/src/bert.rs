@@ -3,7 +3,7 @@ use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
 use flint_model::loader::{self, Plan, Role, WeightSet};
 use flint_model::ops::{self, Act, NormMode, NormSpec};
-use flint_model::pool::KvPool;
+use flint_model::pool::{ArenaSpec, KvArena, KvPool};
 use flint_model::step;
 use flint_model::TextEmbedder;
 use flint_tensor::{Tensor, Weight};
@@ -213,7 +213,20 @@ impl Bert {
         let layers = (0..cfg.layers)
             .map(|i| take_layer(&mut w, i as usize))
             .collect::<Result<Vec<_>>>()?;
-        let kv = KvPool::new(backend, cfg.heads, &[MAX_TOKENS], cfg.head_dim);
+        let mut arena = KvArena::new(&ArenaSpec {
+            seq_lens: vec![MAX_TOKENS],
+            pages: None,
+        })?;
+        arena.alloc(0, 0, MAX_TOKENS)?;
+        let kv = KvPool::new(
+            backend,
+            cfg.heads,
+            cfg.head_dim,
+            arena.seqs(),
+            arena.max_pages(),
+            arena.pages(),
+        );
+        kv.upload(backend, &arena.table());
         let s = alloc_scratch(backend, cfg.hidden, cfg.intermediate);
         Ok(Self {
             cfg,
@@ -365,7 +378,7 @@ impl TextEmbedder for Bert {
                         scale: (cfg.head_dim as f32).sqrt().recip(),
                         m: n,
                         causal: false,
-                        slot: 0,
+                        seq: 0,
                         args: Binding::Full(&s.meta),
                     },
                 )?;

@@ -89,10 +89,10 @@ fn synth_llama() -> (std::path::PathBuf, Value) {
     (dir, config)
 }
 
-fn chunk<'a>(tokens: &'a [u32], slot: u32, logit_rows: &'a [u32]) -> SeqChunk<'a> {
+fn chunk<'a>(tokens: &'a [u32], seq: u32, logit_rows: &'a [u32]) -> SeqChunk<'a> {
     SeqChunk {
         tokens,
-        slot,
+        seq,
         logit_rows,
         hidden_rows: &[],
     }
@@ -100,13 +100,13 @@ fn chunk<'a>(tokens: &'a [u32], slot: u32, logit_rows: &'a [u32]) -> SeqChunk<'a
 
 fn chunk_full<'a>(
     tokens: &'a [u32],
-    slot: u32,
+    seq: u32,
     logit_rows: &'a [u32],
     hidden_rows: &'a [u32],
 ) -> SeqChunk<'a> {
     SeqChunk {
         tokens,
-        slot,
+        seq,
         logit_rows,
         hidden_rows,
     }
@@ -125,9 +125,19 @@ fn self_speculator_drafts_from_the_captured_depth() {
     let (dir, config) = synth_llama();
     let mut backend = Backend::new().unwrap();
     let source = open_checkpoint(&dir).unwrap();
-    let mut model = llama::load(source.as_ref(), &config, &[64], Some(1), &backend).unwrap();
+    let mut model = llama::load(
+        source.as_ref(),
+        &config,
+        &flint_model::pool::ArenaSpec {
+            seq_lens: vec![64],
+            pages: None,
+        },
+        Some(1),
+        &backend,
+    ).unwrap();
 
     let tokens: Vec<u32> = (0..8).map(|i| (i * 3) % 127 + 1).collect();
+    model.alloc_pages(&backend, 0, tokens.len() as u32).unwrap();
     let last = [tokens.len() as u32 - 1];
     let out = model
         .forward(
@@ -144,6 +154,7 @@ fn self_speculator_drafts_from_the_captured_depth() {
         .expect("spec_depth 1 enables the self-speculator")
         .snapshot(&backend, 0);
     let extra = [5u32, 6];
+    model.alloc_pages(&backend, 0, extra.len() as u32).unwrap();
     let _ = model
         .forward(&mut backend, &[chunk(&extra, 0, &[1])])
         .unwrap();
@@ -157,6 +168,9 @@ fn self_speculator_drafts_from_the_captured_depth() {
         pos_before + 1,
         "restore rolls the rejected draft back by one position"
     );
+    let keep = model.pos(0);
+    model.truncate_pages(&backend, 0, keep).unwrap();
+    model.alloc_pages(&backend, 0, 1).unwrap();
 
     let draft = model
         .speculator()
@@ -174,12 +188,21 @@ fn self_speculator_drafts_from_the_captured_depth() {
 }
 
 #[test]
-fn batch_slots_match_solo_and_isolate_sequences() {
+fn batch_seqs_match_solo_and_isolate_sequences() {
     let _g = gpu();
     let (dir, config) = synth_llama();
     let backend = Backend::new().unwrap();
     let source = open_checkpoint(&dir).unwrap();
-    let mut model = llama::load(source.as_ref(), &config, &[64, 64], None, &backend).unwrap();
+    let mut model = llama::load(
+        source.as_ref(),
+        &config,
+        &flint_model::pool::ArenaSpec {
+            seq_lens: vec![64, 64],
+            pages: None,
+        },
+        None,
+        &backend,
+    ).unwrap();
     let mut backend = backend;
 
     let seq_a: Vec<u32> = (0..16).map(|i| (i * 3) % 127 + 1).collect();
@@ -187,6 +210,8 @@ fn batch_slots_match_solo_and_isolate_sequences() {
     let seq_b: Vec<u32> = (0..16).map(|i| (i * 5) % 127 + 1).collect();
     let last_b = [seq_b.len() as u32 - 1];
 
+    model.alloc_pages(&backend, 0, seq_a.len() as u32).unwrap();
+    model.alloc_pages(&backend, 1, seq_b.len() as u32).unwrap();
     let batch = model
         .forward(
             &mut backend,
@@ -199,15 +224,17 @@ fn batch_slots_match_solo_and_isolate_sequences() {
 
     model.reset(&backend, 0).unwrap();
     model.reset(&backend, 1).unwrap();
+    model.alloc_pages(&backend, 0, seq_a.len() as u32).unwrap();
     let solo_a = model
         .forward(&mut backend, &[chunk(&seq_a, 0, &last_a)])
         .unwrap();
+    model.alloc_pages(&backend, 1, seq_b.len() as u32).unwrap();
     let solo_b = model
         .forward(&mut backend, &[chunk(&seq_b, 1, &last_b)])
         .unwrap();
 
-    assert_same(&batch[0].logits[0], &solo_a[0].logits[0], "slot 0 vs solo");
-    assert_same(&batch[1].logits[0], &solo_b[0].logits[0], "slot 1 vs solo");
+    assert_same(&batch[0].logits[0], &solo_a[0].logits[0], "seq 0 vs solo");
+    assert_same(&batch[1].logits[0], &solo_b[0].logits[0], "seq 1 vs solo");
     assert_ne!(
         batch[0].logits[0], batch[1].logits[0],
         "different sequences must yield different logits"
@@ -215,16 +242,20 @@ fn batch_slots_match_solo_and_isolate_sequences() {
 
     model.reset(&backend, 0).unwrap();
     model.reset(&backend, 1).unwrap();
+    model.alloc_pages(&backend, 0, seq_a.len() as u32).unwrap();
+    model.alloc_pages(&backend, 1, seq_a.len() as u32).unwrap();
     let mirror = model
         .forward(
             &mut backend,
             &[chunk(&seq_a, 0, &last_a), chunk(&seq_a, 1, &last_a)],
         )
         .unwrap();
-    assert_same(&mirror[0].logits[0], &mirror[1].logits[0], "same tokens across slots");
+    assert_same(&mirror[0].logits[0], &mirror[1].logits[0], "same tokens across seqs");
 
     model.reset(&backend, 0).unwrap();
     model.reset(&backend, 1).unwrap();
+    model.alloc_pages(&backend, 0, seq_a.len() as u32).unwrap();
+    model.alloc_pages(&backend, 1, seq_b.len() as u32).unwrap();
     let step1 = model
         .forward(
             &mut backend,
@@ -236,6 +267,8 @@ fn batch_slots_match_solo_and_isolate_sequences() {
     let tail_b = [9u32, 8, 7];
     let last_ta = [tail_a.len() as u32 - 1];
     let last_tb = [tail_b.len() as u32 - 1];
+    model.alloc_pages(&backend, 0, tail_a.len() as u32).unwrap();
+    model.alloc_pages(&backend, 1, tail_b.len() as u32).unwrap();
     let step2 = model
         .forward(
             &mut backend,
@@ -243,15 +276,28 @@ fn batch_slots_match_solo_and_isolate_sequences() {
         )
         .unwrap();
 
-    let mut ctrl = llama::load(source.as_ref(), &config, &[64, 64], None, &backend).unwrap();
+    let mut ctrl = llama::load(
+        source.as_ref(),
+        &config,
+        &flint_model::pool::ArenaSpec {
+            seq_lens: vec![64, 64],
+            pages: None,
+        },
+        None,
+        &backend,
+    ).unwrap();
     ctrl.reset(&backend, 0).unwrap();
     ctrl.reset(&backend, 1).unwrap();
+    ctrl.alloc_pages(&backend, 0, seq_a.len() as u32).unwrap();
+    ctrl.alloc_pages(&backend, 1, seq_b.len() as u32).unwrap();
     let _ = ctrl
         .forward(
             &mut backend,
             &[chunk(&seq_a, 0, &[]), chunk(&seq_b, 1, &[])],
         )
         .unwrap();
+    ctrl.alloc_pages(&backend, 0, tail_a.len() as u32).unwrap();
+    ctrl.alloc_pages(&backend, 1, tail_b.len() as u32).unwrap();
     let ctrl2 = ctrl
         .forward(
             &mut backend,
@@ -259,9 +305,55 @@ fn batch_slots_match_solo_and_isolate_sequences() {
         )
         .unwrap();
 
-    assert_same(&step2[0].logits[0], &ctrl2[0].logits[0], "slot 0 continuation");
-    assert_same(&step2[1].logits[0], &ctrl2[1].logits[0], "slot 1 continuation");
+    assert_same(&step2[0].logits[0], &ctrl2[0].logits[0], "seq 0 continuation");
+    assert_same(&step2[1].logits[0], &ctrl2[1].logits[0], "seq 1 continuation");
     assert_ne!(step2[0].logits[0], step2[1].logits[0]);
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn paged_attention_matches_contiguous_layout() {
+    let _g = gpu();
+    let (dir, config) = synth_llama();
+    let mut backend = Backend::new().unwrap();
+    let source = open_checkpoint(&dir).unwrap();
+
+    let tokens: Vec<u32> = (0..48).map(|i| (i * 7) % 127 + 1).collect();
+    let last = [tokens.len() as u32 - 1];
+
+    let mut plain = llama::load(
+        source.as_ref(),
+        &config,
+        &flint_model::pool::ArenaSpec {
+            seq_lens: vec![128],
+            pages: None,
+        },
+        None,
+        &backend,
+    ).unwrap();
+    plain.alloc_pages(&backend, 0, tokens.len() as u32).unwrap();
+    let want = plain
+        .forward(&mut backend, &[chunk(&tokens, 0, &last)])
+        .unwrap();
+
+    let mut paged = llama::load(
+        source.as_ref(),
+        &config,
+        &flint_model::pool::ArenaSpec {
+            seq_lens: vec![128, 128],
+            pages: Some(8),
+        },
+        None,
+        &backend,
+    )
+        .unwrap();
+    paged.alloc_pages(&backend, 1, 128).unwrap();
+    paged.alloc_pages(&backend, 0, tokens.len() as u32).unwrap();
+    let got = paged
+        .forward(&mut backend, &[chunk(&tokens, 0, &last)])
+        .unwrap();
+
+    assert_same(&want[0].logits[0], &got[0].logits[0], "paged vs contiguous");
     std::fs::remove_dir_all(&dir).ok();
 }

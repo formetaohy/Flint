@@ -1,5 +1,6 @@
 pub mod modes;
 pub const ATTN_BR: u32 = 8;
+pub const PAGE_LEN: u32 = 32;
 pub mod name {
     pub const GEMM: &str = "gemm";
     pub const GEMM_COOP: &str = "gemm_coop";
@@ -278,7 +279,7 @@ const SHADERS: &[ShaderSpec] = &[
     shader!(
         name::ATTN,
         ["attn.wgsl"],
-        &[BindingMode::ReadWrite; 5],
+        &[BindingMode::ReadWrite; 6],
         &[
             ("M", Scalar::U32),
             ("N_HEADS", Scalar::U32),
@@ -287,18 +288,20 @@ const SHADERS: &[ShaderSpec] = &[
             ("SCALE", Scalar::F32),
             ("WINDOW", Scalar::U32),
             ("NQ_PER_KV", Scalar::U32),
-            ("SLOT", Scalar::U32),
+            ("SEQ", Scalar::U32),
             ("CAUSAL", Scalar::U32),
+            ("MAX_PAGES", Scalar::U32),
         ]
     ),
     shader!(
         name::KV_STORE,
         ["kv_store.wgsl"],
-        &[BindingMode::ReadWrite; 5],
+        &[BindingMode::ReadWrite; 6],
         &[
             ("N_KV", Scalar::U32),
             ("HEAD_DIM", Scalar::U32),
             ("POOL_LEN", Scalar::U32),
+            ("MAX_PAGES", Scalar::U32),
         ]
     ),
     shader!(

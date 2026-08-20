@@ -3,6 +3,7 @@ use flint_checkpoint::{Checkpoint, CheckpointKind};
 use flint_error::{Error, Result};
 use flint_model::loader::{MoEPart, MoEPlan, Plan, Role, load_moe_experts, upload};
 use flint_model::ops::{Act, RopeScaling};
+use flint_model::pool::ArenaSpec;
 use flint_model::routing::RouteKind;
 use flint_tensor::Weight;
 use serde_json::Value;
@@ -148,7 +149,7 @@ fn phi_plan(gguf: bool) -> Plan {
 pub fn load(
     source: &dyn Checkpoint,
     v: &Value,
-    slot_lens: &[u32],
+    arena: &ArenaSpec,
     spec_depth: Option<u32>,
     backend: &Backend,
 ) -> Result<Model> {
@@ -159,7 +160,7 @@ pub fn load(
     } else {
         hf_split_fused(backend, source, &cfg, phi_role)?
     };
-    Model::load_extra(source, cfg, &phi_plan(gguf), extra, slot_lens, spec_depth, backend)
+    Model::load_extra(source, cfg, &phi_plan(gguf), extra, arena, spec_depth, backend)
 }
 
 fn hf_split_fused(
@@ -226,7 +227,7 @@ fn hf_key_moe(name: &str) -> Option<String> {
 pub fn load_moe(
     source: &dyn Checkpoint,
     v: &Value,
-    slot_lens: &[u32],
+    arena: &ArenaSpec,
     spec_depth: Option<u32>,
     backend: &Backend,
 ) -> Result<Model> {
@@ -250,7 +251,7 @@ pub fn load_moe(
         shared: false,
     };
     let extra = load_moe_experts(backend, source, &moe_plan, dense_role)?;
-    Model::load_extra(source, cfg, &plan, extra, slot_lens, spec_depth, backend)
+    Model::load_extra(source, cfg, &plan, extra, arena, spec_depth, backend)
 }
 
 fn f32_list(v: &Value, key: &str) -> Result<Vec<f32>> {
