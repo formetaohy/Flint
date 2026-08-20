@@ -10,6 +10,7 @@ pub fn synthesize_config(source: &dyn Checkpoint, family: Family) -> Result<Valu
         Family::Gemma => transformer_config(source, true),
         Family::Gemma4 => gemma4_config(source),
         Family::Phi => phi_config(source),
+        Family::Qwen35 => qwen35_config(source),
     }
 }
 
@@ -248,6 +249,108 @@ fn vocab_size(m: &Metadata, arch: &str) -> Result<u32> {
     m.u32(&format!("{arch}.vocab_size"))
         .or_else(|| m.str_array("tokenizer.ggml.tokens").map(|t| t.len() as u32))
         .ok_or_else(|| Error::Config("GGUF has no vocab size".into()))
+}
+
+fn qwen35_config(source: &dyn Checkpoint) -> Result<Value> {
+    let m = source.metadata()?;
+    let key = |k: &str| format!("qwen35.{k}");
+    let req = |k: &str| -> Result<u32> {
+        m.u32(&key(k))
+            .ok_or_else(|| Error::Config(format!("GGUF metadata missing {}", key(k))))
+    };
+
+    let hidden = req("embedding_length")?;
+    let heads = req("attention.head_count")?;
+    let kv = req("attention.head_count_kv")?;
+    let head_dim = req("attention.key_length")?;
+    if let Some(v) = m.u32(&key("attention.value_length"))
+        && v != head_dim
+    {
+        return Err(Error::Config(format!(
+            "asymmetric head dims (key {head_dim}, value {v}) unsupported"
+        )));
+    }
+    let block_count = req("block_count")?;
+    let nextn = m.u32(&key("nextn_predict_layers")).unwrap_or(0);
+    let layers = block_count.checked_sub(nextn).ok_or_else(|| {
+        Error::Config(format!(
+            "nextn_predict_layers {nextn} exceeds block_count {block_count}"
+        ))
+    })?;
+    if layers == 0 {
+        return Err(Error::Config("qwen35 trunk has zero layers".into()));
+    }
+
+    let layer_types: Vec<Value> = if let Some(rec) = m.u32_array(&key("attention.recurrent_layers")) {
+        if rec.len() < layers as usize {
+            return Err(Error::Config("recurrent_layers shorter than the trunk".into()));
+        }
+        rec[..layers as usize]
+            .iter()
+            .map(|&r| {
+                if r != 0 { "linear_attention" } else { "full_attention" }.into()
+            })
+            .collect()
+    } else {
+        let interval = m
+            .u32(&key("full_attention_interval"))
+            .ok_or_else(|| {
+                Error::Config(
+                    "qwen35 has neither attention.recurrent_layers nor full_attention_interval"
+                        .into(),
+                )
+            })?;
+        if interval == 0 {
+            return Err(Error::Config("full_attention_interval must be non-zero".into()));
+        }
+        (0..layers)
+            .map(|l| {
+                if (l + 1) % interval != 0 {
+                    "linear_attention"
+                } else {
+                    "full_attention"
+                }
+                .into()
+            })
+            .collect()
+    };
+
+    let lin_val_heads = req("ssm.time_step_rank")?;
+    let lin_inner = req("ssm.inner_size")?;
+    if !lin_inner.is_multiple_of(lin_val_heads) {
+        return Err(Error::Config(format!(
+            "ssm.inner_size {lin_inner} not divisible by time_step_rank {lin_val_heads}"
+        )));
+    }
+
+    let mut cfg = json!({
+        "model_type": "qwen35",
+        "hidden_size": hidden,
+        "num_attention_heads": heads,
+        "num_key_value_heads": kv,
+        "head_dim": head_dim,
+        "intermediate_size": req("feed_forward_length")?,
+        "num_hidden_layers": layers,
+        "vocab_size": vocab_size(m, "qwen35")?,
+        "layer_types": layer_types,
+        "rotary_dim": m.u32(&key("rope.dimension_count")).unwrap_or(head_dim),
+        "rope_theta": m.f64(&key("rope.freq_base")).unwrap_or(10_000_000.0),
+        "rms_norm_eps": m
+            .f64(&key("attention.layer_norm_rms_epsilon"))
+            .unwrap_or(1e-6),
+        "linear_num_key_heads": req("ssm.group_count")?,
+        "linear_num_value_heads": lin_val_heads,
+        "linear_key_head_dim": req("ssm.state_size")?,
+        "linear_value_head_dim": lin_inner / lin_val_heads,
+        "linear_conv_kernel_dim": m.u32(&key("ssm.conv_kernel")).unwrap_or(4),
+        "eos_token_id": eos_ids(m),
+        "tie_word_embeddings": tied(source),
+    });
+
+    if let Some(scale) = m.f64(&key("attention.scale")) {
+        cfg["attention_scale"] = json!(scale);
+    }
+    Ok(cfg)
 }
 
 fn eos_ids(m: &Metadata) -> Vec<u32> {

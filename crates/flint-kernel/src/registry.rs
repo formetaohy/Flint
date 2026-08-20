@@ -235,4 +235,54 @@ pub const SHADERS: &[ShaderSpec] = &[
             ("MAX_PAGES", Scalar::U32),
         ]
     ),
+    shader!(
+        shader::SPLIT_QG,
+        ["split_qg.wgsl"],
+        &[BindingMode::ReadWrite; 3],
+        &[
+            ("ROWS", Scalar::U32),
+            ("HEADS", Scalar::U32),
+            ("HD", Scalar::U32),
+        ]
+    ),
+    shader!(
+        shader::SIGMOID_MUL,
+        ["sigmoid_mul.wgsl"],
+        &[BindingMode::ReadWrite; 3],
+        &[("N_ELEM", Scalar::U32)]
+    ),
+    shader!(
+        shader::CONV1D,
+        ["conv1d.wgsl"],
+        &[BindingMode::ReadWrite; 4],
+        &[("DIM", Scalar::U32)]
+    ),
+    shader!(
+        shader::DELTA_GATE,
+        ["delta_gate.wgsl"],
+        &[BindingMode::ReadWrite; 6],
+        &[("HEADS", Scalar::U32), ("ROW_T", Scalar::U32)]
+    ),
+    shader!(
+        shader::DELTA_RECUR,
+        ["delta_recur.wgsl"],
+        &[BindingMode::ReadWrite; 7],
+        &[
+            ("HEADS", Scalar::U32),
+            ("K_DIM", Scalar::U32),
+            ("V_DIM", Scalar::U32),
+        ]
+    ),
+    shader!(
+        shader::REPEAT_QK,
+        ["repeat_qk.wgsl"],
+        &[BindingMode::ReadWrite; 2],
+        &[
+            ("ROWS", Scalar::U32),
+            ("N_K", Scalar::U32),
+            ("N_V", Scalar::U32),
+            ("K_DIM", Scalar::U32),
+            ("CONV_DIM", Scalar::U32),
+        ]
+    ),
 ];

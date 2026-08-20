@@ -1,3 +1,5 @@
+mod iq_refs;
+
 use flint_checkpoint::TensorData;
 use flint_checkpoint::dequant::{GgmlType, to_f32};
 use flint_num::f16_to_f32;
@@ -45,18 +47,114 @@ fn type_table_matches_ggml() {
         (12, GgmlType::Q4K, 256, 144),
         (13, GgmlType::Q5K, 256, 176),
         (14, GgmlType::Q6K, 256, 210),
+        (15, GgmlType::Q8K, 256, 292),
+        (16, GgmlType::Iq2Xxs, 256, 66),
+        (17, GgmlType::Iq2Xs, 256, 74),
+        (18, GgmlType::Iq3Xxs, 256, 98),
+        (19, GgmlType::Iq1S, 256, 50),
+        (20, GgmlType::Iq4Nl, 32, 18),
+        (21, GgmlType::Iq3S, 256, 110),
+        (22, GgmlType::Iq2S, 256, 82),
+        (23, GgmlType::Iq4Xs, 256, 136),
+        (29, GgmlType::Iq1M, 256, 56),
         (30, GgmlType::Bf16, 1, 2),
+        (34, GgmlType::Tq1_0, 256, 54),
+        (35, GgmlType::Tq2_0, 256, 66),
+        (39, GgmlType::Mxfp4, 32, 17),
+        (40, GgmlType::Nvfp4, 64, 36),
+        (41, GgmlType::Q1_0, 32, 6),
+        (42, GgmlType::Q2_0, 64, 18),
     ];
     for &(tag, ty, bl, bb) in valid {
         assert_eq!(GgmlType::from_u32(tag).unwrap(), ty);
         assert_eq!(ty.block_len(), bl);
         assert_eq!(ty.block_bytes(), bb);
     }
-    for tag in [4u32, 5, 9, 15, 29, 31] {
+    for tag in [4u32, 5, 9, 24, 31] {
         assert!(
             GgmlType::from_u32(tag).is_err(),
             "tag {tag} must be rejected"
         );
+    }
+}
+
+#[test]
+fn new_quants_match_gguf_reference() {
+    for case in iq_refs::cases() {
+        let got = to_f32(case.ty, &case.raw, case.want.len()).unwrap();
+        assert_eq!(got.len(), case.want.len(), "{:?}", case.ty);
+        for (i, (g, w)) in got.iter().zip(&case.want).enumerate() {
+            if w.is_nan() {
+                assert!(g.is_nan(), "{:?} element {i}: decoder {g} vs gguf-py {w}", case.ty);
+                continue;
+            }
+            let diff = (g - w).abs();
+            assert!(
+                diff <= w.abs() * 1e-4 + 1e-30,
+                "{:?} element {i}: decoder {g} vs gguf-py {w}",
+                case.ty
+            );
+        }
+    }
+}
+
+#[test]
+fn q8k_and_bitnet_decode() {
+    let mut raw = vec![0u8; 292];
+    raw[0..4].copy_from_slice(&1.5f32.to_le_bytes());
+    for i in 0..256u32 {
+        raw[4 + i as usize] = (i as i8) as u8;
+    }
+    let got = to_f32(GgmlType::Q8K, &raw, 256).unwrap();
+    for i in 0..256usize {
+        assert_eq!(got[i], 1.5 * (i as i8) as f32, "Q8_K element {i}");
+    }
+
+    let mut raw = vec![0u8; 6];
+    raw[0..2].copy_from_slice(&f32_to_half(2.0).to_le_bytes());
+    raw[2] = 0b1010_1010;
+    let got = to_f32(GgmlType::Q1_0, &raw, 32).unwrap();
+    assert_eq!(got[0], -2.0);
+    assert_eq!(got[1], 2.0);
+    assert_eq!(got[7], 2.0);
+    assert_eq!(got[8], -2.0);
+
+    let mut raw = vec![0u8; 18];
+    raw[0..2].copy_from_slice(&f32_to_half(0.5).to_le_bytes());
+    raw[2] = 0b01_00_11_10;
+    let got = to_f32(GgmlType::Q2_0, &raw, 64).unwrap();
+    assert_eq!(got[0], 0.5);
+    assert_eq!(got[1], 1.0);
+    assert_eq!(got[2], -0.5);
+    assert_eq!(got[3], 0.0);
+}
+
+#[test]
+fn tq1_0_decodes_balanced_ternary() {
+    let mut raw = vec![0u8; 54];
+    raw[50..52].copy_from_slice(&f32_to_half(1.0).to_le_bytes());
+    raw[0] = 194;
+    let got = to_f32(GgmlType::Tq1_0, &raw, 256).unwrap();
+    assert_eq!(&got[0..5], &[1.0, -1.0, 1.0, 0.0, 0.0]);
+
+    let mut raw = vec![0u8; 54];
+    raw[50..52].copy_from_slice(&f32_to_half(1.0).to_le_bytes());
+    raw[52] = 0;
+    let got = to_f32(GgmlType::Tq1_0, &raw, 256).unwrap();
+    assert_eq!(&got[240..244], &[-1.0, -1.0, -1.0, -1.0]);
+}
+
+fn f32_to_half(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = (b >> 13) & 0x3ff;
+    if exp <= 0 {
+        0
+    } else if exp >= 0x1f {
+        0x7c00
+    } else {
+        sign | ((exp as u16) << 10) | mant as u16
     }
 }
 

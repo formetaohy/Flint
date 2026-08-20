@@ -62,6 +62,48 @@ fn unigram_meta() -> Metadata {
 }
 
 #[test]
+fn bpe_pre_types_split_digits_per_regex() {
+    let meta = |pre: &str| {
+        let mut kv = HashMap::new();
+        for (key, val) in [
+            ("tokenizer.ggml.model", MetaVal::Str("gpt2".into())),
+            ("tokenizer.ggml.pre", MetaVal::Str(pre.into())),
+            (
+                "tokenizer.ggml.tokens",
+                MetaVal::Arr(
+                    ["1", "2", "12", "a"]
+                        .iter()
+                        .map(|t| MetaVal::Str(t.to_string()))
+                        .collect(),
+                ),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                MetaVal::Arr(vec![MetaVal::Str("1 2".into())]),
+            ),
+        ] {
+            kv.insert(key.into(), val);
+        }
+        Metadata::new(kv)
+    };
+
+    for pre in ["qwen2", "qwen3", "qwen35"] {
+        let tok = from_metadata(&meta(pre)).unwrap();
+        assert_eq!(
+            tok.encode("12").unwrap(),
+            vec![0, 1],
+            "{pre}: \\p{{N}} splits digits one by one"
+        );
+    }
+    let tok = from_metadata(&meta("llama3")).unwrap();
+    assert_eq!(
+        tok.encode("12").unwrap(),
+        vec![2],
+        "llama3: \\p{{N}}{{1,3}} keeps digit runs together"
+    );
+}
+
+#[test]
 fn bpe_rebuild_keeps_ids_and_honors_merges() {
     let tok = from_metadata(&bpe_meta()).unwrap();
 

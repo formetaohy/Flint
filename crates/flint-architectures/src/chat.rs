@@ -6,6 +6,28 @@ pub trait ChatFormat: Send + Sync {
 
 pub struct ChatMl;
 
+pub struct ChatMlThink;
+
+impl ChatFormat for ChatMlThink {
+    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
+        let mut out = String::new();
+        push_turn(&mut out, "system", system);
+        for (u, a) in history {
+            push_turn(&mut out, "user", u);
+            push_turn(&mut out, "assistant", a);
+        }
+        push_turn(&mut out, "user", user);
+        out.push_str(&im_marker(true));
+        out.push_str("assistant");
+        out.push('\n');
+        out.push_str("<think>\n\n</think>\n\n");
+        out
+    }
+    fn stop_literals(&self) -> &'static [&'static str] {
+        &["im_end"]
+    }
+}
+
 impl ChatFormat for ChatMl {
     fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
         let mut out = String::new();

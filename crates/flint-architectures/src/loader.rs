@@ -9,9 +9,9 @@ use flint_tokenizer::Tokenizer;
 use serde_json::Value;
 
 use crate::chat::{
-    ChatFormat, ChatMl, Gemma4Chat, GemmaChat, Llama2Chat, Llama3Chat, Phi4Chat,
+    ChatFormat, ChatMl, ChatMlThink, Gemma4Chat, GemmaChat, Llama2Chat, Llama3Chat, Phi4Chat,
 };
-use crate::{gemma, gemma4, llama, phi};
+use crate::{gemma, gemma4, llama, phi, qwen35};
 
 pub struct ChatModel {
     pub model: Box<dyn LanguageModel + Send>,
@@ -38,6 +38,7 @@ impl Default for LoadOptions {
 
 #[derive(Clone, Copy)]
 pub enum Family {
+    Qwen35,
     Llama,
     Gemma,
     Phi,
@@ -47,6 +48,7 @@ pub enum Family {
 impl Family {
     fn from_gguf_arch(a: &str) -> Result<Self> {
         match a {
+            "qwen35" => Ok(Family::Qwen35),
             "llama" | "qwen2" | "qwen3" | "mistral" => Ok(Family::Llama),
             "gemma" | "gemma2" | "gemma3" => Ok(Family::Gemma),
             "gemma4" => Ok(Family::Gemma4),
@@ -59,6 +61,7 @@ impl Family {
 
     fn chat_format(self, config: &Value) -> Box<dyn ChatFormat + Send + Sync> {
         match self {
+            Family::Qwen35 => Box::new(ChatMlThink),
             Family::Llama => llama_chat(config),
             Family::Gemma => Box::new(GemmaChat),
             Family::Phi => Box::new(Phi4Chat),
@@ -84,6 +87,12 @@ pub fn load(model_dir: &Path, opts: &LoadOptions, backend: &Backend) -> Result<C
         pages: opts.pages,
     };
     let model: Box<dyn LanguageModel + Send> = match family {
+        Family::Qwen35 => Box::new(qwen35::Qwen35::load(
+            &source,
+            &config,
+            &arena,
+            backend,
+        )?),
         Family::Llama => Box::new(llama::load(
             &source,
             &config,

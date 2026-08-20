@@ -192,6 +192,157 @@ fn gemma_synthesis_adds_end_of_turn_to_eos() {
 }
 
 #[test]
+fn qwen35_synthesis_reads_interval_layout() {
+    let src = FakeSource::new(
+        "qwen35",
+        vec![
+            ("qwen35.embedding_length", MetaVal::UInt(1024)),
+            ("qwen35.feed_forward_length", MetaVal::UInt(3584)),
+            ("qwen35.block_count", MetaVal::UInt(5)),
+            ("qwen35.attention.head_count", MetaVal::UInt(8)),
+            ("qwen35.attention.head_count_kv", MetaVal::UInt(2)),
+            ("qwen35.attention.key_length", MetaVal::UInt(256)),
+            ("qwen35.attention.value_length", MetaVal::UInt(256)),
+            ("qwen35.rope.dimension_count", MetaVal::UInt(64)),
+            ("qwen35.rope.freq_base", MetaVal::Float(10_000_000.0)),
+            ("qwen35.full_attention_interval", MetaVal::UInt(4)),
+            ("qwen35.ssm.conv_kernel", MetaVal::UInt(4)),
+            ("qwen35.ssm.inner_size", MetaVal::UInt(2048)),
+            ("qwen35.ssm.state_size", MetaVal::UInt(128)),
+            ("qwen35.ssm.group_count", MetaVal::UInt(16)),
+            ("qwen35.ssm.time_step_rank", MetaVal::UInt(16)),
+            (
+                "tokenizer.ggml.tokens",
+                arr_str(&["<pad>", "<eos>", "a"]),
+            ),
+            ("tokenizer.ggml.eos_token_id", MetaVal::UInt(1)),
+        ],
+        &["token_embd.weight"],
+    );
+    let cfg = flint_architectures::gguf::synthesize_config(&src, flint_architectures::Family::Qwen35)
+        .unwrap();
+    assert_eq!(cfg["hidden_size"], json!(1024));
+    assert_eq!(cfg["head_dim"], json!(256));
+    assert_eq!(cfg["num_hidden_layers"], json!(5));
+    assert_eq!(cfg["rotary_dim"], json!(64));
+    assert_eq!(cfg["rope_theta"], json!(10_000_000.0));
+    assert_eq!(cfg["linear_key_head_dim"], json!(128));
+    assert_eq!(cfg["linear_value_head_dim"], json!(128));
+    assert_eq!(cfg["linear_conv_kernel_dim"], json!(4));
+    assert_eq!(cfg["vocab_size"], json!(3));
+    assert_eq!(cfg["eos_token_id"], json!([1]));
+    assert_eq!(
+        cfg["layer_types"],
+        json!([
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention"
+        ])
+    );
+    assert_eq!(cfg["tie_word_embeddings"], json!(true));
+    assert_eq!(cfg["rms_norm_eps"], json!(1e-6));
+}
+
+#[test]
+fn qwen35_synthesis_reads_recurrent_layers_and_trims_nextn() {
+    let src = FakeSource::new(
+        "qwen35",
+        vec![
+            ("qwen35.embedding_length", MetaVal::UInt(64)),
+            ("qwen35.feed_forward_length", MetaVal::UInt(128)),
+            ("qwen35.block_count", MetaVal::UInt(4)),
+            ("qwen35.attention.head_count", MetaVal::UInt(4)),
+            ("qwen35.attention.head_count_kv", MetaVal::UInt(2)),
+            ("qwen35.attention.key_length", MetaVal::UInt(64)),
+            ("qwen35.rope.dimension_count", MetaVal::UInt(32)),
+            ("qwen35.nextn_predict_layers", MetaVal::UInt(1)),
+            (
+                "qwen35.attention.recurrent_layers",
+                MetaVal::Arr(vec![
+                    MetaVal::Bool(true),
+                    MetaVal::Bool(false),
+                    MetaVal::Bool(true),
+                    MetaVal::Bool(false),
+                ]),
+            ),
+            ("qwen35.ssm.inner_size", MetaVal::UInt(512)),
+            ("qwen35.ssm.state_size", MetaVal::UInt(32)),
+            ("qwen35.ssm.group_count", MetaVal::UInt(8)),
+            ("qwen35.ssm.time_step_rank", MetaVal::UInt(16)),
+            (
+                "tokenizer.ggml.tokens",
+                arr_str(&["<eos>", "a", "b"]),
+            ),
+            ("tokenizer.ggml.eos_token_id", MetaVal::UInt(0)),
+        ],
+        &[],
+    );
+    let cfg = flint_architectures::gguf::synthesize_config(&src, flint_architectures::Family::Qwen35)
+        .unwrap();
+    assert_eq!(
+        cfg["layer_types"],
+        json!(["linear_attention", "full_attention", "linear_attention"]),
+        "the nextn layer is trimmed from the trunk"
+    );
+}
+
+#[test]
+fn qwen35_synthesis_fails_fast() {
+    let base = vec![
+        ("qwen35.embedding_length", MetaVal::UInt(64)),
+        ("qwen35.feed_forward_length", MetaVal::UInt(128)),
+        ("qwen35.block_count", MetaVal::UInt(2)),
+        ("qwen35.attention.head_count", MetaVal::UInt(4)),
+        ("qwen35.attention.head_count_kv", MetaVal::UInt(2)),
+        ("qwen35.attention.key_length", MetaVal::UInt(64)),
+        ("qwen35.rope.dimension_count", MetaVal::UInt(32)),
+        ("qwen35.ssm.inner_size", MetaVal::UInt(512)),
+        ("qwen35.ssm.state_size", MetaVal::UInt(32)),
+        ("qwen35.ssm.group_count", MetaVal::UInt(8)),
+        ("qwen35.ssm.time_step_rank", MetaVal::UInt(16)),
+    ];
+
+    let src = FakeSource::new("qwen35", base.clone(), &[]);
+    assert!(
+        flint_architectures::gguf::synthesize_config(&src, flint_architectures::Family::Qwen35)
+            .is_err(),
+        "missing recurrent layout"
+    );
+
+    let mut with_nextn = base.clone();
+    with_nextn.push(("qwen35.nextn_predict_layers", MetaVal::UInt(2)));
+    with_nextn.push(("qwen35.full_attention_interval", MetaVal::UInt(4)));
+    let src = FakeSource::new("qwen35", with_nextn, &[]);
+    assert!(
+        flint_architectures::gguf::synthesize_config(&src, flint_architectures::Family::Qwen35)
+            .is_err(),
+        "nextn exceeds the block count"
+    );
+
+    let mut bad_inner = base.clone();
+    bad_inner.push(("qwen35.full_attention_interval", MetaVal::UInt(4)));
+    bad_inner.push(("qwen35.ssm.inner_size", MetaVal::UInt(511)));
+    let src = FakeSource::new("qwen35", bad_inner, &[]);
+    assert!(
+        flint_architectures::gguf::synthesize_config(&src, flint_architectures::Family::Qwen35)
+            .is_err(),
+        "inner_size not divisible by the value heads"
+    );
+
+    let mut asym = base.clone();
+    asym.push(("qwen35.full_attention_interval", MetaVal::UInt(4)));
+    asym.push(("qwen35.attention.value_length", MetaVal::UInt(128)));
+    let src = FakeSource::new("qwen35", asym, &[]);
+    assert!(
+        flint_architectures::gguf::synthesize_config(&src, flint_architectures::Family::Qwen35)
+            .is_err(),
+        "asymmetric head dims"
+    );
+}
+
+#[test]
 fn synthesis_fails_fast() {
     let src = FakeSource::new("llama", vec![], &[]);
     assert!(

@@ -46,6 +46,10 @@ pub fn from_metadata(meta: &Metadata) -> Result<Tokenizer> {
 
 const LLAMA3_SPLIT: &str = r"(?:\'[sS]|\'[tT]|\'[rR][eE]|\'[vV][eE]|\'[mM]|\'[lL][lL]|\'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+const QWEN2_SPLIT: &str = r"(?:\'[sS]|\'[tT]|\'[rR][eE]|\'[vV][eE]|\'[mM]|\'[lL][lL]|\'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+const QWEN35_SPLIT: &str = r"(?:\'[sS]|\'[tT]|\'[rR][eE]|\'[vV][eE]|\'[mM]|\'[lL][lL]|\'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 fn from_gguf_bpe(meta: &Metadata) -> Result<Tokenizer> {
     let tokens = meta
         .str_array("tokenizer.ggml.tokens")
@@ -87,14 +91,20 @@ fn from_gguf_bpe(meta: &Metadata) -> Result<Tokenizer> {
         meta.str("tokenizer.ggml.pre"),
         Some("llama-bpe" | "llama3" | "llama-v3" | "falcon3" | "pixtral")
     );
+    let split = match meta.str("tokenizer.ggml.pre") {
+        Some("qwen35") => Some(QWEN35_SPLIT),
+        Some("qwen2" | "qwen3") => Some(QWEN2_SPLIT),
+        _ if llama3 => Some(LLAMA3_SPLIT),
+        _ => None,
+    };
     let bpe = bpe
         .build()
         .map_err(|e| Error::Tokenizer(format!("BPE build: {e}")))?;
     let mut inner = HfTokenizer::new(bpe);
-    if llama3 {
+    if let Some(split) = split {
         inner.with_pre_tokenizer(Some(PreTokenizers::new(vec![
             Split::new(
-                SplitPattern::Regex(LLAMA3_SPLIT.into()),
+                SplitPattern::Regex(split.into()),
                 SplitDelimiterBehavior::Isolated,
                 false,
             )
