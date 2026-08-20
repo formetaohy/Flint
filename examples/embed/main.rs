@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use flint_backend::Backend;
 use flint_error::Result;
-use flint_examples::assets::{self, Format};
-use flint_examples::hub::Hub;
+use flint_hub::assets::{self, Format};
+use flint_hub::hub::Hub;
 
 #[derive(Parser)]
 #[command(

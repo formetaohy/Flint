@@ -189,10 +189,34 @@ impl Builder {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        let order = schema
+            .get("propertyOrder")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .filter(|n| props.contains_key(*n))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut names: Vec<&String> = props
+            .keys()
+            .filter(|k| !order.contains(&k.as_str()))
+            .collect();
+        names.splice(
+            0..0,
+            order.iter().map(|n| {
+                props
+                    .keys()
+                    .find(|k| k.as_str() == *n)
+                    .expect("propertyOrder names are validated against the properties")
+            }),
+        );
         let mut pre: Option<u32> = None;
         let mut opt_any: Option<u32> = None;
         let mut first_required = true;
-        for (name, sub) in props.iter() {
+        for name in names {
+            let sub = &props[name];
             let key = self.lit(&format!("\"{name}\":"));
             let value = self.build(sub)?;
             let prop = self.seq(key, value);
@@ -715,6 +739,49 @@ mod tests {
         m.commit(&t, 2);
         let mask = m.mask(&t);
         assert_eq!(mask[3], 1.0);
+    }
+
+    #[test]
+    fn property_order_overrides_alphabetical_emission() {
+        let t = trie(
+            &[
+                ("{\"b\":", 0),
+                ("\"y\"", 1),
+                (",\"a\":", 2),
+                ("\"x\"", 3),
+                ("}", 4),
+            ],
+            5,
+        );
+        let mut m = matcher(
+            json!({"type": "object", "propertyOrder": ["b", "a"], "required": ["b", "a"],
+                "properties": {"a": {"type": "string", "enum": ["x"]}, "b": {"type": "string", "enum": ["y"]}}}),
+            &t,
+        );
+        let mask = m.mask(&t);
+        assert_eq!(mask[0], 1.0, "propertyOrder forces the b property first");
+        for (tok, &v) in mask.iter().enumerate().skip(1) {
+            assert_eq!(v, 0.0, "token {tok} must not start the object");
+        }
+        for tok in [0, 1, 2, 3, 4] {
+            m.commit(&t, tok);
+        }
+        assert!(m.is_complete());
+    }
+
+    #[test]
+    fn any_of_accepts_either_branch() {
+        let t = trie(&[("\"a\"", 0), ("\"b\"", 1)], 2);
+        let m = matcher(
+            json!({"anyOf": [
+                {"type": "string", "enum": ["a"]},
+                {"type": "string", "enum": ["b"]}
+            ]}),
+            &t,
+        );
+        let mask = m.mask(&t);
+        assert_eq!(mask[0], 1.0);
+        assert_eq!(mask[1], 1.0);
     }
 
     #[test]

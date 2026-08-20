@@ -12,6 +12,14 @@ pub struct Tokenizer {
     inner: HfTokenizer,
 }
 
+impl Clone for Tokenizer {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 pub struct StreamDecoder {
     ids: Vec<u32>,
     prefix: String,

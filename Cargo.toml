@@ -21,6 +21,8 @@ flint-architectures = { path = "crates/flint-architectures" }
 flint-tokenizer = { path = "crates/flint-tokenizer" }
 flint-generate = { path = "crates/flint-generate" }
 flint-profiler = { path = "crates/flint-profiler" }
+flint-hub = { path = "crates/flint-hub" }
+flint-server = { path = "crates/flint-server" }
 
 ahash = "0.8.12"
 bytemuck = "1.25.2"
@@ -32,6 +34,7 @@ safetensors = "0.8.0"
 serde = "1.0.229"
 serde_json = "1.0.151"
 thiserror = "2.0.19"
+tiny_http = "0.12"
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 ureq = { version = "2", features = ["json", "proxy-from-env"] }
 wgpu = { version = "30", default-features = false, features = ["metal", "vulkan", "wgsl", "std", "parking_lot"] }

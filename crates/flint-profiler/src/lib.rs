@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use flint_error::{Error, Result};
 use flint_gpu::{Buffer, Device, Encoder, HostAccess, TimestampSet};
@@ -63,7 +63,7 @@ struct Span {
 }
 
 pub struct GpuProfiler {
-    device: Rc<Device>,
+    device: Arc<Device>,
     generations: Vec<Generation>,
     spans: Vec<Span>,
     totals: HashMap<&'static str, (u64, u64)>,
@@ -72,11 +72,11 @@ pub struct GpuProfiler {
 }
 
 impl GpuProfiler {
-    pub fn new(device: Rc<Device>) -> Result<Self> {
+    pub fn new(device: Arc<Device>) -> Result<Self> {
         Self::with_initial_capacity(device, INITIAL_CAPACITY)
     }
 
-    pub fn with_initial_capacity(device: Rc<Device>, capacity: u32) -> Result<Self> {
+    pub fn with_initial_capacity(device: Arc<Device>, capacity: u32) -> Result<Self> {
         let generation = Generation::new(device.as_ref(), capacity)?;
         Ok(Self {
             period_ns: device.timestamp_period_ns(),

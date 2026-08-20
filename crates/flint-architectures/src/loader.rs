@@ -17,9 +17,9 @@ use crate::qwen35::Qwen35;
 use crate::{gemma, gemma4, llama, phi};
 
 pub struct ChatModel {
-    pub model: Box<dyn LanguageModel>,
+    pub model: Box<dyn LanguageModel + Send>,
     pub tokenizer: Tokenizer,
-    pub chat: Box<dyn ChatFormat>,
+    pub chat: Box<dyn ChatFormat + Send + Sync>,
     pub stop: Vec<u32>,
 }
 
@@ -64,6 +64,7 @@ impl Family {
 
     fn from_gguf_arch(a: &str) -> Result<Self> {
         match a {
+            "qwen35" => Ok(Family::Qwen35),
             "llama" | "qwen2" | "qwen3" | "mistral" => Ok(Family::Llama),
             "gemma" | "gemma2" | "gemma3" => Ok(Family::Gemma),
             "gemma4" => Ok(Family::Gemma4),
@@ -75,7 +76,7 @@ impl Family {
         }
     }
 
-    fn chat_format(self, config: &Value) -> Box<dyn ChatFormat> {
+    fn chat_format(self, config: &Value) -> Box<dyn ChatFormat + Send + Sync> {
         match self {
             Family::Qwen35 => Box::new(ChatMlThink),
             Family::Llama => llama_chat(config),
@@ -87,7 +88,7 @@ impl Family {
     }
 }
 
-fn llama_chat(config: &Value) -> Box<dyn ChatFormat> {
+fn llama_chat(config: &Value) -> Box<dyn ChatFormat + Send + Sync> {
     match config.get("vocab_size").and_then(Value::as_u64) {
         Some(128256) => Box::new(Llama3Chat),
         Some(32000) => Box::new(Llama2Chat),
@@ -103,7 +104,7 @@ pub fn load(model_dir: &Path, opts: &LoadOptions, backend: &Backend) -> Result<C
         seq_lens: opts.seq_lens.clone(),
         pages: opts.pages,
     };
-    let model: Box<dyn LanguageModel> = match family {
+    let model: Box<dyn LanguageModel + Send> = match family {
         Family::Qwen35 => Box::new(Qwen35::load(source.as_ref(), &config, &arena, backend)?),
         Family::Llama => Box::new(llama::load(
             source.as_ref(),

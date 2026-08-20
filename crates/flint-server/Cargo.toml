@@ -1,5 +1,5 @@
 [package]
-name = "flint-examples"
+name = "flint-server"
 version.workspace = true
 license.workspace = true
 edition.workspace = true
@@ -15,16 +15,4 @@ flint-tokenizer.workspace = true
 clap.workspace = true
 env_logger.workspace = true
 serde_json.workspace = true
-ureq.workspace = true
-
-[[example]]
-name = "chat"
-path = "chat/main.rs"
-
-[[example]]
-name = "embed"
-path = "embed/main.rs"
-
-[[example]]
-name = "schema"
-path = "schema/main.rs"
+tiny_http.workspace = true

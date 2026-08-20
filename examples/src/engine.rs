@@ -41,7 +41,7 @@ pub fn spawn(
         chat_model.stop,
         false,
     );
-    let id = engine.create(&text, max_tokens, grammar)?;
+    let id = engine.create(&text, max_tokens, grammar, None, &[])?;
     Ok((engine, id))
 }
 

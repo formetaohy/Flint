@@ -1,6 +1,6 @@
 mod matmul;
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use flint_error::{Error, Result};
 use flint_gpu::{BindingRef, Buffer, Device, Encoder, HostAccess, Kernel, Submission};
@@ -52,14 +52,14 @@ impl<'a> Commands<'a> {
 }
 
 pub struct Backend {
-    device: Rc<Device>,
+    device: Arc<Device>,
     kernels: Kernels,
     unit_scale: Tensor,
     gemv_partial: Tensor,
     gemm_partial: Tensor,
     gemm_xf16: Tensor,
     read_staging: std::cell::RefCell<(Buffer, u64)>,
-    profiler: Option<Rc<std::cell::RefCell<flint_profiler::GpuProfiler>>>,
+    profiler: Option<Arc<std::sync::Mutex<flint_profiler::GpuProfiler>>>,
 
     pending: Vec<Submission>,
     retired: Vec<(Tensor, u32)>,
@@ -68,7 +68,7 @@ pub struct Backend {
 impl Backend {
     pub fn new() -> Result<Self> {
         let device =
-            Rc::new(Device::open().map_err(|e| Error::Gpu(format!("no suitable backend: {e}")))?);
+            Arc::new(Device::open().map_err(|e| Error::Gpu(format!("no suitable backend: {e}")))?);
         let kernels = Kernels::new(device.as_ref())?;
         Self::warmup(device.as_ref(), &kernels)?;
         let unit_scale = Tensor::new(Self::zeroed_buf(device.as_ref(), 4), vec![1], DType::F32);
@@ -92,7 +92,7 @@ impl Backend {
         })
     }
 
-    pub fn device(&self) -> Rc<Device> {
+    pub fn device(&self) -> Arc<Device> {
         self.device.clone()
     }
 
@@ -252,7 +252,7 @@ impl Backend {
 
     pub fn attach_profiler(
         &mut self,
-        profiler: Rc<std::cell::RefCell<flint_profiler::GpuProfiler>>,
+        profiler: Arc<std::sync::Mutex<flint_profiler::GpuProfiler>>,
     ) {
         self.profiler = Some(profiler);
     }
@@ -267,9 +267,12 @@ impl Backend {
     ) -> Result<()> {
         match &self.profiler {
             Some(profiler) => {
-                let span = profiler.borrow_mut().mark_begin(commands.raw())?;
+                let span = profiler.lock().unwrap().mark_begin(commands.raw())?;
                 Self::set(&self.kernels, commands, name, consts, bufs, groups)?;
-                profiler.borrow_mut().mark_end(commands.raw(), name, span)
+                profiler
+                    .lock()
+                    .unwrap()
+                    .mark_end(commands.raw(), name, span)
             }
             None => Self::set(&self.kernels, commands, name, consts, bufs, groups),
         }

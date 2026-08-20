@@ -4,6 +4,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     #[error("gpu: {0}")]
     Gpu(String),
     #[error("checkpoint: {0}")]

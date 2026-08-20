@@ -220,7 +220,7 @@ fn run(prompt: &str, max_tokens: usize, eos_after: Option<u32>) -> (Vec<u32>, Ge
     let n = tokenizer().encode(prompt).unwrap().len() as u32;
     let eos_at = eos_after.map(|k| n - 1 + k);
     let mut engine = new_engine(eos_at, SamplingParams::default(), false);
-    let id = engine.create(prompt, max_tokens, None).unwrap();
+    let id = engine.create(prompt, max_tokens, None, None, &[]).unwrap();
     let tokens = drain(&mut engine, id);
     let stats = engine.stats(id).unwrap();
     (tokens, stats, n)
@@ -262,7 +262,7 @@ fn multi_turn_reset_reproduces_output() {
     };
     let mut engine = new_engine(None, params, false);
     let collect = |engine: &mut Engine| -> Vec<u32> {
-        let id = engine.create("t0 t1 t2", 8, None).unwrap();
+        let id = engine.create("t0 t1 t2", 8, None, None, &[]).unwrap();
         let tokens = drain(engine, id);
         engine.close(id).unwrap();
         tokens
@@ -280,8 +280,8 @@ fn multi_turn_reset_reproduces_output() {
 fn concurrent_sessions_share_the_engine_without_interference() {
     let _g = gpu();
     let mut engine = new_engine(None, SamplingParams::default(), false);
-    let a = engine.create("t0 t1 t2", 6, None).unwrap();
-    let b = engine.create("t3 t4", 6, None).unwrap();
+    let a = engine.create("t0 t1 t2", 6, None, None, &[]).unwrap();
+    let b = engine.create("t3 t4", 6, None, None, &[]).unwrap();
     let mut got_a = Vec::new();
     let mut got_b = Vec::new();
     loop {
@@ -304,9 +304,9 @@ fn concurrent_sessions_share_the_engine_without_interference() {
 fn session_exhaustion_fails_fast() {
     let _g = gpu();
     let mut engine = new_engine(None, SamplingParams::default(), false);
-    let a = engine.create("t0", 8, None).unwrap();
-    let b = engine.create("t1", 8, None).unwrap();
-    let err = engine.create("t2", 8, None).err().unwrap();
+    let a = engine.create("t0", 8, None, None, &[]).unwrap();
+    let b = engine.create("t1", 8, None, None, &[]).unwrap();
+    let err = engine.create("t2", 8, None, None, &[]).err().unwrap();
     assert!(err.to_string().contains("no free sequence"), "{err}");
     let _ = (a, b);
 }
@@ -320,12 +320,12 @@ fn greedy_speculation_matches_plain_greedy() {
     };
     let plain = {
         let mut engine = new_engine(None, params, false);
-        let id = engine.create("t0 t1", 24, None).unwrap();
+        let id = engine.create("t0 t1", 24, None, None, &[]).unwrap();
         drain(&mut engine, id)
     };
     let spec = {
         let mut engine = new_engine(None, params, true);
-        let id = engine.create("t0 t1", 24, None).unwrap();
+        let id = engine.create("t0 t1", 24, None, None, &[]).unwrap();
         drain(&mut engine, id)
     };
     assert_eq!(
@@ -353,7 +353,7 @@ fn grammar_forces_the_schema_literal() {
         "properties": {"mode": {"type": "string", "enum": ["fast"]}}
     }))
     .unwrap();
-    let id = engine.create("t0", 64, Some(grammar)).unwrap();
+    let id = engine.create("t0", 64, Some(grammar), None, &[]).unwrap();
     let mut tokens = Vec::new();
     loop {
         engine.step().unwrap();
@@ -389,7 +389,7 @@ fn stats_account_prefill_and_decode() {
 fn poll_drains_pieces_and_finished_holds_until_empty() {
     let _g = gpu();
     let mut engine = new_engine(None, SamplingParams::default(), false);
-    let id = engine.create("t0", 3, None).unwrap();
+    let id = engine.create("t0", 3, None, None, &[]).unwrap();
     let mut all: Vec<Piece> = Vec::new();
     while !engine.finished(id) {
         engine.step().unwrap();

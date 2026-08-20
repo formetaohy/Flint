@@ -1,4 +1,4 @@
-pub trait ChatFormat {
+pub trait ChatFormat: Send + Sync {
     fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String;
 
     fn stop_literals(&self) -> &'static [&'static str];

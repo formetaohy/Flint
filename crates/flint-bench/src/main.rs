@@ -111,7 +111,7 @@ fn main() -> Result<()> {
     let mut backend = Backend::new()?;
     eprintln!("[bench] adapter: {}", backend.adapter_name());
     let profiler = if args.profile {
-        let p = std::rc::Rc::new(std::cell::RefCell::new(flint_profiler::GpuProfiler::new(
+        let p = std::sync::Arc::new(std::sync::Mutex::new(flint_profiler::GpuProfiler::new(
             backend.device(),
         )?));
         backend.attach_profiler(p.clone());
@@ -155,7 +155,7 @@ fn main() -> Result<()> {
     )?;
     let _ = backend.read_f32(&backend.unit_scale().buf, 0, 1)?;
     let prefill_span = match &profiler {
-        Some(p) => Some(p.borrow_mut().begin_span()?),
+        Some(p) => Some(p.lock().unwrap().begin_span()?),
         None => None,
     };
     let t0 = Instant::now();
@@ -187,7 +187,7 @@ fn main() -> Result<()> {
         )?;
     }
     if let (Some(p), Some(span)) = (&profiler, prefill_span) {
-        p.borrow_mut().end_span("prefill", span)?;
+        p.lock().unwrap().end_span("prefill", span)?;
     }
 
     let _ = backend.read_f32(&backend.unit_scale().buf, 0, 1)?;
@@ -202,7 +202,7 @@ fn main() -> Result<()> {
     let mut logits: Vec<f32> = Vec::new();
     let mut per_step: Vec<f64> = Vec::new();
     let decode_span = match &profiler {
-        Some(p) => Some(p.borrow_mut().begin_span()?),
+        Some(p) => Some(p.lock().unwrap().begin_span()?),
         None => None,
     };
     let t0 = Instant::now();
@@ -226,7 +226,7 @@ fn main() -> Result<()> {
     }
     let decode_secs = t0.elapsed().as_secs_f64();
     if let (Some(p), Some(span)) = (&profiler, decode_span) {
-        p.borrow_mut().end_span("decode", span)?;
+        p.lock().unwrap().end_span("decode", span)?;
     }
     eprintln!(
         "[bench] decode: {} tok in {:.2}s ({:.1} tok/s)",
@@ -244,9 +244,9 @@ fn main() -> Result<()> {
     );
 
     if let Some(p) = &profiler {
-        p.borrow_mut().flush()?;
+        p.lock().unwrap().flush()?;
         eprintln!("[bench] GPU time breakdown (cumulative over prefill+decode):");
-        eprint!("{}", flint_profiler::breakdown(&p.borrow().report()));
+        eprint!("{}", flint_profiler::breakdown(&p.lock().unwrap().report()));
     }
     Ok(())
 }

@@ -20,7 +20,7 @@ pub(crate) struct Plan {
 
 pub(crate) struct Resolver<'a> {
     pub(crate) backend: &'a mut Backend,
-    pub(crate) model: &'a mut Box<dyn LanguageModel>,
+    pub(crate) model: &'a mut Box<dyn LanguageModel + Send>,
     pub(crate) tokenizer: &'a Tokenizer,
     pub(crate) trie: &'a Option<TokenTrie>,
     pub(crate) speculate: bool,

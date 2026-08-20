@@ -16,6 +16,7 @@ pub struct Piece {
     pub text: String,
 }
 
+#[derive(Clone, Copy)]
 pub struct GenStats {
     pub prefill_tokens: usize,
     pub decode_tokens: usize,
@@ -60,7 +61,7 @@ pub(crate) struct Session {
 
 pub struct Engine {
     backend: Backend,
-    model: Box<dyn LanguageModel>,
+    model: Box<dyn LanguageModel + Send>,
     tokenizer: Tokenizer,
     sampling: SamplingParams,
     seed: u64,
@@ -75,7 +76,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(
         backend: Backend,
-        model: Box<dyn LanguageModel>,
+        model: Box<dyn LanguageModel + Send>,
         tokenizer: Tokenizer,
         sampling: SamplingParams,
         seed: u64,
@@ -104,6 +105,8 @@ impl Engine {
         prompt: &str,
         max_tokens: usize,
         grammar: Option<Grammar>,
+        sampling: Option<SamplingParams>,
+        stop_extra: &[u32],
     ) -> Result<SessionId> {
         let prompt_ids = self.tokenizer.encode(prompt)?;
         if prompt_ids.is_empty() {
@@ -123,18 +126,24 @@ impl Engine {
         self.model
             .alloc_pages(&self.backend, seq, prompt_ids.len() as u32)?;
         self.seed = self.seed.wrapping_add(1);
+        let mut stop = self.stop.clone();
+        for &t in stop_extra {
+            if !stop.contains(&t) {
+                stop.push(t);
+            }
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.sessions.insert(
             id,
             Session {
                 seq,
-                sampler: Sampler::new(self.sampling, self.seed),
+                sampler: Sampler::new(sampling.unwrap_or(self.sampling), self.seed),
                 decoder: self.tokenizer.stream_decoder(),
                 context: Vec::new(),
                 prompt: prompt_ids,
                 max_tokens,
-                stop: self.stop.clone(),
+                stop,
                 phase: Phase::Prefill { done: 0 },
                 queue: VecDeque::new(),
                 stats: GenStats {
