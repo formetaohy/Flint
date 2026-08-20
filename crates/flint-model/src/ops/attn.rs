@@ -1,5 +1,6 @@
-use flint_backend::{ATTN_BR, Backend, Binding, Commands, shader};
+use flint_backend::{Backend, Binding, Commands};
 use flint_error::Result;
+use flint_kernel::{ATTN_BR, shader};
 use flint_tensor::Tensor;
 
 use crate::pool::KvPool;

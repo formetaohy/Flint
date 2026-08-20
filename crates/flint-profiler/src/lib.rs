@@ -105,7 +105,12 @@ impl GpuProfiler {
         self.begin(encoder)
     }
 
-    pub fn mark_end(&mut self, encoder: &mut Encoder, label: &'static str, span: usize) -> Result<()> {
+    pub fn mark_end(
+        &mut self,
+        encoder: &mut Encoder,
+        label: &'static str,
+        span: usize,
+    ) -> Result<()> {
         self.end(encoder, label, span)
     }
 

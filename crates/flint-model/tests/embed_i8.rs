@@ -20,7 +20,7 @@ fn embed_i8_matches_cpu_dequant() {
     );
     let ids_t = Tensor::new(backend.storage(16), vec![4], DType::U32);
     backend.write_u32(&ids_t.buf, &[3, 1, 0, 2]);
-    let y = backend.zero_tensor(&[16, dim]);
+    let y = backend.zero_tensor(&[16, dim], DType::F32);
     {
         let mut enc = backend.encoder().unwrap();
         {
@@ -42,9 +42,7 @@ fn embed_i8_matches_cpu_dequant() {
         }
         backend.submit(&mut enc).unwrap();
     }
-    let got = backend
-        .read_f32(&y.buf, 0, (4 * dim) as usize)
-        .unwrap();
+    let got = backend.read_f32(&y.buf, 0, (4 * dim) as usize).unwrap();
     let ids = [3u32, 1, 0, 2];
     for r in 0..rows {
         let src = ids[r as usize];

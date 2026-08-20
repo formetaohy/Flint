@@ -8,13 +8,11 @@ pub struct TimestampSet {
 
 impl TimestampSet {
     pub(crate) fn create(device: &DeviceRef, capacity: u32) -> Result<Self> {
-        let query_set = device
-            .device
-            .create_query_set(&wgpu::QuerySetDescriptor {
-                label: None,
-                ty: wgpu::QueryType::Timestamp,
-                count: capacity,
-            });
+        let query_set = device.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: None,
+            ty: wgpu::QueryType::Timestamp,
+            count: capacity,
+        });
         Ok(Self { query_set })
     }
 }

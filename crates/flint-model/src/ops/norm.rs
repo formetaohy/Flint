@@ -1,9 +1,11 @@
-use flint_backend::{Backend, Binding, Commands, shader};
+use flint_backend::{Backend, Binding, Commands};
 use flint_error::Result;
+use flint_kernel::NormMode;
+use flint_kernel::shader;
 use flint_tensor::Tensor;
 
 pub struct NormSpec {
-    pub mode: super::NormMode,
+    pub mode: NormMode,
     pub rows: u32,
     pub dim: u32,
     pub w_dim: u32,
@@ -15,7 +17,7 @@ pub struct NormSpec {
 }
 
 impl NormSpec {
-    pub fn new(mode: super::NormMode, rows: u32, dim: u32, eps: f32) -> Self {
+    pub fn new(mode: NormMode, rows: u32, dim: u32, eps: f32) -> Self {
         Self {
             mode,
             rows,

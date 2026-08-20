@@ -686,6 +686,7 @@ dependencies = [
  "flint-backend",
  "flint-checkpoint",
  "flint-error",
+ "flint-kernel",
  "flint-num",
  "flint-tensor",
  "serde_json",

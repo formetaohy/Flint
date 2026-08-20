@@ -48,11 +48,7 @@ impl FakeModel {
 }
 
 impl LanguageModel for FakeModel {
-    fn forward(
-        &mut self,
-        _backend: &mut Backend,
-        batch: &[SeqChunk],
-    ) -> Result<Vec<ChunkOut>> {
+    fn forward(&mut self, _backend: &mut Backend, batch: &[SeqChunk]) -> Result<Vec<ChunkOut>> {
         let m: u32 = batch.iter().map(SeqChunk::len).sum();
         assert!(m > 0 && m <= MAX_M, "chunk size {m} outside [1, {MAX_M}]");
         let mut outs = Vec::with_capacity(batch.len());
@@ -111,12 +107,7 @@ impl LanguageModel for FakeModel {
         Ok(())
     }
 
-    fn truncate_pages(
-        &mut self,
-        _backend: &Backend,
-        _seq: u32,
-        _keep_tokens: u32,
-    ) -> Result<()> {
+    fn truncate_pages(&mut self, _backend: &Backend, _seq: u32, _keep_tokens: u32) -> Result<()> {
         Ok(())
     }
 
@@ -168,10 +159,7 @@ fn json_tokenizer() -> Tokenizer {
 fn tokenizer_with_vocab(vocab: Vec<String>) -> Tokenizer {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "flint-gen-tok-{}-{n}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("flint-gen-tok-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let json = format!(
@@ -199,11 +187,7 @@ fn tokenizer_with_vocab(vocab: Vec<String>) -> Tokenizer {
     tok
 }
 
-fn new_engine(
-    eos_at: Option<u32>,
-    sampling: SamplingParams,
-    speculate: bool,
-) -> Engine {
+fn new_engine(eos_at: Option<u32>, sampling: SamplingParams, speculate: bool) -> Engine {
     let backend = Backend::new().unwrap();
     Engine::new(
         backend,
@@ -231,11 +215,7 @@ fn drain(engine: &mut Engine, id: SessionId) -> Vec<u32> {
     tokens
 }
 
-fn run(
-    prompt: &str,
-    max_tokens: usize,
-    eos_after: Option<u32>,
-) -> (Vec<u32>, GenStats, u32) {
+fn run(prompt: &str, max_tokens: usize, eos_after: Option<u32>) -> (Vec<u32>, GenStats, u32) {
     let _g = gpu();
     let n = tokenizer().encode(prompt).unwrap().len() as u32;
     let eos_at = eos_after.map(|k| n - 1 + k);
@@ -348,7 +328,10 @@ fn greedy_speculation_matches_plain_greedy() {
         let id = engine.create("t0 t1", 24, None).unwrap();
         drain(&mut engine, id)
     };
-    assert_eq!(spec, plain, "speculative decode must not alter greedy output");
+    assert_eq!(
+        spec, plain,
+        "speculative decode must not alter greedy output"
+    );
 }
 
 #[test]

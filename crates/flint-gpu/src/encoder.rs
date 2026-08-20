@@ -1,9 +1,9 @@
 use flint_error::{Error, Result};
 
+use crate::DeviceRef;
 use crate::buffer::Buffer;
 use crate::kernel::Kernel;
 use crate::query::TimestampSet;
-use crate::DeviceRef;
 
 pub struct BindingRef<'a> {
     pub index: u32,
@@ -51,7 +51,9 @@ impl Encoder {
         if bindings.len() != kernel.binding_count as usize {
             return Err(Error::Gpu(format!(
                 "kernel {} expects {} bindings, got {}",
-                kernel.name, kernel.binding_count, bindings.len()
+                kernel.name,
+                kernel.binding_count,
+                bindings.len()
             )));
         }
         let group = kernel.bind_group(bindings);
@@ -111,8 +113,12 @@ impl Encoder {
         dst_offset: u64,
     ) -> Result<()> {
         self.close_pass();
-        self.enc
-            .resolve_query_set(&set.query_set, start..start + count, &dst.buffer, dst_offset);
+        self.enc.resolve_query_set(
+            &set.query_set,
+            start..start + count,
+            &dst.buffer,
+            dst_offset,
+        );
         Ok(())
     }
 

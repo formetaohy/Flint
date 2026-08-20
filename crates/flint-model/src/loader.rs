@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use flint_backend::Backend;
 use flint_checkpoint::{Checkpoint, RawTensor, TensorData};
 use flint_error::{Error, Result};
-use flint_tensor::{Tensor, Weight};
 use flint_num::f32_to_bf16;
+use flint_tensor::{Tensor, Weight};
 
 use crate::quant::{choose_group, quantize, repack_q8};
 

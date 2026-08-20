@@ -37,10 +37,7 @@ fn single_shard_roundtrip_without_index() {
     let b = tensor("b", &[4], &[-1.0, 0.0, 2.5, 1e30]);
     write_tensors(
         &dir.join("model.safetensors"),
-        &[
-            entry(&a.0, &a.1, &a.2, a.3),
-            entry(&b.0, &b.1, &b.2, b.3),
-        ],
+        &[entry(&a.0, &a.1, &a.2, a.3), entry(&b.0, &b.1, &b.2, b.3)],
     )
     .unwrap();
     std::fs::write(dir.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();

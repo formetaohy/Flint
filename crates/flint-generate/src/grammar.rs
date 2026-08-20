@@ -8,9 +8,19 @@ use serde_json::{Map, Value};
 pub enum Rule {
     Lit(Vec<u8>),
     Class(Vec<(u8, u8)>),
-    Alt { a: u32, b: u32 },
-    Seq { a: u32, b: u32 },
-    Repeat { rule: u32, min: u32, max: Option<u32> },
+    Alt {
+        a: u32,
+        b: u32,
+    },
+    Seq {
+        a: u32,
+        b: u32,
+    },
+    Repeat {
+        rule: u32,
+        min: u32,
+        max: Option<u32>,
+    },
 }
 
 pub struct Grammar {
@@ -135,9 +145,7 @@ impl Builder {
                 Ok(self.alt(t, f))
             }
             Some("null") => Ok(self.lit("null")),
-            other => Err(Error::Config(format!(
-                "unsupported schema type {other:?}"
-            ))),
+            other => Err(Error::Config(format!("unsupported schema type {other:?}"))),
         }
     }
 
@@ -395,11 +403,7 @@ impl Matcher {
                         work.push(stack);
                     }
                 }
-                Some(Rule::Repeat {
-                    rule,
-                    min,
-                    max,
-                }) => {
+                Some(Rule::Repeat { rule, min, max }) => {
                     let count = stack.last().unwrap().count;
                     if count >= *min {
                         let mut done = stack.clone();
@@ -635,7 +639,17 @@ mod tests {
 
     #[test]
     fn number_rejects_non_numeric_prefixes() {
-        let t = trie(&[("1", 0), ("23", 1), (".5", 2), ("true", 3), ("-", 4), ("0", 5)], 6);
+        let t = trie(
+            &[
+                ("1", 0),
+                ("23", 1),
+                (".5", 2),
+                ("true", 3),
+                ("-", 4),
+                ("0", 5),
+            ],
+            6,
+        );
         let m = matcher(json!({"type": "number"}), &t);
         let mask = m.mask(&t);
         assert_eq!(mask[0], 1.0);
@@ -705,10 +719,7 @@ mod tests {
 
     #[test]
     fn defs_reference_resolves() {
-        let t = trie(
-            &[("{\"a\":", 0), ("1", 1), ("}", 2), ("2", 3), ("]", 4)],
-            5,
-        );
+        let t = trie(&[("{\"a\":", 0), ("1", 1), ("}", 2), ("2", 3), ("]", 4)], 5);
         let mut m = matcher(
             json!({
                 "type": "object",

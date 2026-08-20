@@ -56,14 +56,12 @@ impl Device {
             backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-                ..Default::default()
-            },
-        ))
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            ..Default::default()
+        }))
         .map_err(|e| {
             Error::Gpu(format!(
                 "no wgpu adapter available for backends {backends:?}: {e}"
@@ -77,9 +75,7 @@ impl Device {
                 adapter_limits.max_immediate_size
             )));
         }
-        let timestamps = adapter
-            .features()
-            .contains(wgpu::Features::TIMESTAMP_QUERY)
+        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)
             && adapter
                 .features()
                 .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
@@ -113,16 +109,15 @@ impl Device {
             min_storage_buffer_offset_alignment: adapter_limits.min_storage_buffer_offset_alignment,
             ..wgpu::Limits::default()
         };
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: None,
-                required_features: features,
-                required_limits: limits,
-                experimental_features: experimental,
-                memory_hints: wgpu::MemoryHints::default(),
-                trace: wgpu::Trace::Off,
-            }))
-            .map_err(|e| Error::Gpu(format!("wgpu device request failed: {e}")))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: None,
+            required_features: features,
+            required_limits: limits,
+            experimental_features: experimental,
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+        }))
+        .map_err(|e| Error::Gpu(format!("wgpu device request failed: {e}")))?;
         Ok(Self {
             inner: std::sync::Arc::new(DeviceInner { device, queue }),
             name: info.name,
@@ -181,14 +176,12 @@ impl Device {
         assert!(size > 0, "buffer size must be non-zero");
         let usage = match host_access {
             HostAccess::None => {
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST
             }
-            HostAccess::Read => {
-                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST
-            }
-            HostAccess::Write => {
-                wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST
-            }
+            HostAccess::Read => wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            HostAccess::Write => wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         } | if query_resolve {
             wgpu::BufferUsages::QUERY_RESOLVE
         } else {

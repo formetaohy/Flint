@@ -1,11 +1,11 @@
 use flint_backend::{Backend, Binding, Commands};
 use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
+use flint_model::TextEmbedder;
 use flint_model::loader::{self, Plan, Role, WeightSet};
 use flint_model::ops::{self, Act, NormMode, NormSpec};
 use flint_model::pool::{ArenaSpec, KvArena, KvPool};
-use flint_model::step;
-use flint_model::TextEmbedder;
+use flint_model::rows;
 use flint_tensor::{Tensor, Weight};
 use serde_json::Value;
 
@@ -151,7 +151,7 @@ struct Scratch {
 
 fn alloc_scratch(backend: &Backend, hidden: u32, intermediate: u32) -> Scratch {
     use flint_tensor::DType;
-    let z = |shape: &[u32]| backend.zero_tensor(shape);
+    let z = |shape: &[u32]| backend.zero_tensor(shape, DType::F32);
     let pos_ids = Tensor::new(
         backend.storage(MAX_TOKENS as u64 * 4),
         vec![MAX_TOKENS],
@@ -172,7 +172,7 @@ fn alloc_scratch(backend: &Backend, hidden: u32, intermediate: u32) -> Scratch {
         ),
         pos_ids,
         zero_ids,
-        meta: step::row_meta(backend),
+        meta: rows::row_meta(backend),
         hidden: z(&[MAX_TOKENS, hidden]),
         normed: z(&[MAX_TOKENS, hidden]),
         q_out: z(&[MAX_TOKENS, hidden]),
@@ -255,7 +255,7 @@ impl TextEmbedder for Bert {
         backend.write_u32(&self.s.ids.buf, &ids);
         let positions: Vec<u32> = (0..n).collect();
         let slots = vec![0u32; n as usize];
-        step::write_row_meta(backend, &self.s.meta, &positions, &slots, n);
+        rows::write_row_meta(backend, &self.s.meta, &positions, &slots, n);
 
         let cfg = &self.cfg;
         let mut enc = backend.encoder()?;
@@ -354,9 +354,30 @@ impl TextEmbedder for Bert {
                         kv_width: cfg.hidden,
                     },
                 )?;
-                ops::bias(backend, &mut commands, Binding::Full(&s.q_out), &lw.q_bias, n, cfg.hidden)?;
-                ops::bias(backend, &mut commands, Binding::Full(&s.k_out), &lw.k_bias, n, cfg.hidden)?;
-                ops::bias(backend, &mut commands, Binding::Full(&s.v_out), &lw.v_bias, n, cfg.hidden)?;
+                ops::bias(
+                    backend,
+                    &mut commands,
+                    Binding::Full(&s.q_out),
+                    &lw.q_bias,
+                    n,
+                    cfg.hidden,
+                )?;
+                ops::bias(
+                    backend,
+                    &mut commands,
+                    Binding::Full(&s.k_out),
+                    &lw.k_bias,
+                    n,
+                    cfg.hidden,
+                )?;
+                ops::bias(
+                    backend,
+                    &mut commands,
+                    Binding::Full(&s.v_out),
+                    &lw.v_bias,
+                    n,
+                    cfg.hidden,
+                )?;
                 ops::kv_store(
                     backend,
                     &mut commands,
@@ -390,7 +411,14 @@ impl TextEmbedder for Bert {
                     Binding::Full(&s.ffn_out),
                     n,
                 )?;
-                ops::bias(backend, &mut commands, Binding::Full(&s.ffn_out), &lw.o_bias, n, cfg.hidden)?;
+                ops::bias(
+                    backend,
+                    &mut commands,
+                    Binding::Full(&s.ffn_out),
+                    &lw.o_bias,
+                    n,
+                    cfg.hidden,
+                )?;
                 ops::add(
                     backend,
                     &mut commands,
@@ -441,7 +469,14 @@ impl TextEmbedder for Bert {
                     Binding::Full(&s.ffn_out),
                     n,
                 )?;
-                ops::bias(backend, &mut commands, Binding::Full(&s.ffn_out), &lw.out_bias, n, cfg.hidden)?;
+                ops::bias(
+                    backend,
+                    &mut commands,
+                    Binding::Full(&s.ffn_out),
+                    &lw.out_bias,
+                    n,
+                    cfg.hidden,
+                )?;
                 ops::add(
                     backend,
                     &mut commands,

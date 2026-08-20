@@ -1,9 +1,9 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::path::Path;
 
 use flint_checkpoint::{Checkpoint, CheckpointKind, GgufWriter, MetaVal, Metadata, RawTensor};
 
-use flint_tokenizer::{from_metadata, from_source, load_gguf};
+use flint_tokenizer::{from_metadata, from_source, load};
 
 fn bpe_meta() -> Metadata {
     let tokens = ["a", "b", "ab", "<|im_start|>", "<|im_end|>", "<unused>"];
@@ -163,8 +163,7 @@ fn unigram_rejects_malformed_metadata() {
     assert!(err.to_string().contains("mismatch"), "{err}");
 
     assert!(
-        from_metadata(&mutate_meta("tokenizer.ggml.unknown_token_id", None))
-            .is_ok(),
+        from_metadata(&mutate_meta("tokenizer.ggml.unknown_token_id", None)).is_ok(),
         "unk id is optional"
     );
 }
@@ -258,7 +257,7 @@ fn load_prefers_tokenizer_json_over_gguf_metadata() {
     .unwrap();
 
     let source = flint_checkpoint::open_checkpoint(&dir).unwrap();
-    let tok = load_gguf(Path::new(&dir), source.as_ref()).unwrap();
+    let tok = load(Path::new(&dir), source.as_ref()).unwrap();
     assert_eq!(
         tok.encode("ab").unwrap(),
         vec![0, 1],
@@ -271,7 +270,7 @@ fn load_prefers_tokenizer_json_over_gguf_metadata() {
 fn load_falls_back_to_gguf_without_tokenizer_json() {
     let dir = gguf_dir();
     let source = flint_checkpoint::open_checkpoint(&dir).unwrap();
-    let tok = load_gguf(Path::new(&dir), source.as_ref()).unwrap();
+    let tok = load(Path::new(&dir), source.as_ref()).unwrap();
     assert_eq!(tok.encode("ab").unwrap(), vec![2], "GGUF metadata path");
     std::fs::remove_dir_all(&dir).ok();
 }

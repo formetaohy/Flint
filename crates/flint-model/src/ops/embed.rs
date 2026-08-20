@@ -1,5 +1,6 @@
-use flint_backend::{Backend, Binding, Commands, shader};
+use flint_backend::{Backend, Binding, Commands};
 use flint_error::Result;
+use flint_kernel::shader;
 use flint_tensor::{Tensor, Weight};
 
 pub struct EmbedSpec {
@@ -118,13 +119,7 @@ fn embed_dispatch(
             ("SPLIT", spec.split),
             ("ROWS", spec.table_rows as f64),
         ],
-        &[
-            Binding::Full(spec.ids),
-            w0,
-            w1,
-            scales,
-            y,
-        ],
+        &[Binding::Full(spec.ids), w0, w1, scales, y],
         [(spec.rows * spec.dim).div_ceil(256), 1, 1],
     )
 }

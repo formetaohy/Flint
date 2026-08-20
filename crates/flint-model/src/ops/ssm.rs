@@ -1,5 +1,6 @@
-use flint_backend::{Backend, Binding, Commands, shader};
+use flint_backend::{Backend, Binding, Commands};
 use flint_error::Result;
+use flint_kernel::shader;
 use flint_tensor::Tensor;
 
 pub struct ConvSpec {
@@ -35,7 +36,11 @@ pub struct DeltaGate<'a> {
     pub row: u32,
 }
 
-pub fn delta_gate(backend: &mut Backend, commands: &mut Commands<'_>, spec: &DeltaGate<'_>) -> Result<()> {
+pub fn delta_gate(
+    backend: &mut Backend,
+    commands: &mut Commands<'_>,
+    spec: &DeltaGate<'_>,
+) -> Result<()> {
     backend.dispatch(
         commands,
         shader::DELTA_GATE,
@@ -65,7 +70,11 @@ pub struct DeltaRecur<'a> {
     pub val_dim: u32,
 }
 
-pub fn delta_recur(backend: &mut Backend, commands: &mut Commands<'_>, spec: &DeltaRecur<'_>) -> Result<()> {
+pub fn delta_recur(
+    backend: &mut Backend,
+    commands: &mut Commands<'_>,
+    spec: &DeltaRecur<'_>,
+) -> Result<()> {
     backend.dispatch(
         commands,
         shader::DELTA_RECUR,
@@ -75,13 +84,7 @@ pub fn delta_recur(backend: &mut Backend, commands: &mut Commands<'_>, spec: &De
             ("V_DIM", spec.val_dim as f64),
         ],
         &[
-            spec.q,
-            spec.k,
-            spec.v,
-            spec.beta,
-            spec.g,
-            spec.state,
-            spec.y,
+            spec.q, spec.k, spec.v, spec.beta, spec.g, spec.state, spec.y,
         ],
         [spec.heads, 1, 1],
     )

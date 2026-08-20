@@ -2,12 +2,12 @@ use flint_backend::Backend;
 use flint_error::Result;
 use flint_model::MAX_M;
 use flint_model::loader::{Plan, Role, WeightSet};
-use flint_model::mlp_weights::{MlpBlock, take_mlp, take_moe};
 use flint_model::ops::{self, MlpTiles, MoeTiles};
-use flint_model::step;
-use flint_tensor::{Tensor, Weight};
+use flint_model::rows;
+use flint_model::weights::{MlpBlock, take_mlp, take_moe};
+use flint_tensor::{DType, Tensor, Weight};
 
-use crate::keys::{gguf_key, hf_key};
+use crate::keymap::{gguf_key, hf_key};
 use crate::transformer::config::Config;
 
 pub fn role(key: &str) -> Role {
@@ -151,13 +151,13 @@ pub(crate) fn take_layer(
         },
         per_layer_norm: take_optional(w, per_layer, &k("post_per_layer_input_norm.weight"))?,
         out_scale: take_optional(w, per_layer, &k("layer_scalar"))?,
-        q_out: backend.zero_tensor(&[MAX_M, qw]),
-        k_out: backend.zero_tensor(&[MAX_M, kvw]),
-        v_out: backend.zero_tensor(&[MAX_M, kvw]),
-        q_normed: backend.zero_tensor(&[MAX_M, qw]),
-        k_normed: backend.zero_tensor(&[MAX_M, kvw]),
-        v_normed: backend.zero_tensor(&[MAX_M, kvw]),
-        attn_out: backend.zero_tensor(&[MAX_M, qw]),
+        q_out: backend.zero_tensor(&[MAX_M, qw], DType::F32),
+        k_out: backend.zero_tensor(&[MAX_M, kvw], DType::F32),
+        v_out: backend.zero_tensor(&[MAX_M, kvw], DType::F32),
+        q_normed: backend.zero_tensor(&[MAX_M, qw], DType::F32),
+        k_normed: backend.zero_tensor(&[MAX_M, kvw], DType::F32),
+        v_normed: backend.zero_tensor(&[MAX_M, kvw], DType::F32),
+        attn_out: backend.zero_tensor(&[MAX_M, qw], DType::F32),
     })
 }
 
@@ -197,21 +197,21 @@ pub(crate) fn alloc_scratch(cfg: &Config, backend: &Backend) -> Scratch {
         )
     });
     let per_layer_dim = cfg.per_layer.map(|p| p.dim * cfg.layers);
-    let alloc = |shape: &[u32]| per_layer_dim.map(|_| backend.zero_tensor(shape));
+    let alloc = |shape: &[u32]| per_layer_dim.map(|_| backend.zero_tensor(shape, DType::F32));
     Scratch {
-        ids: step::token_ids(backend),
-        meta: step::row_meta(backend),
-        hidden: backend.zero_tensor(&[MAX_M, cfg.hidden]),
-        hidden2: backend.zero_tensor(&[MAX_M, cfg.hidden]),
-        normed: backend.zero_tensor(&[MAX_M, cfg.hidden]),
+        ids: rows::token_ids(backend),
+        meta: rows::row_meta(backend),
+        hidden: backend.zero_tensor(&[MAX_M, cfg.hidden], DType::F32),
+        hidden2: backend.zero_tensor(&[MAX_M, cfg.hidden], DType::F32),
+        normed: backend.zero_tensor(&[MAX_M, cfg.hidden], DType::F32),
         mlp: MlpTiles {
-            gate_out: backend.zero_tensor(&[MAX_M, mlp_w]),
-            up_out: backend.zero_tensor(&[MAX_M, mlp_w]),
-            act: backend.zero_tensor(&[MAX_M, mlp_w]),
-            down_out: backend.zero_tensor(&[MAX_M, cfg.hidden]),
+            gate_out: backend.zero_tensor(&[MAX_M, mlp_w], DType::F32),
+            up_out: backend.zero_tensor(&[MAX_M, mlp_w], DType::F32),
+            act: backend.zero_tensor(&[MAX_M, mlp_w], DType::F32),
+            down_out: backend.zero_tensor(&[MAX_M, cfg.hidden], DType::F32),
         },
         moe,
-        logits: backend.zero_tensor(&[MAX_M, cfg.vocab]),
+        logits: backend.zero_tensor(&[MAX_M, cfg.vocab], DType::F32),
         per_layer_tok: alloc(&[MAX_M, per_layer_dim.unwrap_or(0)]),
         per_layer_ctx: alloc(&[MAX_M, per_layer_dim.unwrap_or(0)]),
         per_layer_out: alloc(&[MAX_M, per_layer_dim.unwrap_or(0)]),

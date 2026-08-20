@@ -1,4 +1,4 @@
-﻿use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use flint_checkpoint::{Checkpoint, CheckpointKind, Gguf, MetaVal};
 
@@ -279,7 +279,11 @@ fn rejects_unknown_value_types_and_versions() {
     let p = dir.join("v2.gguf");
     std::fs::write(&p, &v2).unwrap();
     assert_eq!(
-        Gguf::open(&p).unwrap().metadata().unwrap().u32("llama.block_count"),
+        Gguf::open(&p)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .u32("llama.block_count"),
         Some(24)
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -307,10 +311,19 @@ fn writer_roundtrips_through_reader() {
 
     let g = Gguf::open(&dir.join("m.gguf")).unwrap();
     assert_eq!(g.kind(), CheckpointKind::Gguf);
-    assert_eq!(g.metadata().unwrap().str("general.architecture"), Some("llama"));
+    assert_eq!(
+        g.metadata().unwrap().str("general.architecture"),
+        Some("llama")
+    );
     assert_eq!(g.metadata().unwrap().u32("llama.block_count"), Some(2));
-    assert_eq!(g.metadata().unwrap().f64("llama.rope.freq_base"), Some(10000.0));
-    assert_eq!(g.metadata().unwrap().get("llama.bool"), Some(&MetaVal::Bool(true)));
+    assert_eq!(
+        g.metadata().unwrap().f64("llama.rope.freq_base"),
+        Some(10000.0)
+    );
+    assert_eq!(
+        g.metadata().unwrap().get("llama.bool"),
+        Some(&MetaVal::Bool(true))
+    );
     assert_eq!(
         g.metadata().unwrap().str_array("tokenizer.ggml.tokens"),
         Some(vec!["a", "b", "<|endoftext|>"])

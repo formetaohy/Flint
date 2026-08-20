@@ -25,7 +25,7 @@ use flint_error::{Error, Result};
 
 use crate::Tokenizer;
 
-pub fn load_gguf(model_dir: &Path, source: &dyn Checkpoint) -> Result<Tokenizer> {
+pub fn load(model_dir: &Path, source: &dyn Checkpoint) -> Result<Tokenizer> {
     let path = model_dir.join("tokenizer.json");
     if path.exists() {
         return Tokenizer::from_file(&path);

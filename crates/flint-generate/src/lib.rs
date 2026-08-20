@@ -1,5 +1,6 @@
 mod engine;
 mod grammar;
+mod resolver;
 mod sampler;
 
 pub use engine::{Engine, GenStats, Piece, SessionId};

@@ -3,9 +3,9 @@ use std::sync::Mutex;
 
 use flint_error::Result;
 
+use crate::DeviceRef;
 use crate::device::{BindingMode, KernelSpec};
 use crate::encoder::BindingRef;
-use crate::DeviceRef;
 
 const BIND_CACHE_CAP: usize = 8192;
 const MAX_BINDINGS: usize = 8;
@@ -74,13 +74,14 @@ impl Kernel {
                     label: Some(spec.name),
                     entries: &entries,
                 });
-        let pipeline_layout = device
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(spec.name),
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: spec.immediate_size,
-            });
+        let pipeline_layout =
+            device
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some(spec.name),
+                    bind_group_layouts: &[Some(&bind_group_layout)],
+                    immediate_size: spec.immediate_size,
+                });
         let pipeline = device
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

@@ -29,7 +29,7 @@ fn zero_fill_resets_a_written_tensor() {
 fn copy_duplicates_contents() {
     let backend = Backend::new().unwrap();
     let src = backend.tensor_f32(&[5.0, 6.0], vec![2]);
-    let dst = backend.zero_tensor(&[2]);
+    let dst = backend.zero_tensor(&[2], DType::F32);
     backend.copy(&src, &dst);
     assert_eq!(backend.read_f32(&dst.buf, 0, 2).unwrap(), vec![5.0, 6.0]);
 }
@@ -79,7 +79,7 @@ fn i8_count_must_align_to_u32_words() {
 #[test]
 fn unknown_shader_is_an_error_not_a_panic() {
     let mut backend = Backend::new().unwrap();
-    let t = backend.zero_tensor(&[1]);
+    let t = backend.zero_tensor(&[1], DType::F32);
     let mut enc = backend.encoder().unwrap();
     let mut commands = Commands::begin(&mut enc);
     let err = backend
@@ -151,14 +151,14 @@ fn external_profiler_records_spans() {
     let mut backend = Backend::new().unwrap();
     let mut prof = GpuProfiler::new(backend.device()).unwrap();
     let span = prof.begin_span().unwrap();
-    let t = backend.zero_tensor(&[1]);
+    let t = backend.zero_tensor(&[1], DType::F32);
     let mut enc = backend.encoder().unwrap();
     let mut commands = Commands::begin(&mut enc);
     let binds = [Binding::Full(&t), Binding::Full(&t), Binding::Full(&t)];
     backend
         .dispatch(
             &mut commands,
-            flint_kernel::name::ADD,
+            flint_kernel::shader::ADD,
             &[("N_ELEM", 1.0)],
             &binds,
             [1, 1, 1],

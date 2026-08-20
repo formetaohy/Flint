@@ -1,11 +1,11 @@
 pub mod config;
 pub mod loader;
-pub mod mlp_weights;
-pub mod model;
 pub mod ops;
 pub mod pool;
 pub mod quant;
 pub mod routing;
-pub mod step;
+pub mod rows;
+pub mod traits;
+pub mod weights;
 
-pub use model::{ChunkOut, LanguageModel, MAX_M, SeqChunk, Speculator, TextEmbedder};
+pub use traits::{ChunkOut, LanguageModel, MAX_M, SeqChunk, Speculator, TextEmbedder};

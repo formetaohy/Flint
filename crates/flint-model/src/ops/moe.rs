@@ -1,11 +1,13 @@
-use flint_backend::{Backend, Binding, Commands, shader};
+use flint_backend::{Backend, Binding, Commands};
 use flint_error::Result;
+use flint_kernel::shader;
 use flint_tensor::{DType, Tensor};
 
-use crate::mlp_weights::{ExpertWeights, MoeMlp};
-use crate::model::MAX_M;
-use crate::ops::{Act, gemm, swiglu};
+use crate::ops::{gemm, swiglu};
 use crate::routing::Routing;
+use crate::traits::MAX_M;
+use crate::weights::{ExpertWeights, MoeMlp};
+use flint_kernel::Act;
 
 pub struct MoeTiles {
     pub logits: Tensor,
@@ -24,7 +26,7 @@ pub struct MoeTiles {
 
 impl MoeTiles {
     pub fn new(cfg: &MoeTilesConfig, backend: &Backend) -> Self {
-        let z = |shape: &[u32]| backend.zero_tensor(shape);
+        let z = |shape: &[u32]| backend.zero_tensor(shape, DType::F32);
 
         let pairs = (cfg.experts + 2) * 64 + cfg.rows * cfg.top_k + cfg.rows;
         MoeTiles {
@@ -166,10 +168,7 @@ pub fn expert_gather(
     backend.dispatch(
         commands,
         shader::EXPERT_GATHER,
-        &[
-            ("HIDDEN", spec.hidden as f64),
-            ("COUNT", spec.count as f64),
-        ],
+        &[("HIDDEN", spec.hidden as f64), ("COUNT", spec.count as f64)],
         &[x, ids, out],
         [(spec.count * spec.hidden).div_ceil(256), 1, 1],
     )
@@ -187,10 +186,7 @@ pub fn expert_scatter(
     backend.dispatch(
         commands,
         shader::EXPERT_SCATTER,
-        &[
-            ("HIDDEN", spec.hidden as f64),
-            ("COUNT", spec.count as f64),
-        ],
+        &[("HIDDEN", spec.hidden as f64), ("COUNT", spec.count as f64)],
         &[acc, src, ids, weights],
         [(spec.count * spec.hidden).div_ceil(256), 1, 1],
     )

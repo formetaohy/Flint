@@ -1,5 +1,6 @@
-use flint_backend::{Backend, Binding, Commands, shader};
+use flint_backend::{Backend, Binding, Commands};
 use flint_error::Result;
+use flint_kernel::shader;
 use flint_tensor::Tensor;
 
 pub fn add(

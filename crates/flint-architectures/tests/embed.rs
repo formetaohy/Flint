@@ -44,10 +44,22 @@ fn synth_bert() -> std::path::PathBuf {
     for l in 0..2u64 {
         let p = format!("encoder.layer.{l}");
         for (part, seed) in [("query", 100), ("key", 101), ("value", 102)] {
-            add(&format!("{p}.attention.self.{part}.weight"), &[128, 128], seed + l);
-            add(&format!("{p}.attention.self.{part}.bias"), &[128], seed + 10 + l);
+            add(
+                &format!("{p}.attention.self.{part}.weight"),
+                &[128, 128],
+                seed + l,
+            );
+            add(
+                &format!("{p}.attention.self.{part}.bias"),
+                &[128],
+                seed + 10 + l,
+            );
         }
-        add(&format!("{p}.attention.output.dense.weight"), &[128, 128], 103 + l);
+        add(
+            &format!("{p}.attention.output.dense.weight"),
+            &[128, 128],
+            103 + l,
+        );
         add(&format!("{p}.attention.output.dense.bias"), &[128], 113 + l);
         add(
             &format!("{p}.attention.output.LayerNorm.weight"),
@@ -59,7 +71,11 @@ fn synth_bert() -> std::path::PathBuf {
             &[128],
             114 + l,
         );
-        add(&format!("{p}.intermediate.dense.weight"), &[256, 128], 105 + l);
+        add(
+            &format!("{p}.intermediate.dense.weight"),
+            &[256, 128],
+            105 + l,
+        );
         add(&format!("{p}.intermediate.dense.bias"), &[256], 115 + l);
         add(&format!("{p}.output.dense.weight"), &[128, 256], 106 + l);
         add(&format!("{p}.output.dense.bias"), &[128], 116 + l);
@@ -113,16 +129,10 @@ fn bert_embed_is_deterministic_unit_norm_and_content_sensitive() {
     assert!(a.iter().all(|v| v.is_finite()));
 
     let b = model.embed(&mut backend, &[1, 2, 3, 4, 5]).unwrap();
-    assert_eq!(
-        a, b,
-        "identical inputs must yield identical embeddings"
-    );
+    assert_eq!(a, b, "identical inputs must yield identical embeddings");
 
     let c = model.embed(&mut backend, &[5, 4, 3, 2, 1]).unwrap();
-    assert_ne!(
-        a, c,
-        "different inputs must yield different embeddings"
-    );
+    assert_ne!(a, c, "different inputs must yield different embeddings");
 
     let short = model.embed(&mut backend, &[1]).unwrap();
     assert_eq!(short.len(), 128);

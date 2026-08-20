@@ -2,23 +2,21 @@ use flint_backend::Backend;
 use flint_error::Result;
 use flint_tensor::{DType, Tensor};
 
-use crate::model::MAX_M;
+use crate::traits::MAX_M;
 
 pub fn token_ids(backend: &Backend) -> Tensor {
     Tensor::new(backend.storage(MAX_M as u64 * 4), vec![MAX_M], DType::U32)
 }
 
 pub fn row_meta(backend: &Backend) -> Tensor {
-    Tensor::new(backend.storage(8 * MAX_M as u64 * 4), vec![8 * MAX_M], DType::U32)
+    Tensor::new(
+        backend.storage(8 * MAX_M as u64 * 4),
+        vec![8 * MAX_M],
+        DType::U32,
+    )
 }
 
-pub fn write_row_meta(
-    backend: &Backend,
-    meta: &Tensor,
-    positions: &[u32],
-    seqs: &[u32],
-    m: u32,
-) {
+pub fn write_row_meta(backend: &Backend, meta: &Tensor, positions: &[u32], seqs: &[u32], m: u32) {
     assert!(
         positions.len() >= m as usize && seqs.len() >= m as usize,
         "row meta arrays must cover the chunk size"
@@ -42,11 +40,7 @@ pub fn read_rows(
     let mut out = Vec::with_capacity(rows.len());
     for &r in rows {
         assert!(r < m, "row {r} outside chunk");
-        out.push(backend.read_f32(
-            &t.buf,
-            (base + r) as u64 * count as u64 * 4,
-            count as usize,
-        )?);
+        out.push(backend.read_f32(&t.buf, (base + r) as u64 * count as u64 * 4, count as usize)?);
     }
     Ok(out)
 }

@@ -25,6 +25,21 @@ impl BenchSpec {
         let head = self.vocab as u64 * h * 33 / 32;
         proj_bytes + embed + head + h * 4
     }
+
+    pub fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "hidden_size": self.hidden,
+            "intermediate_size": self.intermediate,
+            "num_hidden_layers": self.layers,
+            "num_attention_heads": self.q_heads,
+            "num_key_value_heads": self.kv_heads,
+            "head_dim": self.head_dim,
+            "vocab_size": self.vocab,
+            "rope_theta": 500000.0,
+            "eos_token_id": [0],
+            "tie_word_embeddings": false,
+        })
+    }
 }
 
 fn tensors(s: &BenchSpec) -> Vec<(String, Vec<u32>)> {

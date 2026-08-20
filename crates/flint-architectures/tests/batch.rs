@@ -46,7 +46,11 @@ fn synth_llama() -> (std::path::PathBuf, Value) {
     for l in 0..2u64 {
         let p = format!("model.layers.{l}");
         add(&format!("{p}.input_layernorm.weight"), &[128], 10 + l);
-        add(&format!("{p}.post_attention_layernorm.weight"), &[128], 15 + l);
+        add(
+            &format!("{p}.post_attention_layernorm.weight"),
+            &[128],
+            15 + l,
+        );
         add(&format!("{p}.self_attn.q_proj.weight"), &[256, 128], 20 + l);
         add(&format!("{p}.self_attn.k_proj.weight"), &[128, 128], 30 + l);
         add(&format!("{p}.self_attn.v_proj.weight"), &[128, 128], 40 + l);
@@ -134,16 +138,14 @@ fn self_speculator_drafts_from_the_captured_depth() {
         },
         Some(1),
         &backend,
-    ).unwrap();
+    )
+    .unwrap();
 
     let tokens: Vec<u32> = (0..8).map(|i| (i * 3) % 127 + 1).collect();
     model.alloc_pages(&backend, 0, tokens.len() as u32).unwrap();
     let last = [tokens.len() as u32 - 1];
     let out = model
-        .forward(
-            &mut backend,
-            &[chunk_full(&tokens, 0, &last, &last)],
-        )
+        .forward(&mut backend, &[chunk_full(&tokens, 0, &last, &last)])
         .unwrap();
     assert_eq!(out[0].logits.len(), 1, "logits for the last row");
     assert_eq!(out[0].hidden.len(), 1, "hidden captured at the spec depth");
@@ -202,7 +204,8 @@ fn batch_seqs_match_solo_and_isolate_sequences() {
         },
         None,
         &backend,
-    ).unwrap();
+    )
+    .unwrap();
     let mut backend = backend;
 
     let seq_a: Vec<u32> = (0..16).map(|i| (i * 3) % 127 + 1).collect();
@@ -250,7 +253,11 @@ fn batch_seqs_match_solo_and_isolate_sequences() {
             &[chunk(&seq_a, 0, &last_a), chunk(&seq_a, 1, &last_a)],
         )
         .unwrap();
-    assert_same(&mirror[0].logits[0], &mirror[1].logits[0], "same tokens across seqs");
+    assert_same(
+        &mirror[0].logits[0],
+        &mirror[1].logits[0],
+        "same tokens across seqs",
+    );
 
     model.reset(&backend, 0).unwrap();
     model.reset(&backend, 1).unwrap();
@@ -285,7 +292,8 @@ fn batch_seqs_match_solo_and_isolate_sequences() {
         },
         None,
         &backend,
-    ).unwrap();
+    )
+    .unwrap();
     ctrl.reset(&backend, 0).unwrap();
     ctrl.reset(&backend, 1).unwrap();
     ctrl.alloc_pages(&backend, 0, seq_a.len() as u32).unwrap();
@@ -305,8 +313,16 @@ fn batch_seqs_match_solo_and_isolate_sequences() {
         )
         .unwrap();
 
-    assert_same(&step2[0].logits[0], &ctrl2[0].logits[0], "seq 0 continuation");
-    assert_same(&step2[1].logits[0], &ctrl2[1].logits[0], "seq 1 continuation");
+    assert_same(
+        &step2[0].logits[0],
+        &ctrl2[0].logits[0],
+        "seq 0 continuation",
+    );
+    assert_same(
+        &step2[1].logits[0],
+        &ctrl2[1].logits[0],
+        "seq 1 continuation",
+    );
     assert_ne!(step2[0].logits[0], step2[1].logits[0]);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -331,7 +347,8 @@ fn paged_attention_matches_contiguous_layout() {
         },
         None,
         &backend,
-    ).unwrap();
+    )
+    .unwrap();
     plain.alloc_pages(&backend, 0, tokens.len() as u32).unwrap();
     let want = plain
         .forward(&mut backend, &[chunk(&tokens, 0, &last)])
@@ -347,7 +364,7 @@ fn paged_attention_matches_contiguous_layout() {
         None,
         &backend,
     )
-        .unwrap();
+    .unwrap();
     paged.alloc_pages(&backend, 1, 128).unwrap();
     paged.alloc_pages(&backend, 0, tokens.len() as u32).unwrap();
     let got = paged

@@ -43,7 +43,10 @@ fn greedy_transform_is_penalized_argmax() {
         },
         1,
     );
-    assert_eq!(penalized.transform(&logits, &[1, 1, 1], None), Dist::Greedy(3));
+    assert_eq!(
+        penalized.transform(&logits, &[1, 1, 1], None),
+        Dist::Greedy(3)
+    );
 }
 
 #[test]

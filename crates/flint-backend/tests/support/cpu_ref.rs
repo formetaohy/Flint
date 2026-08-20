@@ -1,4 +1,4 @@
-﻿use flint_kernel::{Act, NormMode};
+use flint_kernel::{Act, NormMode};
 
 fn silu(v: f32) -> f32 {
     v / (1.0 + (-v).exp())
@@ -224,8 +224,15 @@ pub struct AttnArgs {
 }
 
 pub fn attn(q: &[f32], k_cache: &[f32], v_cache: &[f32], spec: AttnArgs) -> Vec<f32> {
-    let (m, nq, nkv, hd, max_seq, pos, window) =
-        (spec.m, spec.nq, spec.nkv, spec.hd, spec.max_seq, spec.pos, spec.window);
+    let (m, nq, nkv, hd, max_seq, pos, window) = (
+        spec.m,
+        spec.nq,
+        spec.nkv,
+        spec.hd,
+        spec.max_seq,
+        spec.pos,
+        spec.window,
+    );
     let scale = (hd as f32).sqrt().recip();
     let mut out = vec![0f32; m * nq * hd];
     for mi in 0..m {

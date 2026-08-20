@@ -1,5 +1,6 @@
-use flint_backend::{Backend, PAGE_LEN};
+use flint_backend::Backend;
 use flint_error::{Error, Result};
+use flint_kernel::PAGE_LEN;
 use flint_tensor::{DType, Tensor};
 
 pub struct ArenaSpec {
@@ -28,9 +29,9 @@ impl KvArena {
             .map(|&l| l.div_ceil(PAGE_LEN))
             .max()
             .expect("budgets are non-empty");
-        let pages = spec.pages.unwrap_or_else(|| {
-            spec.seq_lens.iter().map(|&l| l.div_ceil(PAGE_LEN)).sum()
-        });
+        let pages = spec
+            .pages
+            .unwrap_or_else(|| spec.seq_lens.iter().map(|&l| l.div_ceil(PAGE_LEN)).sum());
         if pages == 0 {
             return Err(Error::Model("KV arena needs at least one page".into()));
         }
@@ -137,8 +138,8 @@ impl KvPool {
     ) -> Self {
         let capacity = pages * PAGE_LEN;
         Self {
-            k: backend.zero_bf16_tensor(&[kv_heads, capacity, head_dim]),
-            v: backend.zero_bf16_tensor(&[kv_heads, capacity, head_dim]),
+            k: backend.zero_tensor(&[kv_heads, capacity, head_dim], DType::Bf16),
+            v: backend.zero_tensor(&[kv_heads, capacity, head_dim], DType::Bf16),
             block_table: Tensor::new(
                 backend.storage(seqs as u64 * max_pages as u64 * 4),
                 vec![seqs * max_pages],

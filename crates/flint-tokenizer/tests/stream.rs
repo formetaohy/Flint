@@ -3,8 +3,12 @@ use std::path::PathBuf;
 use flint_tokenizer::Tokenizer;
 
 fn tokenizer_path() -> PathBuf {
-    let thread = std::thread::current().name().unwrap_or_default().replace([':', ' '], "_");
-    let dir = std::env::temp_dir().join(format!("flint-tok-stream-{}-{thread}", std::process::id()));
+    let thread = std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .replace([':', ' '], "_");
+    let dir =
+        std::env::temp_dir().join(format!("flint-tok-stream-{}-{thread}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("tokenizer.json");
     std::fs::write(

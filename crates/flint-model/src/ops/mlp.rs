@@ -1,9 +1,11 @@
-use flint_backend::{Backend, Binding, Commands, shader};
+use flint_backend::{Backend, Binding, Commands};
 use flint_error::Result;
+use flint_kernel::shader;
 use flint_tensor::Tensor;
 
-use crate::mlp_weights::SwigluMlp;
-use crate::ops::{Act, gemm, gemm_acc, gemv};
+use crate::ops::{gemm, gemm_acc, gemv};
+use crate::weights::SwigluMlp;
+use flint_kernel::Act;
 
 pub struct MlpTiles {
     pub gate_out: Tensor,
@@ -40,7 +42,14 @@ pub fn swiglu_mlp(
             Binding::Full(&t.gate_out),
             spec.rows,
         )?;
-        gemm(backend, commands, x, &mlp.up, Binding::Full(&t.up_out), spec.rows)?;
+        gemm(
+            backend,
+            commands,
+            x,
+            &mlp.up,
+            Binding::Full(&t.up_out),
+            spec.rows,
+        )?;
     }
     swiglu(
         backend,

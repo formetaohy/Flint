@@ -1,11 +1,11 @@
 use std::sync::{Mutex, MutexGuard};
 
 use flint_backend::{Backend, Binding, Commands};
-use flint_kernel::{Act, NormMode, name};
+use flint_kernel::{Act, NormMode, shader};
 
 mod support;
-use support::cpu_ref;
 use flint_tensor::{DType, Tensor, Weight};
+use support::cpu_ref;
 
 static GPU: Mutex<()> = Mutex::new(());
 
@@ -37,11 +37,11 @@ impl Ctx {
     }
 
     fn zero(&self, shape: &[u32]) -> Tensor {
-        self.backend.zero_tensor(shape)
+        self.backend.zero_tensor(shape, DType::F32)
     }
 
     fn zero_bf16(&self, shape: &[u32]) -> Tensor {
-        self.backend.zero_bf16_tensor(shape)
+        self.backend.zero_tensor(shape, DType::Bf16)
     }
 
     fn rows(&self, pos: usize, m: usize) -> Tensor {
@@ -66,7 +66,8 @@ impl Ctx {
             vec![pages as u32],
             DType::U32,
         );
-        self.backend.write_u32(&t.buf, &(0..pages as u32).collect::<Vec<_>>());
+        self.backend
+            .write_u32(&t.buf, &(0..pages as u32).collect::<Vec<_>>());
         t
     }
 
@@ -213,7 +214,7 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
     };
 
     ctx.dispatch(
-        name::GEMM,
+        shader::GEMM,
         &[
             ("N", n as f64),
             ("K", k as f64),
@@ -242,19 +243,21 @@ fn gemm_bf16() {
     gemm_case(WType::Bf16, 16, 64, 128, 7);
 }
 
-fn coop_gemm(
-    ctx: &mut Ctx,
-    x: &Tensor,
-    w: &Weight,
-    y: &Tensor,
+struct GemmCase<'a> {
+    x: &'a Tensor,
+    w: &'a Weight,
+    y: &'a Tensor,
     m: u32,
     n: u32,
     k: u32,
     acc: bool,
-) {
-    let xf = ctx.backend.zero_f16_tensor(&[m * k]);
+}
+
+fn coop_gemm(ctx: &mut Ctx, case: &GemmCase<'_>) {
+    let (x, w, y, m, n, k, acc) = (case.x, case.w, case.y, case.m, case.n, case.k, case.acc);
+    let xf = ctx.backend.zero_tensor(&[m * k], DType::F16);
     ctx.dispatch(
-        name::TO_F16,
+        shader::TO_F16,
         &[("N_ELEM", (m * k) as f64)],
         &[Binding::Full(x), Binding::Full(&xf)],
         [(m * k / 4).div_ceil(256), 1, 1],
@@ -267,7 +270,7 @@ fn coop_gemm(
     let wdtype = if w.scale().is_some() { 1.0 } else { 0.0 };
     let group = w.group().unwrap_or(128) as f64;
     ctx.dispatch(
-        name::GEMM_COOP,
+        shader::GEMM_COOP,
         &[
             ("N", n as f64),
             ("K", k as f64),
@@ -301,8 +304,19 @@ fn gemm_coop_bf16() {
     let y = ctx.zero(&[m as u32, n as u32]);
     let wb = ctx.bf16(&w, &[n as u32, k as u32]);
     let weight = Weight::plain(wb);
-    coop_gemm(&mut ctx, &xb, &weight, &y, m as u32, n as u32, k as u32, false);
-    
+    coop_gemm(
+        &mut ctx,
+        &GemmCase {
+            x: &xb,
+            w: &weight,
+            y: &y,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            acc: false,
+        },
+    );
+
     agree(
         &ctx.read(&y),
         &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
@@ -326,8 +340,24 @@ fn gemm_coop_i8_group32() {
     let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
     let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
     let weight = Weight::quant(wb, sb, group as u32);
-    coop_gemm(&mut ctx, &xb, &weight, &y, m as u32, n as u32, k as u32, false);
-    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 1e-2, 1e-2);
+    coop_gemm(
+        &mut ctx,
+        &GemmCase {
+            x: &xb,
+            w: &weight,
+            y: &y,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            acc: false,
+        },
+    );
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::gemm(&x, &cpu_w, m, n, k),
+        1e-2,
+        1e-2,
+    );
 }
 
 #[test]
@@ -343,7 +373,18 @@ fn gemm_coop_bf16_acc() {
     let y = ctx.f32(&y0, &[m as u32, n as u32]);
     let wb = ctx.bf16(&w, &[n as u32, k as u32]);
     let weight = Weight::plain(wb);
-    coop_gemm(&mut ctx, &xb, &weight, &y, m as u32, n as u32, k as u32, true);
+    coop_gemm(
+        &mut ctx,
+        &GemmCase {
+            x: &xb,
+            w: &weight,
+            y: &y,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            acc: true,
+        },
+    );
     let mut expect = cpu_ref::gemm(&x, &bf16_round(&w), m, n, k);
     for i in 0..expect.len() {
         expect[i] += y0[i];
@@ -363,8 +404,19 @@ fn gemm_coop_bf16_multi_tile() {
     let y = ctx.zero(&[m as u32, n as u32]);
     let wb = ctx.bf16(&w, &[n as u32, k as u32]);
     let weight = Weight::plain(wb);
-    coop_gemm(&mut ctx, &xb, &weight, &y, m as u32, n as u32, k as u32, false);
-    
+    coop_gemm(
+        &mut ctx,
+        &GemmCase {
+            x: &xb,
+            w: &weight,
+            y: &y,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            acc: false,
+        },
+    );
+
     agree(
         &ctx.read(&y),
         &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
@@ -403,7 +455,12 @@ fn gemm_acc_coop_full() {
             .unwrap();
     }
     ctx.backend.submit(&mut enc).unwrap();
-    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 1e-2, 1e-2);
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::gemm(&x, &cpu_w, m, n, k),
+        1e-2,
+        1e-2,
+    );
 }
 
 #[test]
@@ -437,7 +494,12 @@ fn gemm_acc_coop_tail() {
             .unwrap();
     }
     ctx.backend.submit(&mut enc).unwrap();
-    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 1e-2, 1e-2);
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::gemm(&x, &cpu_w, m, n, k),
+        1e-2,
+        1e-2,
+    );
 }
 
 #[test]
@@ -508,7 +570,12 @@ fn gemm_acc_coop_long_k() {
             .unwrap();
     }
     ctx.backend.submit(&mut enc).unwrap();
-    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 2e-2, 3e-2);
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::gemm(&x, &cpu_w, m, n, k),
+        2e-2,
+        3e-2,
+    );
 }
 
 #[test]
@@ -541,7 +608,12 @@ fn gemm_classic_segs_long_k() {
             .unwrap();
     }
     ctx.backend.submit(&mut enc).unwrap();
-    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 1e-2, 1e-2);
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::gemm(&x, &cpu_w, m, n, k),
+        1e-2,
+        1e-2,
+    );
 }
 
 #[test]
@@ -598,7 +670,7 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
         Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64)
     };
     ctx.dispatch(
-        name::GEMV,
+        shader::GEMV,
         &[
             ("N", n as f64),
             ("K", k as f64),
@@ -617,7 +689,7 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
     );
     if segs > 1 {
         ctx.dispatch(
-            name::MERGE_GEMV,
+            shader::MERGE_GEMV,
             &[("N", n as f64), ("SEGS", segs as f64), ("ACC", 0.0)],
             &[
                 Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64),
@@ -680,7 +752,7 @@ fn gemv_bf16_split_segs_divide_k_blocks() {
             .unwrap();
     }
     ctx.backend.submit(&mut enc).unwrap();
-    
+
     agree(
         &ctx.read(&y),
         &cpu_ref::gemv(&x, &w, n as usize, k as usize),
@@ -710,7 +782,7 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
     let w = Weight::plain(tb);
 
     ctx.dispatch(
-        name::EMBED,
+        shader::EMBED,
         &[
             ("M", rows as f64),
             ("DIM", dim as f64),
@@ -762,7 +834,7 @@ fn norm_case(mode: NormMode, rows: usize, dim: usize, w_dim: usize, seed: u64) {
     let y = ctx.zero(&[rows as u32, dim as u32]);
 
     ctx.dispatch(
-        name::NORM,
+        shader::NORM,
         &[
             ("MODE", mode as u32 as f64),
             ("DIM", dim as f64),
@@ -787,10 +859,21 @@ fn norm_case(mode: NormMode, rows: usize, dim: usize, w_dim: usize, seed: u64) {
         ],
         [rows as u32, 1, 1],
     );
-    
+
     agree(
         &ctx.read(&y),
-        &cpu_ref::norm(mode, &x, &w, &z, cpu_ref::NormArgs { rows, dim, w_dim, eps: 1e-6 }),
+        &cpu_ref::norm(
+            mode,
+            &x,
+            &w,
+            &z,
+            cpu_ref::NormArgs {
+                rows,
+                dim,
+                w_dim,
+                eps: 1e-6,
+            },
+        ),
         1e-4,
         1e-5,
     );
@@ -865,7 +948,7 @@ fn norm_rope_mode4_pos72_repro() {
     let args = ctx.rows(pos, rows / heads);
 
     ctx.dispatch(
-        name::NORM,
+        shader::NORM,
         &[
             ("MODE", 4.0),
             ("DIM", dim as f64),
@@ -948,7 +1031,7 @@ fn add() {
     let y = ctx.zero(&[n as u32]);
 
     ctx.dispatch(
-        name::ADD,
+        shader::ADD,
         &[("N_ELEM", n as f64)],
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
@@ -968,7 +1051,7 @@ fn bias() {
     let bb = ctx.f32(&b, &[dim as u32]);
 
     ctx.dispatch(
-        name::BIAS,
+        shader::BIAS,
         &[("N_ELEM", (rows * dim) as f64), ("DIM", dim as f64)],
         &[Binding::Full(&xb), Binding::Full(&bb)],
         [1, 1, 1],
@@ -991,12 +1074,17 @@ fn swiglu() {
     let y = ctx.zero(&[n as u32]);
 
     ctx.dispatch(
-        name::SWIGLU,
+        shader::SWIGLU,
         &[("N_ELEM", n as f64), ("MODE", 0.0)],
         &[Binding::Full(&gb), Binding::Full(&ub), Binding::Full(&y)],
         [1, 1, 1],
     );
-    agree(&ctx.read(&y), &cpu_ref::swiglu(&g, &u, Act::Silu), 1e-5, 1e-6);
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::swiglu(&g, &u, Act::Silu),
+        1e-5,
+        1e-6,
+    );
 }
 
 #[test]
@@ -1012,12 +1100,12 @@ fn swiglu_gelu_tanh() {
     let y = ctx.zero(&[n as u32]);
 
     ctx.dispatch(
-        name::SWIGLU,
+        shader::SWIGLU,
         &[("N_ELEM", n as f64), ("MODE", 1.0)],
         &[Binding::Full(&gb), Binding::Full(&ub), Binding::Full(&y)],
         [1, 1, 1],
     );
-    
+
     agree(
         &ctx.read(&y),
         &cpu_ref::swiglu(&g, &u, Act::GeluTanh),
@@ -1038,7 +1126,7 @@ fn softcap() {
     }
     let xb = ctx.f32(&x, &[n as u32]);
     ctx.dispatch(
-        name::SOFTCAP,
+        shader::SOFTCAP,
         &[("N_ELEM", n as f64), ("CAP", 30.0)],
         &[Binding::Full(&xb)],
         [1, 1, 1],
@@ -1060,7 +1148,7 @@ fn mul_broadcast() {
     let y = ctx.zero(&[n as u32]);
 
     ctx.dispatch(
-        name::MUL,
+        shader::MUL,
         &[
             ("N", n as f64),
             ("M", 4.0),
@@ -1092,7 +1180,7 @@ fn expert_gather_scatter() {
     let acc = ctx.zero(&[4u32, hidden as u32]);
 
     ctx.dispatch(
-        name::EXPERT_GATHER,
+        shader::EXPERT_GATHER,
         &[("HIDDEN", hidden as f64), ("COUNT", 4.0)],
         &[
             Binding::Full(&xb),
@@ -1102,7 +1190,7 @@ fn expert_gather_scatter() {
         [1, 1, 1],
     );
     ctx.dispatch(
-        name::EXPERT_SCATTER,
+        shader::EXPERT_SCATTER,
         &[("HIDDEN", hidden as f64), ("COUNT", 4.0)],
         &[
             Binding::Full(&acc),
@@ -1125,7 +1213,7 @@ fn zero_rows() {
     let x = vec![1.0f32, 2.0, 3.0, 4.0];
     let xb = ctx.f32(&x, &[4u32]);
     ctx.dispatch(
-        name::ZERO_ROWS,
+        shader::ZERO_ROWS,
         &[("N_ELEM", 3.0)],
         &[Binding::Full(&xb)],
         [1, 1, 1],
@@ -1148,7 +1236,7 @@ fn sigmoid_mul() {
     let y = ctx.zero(&[n as u32]);
 
     ctx.dispatch(
-        name::SIGMOID_MUL,
+        shader::SIGMOID_MUL,
         &[("N_ELEM", n as f64)],
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
@@ -1169,7 +1257,7 @@ fn concat() {
     let y = ctx.zero(&[rows as u32, 2 * d as u32]);
 
     ctx.dispatch(
-        name::CONCAT,
+        shader::CONCAT,
         &[("ROWS", rows as f64), ("D", d as f64)],
         &[Binding::Full(&ab), Binding::Full(&bb), Binding::Full(&y)],
         [1, 1, 1],
@@ -1200,7 +1288,7 @@ fn rope_case(m: usize, heads: usize, hd: usize, rot: usize, pos: usize, seed: u6
     let args = ctx.rows(pos, m);
 
     ctx.dispatch(
-        name::ROPE,
+        shader::ROPE,
         &[
             ("HEADS", heads as f64),
             ("HEAD_DIM", hd as f64),
@@ -1216,7 +1304,18 @@ fn rope_case(m: usize, heads: usize, hd: usize, rot: usize, pos: usize, seed: u6
         [m as u32, heads as u32, 1],
     );
     let mut cpu = x.clone();
-    cpu_ref::rope(&mut cpu, &cos, &sin, cpu_ref::RopeArgs { m, heads, hd, rot, pos });
+    cpu_ref::rope(
+        &mut cpu,
+        &cos,
+        &sin,
+        cpu_ref::RopeArgs {
+            m,
+            heads,
+            hd,
+            rot,
+            pos,
+        },
+    );
     agree(&ctx.read(&xb), &cpu, 1e-5, 1e-6);
 }
 
@@ -1250,7 +1349,7 @@ fn conv1d_rolls_state_across_steps() {
     for x in &steps {
         ctx.backend.write_f32(&xb.buf, x);
         ctx.dispatch(
-            name::CONV1D,
+            shader::CONV1D,
             &[("DIM", dim as f64)],
             &[
                 Binding::Full(&xb),
@@ -1296,7 +1395,7 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
             ctx.backend
                 .dispatch(
                     &mut pass,
-                    name::CONV1D,
+                    shader::CONV1D,
                     &[("DIM", conv_dim as f64)],
                     &[
                         Binding::Slice(&xb, row(t), conv_dim as u64 * 4),
@@ -1317,7 +1416,7 @@ fn repeat_qk_sees_convd_writes_in_same_pass() {
         ctx.backend
             .dispatch(
                 &mut pass,
-                name::REPEAT_QK,
+                shader::REPEAT_QK,
                 &[
                     ("ROWS", rows as f64),
                     ("N_K", n_k as f64),
@@ -1355,7 +1454,7 @@ fn repeat_qk_case(rows: usize, n_k: usize, n_v: usize, kd: usize, vd: usize, see
     let y = ctx.zero(&[rows as u32, out_dim as u32]);
 
     ctx.dispatch(
-        name::REPEAT_QK,
+        shader::REPEAT_QK,
         &[
             ("ROWS", rows as f64),
             ("N_K", n_k as f64),
@@ -1420,7 +1519,7 @@ fn delta_gate_selects_chunk_rows() {
 
     for row in [0usize, 2] {
         ctx.dispatch(
-            name::DELTA_GATE,
+            shader::DELTA_GATE,
             &[("HEADS", heads as f64), ("ROW_T", row as f64)],
             &[
                 Binding::Full(&bb),
@@ -1461,7 +1560,7 @@ fn delta_recur_case(heads: usize, kd: usize, vd: usize, seed: u64) {
     let out = ctx.zero(&[heads as u32, vd as u32]);
 
     ctx.dispatch(
-        name::DELTA_RECUR,
+        shader::DELTA_RECUR,
         &[
             ("HEADS", heads as f64),
             ("K_DIM", kd as f64),
@@ -1479,7 +1578,15 @@ fn delta_recur_case(heads: usize, kd: usize, vd: usize, seed: u64) {
         [heads as u32, 1, 1],
     );
     let mut state = s0.clone();
-    let cpu = cpu_ref::delta_recur(&q, &k, &v, &beta, &g, &mut state, cpu_ref::DeltaRecurArgs { heads, kd, vd });
+    let cpu = cpu_ref::delta_recur(
+        &q,
+        &k,
+        &v,
+        &beta,
+        &g,
+        &mut state,
+        cpu_ref::DeltaRecurArgs { heads, kd, vd },
+    );
     agree(&ctx.read(&st), &state, 1e-4, 1e-5);
     agree(&ctx.read(&out), &cpu, 1e-4, 1e-5);
 }
@@ -1517,12 +1624,15 @@ fn kv_store_attn_hd128_gqa2_pos71() {
     let bt = ctx.block_table(max_seq);
 
     ctx.dispatch(
-        name::KV_STORE,
+        shader::KV_STORE,
         &[
             ("N_KV", nkv as f64),
             ("HEAD_DIM", hd as f64),
             ("POOL_LEN", max_seq as f64),
-            ("MAX_PAGES", max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64),
+            (
+                "MAX_PAGES",
+                max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64,
+            ),
         ],
         &[
             Binding::Full(&kb),
@@ -1535,7 +1645,7 @@ fn kv_store_attn_hd128_gqa2_pos71() {
         [(nkv * hd / 2) as u32, m as u32, 1],
     );
     ctx.dispatch(
-        name::ATTN,
+        shader::ATTN,
         &[
             ("M", m as f64),
             ("N_HEADS", nq as f64),
@@ -1546,7 +1656,10 @@ fn kv_store_attn_hd128_gqa2_pos71() {
             ("NQ_PER_KV", (nq / nkv) as f64),
             ("SEQ", 0.0),
             ("CAUSAL", 1.0),
-            ("MAX_PAGES", max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64),
+            (
+                "MAX_PAGES",
+                max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64,
+            ),
         ],
         &[
             Binding::Full(&qb),
@@ -1569,7 +1682,21 @@ fn kv_store_attn_hd128_gqa2_pos71() {
         }
     }
     let got = ctx.read(&y);
-    let want = cpu_ref::attn(&q, &kc, &vc, cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window: 0, causal: true });
+    let want = cpu_ref::attn(
+        &q,
+        &kc,
+        &vc,
+        cpu_ref::AttnArgs {
+            m,
+            nq,
+            nkv,
+            hd,
+            max_seq,
+            pos,
+            window: 0,
+            causal: true,
+        },
+    );
     agree(&got, &want, 1e-2, 1e-2);
     eprintln!("nan in gpu: {}", got.iter().filter(|v| v.is_nan()).count());
 }
@@ -1605,7 +1732,7 @@ fn attn_gemm_coexist() {
             ctx.backend
                 .dispatch(
                     &mut pass,
-                    name::ATTN,
+                    shader::ATTN,
                     &[
                         ("M", m as f64),
                         ("N_HEADS", nq as f64),
@@ -1614,9 +1741,12 @@ fn attn_gemm_coexist() {
                         ("SCALE", 1.0 / (hd as f64).sqrt()),
                         ("WINDOW", 0.0),
                         ("NQ_PER_KV", (nq / nkv) as f64),
-            ("SEQ", 0.0),
-            ("CAUSAL", 1.0),
-            ("MAX_PAGES", max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64),
+                        ("SEQ", 0.0),
+                        ("CAUSAL", 1.0),
+                        (
+                            "MAX_PAGES",
+                            max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64,
+                        ),
                     ],
                     &[
                         Binding::Full(&qb),
@@ -1632,7 +1762,7 @@ fn attn_gemm_coexist() {
             ctx.backend
                 .dispatch(
                     &mut pass,
-                    name::GEMM,
+                    shader::GEMM,
                     &[
                         ("N", n2 as f64),
                         ("K", k2 as f64),
@@ -1657,21 +1787,50 @@ fn attn_gemm_coexist() {
         ctx.backend.submit(&mut enc).unwrap();
     }
 
-    
     agree(
         &ctx.read(&y),
-        &cpu_ref::attn(&q, &kc, &vc, cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window: 0, causal: true }),
+        &cpu_ref::attn(
+            &q,
+            &kc,
+            &vc,
+            cpu_ref::AttnArgs {
+                m,
+                nq,
+                nkv,
+                hd,
+                max_seq,
+                pos,
+                window: 0,
+                causal: true,
+            },
+        ),
         2e-3,
         1e-3,
     );
-    agree(&ctx.read(&yg), &cpu_ref::gemm(&x, &w, m, n2, k2), 2e-2, 5e-2);
+    agree(
+        &ctx.read(&yg),
+        &cpu_ref::gemm(&x, &w, m, n2, k2),
+        2e-2,
+        5e-2,
+    );
 }
 
 #[test]
 fn attn_decode_positions() {
     let _g = gpu();
     for pos in [1usize, 63, 64, 65, 255, 511] {
-        attn_case(AttnCase { m: 1, nq: 8, nkv: 2, hd: 128, max_seq: 1024, pos, window: 0, seed: 7000 + pos as u64, k_scale: 0.1, causal: true });
+        attn_case(AttnCase {
+            m: 1,
+            nq: 8,
+            nkv: 2,
+            hd: 128,
+            max_seq: 1024,
+            pos,
+            window: 0,
+            seed: 7000 + pos as u64,
+            k_scale: 0.1,
+            causal: true,
+        });
     }
 }
 struct AttnCase {
@@ -1719,7 +1878,7 @@ fn attn_case(spec: AttnCase) {
     let bt = ctx.block_table(max_seq);
 
     ctx.dispatch(
-        name::ATTN,
+        shader::ATTN,
         &[
             ("M", m as f64),
             ("N_HEADS", nq as f64),
@@ -1730,7 +1889,10 @@ fn attn_case(spec: AttnCase) {
             ("NQ_PER_KV", (nq / nkv) as f64),
             ("SEQ", 0.0),
             ("CAUSAL", causal as u32 as f64),
-            ("MAX_PAGES", max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64),
+            (
+                "MAX_PAGES",
+                max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64,
+            ),
         ],
         &[
             Binding::Full(&qb),
@@ -1740,20 +1902,25 @@ fn attn_case(spec: AttnCase) {
             Binding::Full(&args),
             Binding::Full(&bt),
         ],
-        [
-            (m as u32).div_ceil(flint_kernel::ATTN_BR),
-            nq as u32,
-            1,
-        ],
+        [(m as u32).div_ceil(flint_kernel::ATTN_BR), nq as u32, 1],
     );
-    
+
     agree(
         &ctx.read(&y),
         &cpu_ref::attn(
             &q,
             &kc,
             &vc,
-            cpu_ref::AttnArgs { m, nq, nkv, hd, max_seq, pos, window, causal },
+            cpu_ref::AttnArgs {
+                m,
+                nq,
+                nkv,
+                hd,
+                max_seq,
+                pos,
+                window,
+                causal,
+            },
         ),
         1e-2,
         1e-2,
@@ -1763,38 +1930,104 @@ fn attn_case(spec: AttnCase) {
 #[test]
 fn attn_hd64_multi_block() {
     let _g = gpu();
-    attn_case(AttnCase { m: 16, nq: 8, nkv: 2, hd: 64, max_seq: 512, pos: 256, window: 0, seed: 501, k_scale: 0.1, causal: true });
+    attn_case(AttnCase {
+        m: 16,
+        nq: 8,
+        nkv: 2,
+        hd: 64,
+        max_seq: 512,
+        pos: 256,
+        window: 0,
+        seed: 501,
+        k_scale: 0.1,
+        causal: true,
+    });
 }
 
 #[test]
 fn attn_hd128_gqa4() {
     let _g = gpu();
-    attn_case(AttnCase { m: 8, nq: 32, nkv: 8, hd: 128, max_seq: 1024, pos: 512, window: 0, seed: 503, k_scale: 0.1, causal: true });
+    attn_case(AttnCase {
+        m: 8,
+        nq: 32,
+        nkv: 8,
+        hd: 128,
+        max_seq: 1024,
+        pos: 512,
+        window: 0,
+        seed: 503,
+        k_scale: 0.1,
+        causal: true,
+    });
 }
 
 #[test]
 fn attn_hd256_kd_segments() {
     let _g = gpu();
-    attn_case(AttnCase { m: 4, nq: 8, nkv: 4, hd: 256, max_seq: 512, pos: 300, window: 0, seed: 505, k_scale: 0.1, causal: true });
+    attn_case(AttnCase {
+        m: 4,
+        nq: 8,
+        nkv: 4,
+        hd: 256,
+        max_seq: 512,
+        pos: 300,
+        window: 0,
+        seed: 505,
+        k_scale: 0.1,
+        causal: true,
+    });
 }
 
 #[test]
 fn attn_hd100_odd_dim_segs() {
     let _g = gpu();
-    attn_case(AttnCase { m: 4, nq: 8, nkv: 2, hd: 100, max_seq: 256, pos: 128, window: 0, seed: 507, k_scale: 0.1, causal: true });
+    attn_case(AttnCase {
+        m: 4,
+        nq: 8,
+        nkv: 2,
+        hd: 100,
+        max_seq: 256,
+        pos: 128,
+        window: 0,
+        seed: 507,
+        k_scale: 0.1,
+        causal: true,
+    });
 }
 
 #[test]
 fn attn_sliding_window() {
     let _g = gpu();
-    attn_case(AttnCase { m: 8, nq: 8, nkv: 2, hd: 128, max_seq: 1024, pos: 700, window: 128, seed: 509, k_scale: 0.1, causal: true });
+    attn_case(AttnCase {
+        m: 8,
+        nq: 8,
+        nkv: 2,
+        hd: 128,
+        max_seq: 1024,
+        pos: 700,
+        window: 128,
+        seed: 509,
+        k_scale: 0.1,
+        causal: true,
+    });
 }
 
 #[test]
 fn attn_pos_boundaries() {
     let _g = gpu();
     for pos in [0usize, 1, 31, 32, 33, 63, 64, 65, 127, 255, 511] {
-        attn_case(AttnCase { m: 5, nq: 4, nkv: 2, hd: 64, max_seq: 1024, pos, window: 0, seed: 600 + pos as u64, k_scale: 0.1, causal: true });
+        attn_case(AttnCase {
+            m: 5,
+            nq: 4,
+            nkv: 2,
+            hd: 64,
+            max_seq: 1024,
+            pos,
+            window: 0,
+            seed: 600 + pos as u64,
+            k_scale: 0.1,
+            causal: true,
+        });
     }
 }
 
@@ -1802,27 +2035,71 @@ fn attn_pos_boundaries() {
 fn attn_m_sweep() {
     let _g = gpu();
     for m in [1usize, 2, 7, 8, 9, 15, 16, 17] {
-        attn_case(AttnCase { m, nq: 4, nkv: 2, hd: 128, max_seq: 128, pos: 64, window: 0, seed: 800 + m as u64, k_scale: 0.1, causal: true });
+        attn_case(AttnCase {
+            m,
+            nq: 4,
+            nkv: 2,
+            hd: 128,
+            max_seq: 128,
+            pos: 64,
+            window: 0,
+            seed: 800 + m as u64,
+            k_scale: 0.1,
+            causal: true,
+        });
     }
 }
 
 #[test]
 fn attn_gqa_8x() {
     let _g = gpu();
-    attn_case(AttnCase { m: 2, nq: 16, nkv: 2, hd: 128, max_seq: 64, pos: 32, window: 0, seed: 511, k_scale: 0.1, causal: true });
+    attn_case(AttnCase {
+        m: 2,
+        nq: 16,
+        nkv: 2,
+        hd: 128,
+        max_seq: 64,
+        pos: 32,
+        window: 0,
+        seed: 511,
+        k_scale: 0.1,
+        causal: true,
+    });
 }
 
 #[test]
 fn attn_full_cache_tail() {
     let _g = gpu();
-    attn_case(AttnCase { m: 8, nq: 8, nkv: 2, hd: 128, max_seq: 256, pos: 248, window: 0, seed: 513, k_scale: 1.0, causal: true });
+    attn_case(AttnCase {
+        m: 8,
+        nq: 8,
+        nkv: 2,
+        hd: 128,
+        max_seq: 256,
+        pos: 248,
+        window: 0,
+        seed: 513,
+        k_scale: 1.0,
+        causal: true,
+    });
 }
 
 #[test]
 fn attn_bidirectional_encoder_style() {
     let _g = gpu();
     for (m, pos) in [(4usize, 0usize), (8, 32), (1, 10), (16, 64)] {
-        attn_case(AttnCase { m, nq: 8, nkv: 2, hd: 64, max_seq: 128, pos, window: 0, seed: 900 + pos as u64, k_scale: 0.1, causal: false });
+        attn_case(AttnCase {
+            m,
+            nq: 8,
+            nkv: 2,
+            hd: 64,
+            max_seq: 128,
+            pos,
+            window: 0,
+            seed: 900 + pos as u64,
+            k_scale: 0.1,
+            causal: false,
+        });
     }
 }
 
@@ -1838,7 +2115,7 @@ fn split_qg() {
     let gb = ctx.zero(&[rows as u32, heads as u32, hd as u32]);
 
     ctx.dispatch(
-        name::SPLIT_QG,
+        shader::SPLIT_QG,
         &[
             ("ROWS", rows as f64),
             ("HEADS", heads as f64),
@@ -1868,12 +2145,15 @@ fn kv_store_writes_both_caches() {
     let bt = ctx.block_table(max_seq);
 
     ctx.dispatch(
-        name::KV_STORE,
+        shader::KV_STORE,
         &[
             ("N_KV", nkv as f64),
             ("HEAD_DIM", hd as f64),
             ("POOL_LEN", max_seq as f64),
-            ("MAX_PAGES", max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64),
+            (
+                "MAX_PAGES",
+                max_seq.div_ceil(flint_kernel::PAGE_LEN as usize) as f64,
+            ),
         ],
         &[
             Binding::Full(&kb),
@@ -1918,14 +2198,47 @@ fn anchor_norm_modes() {
     let inv = (2.5f32 + 1e-6).sqrt().recip();
     let x = [1.0f32, 2.0];
 
-    let direct = cpu_ref::norm(NormMode::Direct, &x, &[2.0, 3.0], &[], cpu_ref::NormArgs { rows: 1, dim: 2, w_dim: 2, eps: 1e-6 });
+    let direct = cpu_ref::norm(
+        NormMode::Direct,
+        &x,
+        &[2.0, 3.0],
+        &[],
+        cpu_ref::NormArgs {
+            rows: 1,
+            dim: 2,
+            w_dim: 2,
+            eps: 1e-6,
+        },
+    );
     assert_eq!(direct, vec![inv * 2.0, inv * 6.0]);
 
-    let offset = cpu_ref::norm(NormMode::Offset, &x, &[0.5, -0.25], &[], cpu_ref::NormArgs { rows: 1, dim: 2, w_dim: 2, eps: 1e-6 });
+    let offset = cpu_ref::norm(
+        NormMode::Offset,
+        &x,
+        &[0.5, -0.25],
+        &[],
+        cpu_ref::NormArgs {
+            rows: 1,
+            dim: 2,
+            w_dim: 2,
+            eps: 1e-6,
+        },
+    );
     assert_eq!(offset, vec![inv * 1.5, inv * 1.5]);
 
     let silu1 = 1.0 / (1.0 + (-1.0f32).exp());
-    let gated = cpu_ref::norm(NormMode::Gated, &x, &[2.0, 3.0], &[0.0, 1.0], cpu_ref::NormArgs { rows: 1, dim: 2, w_dim: 2, eps: 1e-6 });
+    let gated = cpu_ref::norm(
+        NormMode::Gated,
+        &x,
+        &[2.0, 3.0],
+        &[0.0, 1.0],
+        cpu_ref::NormArgs {
+            rows: 1,
+            dim: 2,
+            w_dim: 2,
+            eps: 1e-6,
+        },
+    );
     assert_eq!(gated[0], 0.0, "silu(0) gates the first element to zero");
     assert!((gated[1] - inv * 6.0 * silu1).abs() < 1e-6);
 }
@@ -2004,11 +2317,39 @@ fn anchor_attn_causal_and_window() {
     let v = [1.0, 2.0, 3.0, 4.0];
     let q = [1.0, 1.0];
 
-    let full = cpu_ref::attn(&q, &k, &v, cpu_ref::AttnArgs { m: 1, nq: 1, nkv: 1, hd: 2, max_seq: 2, pos: 1, window: 0, causal: true });
+    let full = cpu_ref::attn(
+        &q,
+        &k,
+        &v,
+        cpu_ref::AttnArgs {
+            m: 1,
+            nq: 1,
+            nkv: 1,
+            hd: 2,
+            max_seq: 2,
+            pos: 1,
+            window: 0,
+            causal: true,
+        },
+    );
     assert!((full[0] - 2.0).abs() < 1e-6);
     assert!((full[1] - 3.0).abs() < 1e-6);
 
-    let win = cpu_ref::attn(&q, &k, &v, cpu_ref::AttnArgs { m: 1, nq: 1, nkv: 1, hd: 2, max_seq: 2, pos: 1, window: 1, causal: true });
+    let win = cpu_ref::attn(
+        &q,
+        &k,
+        &v,
+        cpu_ref::AttnArgs {
+            m: 1,
+            nq: 1,
+            nkv: 1,
+            hd: 2,
+            max_seq: 2,
+            pos: 1,
+            window: 1,
+            causal: true,
+        },
+    );
     assert!((win[0] - 3.0).abs() < 1e-6);
     assert!((win[1] - 4.0).abs() < 1e-6);
 }
@@ -2047,7 +2388,11 @@ fn anchor_delta_recur_two_steps() {
         &[0.5],
         &[0.0],
         &mut state,
-        cpu_ref::DeltaRecurArgs { heads: 1, kd: 2, vd: 2 },
+        cpu_ref::DeltaRecurArgs {
+            heads: 1,
+            kd: 2,
+            vd: 2,
+        },
     );
     for (got, want) in state.iter().zip([2.5, 3.5, 0.0, 0.0]) {
         assert!((got - want).abs() < 1e-5, "{got} vs {want}");
@@ -2062,7 +2407,11 @@ fn anchor_delta_recur_two_steps() {
         &[1.0],
         &[-2.0f32.ln()],
         &mut state,
-        cpu_ref::DeltaRecurArgs { heads: 1, kd: 2, vd: 2 },
+        cpu_ref::DeltaRecurArgs {
+            heads: 1,
+            kd: 2,
+            vd: 2,
+        },
     );
     assert!((state[0] - 1.25).abs() < 1e-5);
     assert!((state[1] - 1.75).abs() < 1e-5);

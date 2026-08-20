@@ -13,5 +13,4 @@ flint-profiler.workspace = true
 flint-tensor.workspace = true
 
 [dev-dependencies]
-flint-profiler = { path = "../flint-profiler" }
 flint-num.workspace = true

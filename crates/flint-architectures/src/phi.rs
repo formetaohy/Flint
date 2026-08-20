@@ -8,7 +8,7 @@ use flint_model::routing::RouteKind;
 use flint_tensor::Weight;
 use serde_json::Value;
 
-use crate::keys::{gguf_key, gguf_moe_key, hf_key};
+use crate::keymap::{gguf_key, gguf_moe_key, hf_key};
 use crate::transformer::{Config, Model, MoeConfig, RopeSpec, role as dense_role};
 
 fn moe_key(name: &str) -> Option<(String, MoEPart)> {
@@ -155,27 +155,41 @@ pub fn load(
 ) -> Result<Model> {
     let cfg = parse_transformer(v)?;
     let gguf = source.kind() == CheckpointKind::Gguf;
-    let extra = if gguf {
-        gguf_split_qkv(backend, source, &cfg, phi_role)?
-    } else {
-        hf_split_fused(backend, source, &cfg, phi_role)?
-    };
-    Model::load_extra(source, cfg, &phi_plan(gguf), extra, arena, spec_depth, backend)
+    let extra = split_fused(backend, source, &cfg, gguf, phi_role)?;
+    Model::load_extra(
+        source,
+        cfg,
+        &phi_plan(gguf),
+        extra,
+        arena,
+        spec_depth,
+        backend,
+    )
 }
 
-fn hf_split_fused(
+fn split_fused(
     backend: &Backend,
     source: &dyn Checkpoint,
     cfg: &Config,
+    gguf: bool,
     role: fn(&str) -> Role,
 ) -> Result<Vec<(String, Weight)>> {
     let hd = cfg.head_dims[0];
-    let qw = cfg.q_heads * hd;
-    let kvw = cfg.kv_heads * hd;
+    let (qw, kvw) = (cfg.q_heads * hd, cfg.kv_heads * hd);
     let mut out = Vec::new();
     let names = source.names();
     for l in 0..cfg.layers {
-        let qkv = format!("model.layers.{l}.self_attn.qkv_proj.weight");
+        let (qkv, fused_mlp) = if gguf {
+            (
+                format!("blk.{l}.attn_qkv.weight"),
+                format!("blk.{l}.ffn_up.weight"),
+            )
+        } else {
+            (
+                format!("model.layers.{l}.self_attn.qkv_proj.weight"),
+                format!("model.layers.{l}.mlp.gate_up_proj.weight"),
+            )
+        };
         if names.contains(&qkv) {
             let raw = source.read(&qkv)?;
             if raw.shape.len() != 2 || raw.shape[0] != qw + 2 * kvw {
@@ -197,7 +211,6 @@ fn hf_split_fused(
                 ],
             )?;
         }
-        let fused_mlp = format!("model.layers.{l}.mlp.gate_up_proj.weight");
         if names.contains(&fused_mlp) {
             let raw = source.read(&fused_mlp)?;
             if raw.shape.len() != 2 || raw.shape[0] != 2 * cfg.intermediate {
@@ -267,64 +280,6 @@ fn f32_list(v: &Value, key: &str) -> Result<Vec<f32>> {
                 .collect()
         })
         .unwrap_or_else(|| Err(Error::Config(format!("missing {key:?}"))))
-}
-
-fn gguf_split_qkv(
-    backend: &Backend,
-    source: &dyn Checkpoint,
-    cfg: &Config,
-    role: fn(&str) -> Role,
-) -> Result<Vec<(String, Weight)>> {
-    let hd = cfg.head_dims[0];
-    let (qw, kvw) = (cfg.q_heads * hd, cfg.kv_heads * hd);
-    let mut out = Vec::new();
-    let names = source.names();
-    for l in 0..cfg.layers {
-        let name = format!("blk.{l}.attn_qkv.weight");
-        if !names.contains(&name) {
-            continue;
-        }
-        let raw = source.read(&name)?;
-        if raw.shape.len() != 2 || raw.shape[0] != qw + 2 * kvw {
-            return Err(Error::Config(format!(
-                "{name}: unexpected fused QKV shape {:?} (q {qw}, kv {kvw})",
-                raw.shape
-            )));
-        }
-        split_rows(
-            backend,
-            raw,
-            &mut out,
-            role,
-            |part| format!("layers.{l}.self_attn.{part}.weight"),
-            &[
-                ("q_proj", 0, qw),
-                ("k_proj", qw, qw + kvw),
-                ("v_proj", qw + kvw, qw + 2 * kvw),
-            ],
-        )?;
-    }
-
-    for l in 0..cfg.layers {
-        let name = format!("blk.{l}.ffn_up.weight");
-        if !names.contains(&name) {
-            continue;
-        }
-        let raw = source.read(&name)?;
-        if raw.shape.len() != 2 || raw.shape[0] != 2 * cfg.intermediate {
-            continue;
-        }
-        let half = raw.shape[0] / 2;
-        split_rows(
-            backend,
-            raw,
-            &mut out,
-            role,
-            |part| format!("layers.{l}.mlp.{part}.weight"),
-            &[("gate_proj", 0, half), ("up_proj", half, 2 * half)],
-        )?;
-    }
-    Ok(out)
 }
 
 fn split_rows(

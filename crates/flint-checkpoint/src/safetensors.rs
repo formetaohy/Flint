@@ -58,9 +58,10 @@ impl Checkpoint for Safetensors {
     }
 
     fn read(&self, name: &str) -> Result<RawTensor> {
-        let file_name = self.weight_map.get(name).ok_or_else(|| {
-            Error::Checkpoint(format!("tensor {name:?} not in checkpoint index"))
-        })?;
+        let file_name = self
+            .weight_map
+            .get(name)
+            .ok_or_else(|| Error::Checkpoint(format!("tensor {name:?} not in checkpoint index")))?;
         let file = File::open(self.dir.join(file_name))
             .map_err(|e| Error::Checkpoint(format!("missing shard {file_name}: {e}")))?;
         let mmap = unsafe { Mmap::map(&file) }

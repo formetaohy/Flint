@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 flint-backend.workspace = true
+flint-kernel.workspace = true
 flint-checkpoint.workspace = true
 flint-error.workspace = true
 flint-num.workspace = true

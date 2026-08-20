@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Scalar {
+pub enum Scalar {
     F32,
     U32,
 }
@@ -21,14 +21,14 @@ impl Scalar {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ScalarField {
+pub struct ScalarField {
     pub name: String,
     pub offset: u32,
     pub ty: Scalar,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ScalarLayout {
+pub struct ScalarLayout {
     pub size: u32,
     pub fields: Vec<ScalarField>,
 }

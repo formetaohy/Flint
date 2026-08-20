@@ -1,5 +1,7 @@
 mod config;
+mod forward;
 mod model;
+mod speculator;
 mod weights;
 
 pub use config::{Config, MoeConfig, PerLayerConfig, RopeSpec};

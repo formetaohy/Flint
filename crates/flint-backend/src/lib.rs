@@ -7,9 +7,6 @@ use flint_gpu::{BindingRef, Buffer, Device, Encoder, HostAccess, Kernel, Submiss
 use flint_kernel::Kernels;
 use flint_tensor::{DType, Tensor};
 
-pub use flint_kernel::name as shader;
-pub use flint_kernel::{Act, ATTN_BR, NormMode, PAGE_LEN};
-
 #[derive(Clone, Copy)]
 pub enum Binding<'a> {
     Full(&'a Tensor),
@@ -70,10 +67,8 @@ pub struct Backend {
 
 impl Backend {
     pub fn new() -> Result<Self> {
-        let device = Rc::new(
-            Device::open()
-                .map_err(|e| Error::Gpu(format!("no suitable backend: {e}")))?,
-        );
+        let device =
+            Rc::new(Device::open().map_err(|e| Error::Gpu(format!("no suitable backend: {e}")))?);
         let kernels = Kernels::new(device.as_ref())?;
         Self::warmup(device.as_ref(), &kernels)?;
         let unit_scale = Tensor::new(Self::zeroed_buf(device.as_ref(), 4), vec![1], DType::F32);
@@ -166,30 +161,17 @@ impl Backend {
             .expect("buffer allocation")
     }
 
-    pub fn zero_tensor(&self, shape: &[u32]) -> Tensor {
+    pub fn zero_tensor(&self, shape: &[u32], dtype: DType) -> Tensor {
         let numel: u64 = shape.iter().map(|d| *d as u64).product();
+        let bytes = match dtype {
+            DType::F32 | DType::U32 => numel * 4,
+            DType::Bf16 | DType::F16 => numel * 2,
+            DType::I8 => numel,
+        };
         Tensor::new(
-            Self::zeroed_buf(self.device.as_ref(), numel * 4),
+            Self::zeroed_buf(self.device.as_ref(), bytes),
             shape.to_vec(),
-            DType::F32,
-        )
-    }
-
-    pub fn zero_bf16_tensor(&self, shape: &[u32]) -> Tensor {
-        let numel: u64 = shape.iter().map(|d| *d as u64).product();
-        Tensor::new(
-            Self::zeroed_buf(self.device.as_ref(), numel * 2),
-            shape.to_vec(),
-            DType::Bf16,
-        )
-    }
-
-    pub fn zero_f16_tensor(&self, shape: &[u32]) -> Tensor {
-        let numel: u64 = shape.iter().map(|d| *d as u64).product();
-        Tensor::new(
-            Self::zeroed_buf(self.device.as_ref(), numel * 2),
-            shape.to_vec(),
-            DType::F16,
+            dtype,
         )
     }
 
@@ -287,9 +269,7 @@ impl Backend {
             Some(profiler) => {
                 let span = profiler.borrow_mut().mark_begin(commands.raw())?;
                 Self::set(&self.kernels, commands, name, consts, bufs, groups)?;
-                profiler
-                    .borrow_mut()
-                    .mark_end(commands.raw(), name, span)
+                profiler.borrow_mut().mark_end(commands.raw(), name, span)
             }
             None => Self::set(&self.kernels, commands, name, consts, bufs, groups),
         }
@@ -377,7 +357,7 @@ impl Backend {
                 Self::set(
                     kernels,
                     &mut commands,
-                    shader::ADD,
+                    flint_kernel::shader::ADD,
                     &[("N_ELEM", n as f64)],
                     &[Binding::Full(&wxa), Binding::Full(&wxb), Binding::Full(&wy)],
                     [(n / 256) as u32, 1, 1],

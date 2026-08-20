@@ -6,11 +6,8 @@ use flint_architectures::transformer::{Config, Model, plan};
 use flint_backend::Backend;
 use flint_error::Result;
 use flint_model::{LanguageModel, SeqChunk};
-use serde_json::json;
 
 use flint_bench::synth::{BenchSpec, SynthCheckpoint};
-
-mod probes;
 
 #[derive(Parser)]
 struct Args {
@@ -64,43 +61,31 @@ struct Args {
 }
 
 fn config(s: &BenchSpec) -> Config {
-    let v = json!({
-        "hidden_size": s.hidden,
-        "intermediate_size": s.intermediate,
-        "num_hidden_layers": s.layers,
-        "num_attention_heads": s.q_heads,
-        "num_key_value_heads": s.kv_heads,
-        "head_dim": s.head_dim,
-        "vocab_size": s.vocab,
-        "rope_theta": 500000.0,
-        "eos_token_id": [0],
-        "tie_word_embeddings": false,
-    });
-    Config::parse(&v, false).unwrap()
+    Config::parse(&s.config_json(), false).unwrap()
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.bandwidth {
-        return probes::run("bandwidth");
+        return flint_bench::probes::run("bandwidth");
     }
     if args.gemv_probe {
-        return probes::run("gemv");
+        return flint_bench::probes::run("gemv");
     }
     if args.cpu_probe {
-        return probes::run("cpu");
+        return flint_bench::probes::run("cpu");
     }
     if args.gemm_probe {
-        return probes::run("gemm");
+        return flint_bench::probes::run("gemm");
     }
     if args.caps_probe {
-        return probes::run("caps");
+        return flint_bench::probes::run("caps");
     }
     if args.attn_probe {
-        return probes::run("attn");
+        return flint_bench::probes::run("attn");
     }
     if args.paged_probe {
-        return probes::run("paged");
+        return flint_bench::probes::run("paged");
     }
     let spec = BenchSpec {
         hidden: args.hidden,
@@ -126,9 +111,9 @@ fn main() -> Result<()> {
     let mut backend = Backend::new()?;
     eprintln!("[bench] adapter: {}", backend.adapter_name());
     let profiler = if args.profile {
-        let p = std::rc::Rc::new(std::cell::RefCell::new(
-            flint_profiler::GpuProfiler::new(backend.device())?,
-        ));
+        let p = std::rc::Rc::new(std::cell::RefCell::new(flint_profiler::GpuProfiler::new(
+            backend.device(),
+        )?));
         backend.attach_profiler(p.clone());
         Some(p)
     } else {

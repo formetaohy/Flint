@@ -2,7 +2,8 @@ use flint_error::Result;
 use flint_gpu::CoopVariant;
 use flint_tensor::{DType, Weight};
 
-use crate::{Backend, Binding, Commands, shader};
+use crate::{Backend, Binding, Commands};
+use flint_kernel::shader;
 
 impl Backend {
     fn ensure_gemm_partial(&mut self, words: u32) {
@@ -213,10 +214,7 @@ impl Backend {
         acc: bool,
     ) -> Result<()> {
         let (n, k, wb, dtype) = Self::weight_io(w);
-        assert!(
-            k.is_multiple_of(32),
-            "gemv K {k} is not a multiple of 32"
-        );
+        assert!(k.is_multiple_of(32), "gemv K {k} is not a multiple of 32");
         let base = n.div_ceil(64);
         let segs: u32 = if base >= 96 {
             1

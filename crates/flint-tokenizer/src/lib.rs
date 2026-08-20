@@ -7,7 +7,7 @@ use flint_error::{Error, Result};
 
 mod gguf;
 
-pub use gguf::{from_metadata, from_source, load_gguf};
+pub use gguf::{from_metadata, from_source, load};
 pub struct Tokenizer {
     inner: HfTokenizer,
 }
