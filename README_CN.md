@@ -23,7 +23,7 @@ Flint 是用纯 Rust 编写、基于 [WGPU](https://github.com/gfx-rs/wgpu) 的�
 
 - **跨平台** —— 一次编写，随处运行。
 - **高性能** —— 高度优化的的推理核心。
-- **多格式** —— 支持 `safetensors` 和 `GGUF` 格式。
+- **API 服务器** —— 以 OpenAI（chat completions / responses）、Anthropic messages、Gemini API 方式对外提供模型服务
 
 ## 支持的架构
 
