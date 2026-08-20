@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use flint_checkpoint::{Checkpoint, CheckpointKind, GgufWriter, MetaVal, Metadata, RawTensor};
+use flint_checkpoint::{Checkpoint, GgufWriter, MetaVal, Metadata, RawTensor};
 
 use flint_tokenizer::{from_metadata, from_source, load};
 
@@ -192,22 +192,14 @@ impl Checkpoint for NoTokenizer {
     fn metadata(&self) -> flint_error::Result<&Metadata> {
         Ok(&self.meta)
     }
-    fn config_json(&self) -> flint_error::Result<serde_json::Value> {
-        Err(flint_error::Error::Checkpoint(
-            "NoTokenizer has no config.json".into(),
-        ))
-    }
-    fn kind(&self) -> CheckpointKind {
-        CheckpointKind::Safetensors
-    }
 }
 
 #[test]
-fn from_source_rejects_non_gguf_checkpoints() {
+fn from_source_rejects_checkpoints_without_tokenizer_metadata() {
     let err = from_source(&NoTokenizer::new())
         .err()
-        .expect("safetensors carries no tokenizer metadata");
-    assert!(err.to_string().contains("tokenizer metadata"), "{err}");
+        .expect("empty metadata carries no tokenizer");
+    assert!(err.to_string().contains("tokenizer.ggml.tokens"), "{err}");
 }
 
 fn gguf_dir() -> std::path::PathBuf {
@@ -257,7 +249,7 @@ fn load_prefers_tokenizer_json_over_gguf_metadata() {
     .unwrap();
 
     let source = flint_checkpoint::open_checkpoint(&dir).unwrap();
-    let tok = load(Path::new(&dir), source.as_ref()).unwrap();
+    let tok = load(Path::new(&dir), &source).unwrap();
     assert_eq!(
         tok.encode("ab").unwrap(),
         vec![0, 1],
@@ -270,7 +262,7 @@ fn load_prefers_tokenizer_json_over_gguf_metadata() {
 fn load_falls_back_to_gguf_without_tokenizer_json() {
     let dir = gguf_dir();
     let source = flint_checkpoint::open_checkpoint(&dir).unwrap();
-    let tok = load(Path::new(&dir), source.as_ref()).unwrap();
+    let tok = load(Path::new(&dir), &source).unwrap();
     assert_eq!(tok.encode("ab").unwrap(), vec![2], "GGUF metadata path");
     std::fs::remove_dir_all(&dir).ok();
 }

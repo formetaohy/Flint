@@ -112,35 +112,6 @@ pub fn mul(a: &[f32], b: &[f32], n: usize, m: usize) -> Vec<f32> {
     (0..n).map(|i| a[i] * b[i % m]).collect()
 }
 
-pub fn expert_gather(x: &[f32], ids: &[u32], rows: usize, hidden: usize) -> Vec<f32> {
-    let mut out = vec![0f32; rows * hidden];
-    for (r, &id) in ids.iter().enumerate() {
-        out[r * hidden..(r + 1) * hidden]
-            .copy_from_slice(&x[id as usize * hidden..(id as usize + 1) * hidden]);
-    }
-    out
-}
-
-pub fn expert_scatter(acc: &mut [f32], src: &[f32], ids: &[u32], weights: &[f32], hidden: usize) {
-    for (i, &id) in ids.iter().enumerate() {
-        let w = weights[i];
-        for c in 0..hidden {
-            acc[id as usize * hidden + c] += w * src[i * hidden + c];
-        }
-    }
-}
-
-pub fn zero_rows(x: &mut [f32], n: usize) {
-    x[..n].fill(0.0);
-}
-
-pub fn sigmoid_mul(a: &[f32], b: &[f32]) -> Vec<f32> {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| x * (1.0 / (1.0 + (-y).exp())))
-        .collect()
-}
-
 pub fn concat(a: &[f32], b: &[f32], rows: usize, d: usize) -> Vec<f32> {
     let mut out = vec![0f32; rows * 2 * d];
     for r in 0..rows {
@@ -148,21 +119,6 @@ pub fn concat(a: &[f32], b: &[f32], rows: usize, d: usize) -> Vec<f32> {
         out[r * 2 * d + d..(r + 1) * 2 * d].copy_from_slice(&b[r * d..(r + 1) * d]);
     }
     out
-}
-
-pub fn split_qg(x: &[f32], rows: usize, heads: usize, hd: usize) -> (Vec<f32>, Vec<f32>) {
-    let mut q = vec![0f32; rows * heads * hd];
-    let mut g = vec![0f32; rows * heads * hd];
-    for m in 0..rows {
-        for h in 0..heads {
-            for d in 0..hd {
-                let base = (m * heads + h) * 2 * hd;
-                q[(m * heads + h) * hd + d] = x[base + d];
-                g[(m * heads + h) * hd + d] = x[base + hd + d];
-            }
-        }
-    }
-    (q, g)
 }
 
 pub struct RopeArgs {
@@ -265,112 +221,6 @@ pub fn attn(q: &[f32], k_cache: &[f32], v_cache: &[f32], spec: AttnArgs) -> Vec<
                 }
                 out[(mi * nq + h) * hd + d] = o;
             }
-        }
-    }
-    out
-}
-
-pub fn conv1d(x: &[f32], w: &[f32], state: &mut [f32]) -> Vec<f32> {
-    let dim = x.len();
-    let mut out = vec![0f32; dim];
-    for c in 0..dim {
-        out[c] = silu(
-            w[c * 4] * state[c * 3]
-                + w[c * 4 + 1] * state[c * 3 + 1]
-                + w[c * 4 + 2] * state[c * 3 + 2]
-                + w[c * 4 + 3] * x[c],
-        );
-        state[c * 3] = state[c * 3 + 1];
-        state[c * 3 + 1] = state[c * 3 + 2];
-        state[c * 3 + 2] = x[c];
-    }
-    out
-}
-
-pub fn repeat_qk(
-    x: &[f32],
-    out: &mut [f32],
-    rows: usize,
-    n_k: usize,
-    n_v: usize,
-    kd: usize,
-    vd: usize,
-) {
-    let ratio = n_v / n_k;
-    let conv_dim = 2 * n_k * kd + n_v * vd;
-    let out_dim = 2 * n_v * kd;
-    for r in 0..rows {
-        for seg in 0..2 {
-            for h in 0..n_v {
-                for d in 0..kd {
-                    out[r * out_dim + seg * n_v * kd + h * kd + d] =
-                        x[r * conv_dim + seg * n_k * kd + (h / ratio) * kd + d];
-                }
-            }
-        }
-    }
-}
-
-pub fn delta_gate(b: &[f32], a: &[f32], a_log: &[f32], dt_bias: &[f32]) -> (Vec<f32>, Vec<f32>) {
-    let heads = b.len();
-    let mut beta = vec![0f32; heads];
-    let mut g = vec![0f32; heads];
-    for h in 0..heads {
-        beta[h] = 1.0 / (1.0 + (-b[h]).exp());
-        g[h] = -a_log[h].exp() * (1.0 + (a[h] + dt_bias[h]).exp()).ln();
-    }
-    (beta, g)
-}
-
-pub struct DeltaRecurArgs {
-    pub heads: usize,
-    pub kd: usize,
-    pub vd: usize,
-}
-
-pub fn delta_recur(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    beta: &[f32],
-    g: &[f32],
-    state: &mut [f32],
-    spec: DeltaRecurArgs,
-) -> Vec<f32> {
-    let (heads, kd, vd) = (spec.heads, spec.kd, spec.vd);
-    let l2norm = |row: &[f32]| -> Vec<f32> {
-        let inv = (row.iter().map(|w| w * w).sum::<f32>() + 1e-6)
-            .sqrt()
-            .recip();
-        row.iter().map(|w| w * inv).collect()
-    };
-    let scale = (kd as f32).sqrt().recip();
-    let mut out = vec![0f32; heads * vd];
-    for h in 0..heads {
-        let qq: Vec<f32> = l2norm(&q[h * kd..(h + 1) * kd])
-            .iter()
-            .map(|x| x * scale)
-            .collect();
-        let kk = l2norm(&k[h * kd..(h + 1) * kd]);
-        let decay = g[h].exp();
-        let bt = beta[h];
-        let base = h * kd * vd;
-        for e in 0..kd * vd {
-            state[base + e] *= decay;
-        }
-        let kv_mem: Vec<f32> = (0..vd)
-            .map(|vi| (0..kd).map(|ki| state[base + ki * vd + vi] * kk[ki]).sum())
-            .collect();
-        let delta: Vec<f32> = (0..vd)
-            .map(|vi| (v[h * vd + vi] - kv_mem[vi]) * bt)
-            .collect();
-        for ki in 0..kd {
-            for vi in 0..vd {
-                state[base + ki * vd + vi] += kk[ki] * delta[vi];
-            }
-        }
-        for vi in 0..vd {
-            out[h * vd + vi] = (0..kd).map(|ki| state[base + ki * vd + vi] * qq[ki]).sum();
         }
     }
     out

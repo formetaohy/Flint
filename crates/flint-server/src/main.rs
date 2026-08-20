@@ -2,10 +2,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use flint_error::Result;
-use flint_hub::assets::{self, Format};
-use flint_hub::hub::Hub;
+use flint_fetch::{Repo, fetch};
 
-use flint_server::hub::Hub as EngineHub;
+use flint_server::hub::Hub;
 use flint_server::server::{ServerConfig, serve};
 
 #[derive(Parser)]
@@ -18,8 +17,6 @@ struct Args {
     #[arg(long)]
     model: Option<String>,
 
-    #[arg(long, value_enum, default_value_t = Format::Gguf)]
-    format: Format,
 
     #[arg(long)]
     dir: Option<PathBuf>,
@@ -52,7 +49,7 @@ fn main() -> Result<()> {
     let dir = match (&args.model, &args.dir) {
         (Some(model), None) => {
             let dir = PathBuf::from("temp").join(model.replace('/', "--"));
-            assets::ensure(&Hub::new(model), args.format, &dir)?;
+            fetch(&Repo::new(model), &dir)?;
             dir
         }
         (None, Some(dir)) => dir.clone(),
@@ -92,7 +89,7 @@ fn main() -> Result<()> {
         chat_model.stop,
         args.speculate,
     );
-    let hub = EngineHub::new(
+    let hub = Hub::new(
         engine,
         chat_model.chat,
         chat_model.tokenizer,

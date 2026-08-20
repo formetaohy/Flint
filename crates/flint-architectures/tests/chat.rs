@@ -1,4 +1,4 @@
-use flint_architectures::chat::{ChatFormat, ChatMl, ChatMlThink, GemmaChat, Llama3Chat};
+use flint_architectures::chat::{ChatFormat, ChatMl, GemmaChat, Llama3Chat};
 
 fn im(start: bool) -> String {
     format!("<|im_{}|>", if start { "start" } else { "end" })
@@ -33,15 +33,6 @@ fn chatml_interleaves_history() {
         im(true),
     );
     assert_eq!(got, want);
-}
-
-#[test]
-fn chatml_think_opens_an_empty_think_block() {
-    let plain = ChatMl.render("s", &[], "u");
-    let think = ChatMlThink.render("s", &[], "u");
-    let block = "<think>\n\n</think>\n\n".to_string();
-    assert!(!plain.contains(&block), "plain ChatML has no think block");
-    assert!(think.ends_with(&format!("{}assistant\n{block}", im(true))));
 }
 
 #[test]
@@ -99,6 +90,5 @@ fn gemma_appends_history_as_user_model_pairs() {
 #[test]
 fn stop_literals_per_family() {
     assert_eq!(ChatMl.stop_literals(), &["im_end"]);
-    assert_eq!(ChatMlThink.stop_literals(), &["im_end"]);
     assert_eq!(GemmaChat.stop_literals(), &["<end_of_turn>"]);
 }

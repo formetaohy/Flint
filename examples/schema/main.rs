@@ -4,8 +4,7 @@ use clap::Parser;
 use flint_error::{Error, Result};
 use flint_examples::engine;
 use flint_generate::Grammar;
-use flint_hub::assets::{self, Format};
-use flint_hub::hub::Hub;
+use flint_fetch::{Repo, fetch};
 
 #[derive(Parser)]
 #[command(
@@ -23,9 +22,6 @@ struct Args {
     #[arg(long)]
     schema: PathBuf,
 
-    #[arg(long, value_enum, default_value_t = Format::Gguf)]
-    format: Format,
-
     #[arg(long, default_value_t = 8192)]
     max_tokens: usize,
 
@@ -37,7 +33,7 @@ fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
     let dir = PathBuf::from("temp").join(args.model.replace('/', "--"));
-    assets::ensure(&Hub::new(&args.model), args.format, &dir)?;
+    fetch(&Repo::new(&args.model), &dir)?;
     let text = std::fs::read_to_string(&args.schema)
         .map_err(|e| Error::Config(format!("read {}: {e}", args.schema.display())))?;
     let schema = serde_json::from_str(&text)

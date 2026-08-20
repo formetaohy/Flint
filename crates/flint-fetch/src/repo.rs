@@ -11,13 +11,13 @@ pub struct FileEntry {
     pub size: u64,
 }
 
-pub struct Hub {
+pub struct Repo {
     endpoint: String,
-    repo: String,
+    name: String,
 }
 
-impl Hub {
-    pub fn new(repo: &str) -> Self {
+impl Repo {
+    pub fn new(name: &str) -> Self {
         let endpoint = std::env::var("HF_ENDPOINT")
             .ok()
             .filter(|s| !s.is_empty())
@@ -26,14 +26,14 @@ impl Hub {
             .to_string();
         Self {
             endpoint,
-            repo: repo.to_string(),
+            name: name.to_string(),
         }
     }
 
     pub fn files(&self) -> Result<Vec<FileEntry>> {
         let url = format!(
             "{}/api/models/{}/tree/main?recursive=true",
-            self.endpoint, self.repo
+            self.endpoint, self.name
         );
         let resp = ureq::get(&url)
             .call()
@@ -55,7 +55,7 @@ impl Hub {
     }
 
     pub fn download(&self, path: &str, dest: &Path) -> Result<u64> {
-        let url = format!("{}/{}/resolve/main/{path}", self.endpoint, self.repo);
+        let url = format!("{}/{}/resolve/main/{path}", self.endpoint, self.name);
         eprintln!("[hf] downloading {url}");
         let resp = ureq::get(&url)
             .call()

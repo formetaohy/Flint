@@ -2,12 +2,12 @@ use flint_backend::Backend;
 use flint_error::Result;
 use flint_model::MAX_M;
 use flint_model::loader::{Plan, Role, WeightSet};
-use flint_model::ops::{self, MlpTiles, MoeTiles};
+use flint_model::ops::MlpTiles;
 use flint_model::rows;
-use flint_model::weights::{MlpBlock, take_mlp, take_moe};
+use flint_model::weights::{SwigluMlp, take_mlp};
 use flint_tensor::{DType, Tensor, Weight};
 
-use crate::keymap::{gguf_key, hf_key};
+use crate::keymap::gguf_key;
 use crate::transformer::config::Config;
 
 pub fn role(key: &str) -> Role {
@@ -23,9 +23,9 @@ pub fn role(key: &str) -> Role {
     }
 }
 
-pub fn plan(gguf: bool) -> Plan {
+pub fn plan() -> Plan {
     Plan {
-        key: if gguf { gguf_key } else { hf_key },
+        key: gguf_key,
         role,
     }
 }
@@ -44,7 +44,7 @@ pub(crate) struct LayerW {
     pub(crate) q_norm: Option<Tensor>,
     pub(crate) k_norm: Option<Tensor>,
     pub(crate) post_attn_norm: Option<Tensor>,
-    pub(crate) mlp: MlpBlock,
+    pub(crate) mlp: SwigluMlp,
     pub(crate) post_ffn_norm: Option<Tensor>,
     pub(crate) per_layer_gate: Option<Weight>,
     pub(crate) per_layer_proj: Option<Weight>,
@@ -96,33 +96,10 @@ pub(crate) fn take_layer(
     } else {
         (None, None)
     };
-    let mlp = match cfg.moe {
-        Some(moe) => MlpBlock::Moe(Box::new(take_moe(
-            w,
-            &format!("layers.{l}"),
-            moe.experts,
-            moe.top_k,
-            moe.shared_scale,
-            cfg.layernorm,
-        )?)),
-        None => MlpBlock::Dense(Box::new(take_mlp(
-            w,
-            &format!("layers.{l}"),
-            cfg.layernorm,
-            cfg.hf_names,
-        )?)),
-    };
+    let mlp = take_mlp(w, &format!("layers.{l}"), cfg.layernorm)?;
     let per_layer = cfg.has_ple();
-    let post_attn_key = if cfg.hf_names {
-        "post_attention_layernorm.weight"
-    } else {
-        "post_attention_norm.weight"
-    };
-    let post_ffn_key = if cfg.hf_names {
-        "post_feedforward_layernorm.weight"
-    } else {
-        "post_ffw_norm.weight"
-    };
+    let post_attn_key = "post_attention_norm.weight";
+    let post_ffn_key = "post_ffw_norm.weight";
     Ok(LayerW {
         attn_norm: w.take_tensor(&k("input_layernorm.weight"))?,
         attn_norm_bias: take_optional(w, cfg.layernorm, &k("input_layernorm.bias"))?,
@@ -171,7 +148,6 @@ pub(crate) struct Scratch {
 
     pub(crate) mlp: MlpTiles,
 
-    pub(crate) moe: Option<MoeTiles>,
     pub(crate) logits: Tensor,
 
     pub(crate) per_layer_tok: Option<Tensor>,
@@ -184,18 +160,6 @@ pub(crate) struct Scratch {
 
 pub(crate) fn alloc_scratch(cfg: &Config, backend: &Backend) -> Scratch {
     let mlp_w = cfg.max_mlp_width();
-    let moe = cfg.moe.map(|m| {
-        ops::MoeTiles::new(
-            &ops::MoeTilesConfig {
-                experts: m.experts,
-                rows: MAX_M,
-                top_k: m.top_k,
-                hidden: cfg.hidden,
-                intermediate: cfg.intermediate,
-            },
-            backend,
-        )
-    });
     let per_layer_dim = cfg.per_layer.map(|p| p.dim * cfg.layers);
     let alloc = |shape: &[u32]| per_layer_dim.map(|_| backend.zero_tensor(shape, DType::F32));
     Scratch {
@@ -210,7 +174,6 @@ pub(crate) fn alloc_scratch(cfg: &Config, backend: &Backend) -> Scratch {
             act: backend.zero_tensor(&[MAX_M, mlp_w], DType::F32),
             down_out: backend.zero_tensor(&[MAX_M, cfg.hidden], DType::F32),
         },
-        moe,
         logits: backend.zero_tensor(&[MAX_M, cfg.vocab], DType::F32),
         per_layer_tok: alloc(&[MAX_M, per_layer_dim.unwrap_or(0)]),
         per_layer_ctx: alloc(&[MAX_M, per_layer_dim.unwrap_or(0)]),

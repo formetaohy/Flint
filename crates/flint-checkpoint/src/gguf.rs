@@ -8,7 +8,7 @@ use flint_error::{Error, Result};
 use flint_num::{f32_to_bf16, f32_to_f16};
 
 use super::dequant::{self, GgmlType};
-use super::{Checkpoint, CheckpointKind, MetaVal, Metadata, RawTensor, TensorData};
+use super::{Checkpoint, MetaVal, Metadata, RawTensor, TensorData};
 
 const MAGIC: u32 = 0x4655_4747;
 
@@ -247,14 +247,6 @@ impl Checkpoint for Gguf {
 
     fn metadata(&self) -> Result<&Metadata> {
         Ok(&self.meta)
-    }
-
-    fn config_json(&self) -> Result<serde_json::Value> {
-        Err(Error::Checkpoint("GGUF has no config.json".into()))
-    }
-
-    fn kind(&self) -> CheckpointKind {
-        CheckpointKind::Gguf
     }
 }
 

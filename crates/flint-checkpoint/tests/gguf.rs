@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use flint_checkpoint::{Checkpoint, CheckpointKind, Gguf, MetaVal};
+use flint_checkpoint::{Checkpoint, Gguf, MetaVal};
 
 fn w_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -115,9 +115,6 @@ fn reads_metadata_and_tensors() {
     let path = write_synth("main", "m.gguf");
     let gguf = Gguf::open(&path).unwrap();
 
-    assert_eq!(gguf.kind(), CheckpointKind::Gguf);
-    assert!(gguf.config_json().is_err());
-
     let meta = gguf.metadata().unwrap();
     assert_eq!(meta.str("general.architecture"), Some("llama"));
     assert_eq!(meta.u32("llama.block_count"), Some(24));
@@ -173,9 +170,10 @@ fn rejects_bad_magic_and_truncation() {
 fn open_dispatches_on_directory_contents() {
     let dir = tmp_dir("open");
     std::fs::write(dir.join("m.gguf"), synth_gguf()).unwrap();
+    let gguf = flint_checkpoint::open_checkpoint(&dir).unwrap();
     assert_eq!(
-        flint_checkpoint::open_checkpoint(&dir).unwrap().kind(),
-        CheckpointKind::Gguf
+        gguf.metadata().unwrap().str("general.architecture"),
+        Some("llama")
     );
 
     std::fs::write(dir.join("m-00001.gguf"), synth_gguf()).unwrap();
@@ -186,7 +184,10 @@ fn open_dispatches_on_directory_contents() {
     std::fs::remove_dir_all(&dir).ok();
 
     let empty = tmp_dir("empty");
-    assert!(flint_checkpoint::open_checkpoint(&empty).is_err());
+    assert!(
+        err_str(flint_checkpoint::open_checkpoint(&empty)).contains("no .gguf"),
+        "a directory without GGUF files must fail"
+    );
     std::fs::remove_dir_all(&empty).ok();
 
     assert!(flint_checkpoint::open_checkpoint(Path::new("./no-such-dir-flint")).is_err());
@@ -310,7 +311,6 @@ fn writer_roundtrips_through_reader() {
     std::fs::write(dir.join("m.gguf"), w.finish()).unwrap();
 
     let g = Gguf::open(&dir.join("m.gguf")).unwrap();
-    assert_eq!(g.kind(), CheckpointKind::Gguf);
     assert_eq!(
         g.metadata().unwrap().str("general.architecture"),
         Some("llama")

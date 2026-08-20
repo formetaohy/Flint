@@ -1,5 +1,5 @@
 use flint_backend::Backend;
-use flint_checkpoint::{Checkpoint, CheckpointKind};
+use flint_checkpoint::Checkpoint;
 use flint_error::Result;
 use serde_json::Value;
 
@@ -42,7 +42,7 @@ pub fn load(
     Model::load(
         source,
         cfg,
-        &plan(source.kind() == CheckpointKind::Gguf),
+        &plan(),
         arena,
         spec_depth,
         backend,

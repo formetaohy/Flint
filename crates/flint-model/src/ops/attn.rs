@@ -80,38 +80,6 @@ pub fn kv_store(
     )
 }
 
-pub struct RepeatQkSpec {
-    pub rows: u32,
-    pub n_k: u32,
-    pub n_v: u32,
-    pub key_dim: u32,
-    pub val_dim: u32,
-}
-
-pub fn repeat_qk(
-    backend: &mut Backend,
-    commands: &mut Commands<'_>,
-    x: Binding<'_>,
-    y: Binding<'_>,
-    spec: &RepeatQkSpec,
-) -> Result<()> {
-    let conv_dim = 2 * spec.n_k * spec.key_dim + spec.n_v * spec.val_dim;
-    backend.dispatch(
-        commands,
-        shader::REPEAT_QK,
-        &[
-            ("ROWS", spec.rows as f64),
-            ("N_K", spec.n_k as f64),
-            ("N_V", spec.n_v as f64),
-            ("K_DIM", spec.key_dim as f64),
-            ("RATIO", (spec.n_v / spec.n_k) as f64),
-            ("CONV_DIM", conv_dim as f64),
-        ],
-        &[x, y],
-        [spec.rows, 1, 1],
-    )
-}
-
 pub fn check_head_dim(head_dim: u32) -> Result<()> {
     if !(64..=512).contains(&head_dim) {
         return Err(flint_error::Error::Config(format!(

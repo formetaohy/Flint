@@ -20,7 +20,7 @@ use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tokenizers::tokenizer::AddedToken;
 use tokenizers::tokenizer::SplitDelimiterBehavior;
 
-use flint_checkpoint::{Checkpoint, CheckpointKind, Metadata};
+use flint_checkpoint::{Checkpoint, Metadata};
 use flint_error::{Error, Result};
 
 use crate::Tokenizer;
@@ -34,11 +34,6 @@ pub fn load(model_dir: &Path, source: &dyn Checkpoint) -> Result<Tokenizer> {
 }
 
 pub fn from_source(source: &dyn Checkpoint) -> Result<Tokenizer> {
-    if source.kind() != CheckpointKind::Gguf {
-        return Err(Error::Tokenizer(
-            "checkpoint carries no tokenizer metadata".into(),
-        ));
-    }
     from_metadata(source.metadata()?)
 }
 

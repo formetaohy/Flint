@@ -71,7 +71,3 @@ pub trait Speculator {
 
     fn restore(&mut self, backend: &Backend, seq: u32);
 }
-
-pub trait TextEmbedder {
-    fn embed(&mut self, backend: &mut Backend, tokens: &[u32]) -> Result<Vec<f32>>;
-}

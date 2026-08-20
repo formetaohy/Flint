@@ -93,23 +93,6 @@ pub fn row_mul(
     )
 }
 
-pub fn sigmoid_mul(
-    backend: &mut Backend,
-    commands: &mut Commands<'_>,
-    a: Binding<'_>,
-    b: Binding<'_>,
-    y: Binding<'_>,
-    n_elem: u32,
-) -> Result<()> {
-    backend.dispatch(
-        commands,
-        shader::SIGMOID_MUL,
-        &[("N_ELEM", n_elem as f64)],
-        &[a, b, y],
-        [n_elem.div_ceil(256), 1, 1],
-    )
-}
-
 pub fn concat(
     backend: &mut Backend,
     commands: &mut Commands<'_>,

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use flint_checkpoint::{Checkpoint, CheckpointKind, Metadata, RawTensor, TensorData};
+use flint_checkpoint::{Checkpoint, Metadata, RawTensor, TensorData};
 use flint_error::Result;
 
 #[derive(Clone, Copy, Debug)]
@@ -44,33 +44,27 @@ impl BenchSpec {
 
 fn tensors(s: &BenchSpec) -> Vec<(String, Vec<u32>)> {
     let mut v = vec![
-        ("model.embed_tokens.weight".into(), vec![s.vocab, s.hidden]),
-        ("lm_head.weight".into(), vec![s.vocab, s.hidden]),
-        ("model.norm.weight".into(), vec![s.hidden]),
+        ("token_embd.weight".into(), vec![s.vocab, s.hidden]),
+        ("output.weight".into(), vec![s.vocab, s.hidden]),
+        ("output_norm.weight".into(), vec![s.hidden]),
     ];
     for l in 0..s.layers {
-        let p = format!("model.layers.{l}");
-        v.push((format!("{p}.input_layernorm.weight"), vec![s.hidden]));
-        v.push((
-            format!("{p}.post_attention_layernorm.weight"),
-            vec![s.hidden],
-        ));
+        let p = format!("blk.{l}");
+        v.push((format!("{p}.attn_norm.weight"), vec![s.hidden]));
+        v.push((format!("{p}.ffn_norm.weight"), vec![s.hidden]));
         let qk = s.q_heads * s.head_dim;
         let vk = s.kv_heads * s.head_dim;
-        v.push((format!("{p}.self_attn.q_proj.weight"), vec![qk, s.hidden]));
-        v.push((format!("{p}.self_attn.k_proj.weight"), vec![vk, s.hidden]));
-        v.push((format!("{p}.self_attn.v_proj.weight"), vec![vk, s.hidden]));
-        v.push((format!("{p}.self_attn.o_proj.weight"), vec![s.hidden, qk]));
+        v.push((format!("{p}.attn_q.weight"), vec![qk, s.hidden]));
+        v.push((format!("{p}.attn_k.weight"), vec![vk, s.hidden]));
+        v.push((format!("{p}.attn_v.weight"), vec![vk, s.hidden]));
+        v.push((format!("{p}.attn_output.weight"), vec![s.hidden, qk]));
         v.push((
-            format!("{p}.mlp.gate_proj.weight"),
+            format!("{p}.ffn_gate.weight"),
             vec![s.intermediate, s.hidden],
         ));
+        v.push((format!("{p}.ffn_up.weight"), vec![s.intermediate, s.hidden]));
         v.push((
-            format!("{p}.mlp.up_proj.weight"),
-            vec![s.intermediate, s.hidden],
-        ));
-        v.push((
-            format!("{p}.mlp.down_proj.weight"),
+            format!("{p}.ffn_down.weight"),
             vec![s.hidden, s.intermediate],
         ));
     }
@@ -103,6 +97,7 @@ pub struct SynthCheckpoint {
     hidden: u32,
 
     index: HashMap<String, (Vec<u32>, u64)>,
+    meta: Metadata,
 }
 
 impl SynthCheckpoint {
@@ -114,9 +109,15 @@ impl SynthCheckpoint {
                 (name, (shape, seed))
             })
             .collect();
+        let mut kv = HashMap::new();
+        kv.insert(
+            "general.architecture".to_string(),
+            flint_checkpoint::MetaVal::Str("llama".into()),
+        );
         Self {
             hidden: spec.hidden,
             index,
+            meta: Metadata::new(kv),
         }
     }
 }
@@ -134,7 +135,10 @@ impl Checkpoint for SynthCheckpoint {
         let n = shape.iter().map(|d| *d as usize).product();
         let mut data = vec![0f32; n];
 
-        let gain = if name.ends_with("_proj.weight") || name.ends_with("lm_head.weight") {
+        let gain = if name.ends_with(".weight")
+            && !name.contains("norm")
+            && name != "token_embd.weight"
+        {
             1.0 / (self.hidden as f32).sqrt()
         } else {
             1.0
@@ -147,17 +151,6 @@ impl Checkpoint for SynthCheckpoint {
     }
 
     fn metadata(&self) -> Result<&Metadata> {
-        static EMPTY: std::sync::LazyLock<Metadata> = std::sync::LazyLock::new(Metadata::default);
-        Ok(&EMPTY)
-    }
-
-    fn config_json(&self) -> Result<serde_json::Value> {
-        Err(flint_error::Error::Model(
-            "synthetic checkpoints carry no config.json".into(),
-        ))
-    }
-
-    fn kind(&self) -> CheckpointKind {
-        CheckpointKind::Safetensors
+        Ok(&self.meta)
     }
 }

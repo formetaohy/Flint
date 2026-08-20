@@ -1,7 +1,6 @@
 use flint_error::{Error, Result};
 use flint_model::config::{f64_field, u32_field, u32_list};
 use flint_model::ops::{Act, RopeScaling, check_gemm_dims, check_head_dim};
-use flint_model::routing::RouteKind;
 use serde_json::Value;
 
 #[derive(Clone, Debug)]
@@ -13,14 +12,6 @@ pub struct RopeSpec {
 
     pub partial: Option<u32>,
     pub scaling: Option<RopeScaling>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct MoeConfig {
-    pub experts: u32,
-    pub top_k: u32,
-    pub shared_scale: f32,
-    pub kind: RouteKind,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,8 +42,6 @@ pub struct Config {
 
     pub sandwich: bool,
 
-    pub hf_names: bool,
-
     pub windows: Vec<u32>,
 
     pub norm_eps: f32,
@@ -73,8 +62,6 @@ pub struct Config {
     pub attn_scale: Option<f32>,
 
     pub softcap: Option<f32>,
-
-    pub moe: Option<MoeConfig>,
 
     pub per_layer: Option<PerLayerConfig>,
 }
@@ -129,7 +116,6 @@ impl Config {
             qk_norm: false,
             v_norm: false,
             sandwich: false,
-            hf_names: false,
             windows: vec![0; layers as usize],
             norm_eps: 1e-6,
             layernorm: false,
@@ -147,7 +133,6 @@ impl Config {
             kv_shared: 0,
             attn_scale: None,
             softcap: None,
-            moe: None,
             per_layer: None,
         })
     }
@@ -169,17 +154,6 @@ impl Config {
         let max_hd = *t.head_dims.iter().max().expect("non-empty head_dims");
         for &hd in &t.head_dims {
             check_head_dim(hd)?;
-        }
-        if let Some(moe) = t.moe {
-            if !moe.experts.is_multiple_of(16) {
-                return Err(Error::Config(format!(
-                    "num_experts {} must be a multiple of 16 (gemm tiles)",
-                    moe.experts
-                )));
-            }
-            if moe.top_k == 0 || moe.top_k > moe.experts {
-                return Err(Error::Config("top_k outside [1, experts]".into()));
-            }
         }
         for r in &t.rope {
             if !r.dim.is_multiple_of(2) || r.freq_dim == 0 {

@@ -10,7 +10,7 @@ flint-architectures.workspace = true
 flint-backend.workspace = true
 flint-error.workspace = true
 flint-generate.workspace = true
-flint-hub.workspace = true
+flint-fetch.workspace = true
 flint-tokenizer.workspace = true
 clap.workspace = true
 env_logger.workspace = true
@@ -20,10 +20,6 @@ ureq.workspace = true
 [[example]]
 name = "chat"
 path = "chat/main.rs"
-
-[[example]]
-name = "embed"
-path = "embed/main.rs"
 
 [[example]]
 name = "schema"

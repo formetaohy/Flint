@@ -3,9 +3,8 @@ pub mod loader;
 pub mod ops;
 pub mod pool;
 pub mod quant;
-pub mod routing;
 pub mod rows;
 pub mod traits;
 pub mod weights;
 
-pub use traits::{ChunkOut, LanguageModel, MAX_M, SeqChunk, Speculator, TextEmbedder};
+pub use traits::{ChunkOut, LanguageModel, MAX_M, SeqChunk, Speculator};

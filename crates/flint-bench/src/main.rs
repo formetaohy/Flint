@@ -124,7 +124,7 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let source = SynthCheckpoint::new(spec);
     let cfg = config(&spec);
-    let plan = plan(false);
+    let plan = plan();
     let mut backend = backend;
     let arena = flint_model::pool::ArenaSpec {
         seq_lens: vec![args.max_seq],

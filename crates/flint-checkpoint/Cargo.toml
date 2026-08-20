@@ -8,6 +8,5 @@ license.workspace = true
 flint-error.workspace = true
 flint-num.workspace = true
 memmap2.workspace = true
-safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true

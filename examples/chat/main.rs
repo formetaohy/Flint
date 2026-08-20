@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use flint_error::Result;
 use flint_examples::engine;
-use flint_hub::assets::{self, Format};
-use flint_hub::hub::Hub;
+use flint_fetch::{Repo, fetch};
 
 #[derive(Parser)]
 #[command(
@@ -19,9 +18,6 @@ struct Args {
     #[arg(long)]
     prompt: String,
 
-    #[arg(long, value_enum, default_value_t = Format::Gguf)]
-    format: Format,
-
     #[arg(long, default_value_t = 8192)]
     max_tokens: usize,
 
@@ -33,7 +29,7 @@ fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
     let dir = PathBuf::from("temp").join(args.model.replace('/', "--"));
-    assets::ensure(&Hub::new(&args.model), args.format, &dir)?;
+    fetch(&Repo::new(&args.model), &dir)?;
     let (mut engine, id) = engine::spawn(
         &dir,
         SYSTEM,

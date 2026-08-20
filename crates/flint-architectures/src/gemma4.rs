@@ -1,5 +1,5 @@
 use flint_backend::Backend;
-use flint_checkpoint::{Checkpoint, CheckpointKind};
+use flint_checkpoint::Checkpoint;
 use flint_error::{Error, Result};
 use flint_model::ops::Act;
 use serde_json::{Value, json};
@@ -145,12 +145,11 @@ pub fn load(
     spec_depth: Option<u32>,
     backend: &Backend,
 ) -> Result<Model> {
-    let mut cfg = parse_config(v)?;
-    cfg.hf_names = source.kind() == CheckpointKind::Safetensors;
+    let cfg = parse_config(v)?;
     Model::load(
         source,
         cfg,
-        &plan(source.kind() == CheckpointKind::Gguf),
+        &plan(),
         arena,
         spec_depth,
         backend,

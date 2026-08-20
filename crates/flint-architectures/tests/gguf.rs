@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use flint_architectures::keymap::gguf_key;
-use flint_checkpoint::{Checkpoint, CheckpointKind, MetaVal, Metadata, RawTensor};
+use flint_checkpoint::{Checkpoint, MetaVal, Metadata, RawTensor};
 use serde_json::json;
 
 #[test]
@@ -101,14 +101,6 @@ impl Checkpoint for FakeSource {
     fn metadata(&self) -> flint_error::Result<&Metadata> {
         Ok(&self.meta)
     }
-    fn config_json(&self) -> flint_error::Result<serde_json::Value> {
-        Err(flint_error::Error::Checkpoint(
-            "fake GGUF source has no config.json".into(),
-        ))
-    }
-    fn kind(&self) -> CheckpointKind {
-        CheckpointKind::Gguf
-    }
 }
 
 fn arr_str(items: &[&str]) -> MetaVal {
@@ -206,10 +198,5 @@ fn synthesis_fails_fast() {
         flint_architectures::gguf::synthesize_config(&src, flint_architectures::Family::Llama)
             .is_err(),
         "missing embedding_length"
-    );
-    assert!(
-        flint_architectures::gguf::synthesize_config(&src, flint_architectures::Family::Qwen35)
-            .is_err(),
-        "Qwen3.5 has no GGUF form"
     );
 }

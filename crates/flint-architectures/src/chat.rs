@@ -6,19 +6,19 @@ pub trait ChatFormat: Send + Sync {
 
 pub struct ChatMl;
 
-pub struct ChatMlThink;
-
-pub struct GemmaChat;
-
-pub struct Phi3Chat;
-
-pub struct Phi4Chat;
-
-pub struct Gemma4Chat;
-
 impl ChatFormat for ChatMl {
     fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
-        render_chatml(false, system, history, user)
+        let mut out = String::new();
+        push_turn(&mut out, "system", system);
+        for (u, a) in history {
+            push_turn(&mut out, "user", u);
+            push_turn(&mut out, "assistant", a);
+        }
+        push_turn(&mut out, "user", user);
+        out.push_str(&im_marker(true));
+        out.push_str("assistant");
+        out.push('\n');
+        out
     }
     fn stop_literals(&self) -> &'static [&'static str] {
         &["im_end"]
@@ -111,25 +111,39 @@ impl ChatFormat for Llama2Chat {
     }
 }
 
-impl ChatFormat for ChatMlThink {
-    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
-        render_chatml(true, system, history, user)
-    }
-    fn stop_literals(&self) -> &'static [&'static str] {
-        &["im_end"]
-    }
-}
+pub struct GemmaChat;
 
 impl ChatFormat for GemmaChat {
     fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
-        render_gemma(system, history, user)
+        let mut out = String::new();
+        out.push_str("<bos>");
+        let first_user = if system.is_empty() {
+            user.to_string()
+        } else {
+            format!("{system}\n\n{user}")
+        };
+        out.push_str("<start_of_turn>user\n");
+        out.push_str(&first_user);
+        out.push_str("<end_of_turn>\n");
+        for (u, a) in history {
+            out.push_str("<start_of_turn>user\n");
+            out.push_str(u);
+            out.push_str("<end_of_turn>\n");
+            out.push_str("<start_of_turn>model\n");
+            out.push_str(a);
+            out.push_str("<end_of_turn>\n");
+        }
+        out.push_str("<start_of_turn>model\n");
+        out
     }
     fn stop_literals(&self) -> &'static [&'static str] {
         &["<end_of_turn>"]
     }
 }
 
-impl ChatFormat for Phi3Chat {
+pub struct Phi4Chat;
+
+impl ChatFormat for Phi4Chat {
     fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
         let mut out = String::new();
         push_phi_turn(&mut out, "system", system);
@@ -138,23 +152,6 @@ impl ChatFormat for Phi3Chat {
             push_phi_turn(&mut out, "assistant", a);
         }
         push_phi_turn(&mut out, "user", user);
-        out.push_str("<|assistant|>\n");
-        out
-    }
-    fn stop_literals(&self) -> &'static [&'static str] {
-        &["<|end|>"]
-    }
-}
-
-impl ChatFormat for Phi4Chat {
-    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
-        let mut out = String::new();
-        push_phi4_turn(&mut out, "system", system);
-        for (u, a) in history {
-            push_phi4_turn(&mut out, "user", u);
-            push_phi4_turn(&mut out, "assistant", a);
-        }
-        push_phi4_turn(&mut out, "user", user);
         out.push_str("<|assistant|>");
         out
     }
@@ -162,6 +159,8 @@ impl ChatFormat for Phi4Chat {
         &["<|end|>"]
     }
 }
+
+pub struct Gemma4Chat;
 
 impl ChatFormat for Gemma4Chat {
     fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
@@ -189,64 +188,11 @@ fn push_phi_turn(out: &mut String, role: &str, content: &str) {
     if content.is_empty() {
         return;
     }
-    out.push_str(&format!("<|{role}|>\n{content}<|end|>\n"));
-}
-
-fn push_phi4_turn(out: &mut String, role: &str, content: &str) {
-    if content.is_empty() {
-        return;
-    }
     out.push_str(&format!("<|{role}|>{content}<|end|>"));
 }
 
 fn push_gemma4_turn(out: &mut String, role: &str, content: &str) {
     out.push_str(&format!("<|turn>{role}\n{content}<turn|>\n"));
-}
-
-fn render_chatml(think: bool, system: &str, history: &[(String, String)], user: &str) -> String {
-    let mut out = String::new();
-    push_turn(&mut out, "system", system);
-    for (u, a) in history {
-        push_turn(&mut out, "user", u);
-        push_turn(&mut out, "assistant", a);
-    }
-    push_turn(&mut out, "user", user);
-
-    out.push_str(&im_marker(true));
-    out.push_str("assistant");
-    out.push('\n');
-    if think {
-        out.push_str(&think_marker(true));
-        out.push('\n');
-        out.push('\n');
-        out.push_str(&think_marker(false));
-        out.push('\n');
-        out.push('\n');
-    }
-    out
-}
-
-fn render_gemma(system: &str, history: &[(String, String)], user: &str) -> String {
-    let mut out = String::new();
-    out.push_str("<bos>");
-    let first_user = if system.is_empty() {
-        user.to_string()
-    } else {
-        format!("{system}\n\n{user}")
-    };
-    out.push_str("<start_of_turn>user\n");
-    out.push_str(&first_user);
-    out.push_str("<end_of_turn>\n");
-    for (u, a) in history {
-        out.push_str("<start_of_turn>user\n");
-        out.push_str(u);
-        out.push_str("<end_of_turn>\n");
-        out.push_str("<start_of_turn>model\n");
-        out.push_str(a);
-        out.push_str("<end_of_turn>\n");
-    }
-    out.push_str("<start_of_turn>model\n");
-    out
 }
 
 fn push_turn(out: &mut String, role: &str, content: &str) {
@@ -260,12 +206,4 @@ fn push_turn(out: &mut String, role: &str, content: &str) {
 
 fn im_marker(start: bool) -> String {
     format!("<|{}|>", if start { "im_start" } else { "im_end" })
-}
-
-fn think_marker(open: bool) -> String {
-    if open {
-        "<think>".to_string()
-    } else {
-        "</think>".to_string()
-    }
 }

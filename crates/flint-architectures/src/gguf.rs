@@ -10,9 +10,6 @@ pub fn synthesize_config(source: &dyn Checkpoint, family: Family) -> Result<Valu
         Family::Gemma => transformer_config(source, true),
         Family::Gemma4 => gemma4_config(source),
         Family::Phi => phi_config(source),
-        Family::Qwen35 | Family::PhiMoe => Err(Error::Config(
-            "this architecture ships no GGUF (no ggml representation)".into(),
-        )),
     }
 }
 

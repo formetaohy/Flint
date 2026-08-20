@@ -1,24 +1,16 @@
 use flint_backend::Backend;
-use flint_checkpoint::{GgufWriter, SafetensorEntry};
+use flint_checkpoint::GgufWriter;
 
 #[test]
 fn unsupported_formats_fail_fast() {
     let backend = Backend::new().unwrap();
 
-    let dir = std::env::temp_dir().join(format!("flint-badfmt-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("flint-badarch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    flint_checkpoint::write_tensors(
-        &dir.join("model.safetensors"),
-        &[SafetensorEntry {
-            name: "a",
-            shape: &[1],
-            bytes: &[0u8; 4],
-            bf16: false,
-        }],
-    )
-    .unwrap();
-    std::fs::write(dir.join("config.json"), r#"{"model_type": "bert"}"#).unwrap();
+    let mut w = GgufWriter::new(32);
+    w.kv_str("general.architecture", "bert");
+    std::fs::write(dir.join("model.gguf"), w.finish()).unwrap();
     let err = flint_architectures::load(
         &dir,
         &flint_architectures::LoadOptions {
@@ -30,7 +22,10 @@ fn unsupported_formats_fail_fast() {
     )
     .err()
     .unwrap();
-    assert!(err.to_string().contains("unsupported model_type"), "{err}");
+    assert!(
+        err.to_string().contains("unsupported GGUF architecture"),
+        "{err}"
+    );
 
     let gguf_dir = std::env::temp_dir().join(format!("flint-badarch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&gguf_dir);

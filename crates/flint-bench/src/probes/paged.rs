@@ -45,7 +45,7 @@ pub(super) fn paged_probe() -> Result<()> {
         seq_lens: vec![BUDGET; SEQS as usize],
         pages: Some(PAGES),
     };
-    let mut model = Model::load(&source, cfg, &plan(false), &arena, None, &backend)?;
+    let mut model = Model::load(&source, cfg, &plan(), &arena, None, &backend)?;
     for seq in 0..SEQS {
         model.alloc_pages(&backend, seq, PREFILL + DECODE + 32)?;
     }

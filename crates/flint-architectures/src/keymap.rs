@@ -1,21 +1,3 @@
-use flint_model::loader::MoEPart;
-
-pub fn hf_key(name: &str) -> Option<String> {
-    if let Some(rest) = name.strip_prefix("model.language_model.") {
-        Some(rest.to_string())
-    } else if let Some(rest) = name.strip_prefix("model.")
-        && !rest.starts_with("audio_tower.")
-        && !rest.starts_with("vision_tower.")
-        && !rest.starts_with("visual.")
-    {
-        Some(rest.to_string())
-    } else if name.starts_with("lm_head.") || name.starts_with("mtp.") {
-        Some(name.to_string())
-    } else {
-        None
-    }
-}
-
 pub fn gguf_key(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("token_embd.weight") {
         return Some(format!("embed_tokens.weight{rest}"));
@@ -65,21 +47,4 @@ pub fn gguf_key(name: &str) -> Option<String> {
         _ => return None,
     };
     Some(format!("layers.{layer}.{canon}.{suffix}"))
-}
-
-pub fn gguf_moe_key(name: &str) -> Option<(String, MoEPart)> {
-    let rest = name.strip_prefix("blk.")?;
-    let (idx, tail) = rest.split_once('.')?;
-    let prefix = format!("layers.{idx}.mlp");
-    match tail {
-        "ffn_gate_inp.weight" => Some((prefix, MoEPart::Router)),
-        "ffn_gate_up_exps.weight" => Some((prefix, MoEPart::GateUp)),
-        "ffn_gate_exps.weight" => Some((prefix, MoEPart::Gate)),
-        "ffn_up_exps.weight" => Some((prefix, MoEPart::Up)),
-        "ffn_down_exps.weight" => Some((prefix, MoEPart::Down)),
-        "ffn_gate_shexp.weight" => Some((prefix, MoEPart::SharedGate)),
-        "ffn_up_shexp.weight" => Some((prefix, MoEPart::SharedUp)),
-        "ffn_down_shexp.weight" => Some((prefix, MoEPart::SharedDown)),
-        _ => None,
-    }
 }

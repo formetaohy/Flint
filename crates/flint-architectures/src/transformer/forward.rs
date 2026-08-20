@@ -1,9 +1,7 @@
 use flint_backend::{Backend, Binding, Commands};
 use flint_error::{Error, Result};
 use flint_model::ops::{self, NormMode, NormSpec, RopeArgs, RopeInputs};
-use flint_model::routing::Routing;
 use flint_model::rows;
-use flint_model::weights::MlpBlock;
 use flint_model::{ChunkOut, LanguageModel, MAX_M, SeqChunk, Speculator};
 use flint_tensor::Tensor;
 
@@ -382,109 +380,46 @@ impl LanguageModel for Model {
                     &mut commands,
                     &NormSpec::new(self.norm_mode(), m, cfg.hidden, cfg.norm_eps),
                     mlp_src,
-                    lw.mlp.norm(),
-                    self.norm_bias(lw.mlp.norm_bias()),
+                    &lw.mlp.norm,
+                    self.norm_bias(lw.mlp.norm_bias.as_ref()),
                     Binding::Full(&s.normed),
                 )?;
 
-                match &lw.mlp {
-                    MlpBlock::Dense(mlp) => {
-                        let ffn_fused = attn_fused && lw.post_ffn_norm.is_none();
-                        let y = Binding::Full(if ffn_fused {
-                            &s.hidden
-                        } else {
-                            &s.mlp.down_out
-                        });
-                        ops::swiglu_mlp(
-                            backend,
-                            &mut commands,
-                            Binding::Full(&s.normed),
-                            mlp,
-                            &s.mlp,
-                            y,
-                            &ops::MlpSpec {
-                                rows: m,
-                                intermediate: cfg.mlp_width(l as u32),
-                                act: cfg.act,
-                                acc: ffn_fused,
-                            },
-                        )?;
-                        if !ffn_fused {
-                            residual_add(
-                                backend,
-                                &mut commands,
-                                Binding::Full(&s.mlp.down_out),
-                                Binding::Full(&s.hidden2),
-                                Binding::Full(&s.hidden),
-                                &ResidualSpec {
-                                    scratch: s,
-                                    post_norm: lw.post_ffn_norm.as_ref(),
-                                    m,
-                                    hidden: cfg.hidden,
-                                    eps: cfg.norm_eps,
-                                },
-                            )?;
-                        }
-                    }
-                    MlpBlock::Moe(moe) => {
-                        let moe_cfg = cfg.moe.expect("MoE block without MoE config");
-                        let mt = s.moe.as_ref().expect("MoE block without MoE scratch");
-
-                        ops::gemm(
-                            backend,
-                            &mut commands,
-                            Binding::Full(&s.normed),
-                            &moe.router,
-                            Binding::Full(&mt.logits),
+                let ffn_fused = attn_fused && lw.post_ffn_norm.is_none();
+                let y = Binding::Full(if ffn_fused {
+                    &s.hidden
+                } else {
+                    &s.mlp.down_out
+                });
+                ops::swiglu_mlp(
+                    backend,
+                    &mut commands,
+                    Binding::Full(&s.normed),
+                    &lw.mlp,
+                    &s.mlp,
+                    y,
+                    &ops::MlpSpec {
+                        rows: m,
+                        intermediate: cfg.mlp_width(l as u32),
+                        act: cfg.act,
+                        acc: ffn_fused,
+                    },
+                )?;
+                if !ffn_fused {
+                    residual_add(
+                        backend,
+                        &mut commands,
+                        Binding::Full(&s.mlp.down_out),
+                        Binding::Full(&s.hidden2),
+                        Binding::Full(&s.hidden),
+                        &ResidualSpec {
+                            scratch: s,
+                            post_norm: lw.post_ffn_norm.as_ref(),
                             m,
-                        )?;
-                        backend.submit(commands.raw())?;
-                        let logits =
-                            backend.read_f32(&mt.logits.buf, 0, (m * moe_cfg.experts) as usize)?;
-                        let r = Routing::new(
-                            &logits,
-                            m,
-                            moe_cfg.experts,
-                            moe.top_k,
-                            moe_cfg.kind,
-                            moe.shared_scale,
-                        );
-                        backend.write_u32(&mt.rows.buf, &r.rows);
-                        backend.write_f32(&mt.weights.buf, &r.weights);
-                        ops::zero_rows(
-                            backend,
-                            &mut commands,
-                            Binding::Full(&mt.acc),
-                            m * cfg.hidden,
-                        )?;
-                        ops::moe_apply(
-                            backend,
-                            &mut commands,
-                            Binding::Full(&s.normed),
-                            moe,
-                            mt,
-                            &r,
-                            &ops::MoeSpec {
-                                intermediate: cfg.intermediate,
-                                act: cfg.act,
-                                hidden: cfg.hidden,
-                            },
-                        )?;
-                        residual_add(
-                            backend,
-                            &mut commands,
-                            Binding::Full(&mt.acc),
-                            Binding::Full(&s.hidden2),
-                            Binding::Full(&s.hidden),
-                            &ResidualSpec {
-                                scratch: s,
-                                post_norm: lw.post_ffn_norm.as_ref(),
-                                m,
-                                hidden: cfg.hidden,
-                                eps: cfg.norm_eps,
-                            },
-                        )?;
-                    }
+                            hidden: cfg.hidden,
+                            eps: cfg.norm_eps,
+                        },
+                    )?;
                 }
 
                 self.per_layer_step(backend, &mut commands, s, lw, l, m)?;

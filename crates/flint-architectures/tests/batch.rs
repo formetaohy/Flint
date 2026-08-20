@@ -2,7 +2,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use flint_architectures::llama;
 use flint_backend::Backend;
-use flint_checkpoint::{SafetensorEntry, open_checkpoint, write_tensors};
+use flint_checkpoint::{GgufWriter, open_checkpoint};
 use flint_model::{LanguageModel, SeqChunk};
 use serde_json::{Value, json};
 
@@ -24,43 +24,29 @@ fn rng_vec(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-struct Tensor {
-    name: String,
-    shape: Vec<u32>,
-    data: Vec<f32>,
-}
-
 fn synth_llama() -> (std::path::PathBuf, Value) {
     let dir = std::env::temp_dir().join(format!("flint-batch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let mut tensors = Vec::new();
+    let mut w = GgufWriter::new(32);
     let mut add = |name: &str, shape: &[u32], seed: u64| {
-        tensors.push(Tensor {
-            name: name.to_string(),
-            shape: shape.to_vec(),
-            data: rng_vec(shape.iter().product::<u32>() as usize, seed),
-        });
+        w.tensor_f32(name, shape, &rng_vec(shape.iter().product::<u32>() as usize, seed));
     };
-    add("model.embed_tokens.weight", &[128, 128], 1);
+    add("token_embd.weight", &[128, 128], 1);
     for l in 0..2u64 {
-        let p = format!("model.layers.{l}");
-        add(&format!("{p}.input_layernorm.weight"), &[128], 10 + l);
-        add(
-            &format!("{p}.post_attention_layernorm.weight"),
-            &[128],
-            15 + l,
-        );
-        add(&format!("{p}.self_attn.q_proj.weight"), &[256, 128], 20 + l);
-        add(&format!("{p}.self_attn.k_proj.weight"), &[128, 128], 30 + l);
-        add(&format!("{p}.self_attn.v_proj.weight"), &[128, 128], 40 + l);
-        add(&format!("{p}.self_attn.o_proj.weight"), &[128, 256], 50 + l);
-        add(&format!("{p}.mlp.gate_proj.weight"), &[256, 128], 60 + l);
-        add(&format!("{p}.mlp.up_proj.weight"), &[256, 128], 70 + l);
-        add(&format!("{p}.mlp.down_proj.weight"), &[128, 256], 80 + l);
+        let p = format!("blk.{l}");
+        add(&format!("{p}.attn_norm.weight"), &[128], 10 + l);
+        add(&format!("{p}.ffn_norm.weight"), &[128], 15 + l);
+        add(&format!("{p}.attn_q.weight"), &[256, 128], 20 + l);
+        add(&format!("{p}.attn_k.weight"), &[128, 128], 30 + l);
+        add(&format!("{p}.attn_v.weight"), &[128, 128], 40 + l);
+        add(&format!("{p}.attn_output.weight"), &[128, 256], 50 + l);
+        add(&format!("{p}.ffn_gate.weight"), &[256, 128], 60 + l);
+        add(&format!("{p}.ffn_up.weight"), &[256, 128], 70 + l);
+        add(&format!("{p}.ffn_down.weight"), &[128, 256], 80 + l);
     }
-    add("model.norm.weight", &[128], 90);
-    add("lm_head.weight", &[128, 128], 91);
+    add("output_norm.weight", &[128], 90);
+    add("output.weight", &[128, 128], 91);
     let config = json!({
         "model_type": "llama",
         "hidden_size": 128,
@@ -74,22 +60,7 @@ fn synth_llama() -> (std::path::PathBuf, Value) {
         "eos_token_id": [0],
         "tie_word_embeddings": false,
     });
-    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
-    let bytes: Vec<Vec<u8>> = tensors
-        .iter()
-        .map(|t| t.data.iter().flat_map(|v| v.to_le_bytes()).collect())
-        .collect();
-    let entries: Vec<SafetensorEntry> = tensors
-        .iter()
-        .zip(bytes.iter())
-        .map(|(t, b)| SafetensorEntry {
-            name: &t.name,
-            shape: &t.shape,
-            bytes: b,
-            bf16: false,
-        })
-        .collect();
-    write_tensors(&dir.join("model.safetensors"), &entries).unwrap();
+    std::fs::write(dir.join("model.gguf"), w.finish()).unwrap();
     (dir, config)
 }
 
@@ -130,7 +101,7 @@ fn self_speculator_drafts_from_the_captured_depth() {
     let mut backend = Backend::new().unwrap();
     let source = open_checkpoint(&dir).unwrap();
     let mut model = llama::load(
-        source.as_ref(),
+        &source,
         &config,
         &flint_model::pool::ArenaSpec {
             seq_lens: vec![64],
@@ -196,7 +167,7 @@ fn batch_seqs_match_solo_and_isolate_sequences() {
     let backend = Backend::new().unwrap();
     let source = open_checkpoint(&dir).unwrap();
     let mut model = llama::load(
-        source.as_ref(),
+        &source,
         &config,
         &flint_model::pool::ArenaSpec {
             seq_lens: vec![64, 64],
@@ -284,7 +255,7 @@ fn batch_seqs_match_solo_and_isolate_sequences() {
         .unwrap();
 
     let mut ctrl = llama::load(
-        source.as_ref(),
+        &source,
         &config,
         &flint_model::pool::ArenaSpec {
             seq_lens: vec![64, 64],
@@ -339,7 +310,7 @@ fn paged_attention_matches_contiguous_layout() {
     let last = [tokens.len() as u32 - 1];
 
     let mut plain = llama::load(
-        source.as_ref(),
+        &source,
         &config,
         &flint_model::pool::ArenaSpec {
             seq_lens: vec![128],
@@ -355,7 +326,7 @@ fn paged_attention_matches_contiguous_layout() {
         .unwrap();
 
     let mut paged = llama::load(
-        source.as_ref(),
+        &source,
         &config,
         &flint_model::pool::ArenaSpec {
             seq_lens: vec![128, 128],

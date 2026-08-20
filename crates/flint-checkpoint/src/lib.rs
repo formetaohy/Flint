@@ -1,6 +1,5 @@
 pub mod dequant;
 pub mod gguf;
-mod safetensors;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -8,7 +7,6 @@ use std::path::Path;
 use flint_error::{Error, Result};
 
 pub use gguf::{Gguf, GgufWriter};
-pub use safetensors::{SafetensorEntry, Safetensors, write_tensors};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MetaVal {
@@ -138,28 +136,13 @@ pub struct RawTensor {
     pub data: TensorData,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CheckpointKind {
-    Gguf,
-    Safetensors,
-}
-
 pub trait Checkpoint {
     fn names(&self) -> Vec<String>;
     fn read(&self, name: &str) -> Result<RawTensor>;
     fn metadata(&self) -> Result<&Metadata>;
-    fn config_json(&self) -> Result<serde_json::Value>;
-    fn kind(&self) -> CheckpointKind;
 }
 
-pub fn open_checkpoint(model_dir: &Path) -> Result<Box<dyn Checkpoint>> {
-    if let Some(gguf) = find_gguf(model_dir)? {
-        return Ok(Box::new(Gguf::open(&gguf)?));
-    }
-    Ok(Box::new(Safetensors::open(model_dir)?))
-}
-
-fn find_gguf(model_dir: &Path) -> Result<Option<std::path::PathBuf>> {
+pub fn open_checkpoint(model_dir: &Path) -> Result<Gguf> {
     let mut found: Vec<_> = std::fs::read_dir(model_dir)
         .map_err(|e| Error::Checkpoint(format!("cannot read {}: {e}", model_dir.display())))?
         .filter_map(|e| e.ok())
@@ -167,8 +150,11 @@ fn find_gguf(model_dir: &Path) -> Result<Option<std::path::PathBuf>> {
         .filter(|p| p.extension().is_some_and(|x| x == "gguf"))
         .collect();
     match found.len() {
-        0 => Ok(None),
-        1 => Ok(Some(found.remove(0))),
+        0 => Err(Error::Checkpoint(format!(
+            "no .gguf checkpoint in {}",
+            model_dir.display()
+        ))),
+        1 => Gguf::open(&found.remove(0)),
         _ => Err(Error::Checkpoint(format!(
             "multiple .gguf shards in {} — merge into one file",
             model_dir.display()

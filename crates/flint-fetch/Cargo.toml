@@ -1,11 +1,10 @@
 [package]
-name = "flint-hub"
+name = "flint-fetch"
 version.workspace = true
 license.workspace = true
 edition.workspace = true
 
 [dependencies]
 flint-error.workspace = true
-clap.workspace = true
 serde_json.workspace = true
 ureq.workspace = true
