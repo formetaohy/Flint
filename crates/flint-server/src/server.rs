@@ -1,11 +1,22 @@
-use std::time::Instant;
-
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use flint_error::{Error, Result};
-use serde_json::json;
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+use serde_json::{Value, json};
+use tower_http::cors::CorsLayer;
 
 use crate::hub::Hub;
 use crate::protocols;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub(crate) hub: Hub,
+    api_key: Option<String>,
+}
 
 pub struct ServerConfig {
     pub host: String,
@@ -14,175 +25,128 @@ pub struct ServerConfig {
 }
 
 pub fn serve(cfg: ServerConfig, hub: Hub) -> Result<()> {
-    let addr = (cfg.host.as_str(), cfg.port);
-    let server = Server::http(addr)
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Model(format!("build the tokio runtime: {e}")))?;
+    runtime.block_on(serve_async(cfg, hub))
+}
+
+async fn serve_async(cfg: ServerConfig, hub: Hub) -> Result<()> {
+    let model_id = hub.model_id().to_string();
+    let state = AppState {
+        hub,
+        api_key: cfg.api_key,
+    };
+    let app = Router::new()
+        .route("/v1/models", get(models))
+        .route("/healthz", get(health))
+        .route("/health", get(health))
+        .route("/v1/chat/completions", post(protocols::openai_chat::handle))
+        .route("/v1/responses", post(protocols::openai_responses::handle))
+        .route("/v1/messages", post(protocols::anthropic::handle))
+        .route(
+            "/v1/messages/count_tokens",
+            post(protocols::anthropic::handle_count_tokens),
+        )
+        .route("/{*path}", post(gemini))
+        .layer(middleware::from_fn_with_state(state.clone(), authorize))
+        .layer(CorsLayer::very_permissive())
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind((cfg.host.as_str(), cfg.port))
+        .await
         .map_err(|e| Error::Model(format!("bind {}:{}: {e}", cfg.host, cfg.port)))?;
     eprintln!(
-        "[server] listening on http://{}:{} (model: {})",
-        cfg.host,
-        cfg.port,
-        hub.model_id()
+        "[server] listening on http://{}:{} (model: {model_id})",
+        cfg.host, cfg.port
     );
-    for request in server.incoming_requests() {
-        let hub = hub.clone();
-        let api_key = cfg.api_key.clone();
-        std::thread::spawn(move || {
-            let t0 = Instant::now();
-            let method = request.method().clone();
-            let url = request.url().to_string();
-            let status = route(request, &hub, api_key.as_deref());
-            eprintln!(
-                "[server] {} {} -> {status} ({:.1} ms)",
-                method,
-                url,
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
-        });
-    }
-    Ok(())
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| Error::Model(format!("serve: {e}")))
 }
 
-pub fn sse_headers() -> Vec<Header> {
-    vec![
-        Header::from_bytes(b"Content-Type", b"text/event-stream").expect("valid header"),
-        Header::from_bytes(b"Cache-Control", b"no-cache").expect("valid header"),
-        Header::from_bytes(b"Access-Control-Allow-Origin", b"*").expect("valid header"),
-    ]
+async fn authorize(State(state): State<AppState>, request: axum::http::Request<axum::body::Body>, next: Next) -> Response {
+    if authorized(request.headers(), state.api_key.as_deref()) {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        protocols::json_response(
+            json!({"error": {"message": "invalid api key", "type": "authentication_error"}}),
+        ),
+    )
+        .into_response()
 }
 
-fn json_response(value: serde_json::Value) -> Response<std::io::Cursor<Vec<u8>>> {
-    crate::protocols::json_response(value)
-}
-
-fn route(request: Request, hub: &Hub, api_key: Option<&str>) -> u16 {
-    let method = request.method().clone();
-    let path = request
-        .url()
-        .split('?')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    if method == Method::Options {
-        let response = Response::empty(StatusCode(204))
-            .with_header(
-                Header::from_bytes(b"Access-Control-Allow-Origin", b"*").expect("valid header"),
-            )
-            .with_header(
-                Header::from_bytes(b"Access-Control-Allow-Headers", b"*").expect("valid header"),
-            )
-            .with_header(
-                Header::from_bytes(b"Access-Control-Allow-Methods", b"*").expect("valid header"),
-            );
-        let _ = request.respond(response);
-        return 204;
-    }
-    if !authorized(&request, api_key) {
-        let _ = request.respond(
-            json_response(
-                json!({"error": {"message": "invalid api key", "type": "authentication_error"}}),
-            )
-            .with_status_code(StatusCode(401)),
-        );
-        return 401;
-    }
-    match (method, path.as_str()) {
-        (Method::Get, "/v1/models") => {
-            let anthropic = request
-                .headers()
-                .iter()
-                .any(|h| h.field.equiv("x-api-key") || h.field.equiv("anthropic-version"));
-            let _ = request.respond(json_response(if anthropic {
-                anthropic_models_json(hub)
-            } else {
-                models_json(hub)
-            }));
-            200
-        }
-        (Method::Get, "/healthz") | (Method::Get, "/health") => {
-            let _ = request.respond(json_response(json!({"status": "ok"})));
-            200
-        }
-        (Method::Post, "/v1/chat/completions") => {
-            respond(request, |r| protocols::openai_chat::handle(r, hub))
-        }
-        (Method::Post, "/v1/responses") => {
-            respond(request, |r| protocols::openai_responses::handle(r, hub))
-        }
-        (Method::Post, "/v1/messages") => {
-            respond(request, |r| protocols::anthropic::handle(r, hub))
-        }
-        (Method::Post, "/v1/messages/count_tokens") => respond(request, |r| {
-            protocols::anthropic::handle_count_tokens(r, hub)
-        }),
-        (Method::Post, p) if p.ends_with(":generateContent") => {
-            respond(request, |r| protocols::gemini::handle(r, hub, false))
-        }
-        (Method::Post, p) if p.ends_with(":streamGenerateContent") => {
-            respond(request, |r| protocols::gemini::handle(r, hub, true))
-        }
-        _ => {
-            let _ = request.respond(
-                json_response(json!({"error": {"message": format!("not found: {path}"), "type": "not_found"}}))
-                    .with_status_code(StatusCode(404)),
-            );
-            404
-        }
-    }
-}
-
-fn respond(request: Request, f: impl FnOnce(Request) -> Result<()>) -> u16 {
-    match f(request) {
-        Ok(()) => 200,
-        Err(e) => {
-            eprintln!("[server] request failed: {e}");
-            500
-        }
-    }
-}
-
-fn authorized(request: &Request, api_key: Option<&str>) -> bool {
+fn authorized(headers: &HeaderMap, api_key: Option<&str>) -> bool {
     let Some(key) = api_key else {
         return true;
     };
-    let bearer = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Authorization"))
-        .and_then(|h| h.value.as_str().strip_prefix("Bearer "));
-    let x_api = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("x-api-key"))
-        .map(|h| h.value.as_str());
-    let google = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("x-goog-api-key"))
-        .map(|h| h.value.as_str());
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let x_api = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok());
+    let google = headers
+        .get("x-goog-api-key")
+        .and_then(|v| v.to_str().ok());
     bearer == Some(key) || x_api == Some(key) || google == Some(key)
 }
 
-fn models_json(hub: &Hub) -> serde_json::Value {
+async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let anthropic = headers.contains_key("x-api-key") || headers.contains_key("anthropic-version");
+    let body = if anthropic {
+        anthropic_models_json(&state.hub)
+    } else {
+        models_json(&state.hub)
+    };
+    protocols::json_response(body).into_response()
+}
+
+async fn health() -> Response {
+    protocols::json_response(json!({"status": "ok"})).into_response()
+}
+
+async fn gemini(State(state): State<AppState>, Path(path): Path<String>, body: Bytes) -> Response {
+    let stream = if path.ends_with(":streamGenerateContent") {
+        true
+    } else if path.ends_with(":generateContent") {
+        false
+    } else {
+        return (
+            StatusCode::NOT_FOUND,
+            protocols::json_response(
+                json!({"error": {"message": format!("not found: {path}"), "type": "not_found"}}),
+            ),
+        )
+            .into_response();
+    };
+    protocols::gemini::handle(State(state), body, stream).await
+}
+
+fn models_json(hub: &Hub) -> Value {
     json!({
         "object": "list",
         "data": [{
             "id": hub.model_id(),
             "object": "model",
-            "created": crate::protocols::now_secs(),
+            "created": protocols::now_secs(),
             "owned_by": "flint",
             "context_length": hub.context_len(),
         }]
     })
 }
 
-fn anthropic_models_json(hub: &Hub) -> serde_json::Value {
+fn anthropic_models_json(hub: &Hub) -> Value {
     let id = hub.model_id();
     json!({
         "data": [{
             "type": "model",
             "id": id,
             "display_name": id,
-            "created_at": crate::protocols::now_secs().to_string(),
+            "created_at": protocols::now_secs().to_string(),
         }],
         "has_more": false,
         "first_id": id,

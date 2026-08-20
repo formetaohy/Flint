@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
-use flint_generate::{Engine, GenStats, Grammar, SamplingParams, SessionId};
+use flint_generate::{Engine, GenStats, Grammar, Piece, SamplingParams, SessionId};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 pub enum Command {
     Generate {
@@ -11,21 +11,60 @@ pub enum Command {
         stop_extra: Vec<u32>,
         sampling: Option<SamplingParams>,
         grammar: Option<Grammar>,
-        tx: Sender<Event>,
+        tx: UnboundedSender<Event>,
     },
     Close(SessionId),
 }
 
 pub enum Event {
     Started(SessionId),
-    Piece(String),
+    Piece(Piece),
     Done(GenStats),
     Failed(String),
 }
 
+#[derive(Clone)]
+pub struct EngineHandle {
+    cmd: UnboundedSender<Command>,
+}
+
+impl EngineHandle {
+    pub fn send(&self, cmd: Command) {
+        let _ = self.cmd.send(cmd);
+    }
+
+    pub fn sender(&self) -> UnboundedSender<Command> {
+        self.cmd.clone()
+    }
+}
+
+pub struct Client {
+    pub id: SessionId,
+    pub rx: UnboundedReceiver<Event>,
+    guard: CloseGuard,
+}
+
+impl Client {
+    pub(crate) fn new(
+        id: SessionId,
+        rx: UnboundedReceiver<Event>,
+        cmd: UnboundedSender<Command>,
+    ) -> Self {
+        Self {
+            id,
+            rx,
+            guard: CloseGuard { id, cmd },
+        }
+    }
+
+    pub fn into_parts(self) -> (UnboundedReceiver<Event>, CloseGuard) {
+        (self.rx, self.guard)
+    }
+}
+
 pub struct CloseGuard {
-    pub(crate) id: SessionId,
-    pub(crate) cmd: Sender<Command>,
+    id: SessionId,
+    cmd: UnboundedSender<Command>,
 }
 
 impl CloseGuard {
@@ -40,61 +79,81 @@ impl Drop for CloseGuard {
     }
 }
 
-pub struct Client {
-    pub id: SessionId,
-    pub rx: Receiver<Event>,
-    pub guard: CloseGuard,
-}
-
-pub fn spawn(engine: Engine) -> Sender<Command> {
-    let (tx, rx) = channel();
+pub fn spawn(engine: Engine) -> EngineHandle {
+    let (cmd, rx) = unbounded_channel();
     thread::Builder::new()
         .name("flint-engine".into())
         .spawn(move || run(engine, rx))
         .expect("spawn the engine thread");
-    tx
+    EngineHandle { cmd }
 }
 
-fn run(mut engine: Engine, rx: Receiver<Command>) {
-    let mut clients: HashMap<u32, Sender<Event>> = HashMap::new();
-    loop {
+fn run(mut engine: Engine, mut rx: UnboundedReceiver<Command>) {
+    let mut clients: HashMap<u32, UnboundedSender<Event>> = HashMap::new();
+    let result: Result<(), String> = 'outer: loop {
         while let Ok(cmd) = rx.try_recv() {
-            handle(&mut engine, &mut clients, cmd);
+            if let Err(e) = handle(&mut engine, &mut clients, cmd) {
+                break 'outer Err(e);
+            }
         }
         if clients.is_empty() {
-            match rx.recv() {
-                Ok(cmd) => handle(&mut engine, &mut clients, cmd),
-                Err(_) => break,
+            match rx.blocking_recv() {
+                Some(cmd) => {
+                    if let Err(e) = handle(&mut engine, &mut clients, cmd) {
+                        break 'outer Err(e);
+                    }
+                }
+                None => break 'outer Ok(()),
             }
             continue;
         }
         if let Err(e) = engine.step() {
-            eprintln!("[server] engine step failed: {e}");
-            for (_, tx) in clients.drain() {
-                let _ = tx.send(Event::Failed(e.to_string()));
-            }
-            continue;
+            break 'outer Err(e.to_string());
         }
         let mut done = Vec::new();
+        let mut gone = Vec::new();
         for (&id, tx) in &clients {
             for piece in engine.poll(SessionId(id)) {
-                let _ = tx.send(Event::Piece(piece.text));
+                if tx.send(Event::Piece(piece)).is_err() {
+                    gone.push(id);
+                    break;
+                }
             }
-            if engine.finished(SessionId(id)) {
+            if !gone.contains(&id) && engine.finished(SessionId(id)) {
                 done.push(id);
             }
         }
+        for id in gone {
+            clients.remove(&id);
+            if let Err(e) = engine.close(SessionId(id)) {
+                break 'outer Err(e.to_string());
+            }
+        }
         for id in done {
-            let tx = clients.remove(&id).expect("done sessions are registered");
+            let tx = clients
+                .remove(&id)
+                .expect("finished sessions are registered");
             if let Some(stats) = engine.stats(SessionId(id)) {
                 let _ = tx.send(Event::Done(stats));
             }
-            let _ = engine.close(SessionId(id));
+            if let Err(e) = engine.close(SessionId(id)) {
+                break 'outer Err(e.to_string());
+            }
+        }
+    };
+    if let Err(msg) = result {
+        eprintln!("[server] engine worker failed: {msg}");
+        for (_, tx) in clients.drain() {
+            let _ = tx.send(Event::Failed(msg.clone()));
         }
     }
 }
 
-fn handle(engine: &mut Engine, clients: &mut HashMap<u32, Sender<Event>>, cmd: Command) {
+fn handle(
+    engine: &mut Engine,
+    clients: &mut HashMap<u32, UnboundedSender<Event>>,
+    cmd: Command,
+) -> Result<(), String> {
     match cmd {
         Command::Generate {
             prompt,
@@ -107,14 +166,17 @@ fn handle(engine: &mut Engine, clients: &mut HashMap<u32, Sender<Event>>, cmd: C
             Ok(id) => {
                 clients.insert(id.0, tx.clone());
                 let _ = tx.send(Event::Started(id));
+                Ok(())
             }
             Err(e) => {
                 let _ = tx.send(Event::Failed(e.to_string()));
+                Ok(())
             }
         },
         Command::Close(id) => {
-            let _ = engine.close(id);
+            engine.close(id).map_err(|e| e.to_string())?;
             clients.remove(&id.0);
+            Ok(())
         }
     }
 }

@@ -1,14 +1,14 @@
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, channel};
 
-use flint_architectures::chat::ChatFormat;
+use flint_architectures::chat::{ChatFormat, ThinkMode};
 use flint_error::{Error, Result};
-use flint_generate::{Engine, Grammar, SamplingParams};
+use flint_generate::{Engine, Grammar, SamplingParams, SessionId};
 use flint_tokenizer::Tokenizer;
 use serde_json::{Value, json};
 
-use crate::engine_hub::{Client, CloseGuard, Command, Event, spawn};
+use crate::engine_hub::{Client, Command, EngineHandle, Event};
 use crate::tools::{Tool, tool_instruction, wrapper_schema};
+use tokio::sync::mpsc::unbounded_channel;
 
 pub enum ToolChoice {
     Auto,
@@ -27,6 +27,18 @@ pub struct GenerateRequest {
     pub schema: Option<Value>,
     pub tools: Vec<Tool>,
     pub tool_choice: ToolChoice,
+    pub thinking: bool,
+}
+
+pub struct Generation {
+    pub client: Client,
+    pub think: ThinkMode,
+}
+
+#[derive(Clone)]
+pub struct RequestDefaults {
+    pub model_id: String,
+    pub max_tokens: usize,
 }
 
 #[derive(Clone)]
@@ -35,7 +47,7 @@ pub struct Hub {
 }
 
 struct Inner {
-    cmd: Sender<Command>,
+    engine: EngineHandle,
     chat: Box<dyn ChatFormat + Send + Sync>,
     tokenizer: Tokenizer,
     model_id: String,
@@ -52,10 +64,9 @@ impl Hub {
         context_len: u32,
         default_max_tokens: usize,
     ) -> Self {
-        let cmd = spawn(engine);
         Self {
             inner: Arc::new(Inner {
-                cmd,
+                engine: crate::engine_hub::spawn(engine),
                 chat,
                 tokenizer,
                 model_id,
@@ -77,18 +88,26 @@ impl Hub {
         self.inner.default_max_tokens
     }
 
-    pub fn generate(&self, req: &GenerateRequest) -> Result<Client> {
+    pub fn defaults(&self) -> RequestDefaults {
+        RequestDefaults {
+            model_id: self.inner.model_id.clone(),
+            max_tokens: self.inner.default_max_tokens,
+        }
+    }
+
+    pub async fn generate(&self, req: &GenerateRequest) -> Result<Generation> {
         let tools = self.active_tools(req)?;
         let grammar = self.grammar(req, &tools)?;
-        let prompt = self.render(req, &tools);
+        let think = self.think(req);
+        let prompt = self.render(req, &tools, think);
         let stop_extra: Vec<u32> = req
             .stop
             .iter()
             .filter_map(|s| self.inner.tokenizer.token_id(s))
             .collect();
-        let (tx, rx) = channel();
+        let (tx, mut rx) = unbounded_channel();
         self.inner
-            .cmd
+            .engine
             .send(Command::Generate {
                 prompt,
                 max_tokens: req.max_tokens,
@@ -96,25 +115,29 @@ impl Hub {
                 sampling: req.sampling,
                 grammar,
                 tx,
-            })
-            .map_err(|_| Error::Model("engine thread is gone".into()))?;
-        match rx.recv() {
-            Ok(Event::Started(id)) => {
-                let guard = CloseGuard {
-                    id,
-                    cmd: self.inner.cmd.clone(),
-                };
-                Ok(Client { id, rx, guard })
-            }
-            Ok(Event::Failed(e)) => Err(Error::Model(e)),
-            _ => Err(Error::Model("engine thread is gone".into())),
+            });
+        match rx.recv().await {
+            Some(Event::Started(id)) => Ok(Generation {
+                client: Client::new(id, rx, self.inner.engine.sender()),
+                think,
+            }),
+            Some(Event::Failed(e)) => Err(Error::Model(e)),
+            Some(_) => Err(Error::Model("engine sent an unexpected event".into())),
+            None => Err(Error::Model("engine thread is gone".into())),
         }
     }
 
     pub fn count_tokens(&self, req: &GenerateRequest) -> Result<usize> {
         let tools = self.active_tools(req)?;
-        let prompt = self.render(req, &tools);
+        let prompt = self.render(req, &tools, self.think(req));
         Ok(self.inner.tokenizer.encode(&prompt)?.len())
+    }
+
+    fn think(&self, req: &GenerateRequest) -> ThinkMode {
+        if !req.thinking || req.grammar_active() {
+            return ThinkMode::None;
+        }
+        self.inner.chat.think_mode()
     }
 
     fn active_tools(&self, req: &GenerateRequest) -> Result<Vec<Tool>> {
@@ -152,7 +175,7 @@ impl Hub {
         }
     }
 
-    fn render(&self, req: &GenerateRequest, tools: &[Tool]) -> String {
+    fn render(&self, req: &GenerateRequest, tools: &[Tool], think: ThinkMode) -> String {
         let mut system = req.system.clone();
         if !tools.is_empty() {
             if !system.is_empty() {
@@ -160,27 +183,23 @@ impl Hub {
             }
             system.push_str(&tool_instruction(tools));
         }
-        self.inner.chat.render(&system, &req.history, &req.user)
+        self.inner
+            .chat
+            .render(&system, &req.history, &req.user, think != ThinkMode::None)
     }
-}
 
-pub fn grammar_active(schema: Option<&Value>, tools: &[Tool], choice: &ToolChoice) -> bool {
-    let has_tools = !matches!(choice, ToolChoice::None) && !tools.is_empty();
-    schema.is_some() || has_tools
+    pub fn close_now(&self, id: SessionId) {
+        self.inner.engine.send(Command::Close(id));
+    }
 }
 
 impl GenerateRequest {
     pub fn grammar_active(&self) -> bool {
-        grammar_active(self.schema.as_ref(), &self.tools, &self.tool_choice)
+        self.schema.is_some()
+            || (!matches!(self.tool_choice, ToolChoice::None) && !self.tools.is_empty())
     }
 
     pub fn tool_wrapper(&self) -> bool {
         !matches!(self.tool_choice, ToolChoice::None) && !self.tools.is_empty()
-    }
-}
-
-impl Hub {
-    pub fn close_now(&self, id: flint_generate::SessionId) {
-        let _ = self.inner.cmd.send(Command::Close(id));
     }
 }

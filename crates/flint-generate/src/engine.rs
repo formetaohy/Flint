@@ -115,7 +115,8 @@ impl Engine {
         let matcher = match grammar {
             Some(g) => {
                 if self.trie.is_none() {
-                    self.trie = Some(TokenTrie::from_tokenizer(&self.tokenizer));
+                    let vocab = self.model.vocab() as usize;
+                    self.trie = Some(TokenTrie::from_tokenizer(&self.tokenizer, vocab));
                 }
                 Some(Matcher::new(Arc::new(g)))
             }

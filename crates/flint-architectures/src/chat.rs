@@ -1,15 +1,27 @@
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThinkMode {
+    None,
+    Emitted,
+    Preopened,
+}
+
 pub trait ChatFormat: Send + Sync {
-    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String;
+    fn render(&self, system: &str, history: &[(String, String)], user: &str, thinking: bool) -> String;
+
+    fn think_mode(&self) -> ThinkMode;
 
     fn stop_literals(&self) -> &'static [&'static str];
 }
+
+const THINK_OPEN: &str = "<think>\n";
+const THINK_EMPTY: &str = "<think>\n\n</think>\n\n";
 
 pub struct ChatMl;
 
 pub struct ChatMlThink;
 
 impl ChatFormat for ChatMlThink {
-    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
+    fn render(&self, system: &str, history: &[(String, String)], user: &str, thinking: bool) -> String {
         let mut out = String::new();
         push_turn(&mut out, "system", system);
         for (u, a) in history {
@@ -20,16 +32,21 @@ impl ChatFormat for ChatMlThink {
         out.push_str(&im_marker(true));
         out.push_str("assistant");
         out.push('\n');
-        out.push_str("<think>\n\n</think>\n\n");
+        out.push_str(if thinking { THINK_OPEN } else { THINK_EMPTY });
         out
     }
+
+    fn think_mode(&self) -> ThinkMode {
+        ThinkMode::Preopened
+    }
+
     fn stop_literals(&self) -> &'static [&'static str] {
         &["im_end"]
     }
 }
 
 impl ChatFormat for ChatMl {
-    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
+    fn render(&self, system: &str, history: &[(String, String)], user: &str, thinking: bool) -> String {
         let mut out = String::new();
         push_turn(&mut out, "system", system);
         for (u, a) in history {
@@ -40,8 +57,16 @@ impl ChatFormat for ChatMl {
         out.push_str(&im_marker(true));
         out.push_str("assistant");
         out.push('\n');
+        if !thinking {
+            out.push_str(THINK_EMPTY);
+        }
         out
     }
+
+    fn think_mode(&self) -> ThinkMode {
+        ThinkMode::Emitted
+    }
+
     fn stop_literals(&self) -> &'static [&'static str] {
         &["im_end"]
     }
@@ -52,7 +77,7 @@ pub struct Llama3Chat;
 pub struct Llama2Chat;
 
 impl ChatFormat for Llama3Chat {
-    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
+    fn render(&self, system: &str, history: &[(String, String)], user: &str, _thinking: bool) -> String {
         let mut out = String::new();
         out.push_str(
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
@@ -95,13 +120,17 @@ impl ChatFormat for Llama3Chat {
         );
         out
     }
+    fn think_mode(&self) -> ThinkMode {
+        ThinkMode::None
+    }
+
     fn stop_literals(&self) -> &'static [&'static str] {
         &["eot_id"]
     }
 }
 
 impl ChatFormat for Llama2Chat {
-    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
+    fn render(&self, system: &str, history: &[(String, String)], user: &str, _thinking: bool) -> String {
         let mut out = String::new();
         out.push_str("<s>");
         out.push_str("[INST] ");
@@ -128,6 +157,11 @@ impl ChatFormat for Llama2Chat {
         out.push_str(" [/INST]");
         out
     }
+
+    fn think_mode(&self) -> ThinkMode {
+        ThinkMode::None
+    }
+
     fn stop_literals(&self) -> &'static [&'static str] {
         &["[INST]"]
     }
@@ -136,7 +170,7 @@ impl ChatFormat for Llama2Chat {
 pub struct GemmaChat;
 
 impl ChatFormat for GemmaChat {
-    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
+    fn render(&self, system: &str, history: &[(String, String)], user: &str, _thinking: bool) -> String {
         let mut out = String::new();
         out.push_str("<bos>");
         let first_user = if system.is_empty() {
@@ -158,6 +192,11 @@ impl ChatFormat for GemmaChat {
         out.push_str("<start_of_turn>model\n");
         out
     }
+
+    fn think_mode(&self) -> ThinkMode {
+        ThinkMode::None
+    }
+
     fn stop_literals(&self) -> &'static [&'static str] {
         &["<end_of_turn>"]
     }
@@ -166,7 +205,7 @@ impl ChatFormat for GemmaChat {
 pub struct Phi4Chat;
 
 impl ChatFormat for Phi4Chat {
-    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
+    fn render(&self, system: &str, history: &[(String, String)], user: &str, _thinking: bool) -> String {
         let mut out = String::new();
         push_phi_turn(&mut out, "system", system);
         for (u, a) in history {
@@ -177,6 +216,11 @@ impl ChatFormat for Phi4Chat {
         out.push_str("<|assistant|>");
         out
     }
+
+    fn think_mode(&self) -> ThinkMode {
+        ThinkMode::None
+    }
+
     fn stop_literals(&self) -> &'static [&'static str] {
         &["<|end|>"]
     }
@@ -185,7 +229,7 @@ impl ChatFormat for Phi4Chat {
 pub struct Gemma4Chat;
 
 impl ChatFormat for Gemma4Chat {
-    fn render(&self, system: &str, history: &[(String, String)], user: &str) -> String {
+    fn render(&self, system: &str, history: &[(String, String)], user: &str, _thinking: bool) -> String {
         let mut out = String::new();
         out.push_str("<bos>");
         if !system.is_empty() {
@@ -201,6 +245,11 @@ impl ChatFormat for Gemma4Chat {
         out.push_str("<|turn>model\n");
         out
     }
+
+    fn think_mode(&self) -> ThinkMode {
+        ThinkMode::None
+    }
+
     fn stop_literals(&self) -> &'static [&'static str] {
         &["<turn|>"]
     }

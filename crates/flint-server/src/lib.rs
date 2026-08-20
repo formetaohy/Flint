@@ -1,3 +1,4 @@
+pub mod bootstrap;
 pub mod engine_hub;
 pub mod hub;
 pub mod protocols;

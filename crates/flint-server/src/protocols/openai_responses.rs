@@ -1,14 +1,18 @@
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use flint_architectures::chat::ThinkMode;
 use flint_error::{Error, Result};
-use flint_generate::GenStats;
+use flint_generate::{GenStats, Piece};
 use serde_json::{Value, json};
-use tiny_http::{Request, Response};
 
-use crate::engine_hub::Event;
-use crate::hub::{GenerateRequest, Hub};
+use crate::hub::{GenerateRequest, RequestDefaults};
 use crate::protocols::{
-    Chat, DecisionSink, SseReader, StreamSink, json_response, length_hit, next_id, now_secs,
-    sse_event,
+    Chat, DecisionSink, Part, SseFrame, StreamSink, collect, json_response, length_hit, next_id,
+    now_secs, split_reasoning, stream_response,
 };
+use crate::server::AppState;
 use crate::tools::render_tool_call;
 
 pub struct Parsed {
@@ -17,89 +21,57 @@ pub struct Parsed {
     pub model: String,
 }
 
-pub fn handle(mut request: Request, hub: &Hub) -> Result<()> {
-    let mut body = String::new();
-    request.as_reader().read_to_string(&mut body)?;
-    let body: Value = match serde_json::from_str(&body) {
+pub async fn handle(State(state): State<AppState>, body: Bytes) -> Response {
+    let body: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            let _ = request.respond(
-                json_response(json!({"error": {"message": format!("invalid JSON body: {e}"), "type": "invalid_request_error"}})),
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("invalid JSON body: {e}"),
             );
-            return Ok(());
         }
     };
-    let parsed = match parse(&body, hub) {
+    let parsed = match parse(&body, &state.hub.defaults()) {
         Ok(p) => p,
         Err(e) => {
-            let _ = request.respond(json_response(
-                json!({"error": {"message": e.to_string(), "type": "invalid_request_error"}}),
-            ));
-            return Ok(());
+            return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
         }
     };
-    let client = match hub.generate(&parsed.req) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = request.respond(json_response(
-                json!({"error": {"message": e.to_string(), "type": "server_error"}}),
-            ));
-            return Ok(());
-        }
+    let generation = match state.hub.generate(&parsed.req).await {
+        Ok(g) => g,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
     };
     let sink = ResponsesSink::new(
         parsed.model.clone(),
         parsed.req.max_tokens,
+        generation.think,
         parsed.req.tool_wrapper(),
     );
     if parsed.stream {
-        let reader = SseReader::new(client.rx, Box::new(sink));
-        let response = Response::new(
-            tiny_http::StatusCode(200),
-            crate::server::sse_headers(),
-            Box::new(reader),
-            None,
-            None,
-        );
-        request.respond(response)?;
-        return Ok(());
+        return stream_response(generation.client, sink).into_response();
     }
-    let rx = client.rx;
-    let mut sink = sink;
-    let mut scratch = Vec::new();
-    loop {
-        match rx.recv() {
-            Ok(Event::Piece(text)) => {
-                if let Err(e) = sink.on_delta(&text, &mut scratch) {
-                    let _ = request.respond(json_response(
-                        json!({"error": {"message": e.to_string(), "type": "server_error"}}),
-                    ));
-                    return Ok(());
-                }
-            }
-            Ok(Event::Done(stats)) => {
-                sink.on_done(&stats, &mut scratch);
-                break;
-            }
-            Ok(Event::Failed(e)) => {
-                let _ = request.respond(json_response(
-                    json!({"error": {"message": e, "type": "server_error"}}),
-                ));
-                return Ok(());
-            }
-            _ => break,
-        }
-    }
-    let _ = request.respond(json_response(sink.final_json()));
-    Ok(())
+    let sink = match collect(generation.client, sink).await {
+        Ok(s) => s,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
+    };
+    json_response(sink.final_json()).into_response()
 }
 
-pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
+fn error(status: StatusCode, kind: &str, message: String) -> Response {
+    (
+        status,
+        json_response(json!({"error": {"message": message, "type": kind}})),
+    )
+        .into_response()
+}
+
+pub fn parse(body: &Value, defaults: &RequestDefaults) -> Result<Parsed> {
     let stream = body["stream"].as_bool().unwrap_or(false);
     let max_tokens = body["max_output_tokens"]
         .as_u64()
         .map(|v| v as usize)
-        .unwrap_or_else(|| hub.default_max_tokens());
+        .unwrap_or(defaults.max_tokens);
     let stop = match &body["stop"] {
         Value::String(s) => vec![s.clone()],
         Value::Array(a) => a
@@ -112,6 +84,7 @@ pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
     let sampling = crate::protocols::openai_chat::parse_sampling(body);
     let tools = crate::protocols::openai_chat::parse_tools(body);
     let tool_choice = crate::protocols::openai_chat::parse_tool_choice(body);
+    let thinking = !matches!(body["reasoning"]["effort"].as_str(), Some("none"));
     let schema = body
         .get("text")
         .and_then(|t| t.get("format"))
@@ -121,7 +94,7 @@ pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
     let model = body["model"]
         .as_str()
         .map(str::to_string)
-        .unwrap_or_else(|| hub.model_id().to_string());
+        .unwrap_or_else(|| defaults.model_id.clone());
     Ok(Parsed {
         req: GenerateRequest {
             system,
@@ -133,6 +106,7 @@ pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
             schema,
             tools,
             tool_choice,
+            thinking,
         },
         stream,
         model,
@@ -173,11 +147,12 @@ fn extract_input(body: &Value) -> Result<Chat> {
                     }
                     "assistant" => {
                         let pending = std::mem::take(&mut user);
-                        history.push((pending, content));
+                        history.push((pending, split_reasoning(&content)));
                     }
                     other => eprintln!("[server] ignoring response message role {other:?}"),
                 }
             }
+            "reasoning" => {}
             "function_call" => {
                 let name = item["name"].as_str().unwrap_or_default();
                 let arguments: Value = item
@@ -215,43 +190,65 @@ fn content_text(content: &Value) -> Option<String> {
 
 pub struct ResponsesSink {
     id: String,
-    item_id: String,
+    message_id: String,
+    reasoning_id: String,
     created: u64,
     model: String,
     max_tokens: usize,
     decision: DecisionSink,
     seq: u64,
     started: bool,
-    call_ids: Vec<String>,
+    reasoning_item_added: bool,
+    message_item_added: bool,
+    calls: Vec<CallIds>,
     stats: Option<GenStats>,
 }
 
+struct CallIds {
+    item_id: String,
+    call_id: String,
+}
+
+impl Clone for CallIds {
+    fn clone(&self) -> Self {
+        Self {
+            item_id: self.item_id.clone(),
+            call_id: self.call_id.clone(),
+        }
+    }
+}
+
 impl ResponsesSink {
-    pub fn new(model: String, max_tokens: usize, constrained: bool) -> Self {
+    pub fn new(model: String, max_tokens: usize, think: ThinkMode, constrained: bool) -> Self {
         Self {
             id: next_id("resp_"),
-            item_id: next_id("msg_"),
+            message_id: next_id("msg_"),
+            reasoning_id: next_id("rs_"),
             created: now_secs(),
             model,
             max_tokens,
             decision: if constrained {
                 DecisionSink::constrained()
             } else {
-                DecisionSink::plain()
+                DecisionSink::plain(think)
             },
             seq: 0,
             started: false,
-            call_ids: Vec::new(),
+            reasoning_item_added: false,
+            message_item_added: false,
+            calls: Vec::new(),
             stats: None,
         }
     }
 
-    fn event(&mut self, out: &mut Vec<u8>, event: &str, payload: Value) {
-        let mut data = payload;
-        data["type"] = json!(event);
-        data["sequence_number"] = json!(self.seq);
+    fn event(&mut self, frames: &mut Vec<SseFrame>, event: &'static str, mut payload: Value) {
+        payload["type"] = json!(event);
+        payload["sequence_number"] = json!(self.seq);
         self.seq += 1;
-        sse_event(out, event, &data.to_string());
+        frames.push(SseFrame {
+            event: Some(event),
+            data: payload.to_string(),
+        });
     }
 
     fn response(&self, status: &str, output: Vec<Value>) -> Value {
@@ -290,52 +287,83 @@ impl ResponsesSink {
                 "output_tokens": stats.decode_tokens,
                 "total_tokens": stats.prefill_tokens + stats.decode_tokens,
                 "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens_details": {"reasoning_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": self.decision.reasoning_tokens},
             },
             "user": null,
             "metadata": {},
         })
     }
 
-    fn output_items(&self) -> Vec<Value> {
-        if self.decision.was_tool_branch() {
-            let content: Vec<Value> = self
-                .decision
+    fn reasoning_item(&self, reasoning: Option<&str>, status: Option<&str>) -> Value {
+        let content = match reasoning {
+            Some(r) => json!([{"type": "reasoning_text", "text": r}]),
+            None => json!([{"type": "reasoning_text", "text": ""}]),
+        };
+        let mut item = json!({
+            "id": self.reasoning_id,
+            "type": "reasoning",
+            "summary": [],
+            "content": content,
+        });
+        if let Some(s) = status {
+            item["status"] = json!(s);
+        }
+        item
+    }
+
+    fn message_item(&self, status: &str) -> Value {
+        let content: Vec<Value> = if self.decision.was_tool_branch() {
+            self.decision
                 .calls
                 .iter()
                 .enumerate()
                 .map(|(i, c)| {
+                    let ids = self
+                        .calls
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| CallIds {
+                            item_id: next_id("fc_"),
+                            call_id: next_id("call_"),
+                        });
                     json!({
                         "type": "function_call",
-                        "id": next_id("fc_"),
-                        "call_id": self.call_ids.get(i).cloned().unwrap_or_else(|| next_id("call_")),
+                        "id": ids.item_id,
+                        "call_id": ids.call_id,
                         "name": c.name.clone(),
                         "arguments": c.args.clone(),
                         "status": "completed",
                     })
                 })
-                .collect();
-            vec![json!({
-                "id": self.item_id,
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": content,
-            })]
+                .collect()
         } else {
             vec![json!({
-                "id": self.item_id,
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "annotations": [],
-                    "logprobs": [],
-                    "text": self.decision.text,
-                }],
+                "type": "output_text",
+                "annotations": [],
+                "logprobs": [],
+                "text": self.decision.text,
             })]
+        };
+        json!({
+            "id": self.message_id,
+            "type": "message",
+            "status": status,
+            "role": "assistant",
+            "content": content,
+        })
+    }
+
+    fn output_items(&self) -> Vec<Value> {
+        let mut items = Vec::new();
+        if self.decision.has_reasoning() {
+            items.push(self.reasoning_item(Some(&self.decision.reasoning_text), Some("completed")));
         }
+        items.push(self.message_item(if self.status() == "incomplete" { "incomplete" } else { "completed" }));
+        items
+    }
+
+    fn message_index(&self) -> usize {
+        usize::from(self.decision.has_reasoning())
     }
 
     fn status(&self) -> &'static str {
@@ -345,34 +373,57 @@ impl ResponsesSink {
         }
     }
 
-    fn ensure_started(&mut self, out: &mut Vec<u8>) {
+    fn ensure_started(&mut self, frames: &mut Vec<SseFrame>) {
         if self.started {
             return;
         }
         self.started = true;
         self.event(
-            out,
+            frames,
             "response.created",
             json!({"response": self.response("in_progress", vec![])}),
         );
         self.event(
-            out,
+            frames,
             "response.in_progress",
             json!({"response": self.response("in_progress", vec![])}),
         );
-        self.event(
-            out,
-            "response.output_item.added",
-            json!({"output_index": 0, "item": {"id": self.item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}}),
-        );
-        if self.decision.was_tool_branch() {
+    }
+
+    fn ensure_reasoning_item(&mut self, frames: &mut Vec<SseFrame>) {
+        self.ensure_started(frames);
+        if self.reasoning_item_added {
             return;
         }
+        self.reasoning_item_added = true;
         self.event(
-            out,
-            "response.content_part.added",
-            json!({"item_id": self.item_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": [], "logprobs": []}}),
+            frames,
+            "response.output_item.added",
+            json!({"output_index": 0, "item": self.reasoning_item(None, Some("in_progress"))}),
         );
+    }
+
+    fn ensure_message_item(&mut self, frames: &mut Vec<SseFrame>) {
+        self.ensure_started(frames);
+        if self.message_item_added {
+            return;
+        }
+        if !self.reasoning_item_added && self.decision.has_reasoning() {
+            self.ensure_reasoning_item(frames);
+        }
+        self.message_item_added = true;
+        self.event(
+            frames,
+            "response.output_item.added",
+            json!({"output_index": self.message_index(), "item": self.message_item("in_progress")}),
+        );
+        if !self.decision.was_tool_branch() {
+            self.event(
+                frames,
+                "response.content_part.added",
+                json!({"item_id": self.message_id, "output_index": self.message_index(), "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": [], "logprobs": []}}),
+            );
+        }
     }
 
     pub fn final_json(&self) -> Value {
@@ -381,103 +432,138 @@ impl ResponsesSink {
 }
 
 impl StreamSink for ResponsesSink {
-    fn on_delta(&mut self, text: &str, out: &mut Vec<u8>) -> Result<()> {
-        let parts = self.decision.push(text)?;
+    fn on_delta(&mut self, piece: &Piece) -> Result<Vec<SseFrame>> {
+        let parts = self.decision.push(piece)?;
+        let mut frames = Vec::new();
         for part in &parts {
             match part {
-                crate::tools::Part::Text(chunk) => {
-                    self.ensure_started(out);
+                Part::Text(chunk) => {
+                    self.ensure_message_item(&mut frames);
                     self.event(
-                        out,
+                        &mut frames,
                         "response.output_text.delta",
-                        json!({"item_id": self.item_id, "output_index": 0, "content_index": 0, "delta": chunk, "logprobs": []}),
+                        json!({"item_id": self.message_id, "output_index": self.message_index(), "content_index": 0, "delta": chunk, "logprobs": []}),
                     );
                 }
-                crate::tools::Part::CallStart { index, name } => {
-                    self.ensure_started(out);
-                    let call_id = next_id("call_");
-                    while self.call_ids.len() < *index {
-                        self.call_ids.push(String::new());
-                    }
-                    self.call_ids[*index - 1] = call_id.clone();
+                Part::Reasoning(chunk) => {
+                    self.ensure_reasoning_item(&mut frames);
                     self.event(
-                        out,
+                        &mut frames,
+                        "response.reasoning_text.delta",
+                        json!({"item_id": self.reasoning_id, "output_index": 0, "content_index": 0, "delta": chunk}),
+                    );
+                }
+                Part::CallStart { name, .. } => {
+                    self.ensure_message_item(&mut frames);
+                    let ids = CallIds {
+                        item_id: next_id("fc_"),
+                        call_id: next_id("call_"),
+                    };
+                    let index = self.calls.len();
+                    self.calls.push(ids.clone());
+                    self.event(
+                        &mut frames,
                         "response.content_part.added",
-                        json!({"item_id": self.item_id, "output_index": 0, "content_index": index - 1, "part": {"type": "function_call", "call_id": call_id, "name": name, "arguments": "", "status": "in_progress"}}),
+                        json!({"item_id": self.message_id, "output_index": self.message_index(), "content_index": index, "part": {"type": "function_call", "id": ids.item_id, "call_id": ids.call_id, "name": name, "arguments": "", "status": "in_progress"}}),
                     );
                 }
-                crate::tools::Part::CallArgs { chunk, .. } => {
+                Part::CallArgs { chunk, .. } => {
                     self.event(
-                        out,
+                        &mut frames,
                         "response.function_call_arguments.delta",
-                        json!({"item_id": self.item_id, "output_index": 0, "delta": chunk}),
+                        json!({"item_id": self.message_id, "output_index": self.message_index(), "delta": chunk}),
                     );
                 }
             }
         }
         self.decision.route(parts);
-        Ok(())
+        Ok(frames)
     }
 
-    fn on_done(&mut self, stats: &GenStats, out: &mut Vec<u8>) {
+    fn on_done(&mut self, stats: &GenStats) -> Result<Vec<SseFrame>> {
         self.stats = Some(*stats);
-        self.ensure_started(out);
-        let items = self.output_items();
-        let item = &items[0];
+        let parts = self.decision.finish()?;
+        self.decision.route(parts);
+        let mut frames = Vec::new();
+        self.ensure_started(&mut frames);
+        if self.decision.has_reasoning() {
+            self.ensure_reasoning_item(&mut frames);
+            self.event(
+                &mut frames,
+                "response.reasoning_text.done",
+                json!({"item_id": self.reasoning_id, "output_index": 0, "content_index": 0, "text": self.decision.reasoning_text}),
+            );
+            self.event(
+                &mut frames,
+                "response.output_item.done",
+                json!({"output_index": 0, "item": self.reasoning_item(Some(&self.decision.reasoning_text), Some("completed"))}),
+            );
+        }
+        self.ensure_message_item(&mut frames);
         if self.decision.was_tool_branch() {
-            let done_parts: Vec<(usize, String, String, Value)> = self
+            let calls: Vec<(String, String)> = self
                 .decision
                 .calls
                 .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    let call_id = self
-                        .call_ids
-                        .get(i)
-                        .cloned()
-                        .unwrap_or_else(|| next_id("call_"));
-                    (i, call_id, c.name.clone(), item["content"][i].clone())
-                })
+                .map(|c| (c.name.clone(), c.args.clone()))
                 .collect();
-            for (i, call_id, name, part) in done_parts {
+            for (i, (name, args)) in calls.into_iter().enumerate() {
+                let ids = self
+                    .calls
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| CallIds {
+                        item_id: next_id("fc_"),
+                        call_id: next_id("call_"),
+                    });
                 self.event(
-                    out,
+                    &mut frames,
                     "response.function_call_arguments.done",
-                    json!({"item_id": self.item_id, "output_index": 0, "arguments": part["arguments"], "name": name, "call_id": call_id}),
+                    json!({"item_id": self.message_id, "output_index": self.message_index(), "arguments": args, "name": name, "call_id": ids.call_id}),
                 );
+                let part = json!({
+                    "type": "function_call",
+                    "id": ids.item_id,
+                    "call_id": ids.call_id,
+                    "name": name,
+                    "arguments": args,
+                    "status": "completed",
+                });
                 self.event(
-                    out,
+                    &mut frames,
                     "response.content_part.done",
-                    json!({"item_id": self.item_id, "output_index": 0, "content_index": i, "part": part}),
+                    json!({"item_id": self.message_id, "output_index": self.message_index(), "content_index": i, "part": part}),
                 );
             }
         } else {
             self.event(
-                out,
+                &mut frames,
                 "response.output_text.done",
-                json!({"item_id": self.item_id, "output_index": 0, "content_index": 0, "text": self.decision.text, "logprobs": []}),
+                json!({"item_id": self.message_id, "output_index": self.message_index(), "content_index": 0, "text": self.decision.text, "logprobs": []}),
             );
             self.event(
-                out,
+                &mut frames,
                 "response.content_part.done",
-                json!({"item_id": self.item_id, "output_index": 0, "content_index": 0, "part": item["content"][0]}),
+                json!({"item_id": self.message_id, "output_index": self.message_index(), "content_index": 0, "part": self.message_item("completed")["content"][0]}),
             );
         }
-        self.event(
-            out,
-            "response.output_item.done",
-            json!({"output_index": 0, "item": item}),
-        );
-        let completed = self.response("completed", items);
-        self.event(out, "response.completed", json!({"response": completed}));
-        sse_event(out, "response.done", "[DONE]");
+        let completed = self.response(self.status(), self.output_items());
+        self.event(&mut frames, "response.output_item.done", json!({
+            "output_index": self.message_index(),
+            "item": self.message_item(if self.status() == "incomplete" { "incomplete" } else { "completed" }),
+        }));
+        self.event(&mut frames, "response.completed", json!({"response": completed}));
+        frames.push(SseFrame {
+            event: Some("response.done"),
+            data: "[DONE]".to_string(),
+        });
+        Ok(frames)
     }
 
-    fn on_failed(&mut self, msg: &str, out: &mut Vec<u8>) {
-        sse_event(
-            out,
-            "error",
-            &json!({"type": "error", "code": "server_error", "message": msg}).to_string(),
-        );
+    fn on_failed(&mut self, msg: &str) -> Vec<SseFrame> {
+        vec![SseFrame {
+            event: Some("error"),
+            data: json!({"type": "error", "code": "server_error", "message": msg}).to_string(),
+        }]
     }
 }

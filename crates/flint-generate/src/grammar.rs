@@ -309,14 +309,14 @@ pub struct TokenTrie {
 }
 
 impl TokenTrie {
-    pub fn from_tokenizer(tokenizer: &Tokenizer) -> Self {
+    pub fn from_tokenizer(tokenizer: &Tokenizer, vocab: usize) -> Self {
         let mut tokens = Vec::new();
-        for id in 0..tokenizer.vocab_size() {
+        for id in 0..tokenizer.vocab_size().min(vocab as u32) {
             if let Some(bytes) = tokenizer.decode_id(id) {
                 tokens.push((id, bytes));
             }
         }
-        Self::build(tokenizer.vocab_size() as usize, &tokens)
+        Self::build(vocab, &tokens)
     }
 
     fn build(vocab: usize, tokens: &[(u32, Vec<u8>)]) -> Self {

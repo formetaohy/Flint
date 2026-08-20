@@ -1,32 +1,203 @@
 pub mod anthropic;
+pub mod decision;
 pub mod gemini;
 pub mod openai_chat;
 pub mod openai_responses;
+pub mod reasoning;
 
-use std::io::{self, Read};
+use std::future::ready;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use flint_error::Result;
-use flint_generate::GenStats;
-use serde_json::Value;
-use tiny_http::{Header, Response};
+use axum::response::sse::{Event as SseEvent, Sse};
+use flint_error::{Error, Result};
+use flint_generate::{GenStats, Piece};
+use futures_util::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::engine_hub::Event;
-use crate::tools::{Call, DecisionParser, Part};
+use crate::engine_hub::{Client, CloseGuard, Event};
+use crate::protocols::decision::DecisionParser;
+use crate::protocols::reasoning::ReasoningParser;
+use flint_architectures::chat::ThinkMode;
 
 pub type Chat = (String, Vec<(String, String)>, String);
 
-pub fn json_response(value: Value) -> Response<std::io::Cursor<Vec<u8>>> {
-    Response::from_data(value.to_string())
-        .with_header(
-            Header::from_bytes(b"Content-Type", b"application/json").expect("valid header"),
-        )
-        .with_header(
-            Header::from_bytes(b"Access-Control-Allow-Origin", b"*").expect("valid header"),
-        )
+#[derive(Debug)]
+pub enum Part {
+    Text(String),
+    Reasoning(String),
+    CallStart { index: usize, name: String },
+    CallArgs { index: usize, chunk: String },
 }
+
+pub struct StreamCall {
+    pub name: String,
+    pub args: String,
+}
+
+pub struct DecisionSink {
+    decision: Option<DecisionParser>,
+    reasoning: Option<ReasoningParser>,
+    pub text: String,
+    pub reasoning_text: String,
+    pub reasoning_tokens: usize,
+    pub calls: Vec<StreamCall>,
+}
+
+impl DecisionSink {
+    pub fn plain(think: ThinkMode) -> Self {
+        Self {
+            decision: None,
+            reasoning: Some(ReasoningParser::new(think)),
+            text: String::new(),
+            reasoning_text: String::new(),
+            reasoning_tokens: 0,
+            calls: Vec::new(),
+        }
+    }
+
+    pub fn constrained() -> Self {
+        Self {
+            decision: Some(DecisionParser::new()),
+            reasoning: None,
+            text: String::new(),
+            reasoning_text: String::new(),
+            reasoning_tokens: 0,
+            calls: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, piece: &Piece) -> Result<Vec<Part>> {
+        match &mut self.reasoning {
+            Some(parser) => {
+                let (parts, thinking) = parser.push(&piece.text);
+                if thinking {
+                    self.reasoning_tokens += 1;
+                }
+                Ok(parts)
+            }
+            None => match &mut self.decision {
+                Some(parser) => parser.push(&piece.text),
+                None => Ok(vec![Part::Text(piece.text.clone())]),
+            },
+        }
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<Part>> {
+        match &mut self.reasoning {
+            Some(parser) => Ok(parser.finish()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn route(&mut self, parts: Vec<Part>) {
+        for part in parts {
+            match part {
+                Part::Text(chunk) => self.text.push_str(&chunk),
+                Part::Reasoning(chunk) => self.reasoning_text.push_str(&chunk),
+                Part::CallStart { index, name } => {
+                    while self.calls.len() < index {
+                        self.calls.push(StreamCall {
+                            name: String::new(),
+                            args: String::new(),
+                        });
+                    }
+                    self.calls[index - 1].name = name;
+                }
+                Part::CallArgs { index, chunk } => {
+                    self.calls[index - 1].args.push_str(&chunk);
+                }
+            }
+        }
+    }
+
+    pub fn was_tool_branch(&self) -> bool {
+        self.decision
+            .as_ref()
+            .is_some_and(DecisionParser::was_tool_branch)
+    }
+
+    pub fn has_reasoning(&self) -> bool {
+        !self.reasoning_text.is_empty() || self.reasoning_tokens > 0
+    }
+}
+
+pub struct SseFrame {
+    pub event: Option<&'static str>,
+    pub data: String,
+}
+
+pub trait StreamSink: Send {
+    fn on_delta(&mut self, piece: &Piece) -> Result<Vec<SseFrame>>;
+    fn on_done(&mut self, stats: &GenStats) -> Result<Vec<SseFrame>>;
+    fn on_failed(&mut self, msg: &str) -> Vec<SseFrame>;
+}
+
+struct StreamState<S> {
+    sink: S,
+    _guard: CloseGuard,
+}
+
+pub fn stream_response<S>(client: Client, sink: S) -> Sse<impl futures_core::Stream<Item = std::result::Result<SseEvent, std::convert::Infallible>>>
+where
+    S: StreamSink + 'static,
+{
+    let (rx, guard) = client.into_parts();
+    let state = StreamState { sink, _guard: guard };
+    let stream = UnboundedReceiverStream::new(rx)
+        .scan(state, |state, event| {
+            let frames = match event {
+                Event::Started(_) => Vec::new(),
+                Event::Piece(piece) => state
+                    .sink
+                    .on_delta(&piece)
+                    .unwrap_or_else(|e| state.sink.on_failed(&e.to_string())),
+                Event::Done(stats) => state
+                    .sink
+                    .on_done(&stats)
+                    .unwrap_or_else(|e| state.sink.on_failed(&e.to_string())),
+                Event::Failed(e) => state.sink.on_failed(&e),
+            };
+            ready(Some(frames))
+        })
+        .flat_map(futures_util::stream::iter)
+        .map(|frame| Ok(match frame.event {
+            Some(name) => SseEvent::default().event(name).data(frame.data),
+            None => SseEvent::default().data(frame.data),
+        }));
+    Sse::new(stream)
+}
+
+pub async fn collect<S>(mut client: Client, mut sink: S) -> Result<S>
+where
+    S: StreamSink,
+{
+    while let Some(event) = client.rx.recv().await {
+        match event {
+            Event::Started(_) => {}
+            Event::Piece(piece) => {
+                sink.on_delta(&piece)?;
+            }
+            Event::Done(stats) => {
+                sink.on_done(&stats)?;
+                return Ok(sink);
+            }
+            Event::Failed(e) => return Err(Error::Model(e)),
+        }
+    }
+    Err(Error::Model("engine closed the stream".into()))
+}
+
+pub fn split_reasoning(content: &str) -> String {
+    match content.rfind(CLOSE_TAG) {
+        Some(i) => content[i + CLOSE_TAG.len()..]
+            .trim_start_matches(['\n'])
+            .to_string(),
+        None => content.to_string(),
+    }
+}
+
+const CLOSE_TAG: &str = "</think>";
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -45,146 +216,6 @@ pub fn length_hit(stats: &GenStats, max_tokens: usize) -> bool {
     stats.decode_tokens >= max_tokens
 }
 
-pub trait StreamSink: Send {
-    fn on_delta(&mut self, text: &str, out: &mut Vec<u8>) -> Result<()>;
-    fn on_done(&mut self, stats: &GenStats, out: &mut Vec<u8>);
-    fn on_failed(&mut self, msg: &str, out: &mut Vec<u8>);
-}
-
-pub struct SseReader {
-    rx: Receiver<Event>,
-    sink: Box<dyn StreamSink>,
-    buf: Vec<u8>,
-    pos: usize,
-    closed: bool,
-}
-
-impl SseReader {
-    pub fn new(rx: Receiver<Event>, sink: Box<dyn StreamSink>) -> Self {
-        Self {
-            rx,
-            sink,
-            buf: Vec::new(),
-            pos: 0,
-            closed: false,
-        }
-    }
-}
-
-impl Read for SseReader {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        while self.pos >= self.buf.len() && !self.closed {
-            self.buf.clear();
-            self.pos = 0;
-            match self.rx.recv() {
-                Ok(Event::Piece(text)) => {
-                    if let Err(e) = self.sink.on_delta(&text, &mut self.buf) {
-                        self.sink.on_failed(&e.to_string(), &mut self.buf);
-                        self.closed = true;
-                    }
-                }
-                Ok(Event::Done(stats)) => {
-                    self.sink.on_done(&stats, &mut self.buf);
-                    self.closed = true;
-                }
-                Ok(Event::Failed(e)) => {
-                    self.sink.on_failed(&e, &mut self.buf);
-                    self.closed = true;
-                }
-                Ok(Event::Started(_)) => {}
-                Err(_) => self.closed = true,
-            }
-        }
-        if self.pos < self.buf.len() {
-            let n = (self.buf.len() - self.pos).min(out.len());
-            out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-            self.pos += n;
-            return Ok(n);
-        }
-        Ok(0)
-    }
-}
-
-pub struct DecisionSink {
-    parser: Option<DecisionParser>,
-    pub text: String,
-    pub calls: Vec<StreamCall>,
-}
-
-pub struct StreamCall {
-    pub name: String,
-    pub args: String,
-}
-
-impl DecisionSink {
-    pub fn plain() -> Self {
-        Self {
-            parser: None,
-            text: String::new(),
-            calls: Vec::new(),
-        }
-    }
-
-    pub fn constrained() -> Self {
-        Self {
-            parser: Some(DecisionParser::new()),
-            text: String::new(),
-            calls: Vec::new(),
-        }
-    }
-
-    pub fn push(&mut self, piece: &str) -> Result<Vec<Part>> {
-        match &mut self.parser {
-            Some(p) => p.push(piece),
-            None => Ok(vec![Part::Text(piece.to_string())]),
-        }
-    }
-
-    pub fn route(&mut self, parts: Vec<Part>) {
-        for part in parts {
-            match part {
-                Part::Text(chunk) => self.text.push_str(&chunk),
-                Part::CallStart { index, name } => {
-                    while self.calls.len() < index {
-                        self.calls.push(StreamCall {
-                            name: String::new(),
-                            args: String::new(),
-                        });
-                    }
-                    self.calls[index - 1].name = name;
-                }
-                Part::CallArgs { index, chunk } => {
-                    self.calls[index - 1].args.push_str(&chunk);
-                }
-            }
-        }
-    }
-
-    pub fn was_tool_branch(&self) -> bool {
-        self.parser
-            .as_ref()
-            .is_some_and(DecisionParser::was_tool_branch)
-    }
-
-    pub fn is_constrained(&self) -> bool {
-        self.parser.is_some()
-    }
-
-    pub fn parsed_calls(&self) -> Option<Result<Vec<Call>>> {
-        self.parser.as_ref().and_then(DecisionParser::tool_calls)
-    }
-}
-
-pub fn sse_event(out: &mut Vec<u8>, event: &str, data: &str) {
-    out.extend_from_slice(b"event: ");
-    out.extend_from_slice(event.as_bytes());
-    out.extend_from_slice(b"\ndata: ");
-    out.extend_from_slice(data.as_bytes());
-    out.extend_from_slice(b"\n\n");
-}
-
-pub fn sse_data(out: &mut Vec<u8>, data: &str) {
-    out.extend_from_slice(b"data: ");
-    out.extend_from_slice(data.as_bytes());
-    out.extend_from_slice(b"\n\n");
+pub fn json_response(value: serde_json::Value) -> axum::Json<serde_json::Value> {
+    axum::Json(value)
 }

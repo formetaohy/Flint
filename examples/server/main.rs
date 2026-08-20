@@ -2,21 +2,18 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use flint_error::{Error, Result};
-
+use flint_fetch::{Repo, fetch};
 use flint_server::bootstrap;
 
 #[derive(Parser)]
 #[command(
-    name = "flint-server",
+    name = "server",
     version,
-    about = "serve a local model behind OpenAI, Anthropic and Gemini compatible APIs"
+    about = "serve a downloaded Hugging Face model behind OpenAI, Anthropic and Gemini compatible APIs"
 )]
 struct Args {
     #[arg(long)]
-    model: Option<String>,
-
-    #[arg(long)]
-    dir: Option<PathBuf>,
+    model: String,
 
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -43,20 +40,13 @@ struct Args {
 fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
-    let dir = match bootstrap::model_dir(args.model.as_deref(), args.dir.as_deref())? {
-        Some(dir) => dir,
-        None => {
-            return Err(Error::Config(
-                "pass exactly one of --model (Hugging Face repo) or --dir (local path)".into(),
-            ));
-        }
-    };
-    let model_id = args
-        .model
-        .unwrap_or_else(|| dir.display().to_string());
+    let dir = PathBuf::from("temp").join(args.model.replace('/', "--"));
+    fetch(&Repo::new(&args.model), &dir).map_err(|e| {
+        Error::Config(format!("download {}: {e}", args.model))
+    })?;
     bootstrap::serve_from(bootstrap::ServeOptions {
         dir,
-        model_id,
+        model_id: args.model,
         host: args.host,
         port: args.port,
         api_key: args.api_key,

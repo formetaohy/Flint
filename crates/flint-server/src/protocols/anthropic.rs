@@ -1,13 +1,18 @@
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use flint_architectures::chat::ThinkMode;
 use flint_error::{Error, Result};
-use flint_generate::{GenStats, SamplingParams};
+use flint_generate::{GenStats, Piece, SamplingParams};
 use serde_json::{Value, json};
-use tiny_http::{Request, Response};
 
-use crate::engine_hub::Event;
-use crate::hub::{GenerateRequest, Hub, ToolChoice};
+use crate::hub::{GenerateRequest, RequestDefaults, ToolChoice};
 use crate::protocols::{
-    Chat, DecisionSink, SseReader, StreamSink, json_response, length_hit, next_id, sse_event,
+    Chat, DecisionSink, Part, SseFrame, StreamSink, collect, json_response, length_hit, next_id,
+    split_reasoning, stream_response,
 };
+use crate::server::AppState;
 use crate::tools::{Tool, render_tool_call};
 
 pub struct Parsed {
@@ -16,113 +21,80 @@ pub struct Parsed {
     pub model: String,
 }
 
-pub fn handle_count_tokens(mut request: Request, hub: &Hub) -> Result<()> {
-    let mut body = String::new();
-    request.as_reader().read_to_string(&mut body)?;
-    let body: Value = match serde_json::from_str(&body) {
+pub async fn handle(State(state): State<AppState>, body: Bytes) -> Response {
+    let body: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            let _ = request.respond(json_response(json!({"type": "error", "error": {"type": "invalid_request_error", "message": format!("invalid JSON body: {e}")}})));
-            return Ok(());
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("invalid JSON body: {e}"),
+            );
         }
     };
-    let parsed = match parse(&body, hub) {
+    let parsed = match parse(&body, &state.hub.defaults()) {
         Ok(p) => p,
         Err(e) => {
-            let _ = request.respond(json_response(json!({"type": "error", "error": {"type": "invalid_request_error", "message": e.to_string()}})));
-            return Ok(());
+            return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
         }
     };
-    match hub.count_tokens(&parsed.req) {
-        Ok(n) => {
-            let _ = request.respond(json_response(json!({"input_tokens": n})));
-        }
-        Err(e) => {
-            let _ = request.respond(json_response(
-                json!({"type": "error", "error": {"type": "api_error", "message": e.to_string()}}),
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub fn handle(mut request: Request, hub: &Hub) -> Result<()> {
-    let mut body = String::new();
-    request.as_reader().read_to_string(&mut body)?;
-    let body: Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = request.respond(json_response(json!({"type": "error", "error": {"type": "invalid_request_error", "message": format!("invalid JSON body: {e}")}})));
-            return Ok(());
-        }
-    };
-    let parsed = match parse(&body, hub) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = request.respond(json_response(json!({"type": "error", "error": {"type": "invalid_request_error", "message": e.to_string()}})));
-            return Ok(());
-        }
-    };
-    let client = match hub.generate(&parsed.req) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = request.respond(json_response(
-                json!({"type": "error", "error": {"type": "api_error", "message": e.to_string()}}),
-            ));
-            return Ok(());
-        }
+    let generation = match state.hub.generate(&parsed.req).await {
+        Ok(g) => g,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e.to_string()),
     };
     let sink = MessageSink::new(
         parsed.model.clone(),
         parsed.req.max_tokens,
+        generation.think,
         parsed.req.tool_wrapper(),
     );
     if parsed.stream {
-        let reader = SseReader::new(client.rx, Box::new(sink));
-        let response = Response::new(
-            tiny_http::StatusCode(200),
-            crate::server::sse_headers(),
-            Box::new(reader),
-            None,
-            None,
-        );
-        request.respond(response)?;
-        return Ok(());
+        return stream_response(generation.client, sink).into_response();
     }
-    let rx = client.rx;
-    let mut sink = sink;
-    let mut scratch = Vec::new();
-    loop {
-        match rx.recv() {
-            Ok(Event::Piece(text)) => {
-                if let Err(e) = sink.on_delta(&text, &mut scratch) {
-                    let _ = request.respond(json_response(json!({"type": "error", "error": {"type": "api_error", "message": e.to_string()}})));
-                    return Ok(());
-                }
-            }
-            Ok(Event::Done(stats)) => {
-                sink.on_done(&stats, &mut scratch);
-                break;
-            }
-            Ok(Event::Failed(e)) => {
-                let _ = request.respond(json_response(
-                    json!({"type": "error", "error": {"type": "api_error", "message": e}}),
-                ));
-                return Ok(());
-            }
-            _ => break,
-        }
-    }
-    let _ = request.respond(json_response(sink.final_json()));
-    Ok(())
+    let sink = match collect(generation.client, sink).await {
+        Ok(s) => s,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e.to_string()),
+    };
+    json_response(sink.final_json()).into_response()
 }
 
-pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
+fn error(status: StatusCode, kind: &str, message: String) -> Response {
+    (
+        status,
+        json_response(json!({"type": "error", "error": {"type": kind, "message": message}})),
+    )
+        .into_response()
+}
+
+pub async fn handle_count_tokens(State(state): State<AppState>, body: Bytes) -> Response {
+    let body: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("invalid JSON body: {e}"),
+            );
+        }
+    };
+    let parsed = match parse(&body, &state.hub.defaults()) {
+        Ok(p) => p,
+        Err(e) => {
+            return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
+        }
+    };
+    match state.hub.count_tokens(&parsed.req) {
+        Ok(n) => json_response(json!({"input_tokens": n})).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e.to_string()),
+    }
+}
+
+pub fn parse(body: &Value, defaults: &RequestDefaults) -> Result<Parsed> {
     let stream = body["stream"].as_bool().unwrap_or(false);
     let max_tokens = body["max_tokens"]
         .as_u64()
         .map(|v| v as usize)
-        .unwrap_or_else(|| hub.default_max_tokens());
+        .unwrap_or(defaults.max_tokens);
     let stop = body
         .get("stop_sequences")
         .and_then(Value::as_array)
@@ -147,6 +119,7 @@ pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
         sampling.top_k = t as usize;
         any = true;
     }
+    let thinking = !matches!(body["thinking"]["type"].as_str(), Some("disabled"));
     let tools = body
         .get("tools")
         .and_then(Value::as_array)
@@ -178,7 +151,7 @@ pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
     let model = body["model"]
         .as_str()
         .map(str::to_string)
-        .unwrap_or_else(|| hub.model_id().to_string());
+        .unwrap_or_else(|| defaults.model_id.clone());
     Ok(Parsed {
         req: GenerateRequest {
             system,
@@ -190,6 +163,7 @@ pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
             schema: None,
             tools,
             tool_choice,
+            thinking,
         },
         stream,
         model,
@@ -233,7 +207,7 @@ fn extract_messages(body: &Value) -> Result<Chat> {
     for m in messages {
         let role = m["role"].as_str().unwrap_or_default();
         let content = match &m["content"] {
-            Value::String(s) => Some(s.clone()),
+            Value::String(s) => Some(split_reasoning(s)),
             Value::Array(blocks) => Some(render_blocks(blocks, &tool_names)),
             _ => None,
         };
@@ -264,9 +238,10 @@ fn render_blocks(
         match b["type"].as_str() {
             Some("text") => {
                 if let Some(t) = b["text"].as_str() {
-                    parts.push(t.to_string());
+                    parts.push(split_reasoning(t));
                 }
             }
+            Some("thinking") | Some("redacted_thinking") => {}
             Some("tool_use") => {
                 let name = b["name"].as_str().unwrap_or_default();
                 let input = b.get("input").cloned().unwrap_or_else(|| json!({}));
@@ -306,12 +281,20 @@ pub struct MessageSink {
     max_tokens: usize,
     decision: DecisionSink,
     started: bool,
-    block: usize,
+    blocks: Vec<Block>,
+    open_block: Option<usize>,
     stats: Option<GenStats>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Block {
+    Thinking,
+    Text,
+    ToolUse,
+}
+
 impl MessageSink {
-    pub fn new(model: String, max_tokens: usize, constrained: bool) -> Self {
+    pub fn new(model: String, max_tokens: usize, think: ThinkMode, constrained: bool) -> Self {
         Self {
             id: next_id("msg_"),
             model,
@@ -319,23 +302,23 @@ impl MessageSink {
             decision: if constrained {
                 DecisionSink::constrained()
             } else {
-                DecisionSink::plain()
+                DecisionSink::plain(think)
             },
             started: false,
-            block: 0,
+            blocks: Vec::new(),
+            open_block: None,
             stats: None,
         }
     }
 
-    fn ensure_started(&mut self, out: &mut Vec<u8>) {
+    fn ensure_started(&mut self, frames: &mut Vec<SseFrame>) {
         if self.started {
             return;
         }
         self.started = true;
-        sse_event(
-            out,
-            "message_start",
-            &json!({"type": "message_start", "message": {
+        frames.push(SseFrame {
+            event: Some("message_start"),
+            data: json!({"type": "message_start", "message": {
                 "id": self.id,
                 "type": "message",
                 "role": "assistant",
@@ -346,15 +329,37 @@ impl MessageSink {
                 "usage": {"input_tokens": 0, "output_tokens": 1}
             }})
             .to_string(),
-        );
-        if !self.decision.was_tool_branch() {
-            sse_event(
-                out,
-                "content_block_start",
-                &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+        });
+    }
+
+    fn start_block(&mut self, block: Block, content_block: Value, frames: &mut Vec<SseFrame>) {
+        self.ensure_started(frames);
+        self.close_open_block(frames);
+        let index = self.blocks.len();
+        self.blocks.push(block);
+        self.open_block = Some(index);
+        frames.push(SseFrame {
+            event: Some("content_block_start"),
+            data: json!({"type": "content_block_start", "index": index, "content_block": content_block})
+                .to_string(),
+        });
+    }
+
+    fn close_open_block(&mut self, frames: &mut Vec<SseFrame>) {
+        let Some(index) = self.open_block.take() else {
+            return;
+        };
+        if self.blocks.get(index) == Some(&Block::Thinking) {
+            frames.push(SseFrame {
+                event: Some("content_block_delta"),
+                data: json!({"type": "content_block_delta", "index": index, "delta": {"type": "signature_delta", "signature": ""}})
                     .to_string(),
-            );
+            });
         }
+        frames.push(SseFrame {
+            event: Some("content_block_stop"),
+            data: json!({"type": "content_block_stop", "index": index}).to_string(),
+        });
     }
 
     fn stop_reason(&self, stats: &GenStats) -> &'static str {
@@ -371,6 +376,60 @@ impl MessageSink {
         json!({"input_tokens": stats.prefill_tokens, "output_tokens": stats.decode_tokens})
     }
 
+    fn emit_part(&mut self, part: &Part, frames: &mut Vec<SseFrame>) {
+        match part {
+            Part::Text(chunk) => {
+                if !self.blocks.contains(&Block::Text) {
+                    self.start_block(Block::Text, json!({"type": "text", "text": ""}), frames);
+                }
+                let index = self
+                    .blocks
+                    .iter()
+                    .position(|b| *b == Block::Text)
+                    .expect("text block was started");
+                frames.push(SseFrame {
+                    event: Some("content_block_delta"),
+                    data: json!({"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": chunk}})
+                        .to_string(),
+                });
+            }
+            Part::Reasoning(chunk) => {
+                if !self.blocks.contains(&Block::Thinking) {
+                    self.start_block(
+                        Block::Thinking,
+                        json!({"type": "thinking", "thinking": "", "signature": ""}),
+                        frames,
+                    );
+                }
+                let index = self
+                    .blocks
+                    .iter()
+                    .position(|b| *b == Block::Thinking)
+                    .expect("thinking block was started");
+                frames.push(SseFrame {
+                    event: Some("content_block_delta"),
+                    data: json!({"type": "content_block_delta", "index": index, "delta": {"type": "thinking_delta", "thinking": chunk}})
+                        .to_string(),
+                });
+            }
+            Part::CallStart { name, .. } => {
+                self.start_block(
+                    Block::ToolUse,
+                    json!({"type": "tool_use", "id": next_id("toolu_"), "name": name, "input": {}}),
+                    frames,
+                );
+            }
+            Part::CallArgs { chunk, .. } => {
+                let index = self.open_block.expect("tool use block is open");
+                frames.push(SseFrame {
+                    event: Some("content_block_delta"),
+                    data: json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": chunk}})
+                        .to_string(),
+                });
+            }
+        }
+    }
+
     pub fn final_json(&self) -> Value {
         let stats = self.stats.expect("completion stats are recorded");
         let content: Vec<Value> = if self.decision.was_tool_branch() {
@@ -383,7 +442,18 @@ impl MessageSink {
                 })
                 .collect()
         } else {
-            vec![json!({"type": "text", "text": self.decision.text})]
+            let mut blocks = Vec::new();
+            if self.decision.has_reasoning() {
+                blocks.push(json!({
+                    "type": "thinking",
+                    "thinking": self.decision.reasoning_text,
+                    "signature": "",
+                }));
+            }
+            if !self.decision.text.is_empty() || blocks.is_empty() {
+                blocks.push(json!({"type": "text", "text": self.decision.text}));
+            }
+            blocks
         };
         json!({
             "id": self.id,
@@ -399,83 +469,42 @@ impl MessageSink {
 }
 
 impl StreamSink for MessageSink {
-    fn on_delta(&mut self, text: &str, out: &mut Vec<u8>) -> Result<()> {
-        let parts = self.decision.push(text)?;
+    fn on_delta(&mut self, piece: &Piece) -> Result<Vec<SseFrame>> {
+        let parts = self.decision.push(piece)?;
+        let mut frames = Vec::new();
         for part in &parts {
-            match part {
-                crate::tools::Part::Text(chunk) => {
-                    self.ensure_started(out);
-                    sse_event(
-                        out,
-                        "content_block_delta",
-                        &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": chunk}})
-                            .to_string(),
-                    );
-                }
-                crate::tools::Part::CallStart { index, name } => {
-                    self.ensure_started(out);
-                    if *index != 1 {
-                        sse_event(
-                            out,
-                            "content_block_stop",
-                            &json!({"type": "content_block_stop", "index": *index - 2}).to_string(),
-                        );
-                    }
-                    sse_event(
-                        out,
-                        "content_block_start",
-                        &json!({"type": "content_block_start", "index": index - 1, "content_block": {"type": "tool_use", "id": next_id("toolu_"), "name": name, "input": {}}})
-                            .to_string(),
-                    );
-                    self.block = *index;
-                }
-                crate::tools::Part::CallArgs { index, chunk } => {
-                    let _ = index;
-                    sse_event(
-                        out,
-                        "content_block_delta",
-                        &json!({"type": "content_block_delta", "index": self.block - 1, "delta": {"type": "input_json_delta", "partial_json": chunk}})
-                            .to_string(),
-                    );
-                }
-            }
+            self.emit_part(part, &mut frames);
         }
         self.decision.route(parts);
-        Ok(())
+        Ok(frames)
     }
 
-    fn on_done(&mut self, stats: &GenStats, out: &mut Vec<u8>) {
+    fn on_done(&mut self, stats: &GenStats) -> Result<Vec<SseFrame>> {
         self.stats = Some(*stats);
-        self.ensure_started(out);
-        let last_block = if self.decision.was_tool_branch() {
-            self.decision.calls.len()
-        } else {
-            1
-        };
-        sse_event(
-            out,
-            "content_block_stop",
-            &json!({"type": "content_block_stop", "index": last_block - 1}).to_string(),
-        );
+        let parts = self.decision.finish()?;
+        let mut frames = Vec::new();
+        for part in &parts {
+            self.emit_part(part, &mut frames);
+        }
+        self.decision.route(parts);
+        self.close_open_block(&mut frames);
         let stop_reason = self.stop_reason(stats);
-        sse_event(
-            out,
-            "message_delta",
-            &json!({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": null}, "usage": {"output_tokens": stats.decode_tokens}})
+        frames.push(SseFrame {
+            event: Some("message_delta"),
+            data: json!({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": null}, "usage": {"output_tokens": stats.decode_tokens}})
                 .to_string(),
-        );
-        sse_event(
-            out,
-            "message_stop",
-            &json!({"type": "message_stop"}).to_string(),
-        );
+        });
+        frames.push(SseFrame {
+            event: Some("message_stop"),
+            data: json!({"type": "message_stop"}).to_string(),
+        });
+        Ok(frames)
     }
 
-    fn on_failed(&mut self, msg: &str, out: &mut Vec<u8>) {
-        sse_event(
-            out,
-            "error",
-            &json!({"type": "error", "error": {"type": "api_error", "message": msg}}).to_string(),
-        );
+    fn on_failed(&mut self, msg: &str) -> Vec<SseFrame> {
+        vec![SseFrame {
+            event: Some("error"),
+            data: json!({"type": "error", "error": {"type": "api_error", "message": msg}}).to_string(),
+        }]
     }
 }

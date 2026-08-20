@@ -1,98 +1,71 @@
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use flint_architectures::chat::ThinkMode;
 use flint_error::{Error, Result};
-use flint_generate::{GenStats, SamplingParams};
+use flint_generate::{GenStats, Piece, SamplingParams};
 use serde_json::{Value, json};
-use tiny_http::{Request, Response};
 
-use crate::engine_hub::Event;
-use crate::hub::{GenerateRequest, Hub, ToolChoice};
+use crate::hub::{GenerateRequest, RequestDefaults, ToolChoice};
 use crate::protocols::{
-    Chat, DecisionSink, SseReader, StreamSink, json_response, length_hit, sse_data,
+    Chat, DecisionSink, Part, SseFrame, StreamSink, collect, json_response, length_hit,
+    stream_response,
 };
+use crate::server::AppState;
 use crate::tools::{Tool, render_tool_call};
 
-pub fn handle(mut request: Request, hub: &Hub, stream: bool) -> Result<()> {
-    let mut body = String::new();
-    request.as_reader().read_to_string(&mut body)?;
-    let body: Value = match serde_json::from_str(&body) {
+pub async fn handle(State(state): State<AppState>, body: Bytes, stream: bool) -> Response {
+    let body: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            let _ = request.respond(json_response(
-                json!({"error": {"code": 400, "message": format!("invalid JSON body: {e}"), "status": "INVALID_ARGUMENT"}}),
-            ));
-            return Ok(());
+            return error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_ARGUMENT",
+                format!("invalid JSON body: {e}"),
+            );
         }
     };
-    let parsed = match parse(&body, hub) {
+    let parsed = match parse(&body, &state.hub.defaults()) {
         Ok(p) => p,
         Err(e) => {
-            let _ = request.respond(json_response(
-                json!({"error": {"code": 400, "message": e.to_string(), "status": "INVALID_ARGUMENT"}}),
-            ));
-            return Ok(());
+            return error(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", e.to_string());
         }
     };
-    let client = match hub.generate(&parsed.req) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = request.respond(json_response(
-                json!({"error": {"code": 500, "message": e.to_string(), "status": "INTERNAL"}}),
-            ));
-            return Ok(());
-        }
+    let generation = match state.hub.generate(&parsed.req).await {
+        Ok(g) => g,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e.to_string()),
     };
     let sink = GeminiSink::new(
         parsed.model.clone(),
         parsed.req.max_tokens,
+        generation.think,
         parsed.req.tool_wrapper(),
     );
     if stream {
-        let reader = SseReader::new(client.rx, Box::new(sink));
-        let response = Response::new(
-            tiny_http::StatusCode(200),
-            crate::server::sse_headers(),
-            Box::new(reader),
-            None,
-            None,
-        );
-        request.respond(response)?;
-        return Ok(());
+        return stream_response(generation.client, sink).into_response();
     }
-    let rx = client.rx;
-    let mut sink = sink;
-    let mut scratch = Vec::new();
-    loop {
-        match rx.recv() {
-            Ok(Event::Piece(text)) => {
-                if let Err(e) = sink.on_delta(&text, &mut scratch) {
-                    let _ = request.respond(json_response(
-                        json!({"error": {"code": 500, "message": e.to_string(), "status": "INTERNAL"}}),
-                    ));
-                    return Ok(());
-                }
-            }
-            Ok(Event::Done(stats)) => {
-                sink.on_done(&stats, &mut scratch);
-                break;
-            }
-            Ok(Event::Failed(e)) => {
-                let _ = request.respond(json_response(
-                    json!({"error": {"code": 500, "message": e, "status": "INTERNAL"}}),
-                ));
-                return Ok(());
-            }
-            _ => break,
-        }
-    }
-    let _ = request.respond(json_response(sink.final_json()));
-    Ok(())
+    let sink = match collect(generation.client, sink).await {
+        Ok(s) => s,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e.to_string()),
+    };
+    json_response(sink.final_json()).into_response()
 }
 
-pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
+fn error(status: StatusCode, kind: &str, message: String) -> Response {
+    (
+        status,
+        json_response(json!({"error": {"code": status.as_u16(), "message": message, "status": kind}})),
+    )
+        .into_response()
+}
+
+pub fn parse(body: &Value, defaults: &RequestDefaults) -> Result<Parsed> {
     let config = &body["generationConfig"];
     let max_tokens = config["maxOutputTokens"]
         .as_u64()
         .map(|v| v as usize)
-        .unwrap_or_else(|| hub.default_max_tokens());
+        .unwrap_or(defaults.max_tokens);
     let stop = config
         .get("stopSequences")
         .and_then(Value::as_array)
@@ -117,6 +90,10 @@ pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
         sampling.top_k = t as usize;
         any = true;
     }
+    let thinking = !matches!(
+        config["thinkingConfig"]["thinkingBudget"].as_u64(),
+        Some(0)
+    );
     let tools = body
         .get("tools")
         .and_then(Value::as_array)
@@ -146,7 +123,6 @@ pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
         _ => ToolChoice::Auto,
     };
     let (system, history, user) = extract_contents(body)?;
-    let model = hub.model_id().to_string();
     Ok(Parsed {
         req: GenerateRequest {
             system,
@@ -158,8 +134,9 @@ pub fn parse(body: &Value, hub: &Hub) -> Result<Parsed> {
             schema: None,
             tools,
             tool_choice,
+            thinking,
         },
-        model,
+        model: defaults.model_id.clone(),
     })
 }
 
@@ -167,6 +144,9 @@ fn extract_contents(body: &Value) -> Result<Chat> {
     let mut system = String::new();
     if let Some(parts) = body["systemInstruction"]["parts"].as_array() {
         for p in parts {
+            if p.get("thought").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
             if let Some(t) = p["text"].as_str() {
                 system.push_str(t);
             }
@@ -183,6 +163,7 @@ fn extract_contents(body: &Value) -> Result<Chat> {
         let parts = c["parts"].as_array().cloned().unwrap_or_default();
         let text: Vec<String> = parts
             .iter()
+            .filter(|p| p.get("thought").and_then(Value::as_bool) != Some(true))
             .filter_map(|p| p["text"].as_str().map(str::to_string))
             .collect();
         let calls: Vec<String> = parts
@@ -197,6 +178,7 @@ fn extract_contents(body: &Value) -> Result<Chat> {
             .collect();
         let responses: Vec<String> = parts
             .iter()
+            .filter(|p| p["functionResponse"].is_object())
             .map(|p| {
                 let fr = &p["functionResponse"];
                 format!(
@@ -240,39 +222,39 @@ pub struct GeminiSink {
 }
 
 impl GeminiSink {
-    pub fn new(model: String, max_tokens: usize, constrained: bool) -> Self {
+    pub fn new(model: String, max_tokens: usize, think: ThinkMode, constrained: bool) -> Self {
         Self {
             model,
             max_tokens,
             decision: if constrained {
                 DecisionSink::constrained()
             } else {
-                DecisionSink::plain()
+                DecisionSink::plain(think)
             },
             stats: None,
         }
     }
 
-    fn candidate(
-        &self,
-        text: Option<&str>,
-        calls: Option<Vec<Value>>,
-        finish: Option<&str>,
-    ) -> Value {
-        let parts: Vec<Value> = match calls {
-            Some(calls) => calls
-                .into_iter()
-                .map(|c| {
-                    let name = c["name"].as_str().unwrap_or_default().to_string();
-                    let args: Value = serde_json::from_str(c["args"].as_str().unwrap_or("{}"))
-                        .unwrap_or_else(|_| json!({}));
-                    json!({"functionCall": {"name": name, "args": args}})
-                })
-                .collect(),
-            None => vec![json!({"text": text.unwrap_or_default()})],
-        };
+    fn parts(&self) -> Vec<Value> {
+        let mut parts: Vec<Value> = Vec::new();
+        if self.decision.has_reasoning() {
+            parts.push(json!({"text": self.decision.reasoning_text, "thought": true}));
+        }
+        if self.decision.was_tool_branch() {
+            for c in &self.decision.calls {
+                let args: Value =
+                    serde_json::from_str(&c.args).unwrap_or_else(|_| json!({}));
+                parts.push(json!({"functionCall": {"name": c.name.clone(), "args": args}}));
+            }
+        } else if !self.decision.text.is_empty() || parts.is_empty() {
+            parts.push(json!({"text": self.decision.text}));
+        }
+        parts
+    }
+
+    fn candidate(&self, finish: Option<&str>) -> Value {
         let mut cand = json!({
-            "content": {"parts": parts, "role": "model"},
+            "content": {"parts": self.parts(), "role": "model"},
             "index": 0,
         });
         if let Some(f) = finish {
@@ -286,6 +268,7 @@ impl GeminiSink {
             "promptTokenCount": stats.prefill_tokens,
             "candidatesTokenCount": stats.decode_tokens,
             "totalTokenCount": stats.prefill_tokens + stats.decode_tokens,
+            "thoughtsTokenCount": self.decision.reasoning_tokens,
         })
     }
 
@@ -297,7 +280,7 @@ impl GeminiSink {
         }
     }
 
-    fn response_json(&self, text: Option<&str>, calls: Option<Vec<Value>>, finish: bool) -> Value {
+    fn response_json(&self, finish: Option<&str>) -> Value {
         let stats = self.stats.unwrap_or(GenStats {
             prefill_tokens: 0,
             decode_tokens: 0,
@@ -306,78 +289,70 @@ impl GeminiSink {
             decode_secs: 0.0,
         });
         json!({
-            "candidates": [self.candidate(text, calls, finish.then(|| self.finish_reason(&stats)))],
+            "candidates": [self.candidate(finish)],
             "usageMetadata": self.usage(&stats),
             "modelVersion": self.model,
         })
     }
 
     pub fn final_json(&self) -> Value {
-        let calls = if self.decision.was_tool_branch() {
-            Some(
-                self.decision
-                    .calls
-                    .iter()
-                    .map(|c| json!({"name": c.name.clone(), "args": c.args.clone()}))
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        self.response_json(Some(self.decision.text.as_str()), calls, true)
+        let stats = self.stats.expect("completion stats are recorded");
+        self.response_json(Some(self.finish_reason(&stats)))
     }
 }
 
 impl StreamSink for GeminiSink {
-    fn on_delta(&mut self, text: &str, out: &mut Vec<u8>) -> Result<()> {
-        let parts = self.decision.push(text)?;
-        let mut text_delta = String::new();
+    fn on_delta(&mut self, piece: &Piece) -> Result<Vec<SseFrame>> {
+        let parts = self.decision.push(piece)?;
+        let mut frames = Vec::new();
         for part in &parts {
-            if let crate::tools::Part::Text(chunk) = part {
-                text_delta.push_str(chunk);
+            match part {
+                Part::Text(chunk) => {
+                    frames.push(SseFrame {
+                        event: None,
+                        data: json!({
+                            "candidates": [{
+                                "content": {"parts": [{"text": chunk}], "role": "model"},
+                                "index": 0,
+                            }],
+                        })
+                        .to_string(),
+                    });
+                }
+                Part::Reasoning(chunk) => {
+                    frames.push(SseFrame {
+                        event: None,
+                        data: json!({
+                            "candidates": [{
+                                "content": {"parts": [{"text": chunk, "thought": true}], "role": "model"},
+                                "index": 0,
+                            }],
+                        })
+                        .to_string(),
+                    });
+                }
+                Part::CallStart { .. } | Part::CallArgs { .. } => {}
             }
         }
-        if !text_delta.is_empty() {
-            sse_data(
-                out,
-                &json!({
-                    "candidates": [{
-                        "content": {"parts": [{"text": text_delta}], "role": "model"},
-                        "index": 0,
-                    }],
-                })
-                .to_string(),
-            );
-        }
         self.decision.route(parts);
-        Ok(())
+        Ok(frames)
     }
 
-    fn on_done(&mut self, stats: &GenStats, out: &mut Vec<u8>) {
+    fn on_done(&mut self, stats: &GenStats) -> Result<Vec<SseFrame>> {
         self.stats = Some(*stats);
-        let calls = if self.decision.was_tool_branch() {
-            Some(
-                self.decision
-                    .calls
-                    .iter()
-                    .map(|c| json!({"name": c.name.clone(), "args": c.args.clone()}))
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        sse_data(
-            out,
-            &self
-                .response_json(Some(self.decision.text.as_str()), calls, true)
-                .to_string(),
-        );
+        let parts = self.decision.finish()?;
+        self.decision.route(parts);
+        let finish = self.finish_reason(stats);
+        Ok(vec![SseFrame {
+            event: None,
+            data: self.response_json(Some(finish)).to_string(),
+        }])
     }
 
-    fn on_failed(&mut self, msg: &str, out: &mut Vec<u8>) {
-        sse_data(
-            out,
-            &json!({"error": {"code": 500, "message": msg, "status": "INTERNAL"}}).to_string(),
-        );
+    fn on_failed(&mut self, msg: &str) -> Vec<SseFrame> {
+        vec![SseFrame {
+            event: None,
+            data: json!({"error": {"code": 500, "message": msg, "status": "INTERNAL"}}).to_string(),
+        }]
     }
 }

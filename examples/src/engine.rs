@@ -31,7 +31,7 @@ pub fn spawn(
     )?;
     eprintln!("[flint] loaded in {:.1}s", load_t.elapsed().as_secs_f64());
 
-    let text = chat_model.chat.render(system, &[], prompt);
+    let text = chat_model.chat.render(system, &[], prompt, true);
     let mut engine = Engine::new(
         backend,
         chat_model.model,
