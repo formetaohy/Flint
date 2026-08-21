@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/formetaohy/Thuban/actions/workflows/ci.yml"><img src="https://github.com/formetaohy/Thuban/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://crates.io/crates/thuban"><img src="https://img.shields.io/crates/v/thuban?style=flat-square" alt="crates.io" /></a>
   <a href="https://github.com/formetaohy/Thuban/stargazers"><img src="https://img.shields.io/github/stars/formetaohy/Thuban?style=flat-square&color=yellow" alt="Stars" /></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/language-Rust-dea584?style=flat-square&logo=rust" alt="Rust" /></a>
   <a href="https://github.com/formetaohy/Thuban/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License" /></a>
