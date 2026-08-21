@@ -6,7 +6,7 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/formetaohy/Flint"
+repository = "https://github.com/formetaohy/Thuban"
 
 [workspace.dependencies]
 thuban_architectures = { path = "crates/thuban_architectures", version = "0.1.0" }
