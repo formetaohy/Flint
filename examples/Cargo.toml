@@ -1,18 +1,18 @@
 [package]
-name = "flint-examples"
+name = "thuban_examples"
 version.workspace = true
 license.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
-flint-architectures.workspace = true
-flint-backend.workspace = true
-flint-error.workspace = true
-flint-generate.workspace = true
-flint-fetch.workspace = true
-flint-server.workspace = true
-flint-tokenizer.workspace = true
+thuban_architectures.workspace = true
+thuban_backend.workspace = true
+thuban_error.workspace = true
+thuban_generate.workspace = true
+thuban_fetch.workspace = true
+thuban_server.workspace = true
+thuban_tokenizer.workspace = true
 clap.workspace = true
 env_logger.workspace = true
 serde_json.workspace = true

@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use flint_error::{Error, Result};
-use flint_fetch::{Repo, fetch};
-use flint_server::bootstrap;
+use thuban_error::{Error, Result};
+use thuban_fetch::{Repo, fetch};
+use thuban_server::bootstrap;
 
 #[derive(Parser)]
 #[command(

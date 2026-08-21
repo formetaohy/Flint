@@ -38,4 +38,4 @@ jobs:
           echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - name: Test
-        run: cargo test --workspace --exclude flint-backend --exclude flint-model --exclude flint-architectures --exclude flint-generate
+        run: cargo test --workspace --exclude thuban_backend --exclude thuban_model --exclude thuban_architectures --exclude thuban_generate

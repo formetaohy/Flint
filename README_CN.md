@@ -1,4 +1,4 @@
-![LOGO](assets/logo.svg)
+<!-- ![LOGO](assets/logo.svg) -->
 
 <p align="center">
   <strong>高性能、跨平台的 LLM 推理引擎</strong>
@@ -15,9 +15,9 @@
   <a href="README.md">English</a>
 </p>
 
-## Flint 是什么？
+## Thuban 是什么？
 
-Flint 是用纯 Rust 编写、基于 [WGPU](https://github.com/gfx-rs/wgpu) 的大模型推理引擎。通过可移植的 Compute Shader 在 GPU 上运行，支持 **Windows**、**Linux/Android**、**macOS/iOS** 和 **Web (WASM)**。
+Thuban 是用纯 Rust 编写、基于 [WGPU](https://github.com/gfx-rs/wgpu) 的大模型推理引擎。通过可移植的 Compute Shader 在 GPU 上运行，支持 **Windows**、**Linux/Android**、**macOS/iOS** 和 **Web (WASM)**。
 
 ## 特性
 
@@ -41,7 +41,7 @@ Flint 是用纯 Rust 编写、基于 [WGPU](https://github.com/gfx-rs/wgpu) 的�
 
 ## 快速开始
 
-[示例](examples/README.md)：Flint 专门设计的可运行示例，可以帮助你快速上手引擎。
+[示例](examples/README.md)：Thuban 专门设计的可运行示例，可以帮助你快速上手引擎。
 
 ## 联系
 

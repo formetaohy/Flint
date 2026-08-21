@@ -5,7 +5,7 @@ A CLI example that downloads a Hugging Face model on demand and serves it behind
 ## Usage
 
 ```sh
-cargo run -p flint-examples --example server -- --model Qwen/Qwen3.5-0.6B-Instruct-2507 --port 8080
+cargo run -p thuban_examples --example server -- --model Qwen/Qwen3.5-0.6B-Instruct-2507 --port 8080
 ```
 
 The server listens on `http://127.0.0.1:8080` and exposes four API surfaces over the same engine:

@@ -9,20 +9,20 @@ license = "MIT"
 repository = "https://github.com/formetaohy/Flint"
 
 [workspace.dependencies]
-flint-error = { path = "crates/flint-error" }
-flint-num = { path = "crates/flint-num" }
-flint-gpu = { path = "crates/flint-gpu" }
-flint-checkpoint = { path = "crates/flint-checkpoint" }
-flint-tensor = { path = "crates/flint-tensor" }
-flint-kernel = { path = "crates/flint-kernel" }
-flint-backend = { path = "crates/flint-backend" }
-flint-model = { path = "crates/flint-model" }
-flint-architectures = { path = "crates/flint-architectures" }
-flint-tokenizer = { path = "crates/flint-tokenizer" }
-flint-generate = { path = "crates/flint-generate" }
-flint-profiler = { path = "crates/flint-profiler" }
-flint-fetch = { path = "crates/flint-fetch" }
-flint-server = { path = "crates/flint-server" }
+thuban_architectures = { path = "crates/thuban_architectures", version = "0.1.0" }
+thuban_backend = { path = "crates/thuban_backend", version = "0.1.0" }
+thuban_checkpoint = { path = "crates/thuban_checkpoint", version = "0.1.0" }
+thuban_error = { path = "crates/thuban_error", version = "0.1.0" }
+thuban_fetch = { path = "crates/thuban_fetch", version = "0.1.0" }
+thuban_generate = { path = "crates/thuban_generate", version = "0.1.0" }
+thuban_gpu = { path = "crates/thuban_gpu", version = "0.1.0" }
+thuban_kernel = { path = "crates/thuban_kernel", version = "0.1.0" }
+thuban_model = { path = "crates/thuban_model", version = "0.1.0" }
+thuban_num = { path = "crates/thuban_num", version = "0.1.0" }
+thuban_profiler = { path = "crates/thuban_profiler", version = "0.1.0" }
+thuban_server = { path = "crates/thuban_server", version = "0.1.0" }
+thuban_tensor = { path = "crates/thuban_tensor", version = "0.1.0" }
+thuban_tokenizer = { path = "crates/thuban_tokenizer", version = "0.1.0" }
 
 ahash = "0.8.12"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

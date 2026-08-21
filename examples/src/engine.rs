@@ -1,10 +1,10 @@
 use std::io::Write as _;
 use std::path::Path;
 
-use flint_architectures::LoadOptions;
-use flint_backend::Backend;
-use flint_error::Result;
-use flint_generate::{Engine, GenStats, Grammar, SessionId};
+use thuban_architectures::LoadOptions;
+use thuban_backend::Backend;
+use thuban_error::Result;
+use thuban_generate::{Engine, GenStats, Grammar, SessionId};
 
 pub fn spawn(
     dir: &Path,
@@ -14,13 +14,13 @@ pub fn spawn(
     ctx_size: u32,
     grammar: Option<Grammar>,
 ) -> Result<(Engine, SessionId)> {
-    eprintln!("[flint] initializing GPU backend...");
+    eprintln!("[thuban] initializing GPU backend...");
     let backend = Backend::new()?;
-    eprintln!("[flint] adapter: {}", backend.adapter_name());
+    eprintln!("[thuban] adapter: {}", backend.adapter_name());
 
-    eprintln!("[flint] loading model from {}...", dir.display());
+    eprintln!("[thuban] loading model from {}...", dir.display());
     let load_t = std::time::Instant::now();
-    let chat_model = flint_architectures::load(
+    let chat_model = thuban_architectures::load(
         dir,
         &LoadOptions {
             seq_lens: vec![ctx_size],
@@ -29,7 +29,7 @@ pub fn spawn(
         },
         &backend,
     )?;
-    eprintln!("[flint] loaded in {:.1}s", load_t.elapsed().as_secs_f64());
+    eprintln!("[thuban] loaded in {:.1}s", load_t.elapsed().as_secs_f64());
 
     let text = chat_model.chat.render(system, &[], prompt, true);
     let mut engine = Engine::new(
@@ -75,7 +75,7 @@ fn stats_summary(s: &GenStats) -> String {
         0.0
     };
     format!(
-        "[flint] prefill: {} tok in {:.2}s ({pp:.1} tok/s) | decode: {} tok in {:.2}s ({tg:.1} tok/s)",
+        "[thuban] prefill: {} tok in {:.2}s ({pp:.1} tok/s) | decode: {} tok in {:.2}s ({tg:.1} tok/s)",
         s.prefill_tokens, s.prefill_secs, s.decode_tokens, s.decode_secs,
     )
 }

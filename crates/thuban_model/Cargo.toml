@@ -1,0 +1,16 @@
+[package]
+name = "thuban_model"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Weight layout, pooling, and fused ops for Thuban models"
+
+[dependencies]
+thuban_backend.workspace = true
+thuban_kernel.workspace = true
+thuban_checkpoint.workspace = true
+thuban_error.workspace = true
+thuban_num.workspace = true
+thuban_tensor.workspace = true
+serde_json.workspace = true

@@ -1,11 +1,11 @@
 # chat
 
-A CLI example that downloads a Hugging Face model on demand and runs streaming chat inference with the Flint compute-shader stack. For thinking models (Qwen3, Qwen3.5, DeepSeek-R1, ...) the stream includes the raw `<think>...</think>` reasoning before the final answer; use the [server](../server/README.md) example if you need reasoning split out per protocol.
+A CLI example that downloads a Hugging Face model on demand and runs streaming chat inference with the Thuban compute-shader stack. For thinking models (Qwen3, Qwen3.5, DeepSeek-R1, ...) the stream includes the raw `<think>...</think>` reasoning before the final answer; use the [server](../server/README.md) example if you need reasoning split out per protocol.
 
 ## Usage
 
 ```sh
-cargo run -p flint-examples --example chat -- --model Qwen/Qwen2.5-0.5B-Instruct --prompt "What is a tensor?" --format safetensors
+cargo run -p thuban_examples --example chat -- --model Qwen/Qwen2.5-0.5B-Instruct --prompt "What is a tensor?" --format safetensors
 ```
 
 The model must ship GGUF quantizations; if the repo contains several, the largest one (highest quality) is picked automatically.

@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use flint_error::{Error, Result};
-use flint_examples::engine;
-use flint_generate::Grammar;
-use flint_fetch::{Repo, fetch};
+use thuban_error::{Error, Result};
+use thuban_examples::engine;
+use thuban_generate::Grammar;
+use thuban_fetch::{Repo, fetch};
 
 #[derive(Parser)]
 #[command(

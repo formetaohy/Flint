@@ -1,0 +1,11 @@
+[package]
+name = "thuban_profiler"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "GPU timestamp profiling for Thuban"
+
+[dependencies]
+thuban_error.workspace = true
+thuban_gpu.workspace = true

@@ -1,4 +1,4 @@
-![LOGO](assets/logo.svg)
+<!-- ![LOGO](assets/logo.svg) -->
 
 <p align="center">
   <strong>Fast, cross-platform LLM inference engine.</strong>
@@ -15,9 +15,9 @@
   <a href="README_CN.md">中文</a>
 </p>
 
-## What is Flint?
+## What is Thuban?
 
-Flint is a LLM inference engine written in pure Rust on [WGPU](https://github.com/gfx-rs/wgpu). It runs on the GPU via portable compute shaders, supporting **Windows**, **Linux/Android**, **macOS/iOS**, and the **Web (WASM)**.
+Thuban is a LLM inference engine written in pure Rust on [WGPU](https://github.com/gfx-rs/wgpu). It runs on the GPU via portable compute shaders, supporting **Windows**, **Linux/Android**, **macOS/iOS**, and the **Web (WASM)**.
 
 ## Features
 
@@ -41,7 +41,7 @@ We're actively adding support for more models. If there's a model you'd like sup
 
 ## Quick Start
 
-[Examples](examples/README.md): Flint's dedicated, runnable examples — a great way to get hands-on with the engine.
+[Examples](examples/README.md): Thuban's dedicated, runnable examples — a great way to get hands-on with the engine.
 
 ## Contact
 

@@ -1,0 +1,14 @@
+[package]
+name = "thuban_kernel"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "WGSL kernel registry and dispatch for Thuban"
+
+[dependencies]
+thuban_error.workspace = true
+thuban_gpu.workspace = true
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }

@@ -1,9 +1,0 @@
-﻿[package]
-name = "flint-profiler"
-version.workspace = true
-license.workspace = true
-edition.workspace = true
-
-[dependencies]
-flint-error.workspace = true
-flint-gpu.workspace = true

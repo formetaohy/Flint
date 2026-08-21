@@ -1,0 +1,14 @@
+[package]
+name = "thuban_generate"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Token generation engine: sampling, grammars, and speculative decoding"
+
+[dependencies]
+thuban_backend.workspace = true
+thuban_error.workspace = true
+thuban_model.workspace = true
+thuban_tokenizer.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "thuban_tensor"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Tensor and weight primitives for Thuban"
+
+[dependencies]
+thuban_gpu.workspace = true

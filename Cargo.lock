@@ -618,186 +618,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flint-architectures"
-version = "0.1.0"
-dependencies = [
- "flint-backend",
- "flint-checkpoint",
- "flint-error",
- "flint-model",
- "flint-tensor",
- "flint-tokenizer",
- "serde_json",
-]
-
-[[package]]
-name = "flint-backend"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "flint-error",
- "flint-gpu",
- "flint-kernel",
- "flint-num",
- "flint-profiler",
- "flint-tensor",
-]
-
-[[package]]
-name = "flint-bench"
-version = "0.1.0"
-dependencies = [
- "clap",
- "flint-architectures",
- "flint-backend",
- "flint-checkpoint",
- "flint-error",
- "flint-gpu",
- "flint-kernel",
- "flint-model",
- "flint-profiler",
- "flint-tensor",
- "serde_json",
-]
-
-[[package]]
-name = "flint-checkpoint"
-version = "0.1.0"
-dependencies = [
- "flint-error",
- "flint-num",
- "memmap2",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "flint-error"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "flint-examples"
-version = "0.1.0"
-dependencies = [
- "clap",
- "env_logger",
- "flint-architectures",
- "flint-backend",
- "flint-error",
- "flint-fetch",
- "flint-generate",
- "flint-server",
- "flint-tokenizer",
- "serde_json",
- "ureq",
-]
-
-[[package]]
-name = "flint-fetch"
-version = "0.1.0"
-dependencies = [
- "flint-error",
- "serde_json",
- "ureq",
-]
-
-[[package]]
-name = "flint-generate"
-version = "0.1.0"
-dependencies = [
- "flint-backend",
- "flint-error",
- "flint-model",
- "flint-tokenizer",
- "serde_json",
-]
-
-[[package]]
-name = "flint-gpu"
-version = "0.1.0"
-dependencies = [
- "flint-error",
- "pollster",
- "wgpu",
-]
-
-[[package]]
-name = "flint-kernel"
-version = "0.1.0"
-dependencies = [
- "flint-error",
- "flint-gpu",
- "naga",
-]
-
-[[package]]
-name = "flint-model"
-version = "0.1.0"
-dependencies = [
- "flint-backend",
- "flint-checkpoint",
- "flint-error",
- "flint-kernel",
- "flint-num",
- "flint-tensor",
- "serde_json",
-]
-
-[[package]]
-name = "flint-num"
-version = "0.1.0"
-
-[[package]]
-name = "flint-profiler"
-version = "0.1.0"
-dependencies = [
- "flint-error",
- "flint-gpu",
-]
-
-[[package]]
-name = "flint-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "clap",
- "env_logger",
- "flint-architectures",
- "flint-backend",
- "flint-error",
- "flint-fetch",
- "flint-generate",
- "flint-tokenizer",
- "futures-core",
- "futures-util",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tower-http",
-]
-
-[[package]]
-name = "flint-tensor"
-version = "0.1.0"
-dependencies = [
- "flint-gpu",
-]
-
-[[package]]
-name = "flint-tokenizer"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "flint-checkpoint",
- "flint-error",
- "serde_json",
- "tokenizers",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2023,6 +1843,206 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "thuban"
+version = "0.1.0"
+dependencies = [
+ "thuban_architectures",
+ "thuban_backend",
+ "thuban_checkpoint",
+ "thuban_error",
+ "thuban_fetch",
+ "thuban_generate",
+ "thuban_gpu",
+ "thuban_kernel",
+ "thuban_model",
+ "thuban_num",
+ "thuban_profiler",
+ "thuban_server",
+ "thuban_tensor",
+ "thuban_tokenizer",
+]
+
+[[package]]
+name = "thuban_architectures"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thuban_backend",
+ "thuban_checkpoint",
+ "thuban_error",
+ "thuban_model",
+ "thuban_tensor",
+ "thuban_tokenizer",
+]
+
+[[package]]
+name = "thuban_backend"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "thuban_error",
+ "thuban_gpu",
+ "thuban_kernel",
+ "thuban_num",
+ "thuban_profiler",
+ "thuban_tensor",
+]
+
+[[package]]
+name = "thuban_bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde_json",
+ "thuban_architectures",
+ "thuban_backend",
+ "thuban_checkpoint",
+ "thuban_error",
+ "thuban_gpu",
+ "thuban_kernel",
+ "thuban_model",
+ "thuban_profiler",
+ "thuban_tensor",
+]
+
+[[package]]
+name = "thuban_checkpoint"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+ "serde",
+ "serde_json",
+ "thuban_error",
+ "thuban_num",
+]
+
+[[package]]
+name = "thuban_error"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "thuban_examples"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "serde_json",
+ "thuban_architectures",
+ "thuban_backend",
+ "thuban_error",
+ "thuban_fetch",
+ "thuban_generate",
+ "thuban_server",
+ "thuban_tokenizer",
+ "ureq",
+]
+
+[[package]]
+name = "thuban_fetch"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thuban_error",
+ "ureq",
+]
+
+[[package]]
+name = "thuban_generate"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thuban_backend",
+ "thuban_error",
+ "thuban_model",
+ "thuban_tokenizer",
+]
+
+[[package]]
+name = "thuban_gpu"
+version = "0.1.0"
+dependencies = [
+ "pollster",
+ "thuban_error",
+ "wgpu",
+]
+
+[[package]]
+name = "thuban_kernel"
+version = "0.1.0"
+dependencies = [
+ "naga",
+ "thuban_error",
+ "thuban_gpu",
+]
+
+[[package]]
+name = "thuban_model"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thuban_backend",
+ "thuban_checkpoint",
+ "thuban_error",
+ "thuban_kernel",
+ "thuban_num",
+ "thuban_tensor",
+]
+
+[[package]]
+name = "thuban_num"
+version = "0.1.0"
+
+[[package]]
+name = "thuban_profiler"
+version = "0.1.0"
+dependencies = [
+ "thuban_error",
+ "thuban_gpu",
+]
+
+[[package]]
+name = "thuban_server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "env_logger",
+ "futures-core",
+ "futures-util",
+ "serde_json",
+ "thuban_architectures",
+ "thuban_backend",
+ "thuban_error",
+ "thuban_fetch",
+ "thuban_generate",
+ "thuban_tokenizer",
+ "tokio",
+ "tokio-stream",
+ "tower-http",
+]
+
+[[package]]
+name = "thuban_tensor"
+version = "0.1.0"
+dependencies = [
+ "thuban_gpu",
+]
+
+[[package]]
+name = "thuban_tokenizer"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "serde_json",
+ "thuban_checkpoint",
+ "thuban_error",
+ "tokenizers",
 ]
 
 [[package]]

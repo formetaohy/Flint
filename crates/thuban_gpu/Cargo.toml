@@ -1,0 +1,12 @@
+[package]
+name = "thuban_gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin portable compute-shader layer over wgpu for Thuban"
+
+[dependencies]
+thuban_error.workspace = true
+wgpu.workspace = true
+pollster.workspace = true

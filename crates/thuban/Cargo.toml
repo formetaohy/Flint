@@ -1,0 +1,57 @@
+[package]
+name = "thuban"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "GPU-accelerated LLM inference engine built on portable compute shaders"
+keywords = ["llm", "inference", "gpu", "compute-shader", "wgpu"]
+categories = ["science", "game-development"]
+readme = "README.md"
+
+[dependencies]
+thuban_architectures = { workspace = true, optional = true }
+thuban_backend = { workspace = true, optional = true }
+thuban_checkpoint = { workspace = true, optional = true }
+thuban_error = { workspace = true, optional = true }
+thuban_fetch = { workspace = true, optional = true }
+thuban_generate = { workspace = true, optional = true }
+thuban_gpu = { workspace = true, optional = true }
+thuban_kernel = { workspace = true, optional = true }
+thuban_model = { workspace = true, optional = true }
+thuban_num = { workspace = true, optional = true }
+thuban_profiler = { workspace = true, optional = true }
+thuban_server = { workspace = true, optional = true }
+thuban_tensor = { workspace = true, optional = true }
+thuban_tokenizer = { workspace = true, optional = true }
+
+[features]
+default = [
+    "thuban_architectures",
+    "thuban_backend",
+    "thuban_checkpoint",
+    "thuban_error",
+    "thuban_fetch",
+    "thuban_generate",
+    "thuban_gpu",
+    "thuban_kernel",
+    "thuban_model",
+    "thuban_num",
+    "thuban_profiler",
+    "thuban_tensor",
+    "thuban_tokenizer",
+]
+thuban_architectures = ["dep:thuban_architectures"]
+thuban_backend = ["dep:thuban_backend"]
+thuban_checkpoint = ["dep:thuban_checkpoint"]
+thuban_error = ["dep:thuban_error"]
+thuban_fetch = ["dep:thuban_fetch"]
+thuban_generate = ["dep:thuban_generate"]
+thuban_gpu = ["dep:thuban_gpu"]
+thuban_kernel = ["dep:thuban_kernel"]
+thuban_model = ["dep:thuban_model"]
+thuban_num = ["dep:thuban_num"]
+thuban_profiler = ["dep:thuban_profiler"]
+thuban_server = ["dep:thuban_server"]
+thuban_tensor = ["dep:thuban_tensor"]
+thuban_tokenizer = ["dep:thuban_tokenizer"]
