@@ -382,7 +382,7 @@ fn coop_gemm(ctx: &mut Ctx, case: &GemmCase<'_>) {
         [(m * k / 4).div_ceil(256), 1, 1],
     );
     ctx.dispatch(
-        shader::GEMM_COOP,
+        shader::GEMM_COOP_M16,
         &[
             ("N", n as f64),
             ("K", k as f64),
@@ -601,94 +601,57 @@ fn gemm_classic_segs_long_k() {
     gemm_acc_case(64, 64, 8192, false, 43);
 }
 
-fn gemv_case(quant: Quant, n: usize, k: usize, seed: u64, segs: u32) {
-    let ctx = Ctx::new();
+fn gemv_case(quant: Quant, n: usize, k: usize, seed: u64) {
+    let mut ctx = Ctx::new();
     let mut rng = Rng(seed);
     let x = rng.fill(k);
     let xb = ctx.f32(&x, &[k as u32]);
     let y = ctx.zero(&[n as u32]);
-    let partial = ctx.zero(&[8, 65536]);
     let (weight, cpu_w) = quant_weight(&ctx, quant, n as u32, k as u32, seed ^ 0xbeef);
-
-    let out = if segs == 1 {
-        Binding::Full(&y)
-    } else {
-        Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64)
-    };
-    ctx.dispatch(
-        shader::GEMV,
-        &[
-            ("N", n as f64),
-            ("K", k as f64),
-            ("QTYPE", qtype_of(&weight) as f64),
-            ("SEGS", segs as f64),
-            ("ACC", 0.0),
-        ],
-        &[
-            Binding::Full(&xb),
-            Binding::Full(weight.tensor()),
-            Binding::Full(ctx.backend.quant_lut()),
-            out,
-        ],
-        [(n.div_ceil(64)) as u32, segs, 1],
-    );
-    if segs > 1 {
-        ctx.dispatch(
-            shader::MERGE_GEMV,
-            &[("N", n as f64), ("SEGS", segs as f64), ("ACC", 0.0)],
-            &[
-                Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64),
-                Binding::Full(&y),
-            ],
-            [(n.div_ceil(256)) as u32, 1, 1],
-        );
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut pass = Commands::begin(&mut enc);
+        ctx.backend
+            .gemv(
+                &mut pass,
+                Binding::Full(&xb),
+                &[thuban_backend::GemvOp {
+                    w: &weight,
+                    y: Binding::Full(&y),
+                    acc: false,
+                }],
+            )
+            .unwrap();
     }
+    ctx.backend.submit(&mut enc).unwrap();
     agree(&ctx.read(&y), &cpu_ref::gemv(&x, &cpu_w, n, k), 1e-3, 1e-2);
 }
 
-fn gemv_bf16_case(n: usize, k: usize, seed: u64, segs: u32) {
-    let ctx = Ctx::new();
+fn gemv_bf16_case(n: usize, k: usize, seed: u64) {
+    let mut ctx = Ctx::new();
     let mut rng = Rng(seed);
     let x = rng.fill(k);
     let w = rng.fill(n * k);
     let xb = ctx.f32(&x, &[k as u32]);
     let y = ctx.zero(&[n as u32]);
-    let partial = ctx.zero(&[8, 65536]);
     let wb = ctx.bf16(&w, &[n as u32, k as u32]);
     let weight = Weight::plain(wb);
-    let out = if segs == 1 {
-        Binding::Full(&y)
-    } else {
-        Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64)
-    };
-    ctx.dispatch(
-        shader::GEMV,
-        &[
-            ("N", n as f64),
-            ("K", k as f64),
-            ("QTYPE", qtype_of(&weight) as f64),
-            ("SEGS", segs as f64),
-            ("ACC", 0.0),
-        ],
-        &[
-            Binding::Full(&xb),
-            Binding::Full(weight.tensor()),
-            Binding::Full(ctx.backend.quant_lut()),
-            out,
-        ],
-        [(n.div_ceil(64)) as u32, segs, 1],
-    );
-    if segs > 1 {
-        ctx.dispatch(
-            shader::MERGE_GEMV,
-            &[("N", n as f64), ("SEGS", segs as f64), ("ACC", 0.0)],
-            &[
-                Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64),
-                Binding::Full(&y),
-            ],
-            [(n.div_ceil(256)) as u32, 1, 1],
-        );
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut pass = Commands::begin(&mut enc);
+        ctx.backend
+            .gemv(
+                &mut pass,
+                Binding::Full(&xb),
+                &[thuban_backend::GemvOp {
+                    w: &weight,
+                    y: Binding::Full(&y),
+                    acc: false,
+                }],
+            )
+            .unwrap();
     }
+    ctx.backend.submit(&mut enc).unwrap();
     agree(
         &ctx.read(&y),
         &cpu_ref::gemv(&x, &bf16_round(&w), n, k),
@@ -700,14 +663,14 @@ fn gemv_bf16_case(n: usize, k: usize, seed: u64, segs: u32) {
 #[test]
 fn gemv_bf16() {
     let _g = gpu();
-    gemv_bf16_case(32, 128, 31, 1);
+    gemv_bf16_case(32, 128, 31);
 }
 
 #[test]
 fn gemv_each_quant() {
     let _g = gpu();
     for (i, &q) in ALL_QUANTS.iter().enumerate() {
-        gemv_case(q, 64, 256, 4000 + i as u64, 1);
+        gemv_case(q, 64, 256, 4000 + i as u64);
     }
 }
 
@@ -716,26 +679,26 @@ fn gemv_each_quant_partial_chunk() {
     let _g = gpu();
     for (i, &q) in ALL_QUANTS.iter().enumerate() {
         let k = if q.block_len() == 32 { 192 } else { 256 };
-        gemv_case(q, 32, k, 5000 + i as u64, 1);
+        gemv_case(q, 32, k, 5000 + i as u64);
     }
 }
 
 #[test]
-fn gemv_each_quant_split4() {
+fn gemv_each_quant_wide_k() {
     let _g = gpu();
     for (i, &q) in ALL_QUANTS.iter().enumerate() {
-        gemv_case(q, 64, 1024, 6000 + i as u64, 4);
+        gemv_case(q, 64, 1024, 6000 + i as u64);
     }
 }
 
 #[test]
-fn gemv_bf16_split8() {
+fn gemv_bf16_wide_k() {
     let _g = gpu();
-    gemv_bf16_case(32, 1024, 47, 8);
+    gemv_bf16_case(32, 1024, 47);
 }
 
 #[test]
-fn gemv_bf16_split_segs_divide_k_blocks() {
+fn gemv_bf16_unaligned_k() {
     let _g = gpu();
     let k = 1088u32;
     let n = 5120u32;
@@ -751,7 +714,15 @@ fn gemv_bf16_split_segs_divide_k_blocks() {
     {
         let mut pass = Commands::begin(&mut enc);
         ctx.backend
-            .gemv(&mut pass, Binding::Full(&xb), &wt, Binding::Full(&y))
+            .gemv(
+                &mut pass,
+                Binding::Full(&xb),
+                &[thuban_backend::GemvOp {
+                    w: &wt,
+                    y: Binding::Full(&y),
+                    acc: false,
+                }],
+            )
             .unwrap();
     }
     ctx.backend.submit(&mut enc).unwrap();
@@ -1512,7 +1483,7 @@ fn anchor_attn_causal_and_window() {
 #[test]
 fn gemv_bf16_wide() {
     let _g = gpu();
-    gemv_bf16_case(256, 2560, 99, 1);
+    gemv_bf16_case(256, 2560, 99);
 }
 
 #[test]
@@ -1545,7 +1516,15 @@ fn gemv_real_q2k_tensor_if_present() {
     {
         let mut pass = Commands::begin(&mut enc);
         ctx.backend
-            .gemv(&mut pass, Binding::Full(&xb), &weight, Binding::Full(&y))
+            .gemv(
+                &mut pass,
+                Binding::Full(&xb),
+                &[thuban_backend::GemvOp {
+                    w: &weight,
+                    y: Binding::Full(&y),
+                    acc: false,
+                }],
+            )
             .unwrap();
     }
     ctx.backend.submit(&mut enc).unwrap();
@@ -1608,4 +1587,158 @@ fn embed_real_model_if_present() {
             );
         }
     }
+}
+
+fn pack_views(backend: &Backend, tensors: Vec<Tensor>) -> Vec<Tensor> {
+    let refs: Vec<&Tensor> = tensors.iter().collect();
+    let packed = backend.pack_weights(&refs);
+    let mut off = 0u64;
+    tensors
+        .into_iter()
+        .map(|t| {
+            let v = Tensor::view(packed.buf.clone(), off, t.shape.clone(), t.dtype);
+            off += t.byte_len();
+            v
+        })
+        .collect()
+}
+
+fn gemv_ops_case(
+    quants: &[Quant],
+    ns: &[u32],
+    k: u32,
+    seed: u64,
+    x: &[f32],
+    rel: f32,
+    abs: f32,
+) {
+    let mut ctx = Ctx::new();
+    let xb = ctx.f32(x, &[k]);
+    let mut weights = Vec::new();
+    let mut cpus = Vec::new();
+    for (i, &q) in quants.iter().enumerate() {
+        let (w, cpu) = quant_weight(&ctx, q, ns[i], k, seed ^ (i as u64) * 0x9e37);
+        weights.push(w.tensor().clone());
+        cpus.push(cpu);
+    }
+    let mut views = pack_views(&ctx.backend, weights);
+    let wrap = |t: Tensor| Weight::quantized(t);
+    let mut ws: Vec<Weight> = (0..views.len()).map(|_| wrap(views.remove(0))).collect();
+    let ys: Vec<Tensor> = ns.iter().map(|&n| ctx.zero(&[n])).collect();
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut pass = Commands::begin(&mut enc);
+        let mut ops: Vec<thuban_backend::GemvOp<'_>> = Vec::new();
+        for i in 0..ys.len() {
+            ops.push(thuban_backend::GemvOp {
+                w: &ws[i],
+                y: Binding::Full(&ys[i]),
+                acc: false,
+            });
+        }
+        ctx.backend.gemv(&mut pass, Binding::Full(&xb), &ops).unwrap();
+    }
+    ctx.backend.submit(&mut enc).unwrap();
+    for i in 0..ys.len() {
+        let gpu = ctx.read(&ys[i]);
+        agree(
+            &gpu,
+            &cpu_ref::gemv(x, &cpus[i], ns[i] as usize, k as usize),
+            rel,
+            abs,
+        );
+    }
+}
+
+#[test]
+fn gemv_qkv() {
+    let _g = gpu();
+    let k = 256u32;
+    let x = Rng(77).fill(k as usize);
+    gemv_ops_case(&[Quant::Q8_0, Quant::Q8_0, Quant::Q8_0], &[64, 16, 16], k, 91, &x, 1e-3, 1e-2);
+}
+
+#[test]
+fn gemv_gateup() {
+    let _g = gpu();
+    let k = 896u32;
+    let x = Rng(78).fill(k as usize);
+    gemv_ops_case(&[Quant::Q8_0, Quant::Q8_0], &[96, 96], k, 92, &x, 1e-3, 1e-2);
+}
+
+#[test]
+fn gemv_mixed_quant() {
+    let _g = gpu();
+    let k = 256u32;
+    let x = Rng(79).fill(k as usize);
+    gemv_ops_case(&[Quant::Q4_0, Quant::Q8_0, Quant::F16], &[32, 64, 48], k, 93, &x, 2e-2, 8e-2);
+}
+
+
+fn gemv_plain_case(dtype: DType, n: usize, k: usize, seed: u64) {
+    let mut ctx = Ctx::new();
+    let mut rng = Rng(seed);
+    let x = rng.fill(k);
+    let w: Vec<f32> = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[k as u32]);
+    let wb = match dtype {
+        DType::F32 => ctx.f32(&w, &[n as u32, k as u32]),
+        DType::F16 => {
+            let bytes: Vec<u8> = w
+                .iter()
+                .flat_map(|v| thuban_num::f32_to_f16(*v).to_le_bytes())
+                .collect();
+            ctx.backend.tensor_f16(&bytes, vec![n as u32, k as u32]).unwrap()
+        }
+        DType::Bf16 => {
+            let bytes: Vec<u8> = w
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            ctx.backend.tensor_bf16(&bytes, vec![n as u32, k as u32]).unwrap()
+        }
+        _ => unreachable!("plain dtype only"),
+    };
+    let weight = Weight::plain(wb);
+    let y = ctx.zero(&[n as u32]);
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut pass = Commands::begin(&mut enc);
+        ctx.backend
+            .gemv(
+                &mut pass,
+                Binding::Full(&xb),
+                &[thuban_backend::GemvOp {
+                    w: &weight,
+                    y: Binding::Full(&y),
+                    acc: false,
+                }],
+            )
+            .unwrap();
+    }
+    ctx.backend.submit(&mut enc).unwrap();
+    let cpu_w: Vec<f32> = match dtype {
+        DType::F16 => w.iter().map(|v| thuban_num::f16_to_f32(thuban_num::f32_to_f16(*v))).collect(),
+        DType::Bf16 => w.iter().map(|v| f32::from_bits((v.to_bits() >> 16) << 16)).collect(),
+        _ => w.clone(),
+    };
+    agree(&ctx.read(&y), &cpu_ref::gemv(&x, &cpu_w, n, k), 1e-3, 1e-2);
+}
+
+#[test]
+fn gemv_f32() {
+    let _g = gpu();
+    gemv_plain_case(DType::F32, 1792, 896, 7001);
+}
+
+#[test]
+fn gemv_f16() {
+    let _g = gpu();
+    gemv_plain_case(DType::F16, 1792, 896, 7003);
+}
+
+#[test]
+fn gemv_bf16_large() {
+    let _g = gpu();
+    gemv_plain_case(DType::Bf16, 1792, 896, 7004);
 }

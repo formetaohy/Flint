@@ -16,14 +16,14 @@ use thuban_gpu::{Device, Kernel};
 pub mod scalar;
 
 use scalar::{Scalar, ScalarField, ScalarLayout};
-use shader::{GEMM_COOP, GEMM_COOP8};
+use shader::{GEMM_COOP_M16, GEMM_COOP_M8};
 
 type PackedScalars = HashMap<(String, Vec<u64>), Vec<u8>>;
 
 fn coop_variant_of(name: &str) -> Option<thuban_gpu::CoopVariant> {
     match name {
-        GEMM_COOP => Some(thuban_gpu::CoopVariant::M16),
-        GEMM_COOP8 => Some(thuban_gpu::CoopVariant::M8),
+        GEMM_COOP_M16 => Some(thuban_gpu::CoopVariant::M16),
+        GEMM_COOP_M8 => Some(thuban_gpu::CoopVariant::M8),
         _ => None,
     }
 }

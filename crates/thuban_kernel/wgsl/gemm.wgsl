@@ -66,7 +66,7 @@ fn gemm(
         let col = lid.x / 2u;
         let h = (lid.x % 2u) * 16u;
         var wv: array<vec4<f32>, 8>;
-        tile32(ty, n0 + col, k1, K, &wv);
+        tile32(ty, n0 + col, k1, K, 0u, &wv);
         if n0 + col < N {
             for (var q = 0u; q < 4u; q++) {
                 ws[(col * PAD + h + 4u * q) / 4u] = wv[h / 16u * 4u + q];
@@ -132,7 +132,7 @@ fn gemm(
                 let col = lid.x / 2u;
                 let h = (lid.x % 2u) * 16u;
                 var wv: array<vec4<f32>, 8>;
-                tile32(ty, n0 + col, k1, K, &wv);
+                tile32(ty, n0 + col, k1, K, 0u, &wv);
                 if n0 + col < N {
                     for (var q = 0u; q < 4u; q++) {
                         ws[(col * PAD + h + 4u * q) / 4u] = wv[h / 16u * 4u + q];

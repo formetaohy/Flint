@@ -21,7 +21,7 @@ fn embed(@builtin(global_invocation_id) gid: vec3<u32>) {
         let row = ids[gid.x / per_row];
         let kb = (gid.x % per_row) * 32u;
         var wv: array<vec4<f32>, 8>;
-        tile32(ty, row, kb, DIM, &wv);
+        tile32(ty, row, kb, DIM, 0u, &wv);
         let o = gid.x * 32u;
         for (var q = 0u; q < 8u; q++) {
             let v = wv[q] * pc.SCALE;

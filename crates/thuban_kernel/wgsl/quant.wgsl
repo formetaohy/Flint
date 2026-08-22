@@ -194,8 +194,8 @@ fn q3k_scale(b: u32, idx: u32) -> f32 {
 }
 
 // Decodes the 32-element tile of row n at column kb (kb % 32 == 0) into out.
-fn tile32(ty: u32, n: u32, kb: u32, K: u32, out: ptr<function, array<vec4<f32>, 8>>) {
-    let nb = n * wrow(ty, K);
+fn tile32(ty: u32, n: u32, kb: u32, K: u32, off: u32, out: ptr<function, array<vec4<f32>, 8>>) {
+    let nb = n * wrow(ty, K) + off;
     switch ty {
         case 0u: {
             let b = nb / 4u + kb;

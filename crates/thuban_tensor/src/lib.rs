@@ -15,15 +15,31 @@ pub enum DType {
     Quant(Quant),
 }
 
+#[derive(Clone)]
 pub struct Tensor {
     pub buf: Buffer,
+    pub offset: u64,
     pub shape: Vec<u32>,
     pub dtype: DType,
 }
 
 impl Tensor {
     pub fn new(buf: Buffer, shape: Vec<u32>, dtype: DType) -> Self {
-        Self { buf, shape, dtype }
+        Self {
+            buf,
+            offset: 0,
+            shape,
+            dtype,
+        }
+    }
+
+    pub fn view(buf: Buffer, offset: u64, shape: Vec<u32>, dtype: DType) -> Self {
+        Self {
+            buf,
+            offset,
+            shape,
+            dtype,
+        }
     }
 
     pub fn numel(&self) -> u64 {

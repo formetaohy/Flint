@@ -55,7 +55,7 @@ impl Qwen35 {
             let p = format!("layers.{i}");
             match kind {
                 LayerKind::Full => layers.push(Layer::Full {
-                    w: take_full_layer(&mut w, &p)?,
+                    w: take_full_layer(&mut w, &p, backend)?,
                     kv: KvPool::new(
                         backend,
                         cfg.kv_heads,
@@ -66,7 +66,7 @@ impl Qwen35 {
                     ),
                 }),
                 LayerKind::Linear => layers.push(Layer::Linear {
-                    w: take_linear_layer(&mut w, &p)?,
+                    w: take_linear_layer(&mut w, &p, backend)?,
                     state: RecurrentPool::new(
                         backend,
                         seqs,

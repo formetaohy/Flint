@@ -1,5 +1,5 @@
 @compute @workgroup_size(256, 1, 1)
-fn gemm_coop(
+fn gemm_coop_m16(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) grid: vec3<u32>,
 ) {

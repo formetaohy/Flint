@@ -90,23 +90,23 @@ pub fn delta_recur(
     )
 }
 
-pub struct SplitQgSpec {
+pub struct SplitQGateSpec {
     pub rows: u32,
     pub heads: u32,
     pub head_dim: u32,
 }
 
-pub fn split_qg(
+pub fn split_q_gate(
     backend: &mut Backend,
     commands: &mut Commands<'_>,
     x: Binding<'_>,
     q: Binding<'_>,
     gate: Binding<'_>,
-    spec: &SplitQgSpec,
+    spec: &SplitQGateSpec,
 ) -> Result<()> {
     backend.dispatch(
         commands,
-        shader::SPLIT_QG,
+        shader::SPLIT_Q_GATE,
         &[
             ("ROWS", spec.rows as f64),
             ("HEADS", spec.heads as f64),

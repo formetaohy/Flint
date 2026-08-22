@@ -10,7 +10,7 @@ var<immediate> pc: Pc;
 @group(0) @binding(2) var<storage, read_write> gate: array<f32>;
 
 @compute @workgroup_size(256, 1, 1)
-fn split_qg(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn split_q_gate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ROWS = pc.ROWS;
     let HEADS = pc.HEADS;
     let HD = pc.HD;

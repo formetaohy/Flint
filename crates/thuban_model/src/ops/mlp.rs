@@ -3,7 +3,7 @@ use thuban_error::Result;
 use thuban_kernel::shader;
 use thuban_tensor::Tensor;
 
-use crate::ops::{gemm, gemm_acc, gemv};
+use crate::ops::{gemm, gemm_acc, gemv_gateup};
 use crate::weights::SwigluMlp;
 use thuban_kernel::Act;
 
@@ -31,8 +31,15 @@ pub fn swiglu_mlp(
     spec: &MlpSpec,
 ) -> Result<()> {
     if spec.rows == 1 {
-        gemv(backend, commands, x, &mlp.gate, Binding::Full(&t.gate_out))?;
-        gemv(backend, commands, x, &mlp.up, Binding::Full(&t.up_out))?;
+        gemv_gateup(
+            backend,
+            commands,
+            x,
+            &mlp.gate,
+            &mlp.up,
+            Binding::Full(&t.gate_out),
+            Binding::Full(&t.up_out),
+        )?;
     } else {
         gemm(
             backend,

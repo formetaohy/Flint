@@ -28,7 +28,7 @@ fn stage_b(p: u32, k1: u32, n0: u32, lid: u32, N: u32, K: u32, ty: u32) {
     let n = lid / 2u;
     let half = (lid % 2u) * 16u;
     var wv: array<vec4<f32>, 8>;
-    tile32(ty, n0 + n, k1, K, &wv);
+    tile32(ty, n0 + n, k1, K, 0u, &wv);
     let base = p * (TN * BK) + n * BK + half;
     for (var q = 0u; q < 4u; q++) {
         let v = wv[half / 16u * 4u + q];

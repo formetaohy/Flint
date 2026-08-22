@@ -1,3 +1,4 @@
+use thuban_backend::Backend;
 use thuban_error::Result;
 use thuban_model::loader::{Plan, Role, WeightSet};
 use thuban_model::pool::KvPool;
@@ -6,13 +7,17 @@ use thuban_tensor::{Tensor, Weight};
 
 use super::state::RecurrentPool;
 
-fn take_mlp(w: &mut WeightSet, p: &str) -> Result<SwigluMlp> {
+fn take_mlp(w: &mut WeightSet, p: &str, backend: &Backend) -> Result<SwigluMlp> {
     let k = |n: &str| format!("{p}.{n}");
+    let mut packed = thuban_model::weights::pack_weights(
+        backend,
+        vec![w.take(&k("mlp.gate_proj.weight"))?, w.take(&k("mlp.up_proj.weight"))?],
+    );
     Ok(SwigluMlp {
         norm: w.take_tensor(&k("post_attention_norm.weight"))?,
         norm_bias: None,
-        gate: w.take(&k("mlp.gate_proj.weight"))?,
-        up: w.take(&k("mlp.up_proj.weight"))?,
+        gate: packed.remove(0),
+        up: packed.remove(0),
         down: w.take(&k("mlp.down_proj.weight"))?,
     })
 }
@@ -118,21 +123,37 @@ pub(super) fn plan() -> Plan {
     }
 }
 
-pub(super) fn take_full_layer(w: &mut WeightSet, p: &str) -> Result<Box<FullLayerW>> {
+pub(super) fn take_full_layer(
+    w: &mut WeightSet,
+    p: &str,
+    backend: &Backend,
+) -> Result<Box<FullLayerW>> {
     let k = |n: &str| format!("{p}.{n}");
+    let mut packed = thuban_model::weights::pack_weights(
+        backend,
+        vec![
+            w.take(&k("self_attn.qg_proj.weight"))?,
+            w.take(&k("self_attn.k_proj.weight"))?,
+            w.take(&k("self_attn.v_proj.weight"))?,
+        ],
+    );
     Ok(Box::new(FullLayerW {
         attn_norm: w.take_tensor(&k("input_layernorm.weight"))?,
-        q: w.take(&k("self_attn.qg_proj.weight"))?,
-        k: w.take(&k("self_attn.k_proj.weight"))?,
-        v: w.take(&k("self_attn.v_proj.weight"))?,
+        q: packed.remove(0),
+        k: packed.remove(0),
+        v: packed.remove(0),
         o: w.take(&k("self_attn.o_proj.weight"))?,
         q_norm: w.take_tensor(&k("self_attn.q_norm.weight"))?,
         k_norm: w.take_tensor(&k("self_attn.k_norm.weight"))?,
-        mlp: take_mlp(w, p)?,
+        mlp: take_mlp(w, p, backend)?,
     }))
 }
 
-pub(super) fn take_linear_layer(w: &mut WeightSet, p: &str) -> Result<Box<LinearLayerW>> {
+pub(super) fn take_linear_layer(
+    w: &mut WeightSet,
+    p: &str,
+    backend: &Backend,
+) -> Result<Box<LinearLayerW>> {
     let k = |n: &str| format!("{p}.linear_attn.{n}");
     Ok(Box::new(LinearLayerW {
         attn_norm: w.take_tensor(&format!("{p}.input_layernorm.weight"))?,
@@ -145,6 +166,6 @@ pub(super) fn take_linear_layer(w: &mut WeightSet, p: &str) -> Result<Box<Linear
         dt_bias: w.take_tensor(&k("dt_bias"))?,
         norm: w.take_tensor(&k("norm.weight"))?,
         out_proj: w.take(&k("out_proj.weight"))?,
-        mlp: take_mlp(w, p)?,
+        mlp: take_mlp(w, p, backend)?,
     }))
 }

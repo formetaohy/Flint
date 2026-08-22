@@ -54,6 +54,8 @@ struct Args {
     attn_probe: bool,
 
     #[arg(long)]
+    dispatch_probe: bool,
+
     paged_probe: bool,
 
     #[arg(long)]
@@ -83,6 +85,9 @@ fn main() -> Result<()> {
     }
     if args.attn_probe {
         return thuban_bench::probes::run("attn");
+    }
+    if args.dispatch_probe {
+        return thuban_bench::probes::run("dispatch");
     }
     if args.paged_probe {
         return thuban_bench::probes::run("paged");

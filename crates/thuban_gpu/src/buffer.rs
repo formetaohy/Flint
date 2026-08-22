@@ -4,19 +4,28 @@ use thuban_error::{Error, Result};
 
 use crate::DeviceRef;
 
+#[derive(Clone)]
 pub struct Buffer {
     pub(crate) buffer: wgpu::Buffer,
     pub(crate) device: DeviceRef,
+    pub(crate) id: u64,
     host_visible: bool,
 }
+
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Buffer {
     pub(crate) fn new(buffer: wgpu::Buffer, device: DeviceRef, host_visible: bool) -> Self {
         Self {
             buffer,
             device,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             host_visible,
         }
+    }
+
+    pub fn same(&self, other: &Self) -> bool {
+        self.id == other.id
     }
 
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<()> {

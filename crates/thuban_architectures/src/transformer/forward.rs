@@ -128,21 +128,31 @@ impl LanguageModel for Model {
                         Binding::Full(&lw.q_out),
                     )
                 };
-                ops::gemm_qkv(
-                    backend,
-                    &mut commands,
-                    Binding::Full(&s.normed),
-                    &ops::QkvSpec {
-                        wq: &lw.q,
-                        wk: lw.k.as_ref().unwrap_or(&lw.q),
-                        wv: lw.v.as_ref().unwrap_or(&lw.q),
-                        yq,
-                        yk,
-                        yv,
-                        rows: m,
-                        kv_width,
-                    },
-                )?;
+                let qkv = ops::QkvSpec {
+                    wq: &lw.q,
+                    wk: lw.k.as_ref().unwrap_or(&lw.q),
+                    wv: lw.v.as_ref().unwrap_or(&lw.q),
+                    yq,
+                    yk,
+                    yv,
+                    rows: m,
+                    kv_width,
+                };
+                if m == 1 {
+                    ops::gemv_qkv(
+                        backend,
+                        &mut commands,
+                        Binding::Full(&s.normed),
+                        &qkv,
+                    )?;
+                } else {
+                    ops::gemm_qkv(
+                        backend,
+                        &mut commands,
+                        Binding::Full(&s.normed),
+                        &qkv,
+                    )?;
+                }
 
                 if let (Some(qb), Some(kb), Some(vb)) = (&lw.q_bias, &lw.k_bias, &lw.v_bias) {
                     ops::bias(
@@ -359,7 +369,7 @@ impl LanguageModel for Model {
                     &mut commands,
                     Binding::Full(&s.mlp.down_out),
                     Binding::Full(&s.hidden),
-                    Binding::Full(&s.hidden2),
+                    Binding::Full(&s.post_attn),
                     &ResidualSpec {
                         scratch: s,
                         post_norm: lw.post_attn_norm.as_ref(),
@@ -372,7 +382,7 @@ impl LanguageModel for Model {
                 let mlp_src = if attn_fused {
                     Binding::Full(&s.hidden)
                 } else {
-                    Binding::Full(&s.hidden2)
+                    Binding::Full(&s.post_attn)
                 };
                 ops::norm(
                     backend,
@@ -409,7 +419,7 @@ impl LanguageModel for Model {
                         backend,
                         &mut commands,
                         Binding::Full(&s.mlp.down_out),
-                        Binding::Full(&s.hidden2),
+                        Binding::Full(&s.post_attn),
                         Binding::Full(&s.hidden),
                         &ResidualSpec {
                             scratch: s,
@@ -422,6 +432,7 @@ impl LanguageModel for Model {
                 }
 
                 self.per_layer_step(backend, &mut commands, s, lw, l, m)?;
+
 
                 if l as u32 + 1 == self.spec_depth && hidden_wanted {
                     self.capture_hidden(&mut commands, batch)?;

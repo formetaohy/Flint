@@ -40,7 +40,11 @@ pub fn read_rows(
     let mut out = Vec::with_capacity(rows.len());
     for &r in rows {
         assert!(r < m, "row {r} outside chunk");
-        out.push(backend.read_f32(&t.buf, (base + r) as u64 * count as u64 * 4, count as usize)?);
+        out.push(backend.read_f32(
+            &t.buf,
+            t.offset + (base + r) as u64 * count as u64 * 4,
+            count as usize,
+        )?);
     }
     Ok(out)
 }

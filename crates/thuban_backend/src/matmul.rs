@@ -17,23 +17,12 @@ impl Backend {
         }
     }
 
-    fn ensure_gemm_xf16(&mut self, words: u32) {
-        if words > self.gemm_xf16.numel() as u32 {
+    fn ensure_gemm_x_f16(&mut self, words: u32) {
+        if words > self.gemm_x_f16.numel() as u32 {
             let old = std::mem::replace(
-                &mut self.gemm_xf16,
+                &mut self.gemm_x_f16,
                 Self::partial_f16_buf(self.device.as_ref(), words as usize)
                     .expect("gemm f16 staging growth"),
-            );
-            self.retire(old);
-        }
-    }
-
-    fn ensure_gemv_partial(&mut self, words: u32) {
-        if words > self.gemv_partial.numel() as u32 {
-            let old = std::mem::replace(
-                &mut self.gemv_partial,
-                Self::partial_buf(self.device.as_ref(), words as usize)
-                    .expect("gemv partial growth"),
             );
             self.retire(old);
         }
@@ -75,21 +64,20 @@ impl Backend {
         let main = rows - rows % 128;
         let coop = if main > 0 && n.is_multiple_of(128) {
             self.device.coop_gemm().map(|v| match v {
-                CoopVariant::M16 => shader::GEMM_COOP,
-                CoopVariant::M8 => shader::GEMM_COOP8,
+                CoopVariant::M16 => shader::GEMM_COOP_M16,
+                CoopVariant::M8 => shader::GEMM_COOP_M8,
             })
         } else {
             None
         };
         if let Some(kernel) = coop {
-            self.ensure_gemm_xf16(main * k);
-            let xf = Binding::Slice(&self.gemm_xf16, 0, main as u64 * k as u64 * 2);
-            Self::set(
-                &self.kernels,
+            self.ensure_gemm_x_f16(main * k);
+            let x_f16 = Binding::Slice(&self.gemm_x_f16, 0, main as u64 * k as u64 * 2);
+            self.dispatch(
                 commands,
                 shader::TO_F16,
                 &[("N_ELEM", (main * k) as f64)],
-                &[x, xf],
+                &[x, x_f16],
                 [(main * k / 4).div_ceil(256), 1, 1],
             )?;
             let consts = [
@@ -103,26 +91,25 @@ impl Backend {
                 ("Y_OFF", 0.0),
             ];
             let lut = Binding::Full(self.quant_lut());
-            Self::set(
-                &self.kernels,
+            self.dispatch(
                 commands,
                 kernel,
                 &consts,
-                &[xf, wb, lut, y],
+                &[x_f16, wb, lut, y],
                 [n.div_ceil(128), main.div_ceil(128), 1],
             )?;
             if rows > main {
                 let tail = rows - main;
                 let xt = x.sub_slice(main as u64 * k as u64 * 4, tail as u64 * k as u64 * 4);
                 let yt = y.sub_slice(main as u64 * n as u64 * 4, tail as u64 * n as u64 * 4);
-                self.classic_gemm(commands, xt, w, yt, tail, acc)?;
+                self.gemm_tiled(commands, xt, w, yt, tail, acc)?;
             }
             return Ok(());
         }
-        self.classic_gemm(commands, x, w, y, rows, acc)
+        self.gemm_tiled(commands, x, w, y, rows, acc)
     }
 
-    fn classic_gemm(
+    fn gemm_tiled(
         &mut self,
         commands: &mut Commands<'_>,
         x: Binding<'_>,
@@ -156,8 +143,7 @@ impl Backend {
         };
         let lut = Binding::Full(self.quant_lut());
         let bufs = [x, wb, lut, yb];
-        Self::set(
-            &self.kernels,
+        self.dispatch(
             commands,
             shader::GEMM,
             &consts,
@@ -177,8 +163,7 @@ impl Backend {
                 Binding::Slice(&self.gemm_partial, 0, (segs * rows * n) as u64 * 4),
                 y,
             ];
-            Self::set(
-                &self.kernels,
+            self.dispatch(
                 commands,
                 shader::MERGE_GEMM,
                 &mconsts,
@@ -188,79 +173,84 @@ impl Backend {
         }
         Ok(())
     }
+}
 
+pub struct GemvOp<'a> {
+    pub w: &'a Weight,
+    pub y: Binding<'a>,
+    pub acc: bool,
+}
+
+impl Backend {
     pub fn gemv(
         &mut self,
         commands: &mut Commands<'_>,
         x: Binding<'_>,
-        w: &Weight,
-        y: Binding<'_>,
+        ops: &[GemvOp<'_>],
     ) -> Result<()> {
-        self.gemv_acc(commands, x, w, y, false)
-    }
-
-    pub fn gemv_acc(
-        &mut self,
-        commands: &mut Commands<'_>,
-        x: Binding<'_>,
-        w: &Weight,
-        y: Binding<'_>,
-        acc: bool,
-    ) -> Result<()> {
-        let (n, k, wb, qtype) = Self::weight_io(w);
-        assert!(k.is_multiple_of(32), "gemv K {k} is not a multiple of 32");
-        let base = n.div_ceil(64);
-        let segs: u32 = if base >= 96 {
-            1
-        } else {
-            [8u32, 4, 2, 1]
-                .into_iter()
-                .find(|s| k % (*s * 32) == 0 && base * *s >= 96)
-                .unwrap_or(1)
-        };
-        if segs > 1 {
-            self.ensure_gemv_partial(n * segs);
+        assert!(
+            !ops.is_empty() && ops.len() <= 3,
+            "gemv takes between 1 and 3 ops"
+        );
+        let mut ns = [0u32; 3];
+        let mut ks = [0u32; 3];
+        let mut qts = [0u32; 3];
+        let mut acs = [0u32; 3];
+        let mut offs = [0u32; 3];
+        let mut max_base = 0u32;
+        let mut wb: Option<Binding<'_>> = None;
+        let mut base_offset = 0u64;
+        for (i, op) in ops.iter().enumerate() {
+            let t = op.w.tensor();
+            let (n, k, binding, qtype) = Self::weight_io(op.w);
+            assert!(k.is_multiple_of(32), "gemv K {k} is not a multiple of 32");
+            if let Some(prev) = &wb {
+                let Binding::Full(pt) = prev else {
+                    unreachable!("gemv weights bind in full")
+                };
+                assert!(
+                    pt.buf.same(&t.buf),
+                    "gemv ops must share one packed weight buffer"
+                );
+            } else {
+                wb = Some(binding);
+                base_offset = t.offset;
+            }
+            ns[i] = n;
+            ks[i] = k;
+            qts[i] = qtype;
+            acs[i] = op.acc as u32;
+            offs[i] = (t.offset - base_offset) as u32;
+            max_base = max_base.max(n.div_ceil(8));
         }
         let consts = [
-            ("N", n as f64),
-            ("K", k as f64),
-            ("QTYPE", qtype as f64),
-            ("SEGS", segs as f64),
-            ("ACC", acc as u32 as f64),
+            ("N0", ns[0] as f64),
+            ("N1", ns[1] as f64),
+            ("N2", ns[2] as f64),
+            ("K0", ks[0] as f64),
+            ("K1", ks[1] as f64),
+            ("K2", ks[2] as f64),
+            ("QT0", qts[0] as f64),
+            ("QT1", qts[1] as f64),
+            ("QT2", qts[2] as f64),
+            ("AC0", acs[0] as f64),
+            ("AC1", acs[1] as f64),
+            ("AC2", acs[2] as f64),
+            ("O0", offs[0] as f64),
+            ("O1", offs[1] as f64),
+            ("O2", offs[2] as f64),
         ];
-        let out = if segs == 1 {
-            y
-        } else {
-            Binding::Slice(&self.gemv_partial, 0, n as u64 * 4 * segs as u64)
-        };
         let lut = Binding::Full(self.quant_lut());
-        let bufs = [x, wb, lut, out];
-        Self::set(
-            &self.kernels,
-            commands,
-            shader::GEMV,
-            &consts,
-            &bufs,
-            [base, segs, 1],
-        )?;
-        if segs > 1 {
-            let bufs = [
-                Binding::Slice(&self.gemv_partial, 0, n as u64 * 4 * segs as u64),
-                y,
-            ];
-            Self::set(
-                &self.kernels,
-                commands,
-                shader::MERGE_GEMV,
-                &[
-                    ("N", n as f64),
-                    ("SEGS", segs as f64),
-                    ("ACC", acc as u32 as f64),
-                ],
-                &bufs,
-                [n.div_ceil(256), 1, 1],
-            )?;
+        let dummy = Binding::Full(self.dummy());
+        let (mut y0, mut y1, mut y2) = (dummy, dummy, dummy);
+        for (i, op) in ops.iter().enumerate() {
+            match i {
+                0 => y0 = op.y,
+                1 => y1 = op.y,
+                _ => y2 = op.y,
+            }
         }
-        Ok(())
+        let bufs = [x, wb.expect("ops implies a weight"), y0, y1, y2, lut];
+        self.dispatch(commands, shader::GEMV, &consts, &bufs, [max_base, 1, 3])
     }
 }

@@ -43,7 +43,7 @@ pub(super) fn full_layer(
         commands,
         Binding::Full(&s.hidden),
         Binding::Full(&s.mlp.down_out),
-        Binding::Full(&s.hidden2),
+        Binding::Full(&s.post_attn),
         m * cfg.hidden,
     )?;
     post_mlp(backend, commands, cfg, s, &w.mlp, m)
@@ -74,7 +74,7 @@ pub(super) fn linear_layer(
         commands,
         Binding::Full(&s.hidden),
         Binding::Full(&s.mlp.down_out),
-        Binding::Full(&s.hidden2),
+        Binding::Full(&s.post_attn),
         m * cfg.hidden,
     )?;
     post_mlp(backend, commands, cfg, s, &w.mlp, m)
@@ -92,21 +92,56 @@ fn full_attn_block(
     let (cfg, s) = (ctx.cfg, ctx.s);
     let (nq, nkv, hd) = (cfg.q_heads, cfg.kv_heads, cfg.head_dim);
 
-    ops::gemm(
-        backend,
-        commands,
-        Binding::Full(&s.normed),
-        &w.q,
-        Binding::Full(&s.qg),
-        m,
-    )?;
-    ops::split_qg(
+    if m == 1 {
+        ops::gemv_qkv(
+            backend,
+            commands,
+            Binding::Full(&s.normed),
+            &ops::QkvSpec {
+                wq: &w.q,
+                wk: &w.k,
+                wv: &w.v,
+                yq: Binding::Full(&s.qg),
+                yk: Binding::Full(&s.k_raw),
+                yv: Binding::Full(&s.v_raw),
+                rows: m,
+                kv_width: nkv * hd,
+            },
+        )?;
+    } else {
+        ops::gemm(
+            backend,
+            commands,
+            Binding::Full(&s.normed),
+            &w.q,
+            Binding::Full(&s.qg),
+            m,
+        )?;
+        ops::gemm(
+            backend,
+            commands,
+            Binding::Full(&s.normed),
+            &w.k,
+            Binding::Full(&s.k_raw),
+            m,
+        )?;
+        ops::gemm(
+            backend,
+            commands,
+            Binding::Full(&s.normed),
+            &w.v,
+            Binding::Full(&s.v_raw),
+            m,
+        )?;
+    }
+
+    ops::split_q_gate(
         backend,
         commands,
         Binding::Full(&s.qg),
         Binding::Full(&s.q),
         Binding::Full(&s.gate),
-        &ops::SplitQgSpec {
+        &ops::SplitQGateSpec {
             rows: m,
             heads: nq,
             head_dim: hd,
@@ -121,14 +156,6 @@ fn full_attn_block(
         Binding::Full(&s.q),
         Binding::Full(&s.q_normed),
     )?;
-    ops::gemm(
-        backend,
-        commands,
-        Binding::Full(&s.normed),
-        &w.k,
-        Binding::Full(&s.k_raw),
-        m,
-    )?;
     ops::norm(
         backend,
         commands,
@@ -137,14 +164,6 @@ fn full_attn_block(
         &w.k_norm,
         Binding::Full(&s.k_raw),
         Binding::Full(&s.k_normed),
-    )?;
-    ops::gemm(
-        backend,
-        commands,
-        Binding::Full(&s.normed),
-        &w.v,
-        Binding::Full(&s.v_raw),
-        m,
     )?;
 
     let rope = ops::RopeInputs {
@@ -380,9 +399,9 @@ fn post_mlp(
         backend,
         commands,
         &ops::NormSpec::new(NormMode::Direct, m, cfg.hidden, cfg.norm_eps),
-        Binding::Full(&s.hidden2),
+        Binding::Full(&s.post_attn),
         &mlp.norm,
-        Binding::Full(&s.hidden2),
+        Binding::Full(&s.post_attn),
         Binding::Full(&s.normed),
     )?;
     ops::swiglu_mlp(
@@ -402,7 +421,7 @@ fn post_mlp(
     ops::add(
         backend,
         commands,
-        Binding::Full(&s.hidden2),
+        Binding::Full(&s.post_attn),
         Binding::Full(&s.mlp.down_out),
         Binding::Full(&s.hidden),
         m * cfg.hidden,

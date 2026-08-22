@@ -43,8 +43,8 @@ pub const SHADERS: &[ShaderSpec] = &[
         ]
     ),
     shader!(
-        shader::GEMM_COOP,
-        ["gemm_coop_common.wgsl", "quant.wgsl", "gemm_coop.wgsl"],
+        shader::GEMM_COOP_M16,
+        ["gemm_coop_common.wgsl", "quant.wgsl", "gemm_coop_m16.wgsl"],
         &[
             BindingMode::ReadOnly,
             BindingMode::ReadOnly,
@@ -63,8 +63,8 @@ pub const SHADERS: &[ShaderSpec] = &[
         ]
     ),
     shader!(
-        shader::GEMM_COOP8,
-        ["gemm_coop_common.wgsl", "quant.wgsl", "gemm_coop8.wgsl"],
+        shader::GEMM_COOP_M8,
+        ["gemm_coop_common.wgsl", "quant.wgsl", "gemm_coop_m8.wgsl"],
         &[
             BindingMode::ReadOnly,
             BindingMode::ReadOnly,
@@ -107,25 +107,27 @@ pub const SHADERS: &[ShaderSpec] = &[
         &[
             BindingMode::ReadOnly,
             BindingMode::ReadOnly,
-            BindingMode::ReadOnly,
-            BindingMode::ReadWrite
+            BindingMode::ReadWrite,
+            BindingMode::ReadWrite,
+            BindingMode::ReadWrite,
+            BindingMode::ReadOnly
         ],
         &[
-            ("N", Scalar::U32),
-            ("K", Scalar::U32),
-            ("QTYPE", Scalar::U32),
-            ("SEGS", Scalar::U32),
-            ("ACC", Scalar::U32),
-        ]
-    ),
-    shader!(
-        shader::MERGE_GEMV,
-        ["merge_gemv.wgsl"],
-        &[BindingMode::ReadWrite; 2],
-        &[
-            ("N", Scalar::U32),
-            ("SEGS", Scalar::U32),
-            ("ACC", Scalar::U32)
+            ("N0", Scalar::U32),
+            ("N1", Scalar::U32),
+            ("N2", Scalar::U32),
+            ("K0", Scalar::U32),
+            ("K1", Scalar::U32),
+            ("K2", Scalar::U32),
+            ("QT0", Scalar::U32),
+            ("QT1", Scalar::U32),
+            ("QT2", Scalar::U32),
+            ("AC0", Scalar::U32),
+            ("AC1", Scalar::U32),
+            ("AC2", Scalar::U32),
+            ("O0", Scalar::U32),
+            ("O1", Scalar::U32),
+            ("O2", Scalar::U32),
         ]
     ),
     shader!(
@@ -244,8 +246,8 @@ pub const SHADERS: &[ShaderSpec] = &[
         ]
     ),
     shader!(
-        shader::SPLIT_QG,
-        ["split_qg.wgsl"],
+        shader::SPLIT_Q_GATE,
+        ["split_q_gate.wgsl"],
         &[BindingMode::ReadWrite; 3],
         &[
             ("ROWS", Scalar::U32),

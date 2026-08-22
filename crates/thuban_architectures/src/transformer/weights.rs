@@ -75,13 +75,32 @@ pub(crate) fn take_layer(
     let kvw = cfg.kv_heads * hd;
     let has_kv = cfg.has_kv(l);
 
-    let (k_w, v_w) = if has_kv {
-        (
-            Some(w.take(&k("self_attn.k_proj.weight"))?),
-            Some(w.take(&k("self_attn.v_proj.weight"))?),
-        )
+    let (q_w, k_w, v_w) = if has_kv {
+        let mut packed = thuban_model::weights::pack_weights(
+            backend,
+            vec![
+                w.take(&k("self_attn.q_proj.weight"))?,
+                w.take(&k("self_attn.k_proj.weight"))?,
+                w.take(&k("self_attn.v_proj.weight"))?,
+            ],
+        );
+        let q = packed.remove(0);
+        let kw = packed.remove(0);
+        let vw = packed.remove(0);
+        (q, Some(kw), Some(vw))
     } else {
-        (None, None)
+        let q = w.take(&k("self_attn.q_proj.weight"))?;
+        let kw = if has_kv {
+            Some(w.take(&k("self_attn.k_proj.weight"))?)
+        } else {
+            None
+        };
+        let vw = if has_kv {
+            Some(w.take(&k("self_attn.v_proj.weight"))?)
+        } else {
+            None
+        };
+        (q, kw, vw)
     };
     let (k_b, v_b) = if has_kv && cfg.qkv_bias {
         (
@@ -91,14 +110,14 @@ pub(crate) fn take_layer(
     } else {
         (None, None)
     };
-    let mlp = take_mlp(w, &format!("layers.{l}"), cfg.layernorm)?;
+    let mlp = take_mlp(w, &format!("layers.{l}"), cfg.layernorm, backend)?;
     let per_layer = cfg.has_ple();
     let post_attn_key = "post_attention_norm.weight";
     let post_ffn_key = "post_ffw_norm.weight";
     Ok(LayerW {
         attn_norm: w.take_tensor(&k("input_layernorm.weight"))?,
         attn_norm_bias: take_optional(w, cfg.layernorm, &k("input_layernorm.bias"))?,
-        q: w.take(&k("self_attn.q_proj.weight"))?,
+        q: q_w,
         k: k_w,
         v: v_w,
         o: w.take(&k("self_attn.o_proj.weight"))?,
@@ -138,7 +157,7 @@ pub(crate) struct Scratch {
 
     pub(crate) meta: Tensor,
     pub(crate) hidden: Tensor,
-    pub(crate) hidden2: Tensor,
+    pub(crate) post_attn: Tensor,
     pub(crate) normed: Tensor,
 
     pub(crate) mlp: MlpTiles,
@@ -161,7 +180,7 @@ pub(crate) fn alloc_scratch(cfg: &Config, backend: &Backend) -> Scratch {
         ids: rows::token_ids(backend),
         meta: rows::row_meta(backend),
         hidden: backend.zero_tensor(&[MAX_M, cfg.hidden], DType::F32),
-        hidden2: backend.zero_tensor(&[MAX_M, cfg.hidden], DType::F32),
+        post_attn: backend.zero_tensor(&[MAX_M, cfg.hidden], DType::F32),
         normed: backend.zero_tensor(&[MAX_M, cfg.hidden], DType::F32),
         mlp: MlpTiles {
             gate_out: backend.zero_tensor(&[MAX_M, mlp_w], DType::F32),

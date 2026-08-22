@@ -11,7 +11,7 @@ pub(super) struct Scratch {
 
     pub(super) meta: Tensor,
     pub(super) hidden: Tensor,
-    pub(super) hidden2: Tensor,
+    pub(super) post_attn: Tensor,
     pub(super) normed: Tensor,
     pub(super) qkv_proj: Tensor,
     pub(super) conv_out: Tensor,
@@ -44,7 +44,7 @@ pub(super) fn alloc_scratch(cfg: &Qwen35Config, backend: &Backend) -> Scratch {
         ids: rows::token_ids(backend),
         meta: rows::row_meta(backend),
         hidden: z(&[MAX_M, h]),
-        hidden2: z(&[MAX_M, h]),
+        post_attn: z(&[MAX_M, h]),
         normed: z(&[MAX_M, h]),
         qkv_proj: z(&[MAX_M, cfg.conv_dim()]),
         conv_out: z(&[MAX_M, cfg.conv_dim()]),

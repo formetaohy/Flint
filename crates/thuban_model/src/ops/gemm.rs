@@ -31,12 +31,7 @@ pub fn gemm_qkv(
     spec: &QkvSpec<'_>,
 ) -> Result<()> {
     if spec.rows == 1 {
-        gemv(backend, commands, x, spec.wq, spec.yq)?;
-        if spec.kv_width > 0 {
-            gemv(backend, commands, x, spec.wk, spec.yk)?;
-            gemv(backend, commands, x, spec.wv, spec.yv)?;
-        }
-        Ok(())
+        gemv_qkv(backend, commands, x, spec)
     } else {
         gemm(backend, commands, x, spec.wq, spec.yq, spec.rows)?;
         if spec.kv_width > 0 {
@@ -47,6 +42,60 @@ pub fn gemm_qkv(
     }
 }
 
+pub fn gemv_qkv(
+    backend: &mut Backend,
+    commands: &mut Commands<'_>,
+    x: Binding<'_>,
+    spec: &QkvSpec<'_>,
+) -> Result<()> {
+    let mut ops = Vec::with_capacity(3);
+    ops.push(thuban_backend::GemvOp {
+        w: spec.wq,
+        y: spec.yq,
+        acc: false,
+    });
+    if spec.kv_width > 0 {
+        ops.push(thuban_backend::GemvOp {
+            w: spec.wk,
+            y: spec.yk,
+            acc: false,
+        });
+        ops.push(thuban_backend::GemvOp {
+            w: spec.wv,
+            y: spec.yv,
+            acc: false,
+        });
+    }
+    backend.gemv(commands, x, &ops)
+}
+
+pub fn gemv_gateup(
+    backend: &mut Backend,
+    commands: &mut Commands<'_>,
+    x: Binding<'_>,
+    gate: &Weight,
+    up: &Weight,
+    yg: Binding<'_>,
+    yu: Binding<'_>,
+) -> Result<()> {
+    backend.gemv(
+        commands,
+        x,
+        &[
+            thuban_backend::GemvOp {
+                w: gate,
+                y: yg,
+                acc: false,
+            },
+            thuban_backend::GemvOp {
+                w: up,
+                y: yu,
+                acc: false,
+            },
+        ],
+    )
+}
+
 pub fn gemv(
     backend: &mut Backend,
     commands: &mut Commands<'_>,
@@ -54,7 +103,11 @@ pub fn gemv(
     w: &Weight,
     y: Binding<'_>,
 ) -> Result<()> {
-    backend.gemv(commands, x, w, y)
+    backend.gemv(
+        commands,
+        x,
+        &[thuban_backend::GemvOp { w, y, acc: false }],
+    )
 }
 
 pub fn gemm_acc(
@@ -67,7 +120,11 @@ pub fn gemm_acc(
     acc: bool,
 ) -> Result<()> {
     if rows == 1 {
-        backend.gemv_acc(commands, x, w, y, acc)
+        backend.gemv(
+            commands,
+            x,
+            &[thuban_backend::GemvOp { w, y, acc }],
+        )
     } else {
         backend.gemm_acc(commands, x, w, y, rows, acc)
     }

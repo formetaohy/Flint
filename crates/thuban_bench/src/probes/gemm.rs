@@ -58,8 +58,8 @@ pub(super) fn gemm_probe() -> Result<()> {
     let tn: u32 = 128;
     let tm: u32 = if coop { 128 } else { 64 };
     let y = backend.zero_tensor(&[m, n], DType::F32);
-    let xf16 = if coop {
-        let xf = backend.zero_tensor(&[m * k], DType::F16);
+    let x_f16 = if coop {
+        let x_f16 = backend.zero_tensor(&[m * k], DType::F16);
         let mut enc = backend.encoder().unwrap();
         {
             let mut commands = Commands::begin(&mut enc);
@@ -67,12 +67,12 @@ pub(super) fn gemm_probe() -> Result<()> {
                 &mut commands,
                 thuban_kernel::shader::TO_F16,
                 &[("N_ELEM", (m * k) as f64)],
-                &[Binding::Full(&xb), Binding::Full(&xf)],
+                &[Binding::Full(&xb), Binding::Full(&x_f16)],
                 [(m * k / 4).div_ceil(256), 1, 1],
             )?;
         }
         backend.submit(&mut enc)?;
-        Some(xf)
+        Some(x_f16)
     } else {
         None
     };
@@ -103,7 +103,7 @@ pub(super) fn gemm_probe() -> Result<()> {
                 let binds = [
                     thuban_gpu::BindingRef {
                         index: 0,
-                        buffer: &xf16.as_ref().unwrap_or(&xb).buf,
+                        buffer: &x_f16.as_ref().unwrap_or(&xb).buf,
                         offset: 0,
                         size: 0,
                     },
@@ -144,7 +144,7 @@ pub(super) fn gemm_probe() -> Result<()> {
             let binds = [
                 thuban_gpu::BindingRef {
                     index: 0,
-                    buffer: &xf16.as_ref().unwrap_or(&xb).buf,
+                    buffer: &x_f16.as_ref().unwrap_or(&xb).buf,
                     offset: 0,
                     size: 0,
                 },
@@ -187,12 +187,12 @@ pub(super) fn gemm_probe() -> Result<()> {
         let mut enc = backend.encoder().unwrap();
         {
             let mut commands = Commands::begin(&mut enc);
-            if let Some(xf) = &xf16 {
+            if let Some(x_f16) = &x_f16 {
                 backend.dispatch(
                     &mut commands,
                     thuban_kernel::shader::TO_F16,
                     &[("N_ELEM", (m * k) as f64)],
-                    &[Binding::Full(&xb), Binding::Full(xf)],
+                    &[Binding::Full(&xb), Binding::Full(x_f16)],
                     [(m * k / 4).div_ceil(256), 1, 1],
                 )?;
             }
@@ -210,7 +210,7 @@ pub(super) fn gemm_probe() -> Result<()> {
                     ("Y_OFF", 0.0),
                 ],
                 &[
-                    Binding::Full(xf16.as_ref().unwrap_or(&xb)),
+                    Binding::Full(x_f16.as_ref().unwrap_or(&xb)),
                     Binding::Full(&wb),
                     Binding::Full(backend.quant_lut()),
                     Binding::Full(&y),

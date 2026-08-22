@@ -363,13 +363,13 @@ impl Model {
                 commands,
                 Binding::Full(&s.hidden),
                 Binding::Full(&s.normed),
-                Binding::Full(&s.hidden2),
+                Binding::Full(&s.post_attn),
                 m * self.cfg.hidden,
             )?;
             ops::mul(
                 backend,
                 commands,
-                Binding::Full(&s.hidden2),
+                Binding::Full(&s.post_attn),
                 Binding::Full(os),
                 Binding::Full(&s.hidden),
                 m * self.cfg.hidden,

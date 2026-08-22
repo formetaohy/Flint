@@ -1,5 +1,7 @@
 mod matmul;
 
+pub use matmul::GemvOp;
+
 use std::sync::Arc;
 
 use thuban_error::{Error, Result};
@@ -20,13 +22,13 @@ impl<'a> Binding<'a> {
             Binding::Full(t) => BindingRef {
                 index,
                 buffer: &t.buf,
-                offset: 0,
+                offset: t.offset,
                 size: 0,
             },
             Binding::Slice(t, off, size) => BindingRef {
                 index,
                 buffer: &t.buf,
-                offset: *off,
+                offset: t.offset + *off,
                 size: *size,
             },
         }
@@ -56,9 +58,9 @@ pub struct Backend {
     device: Arc<Device>,
     kernels: Kernels,
     quant_lut: Tensor,
-    gemv_partial: Tensor,
+    dummy: Tensor,
     gemm_partial: Tensor,
-    gemm_xf16: Tensor,
+    gemm_x_f16: Tensor,
     read_staging: std::cell::RefCell<(Buffer, u64)>,
     profiler: Option<Arc<std::sync::Mutex<thuban_profiler::GpuProfiler>>>,
 
@@ -73,9 +75,9 @@ impl Backend {
         let kernels = Kernels::new(device.as_ref())?;
         Self::warmup(device.as_ref(), &kernels)?;
         let quant_lut = Self::lut_tensor(device.as_ref());
-        let gemv_partial = Self::partial_buf(device.as_ref(), 8 * 65536)?;
+        let dummy = Self::zeroed_tensor(device.as_ref(), 1);
         let gemm_partial = Self::partial_buf(device.as_ref(), 4 * 128 * 16384)?;
-        let gemm_xf16 = Self::partial_f16_buf(device.as_ref(), 128 * 8192)?;
+        let gemm_x_f16 = Self::partial_f16_buf(device.as_ref(), 128 * 8192)?;
         let read_staging = device
             .create_buffer(1 << 20, HostAccess::Read, false)
             .map_err(|e| Error::Gpu(e.to_string()))?;
@@ -83,9 +85,9 @@ impl Backend {
             device,
             kernels,
             quant_lut,
-            gemv_partial,
+            dummy,
             gemm_partial,
-            gemm_xf16,
+            gemm_x_f16,
             read_staging: std::cell::RefCell::new((read_staging, 1 << 20)),
             profiler: None,
             pending: std::cell::RefCell::new(Vec::new()),
@@ -129,6 +131,18 @@ impl Backend {
 
     pub fn quant_lut(&self) -> &Tensor {
         &self.quant_lut
+    }
+
+    pub fn dummy(&self) -> &Tensor {
+        &self.dummy
+    }
+
+    fn zeroed_tensor(device: &Device, words: u32) -> Tensor {
+        Tensor::new(
+            Self::zeroed_buf(device, words as u64 * 4),
+            vec![words],
+            DType::F32,
+        )
     }
 
     fn partial_buf(device: &Device, words: usize) -> Result<Tensor> {
@@ -200,9 +214,23 @@ impl Backend {
     pub fn copy(&self, src: &Tensor, dst: &Tensor) {
         assert_eq!(src.byte_len(), dst.byte_len(), "copy size mismatch");
         let mut enc = self.device.encoder().expect("encoder");
-        enc.copy(&src.buf, 0, &dst.buf, 0, src.byte_len())
+        enc.copy(&src.buf, src.offset, &dst.buf, dst.offset, src.byte_len())
             .expect("copy");
         enc.finish().wait().expect("wait");
+    }
+
+    pub fn pack_weights(&self, tensors: &[&Tensor]) -> Tensor {
+        let total: u64 = tensors.iter().map(|t| t.byte_len()).sum();
+        let buf = self.storage(total);
+        let mut enc = self.device.encoder().expect("encoder");
+        let mut off = 0u64;
+        for t in tensors {
+            enc.copy(&t.buf, t.offset, &buf, off, t.byte_len())
+                .expect("copy");
+            off += t.byte_len();
+        }
+        enc.finish().wait().expect("wait");
+        Tensor::new(buf, vec![(total / 4) as u32], DType::U32)
     }
 
     pub fn tensor_f32(&self, data: &[f32], shape: Vec<u32>) -> Tensor {
