@@ -1,14 +1,11 @@
-# CI on GitHub-hosted runners, which have no GPU: wgpu runs on lavapipe,
-# the Mesa CPU-only Vulkan ICD (the same setup llama.cpp / sherpa-onnx /
-# rerun use for their Vulkan CI legs). Lavapipe caps workgroup shared
-# memory at 32 KiB, below the attention kernel's 36 KiB, so the GPU-bound
-# test targets are excluded here and run on real hardware locally. Every
-# remaining test builds its own toy checkpoint in memory, so no weights are
-# ever downloaded.
 name: CI
 
 on:
   push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
   pull_request:
 
 concurrency:
@@ -18,6 +15,7 @@ concurrency:
 jobs:
   test:
     name: Test
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     env:
       RUST_BACKTRACE: '1'
@@ -28,14 +26,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers spirv-tools
-          # Mesa renamed its lavapipe ICD manifest across releases
-          # (lvp_icd.json on 24.04 updates, lvp_icd.x86_64.json before), so
-          # hardcoding a name leaves the loader with zero ICDs. Pin whichever
-          # manifest this runner actually ships; a future rename fails loudly
-          # right here instead of in the tests.
           ICD="$(find /usr/share/vulkan/icd.d/ -name 'lvp_icd*.json' | head -1)"
           test -n "$ICD" || { echo "::error::lavapipe ICD manifest not found"; exit 1; }
           echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --workspace --exclude thuban_backend --exclude thuban_model --exclude thuban_architectures --exclude thuban_generate
+
+  source-package:
+    name: Source package
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package source
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          workspace_version="$(awk '/^\[workspace\.package\]/{f=1; next} /^\[/{f=0} f && /^version =/{print $3; exit}' Cargo.toml | tr -d '"')"
+          test "$version" = "$workspace_version" || { echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${workspace_version}"; exit 1; }
+          echo "PACKAGE_VERSION=${version//./-}" >> "$GITHUB_ENV"
+          for format in tar.gz zip; do
+            git archive --format="$format" --prefix="thuban-${version}/" -o "thuban-${version}.${format}" HEAD
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thuban-source-${{ env.PACKAGE_VERSION }}
+          path: |
+            thuban-*.tar.gz
+            thuban-*.zip

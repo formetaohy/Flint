@@ -1,6 +1,6 @@
 use thuban_error::Result;
 use thuban_gpu::CoopVariant;
-use thuban_tensor::{DType, Weight};
+use thuban_tensor::Weight;
 
 use crate::{Backend, Binding, Commands};
 use thuban_kernel::shader;
@@ -39,27 +39,23 @@ impl Backend {
         }
     }
 
-    fn weight_io(w: &Weight) -> (u32, u32, Binding<'_>, DType) {
+    fn weight_io(w: &Weight) -> (u32, u32, Binding<'_>, u32) {
         assert_eq!(
             w.tensor().shape.len(),
             2,
             "gemm weight must be a [N, K] matrix"
         );
         let (n, k) = (w.tensor().shape[0], w.tensor().shape[1]);
-        let dtype = match w.tensor().dtype {
-            DType::Bf16 | DType::I8 => w.tensor().dtype,
-            DType::F32 | DType::U32 | DType::F16 => {
+        let qtype = match w.tensor().dtype {
+            thuban_tensor::DType::F32 => 0,
+            thuban_tensor::DType::F16 => 1,
+            thuban_tensor::DType::Bf16 => 30,
+            thuban_tensor::DType::Quant(q) => q.as_u32(),
+            thuban_tensor::DType::U32 => {
                 unreachable!("gemm operands are weights, never index tensors")
             }
         };
-        (n, k, Binding::Full(w.tensor()), dtype)
-    }
-
-    fn scale_binding<'a>(unit_scale: &'a thuban_tensor::Tensor, w: &'a Weight) -> Binding<'a> {
-        match w.scale() {
-            Some(s) => Binding::Full(s),
-            None => Binding::Full(unit_scale),
-        }
+        (n, k, Binding::Full(w.tensor()), qtype)
     }
 
     pub fn gemm_acc(
@@ -71,7 +67,7 @@ impl Backend {
         rows: u32,
         acc: bool,
     ) -> Result<()> {
-        let (n, k, wb, dtype) = Self::weight_io(w);
+        let (n, k, wb, qtype) = Self::weight_io(w);
         assert!(
             k.is_multiple_of(32),
             "gemm K {k} is not a multiple of the BK=32 tile"
@@ -96,24 +92,23 @@ impl Backend {
                 &[x, xf],
                 [(main * k / 4).div_ceil(256), 1, 1],
             )?;
-            let unit_scale = self.unit_scale();
             let consts = [
                 ("N", n as f64),
                 ("K", k as f64),
                 ("M", main as f64),
                 ("SEGS", 1.0),
-                ("WDTYPE", dtype_flag(dtype)),
-                ("GROUP", group_const(w)),
+                ("QTYPE", qtype as f64),
                 ("ACC", acc as u32 as f64),
                 ("Y_STRIDE", n as f64),
                 ("Y_OFF", 0.0),
             ];
+            let lut = Binding::Full(self.quant_lut());
             Self::set(
                 &self.kernels,
                 commands,
                 kernel,
                 &consts,
-                &[xf, wb, Self::scale_binding(unit_scale, w), y],
+                &[xf, wb, lut, y],
                 [n.div_ceil(128), main.div_ceil(128), 1],
             )?;
             if rows > main {
@@ -136,7 +131,7 @@ impl Backend {
         rows: u32,
         acc: bool,
     ) -> Result<()> {
-        let (n, k, wb, dtype) = Self::weight_io(w);
+        let (n, k, wb, qtype) = Self::weight_io(w);
         let segs = if rows > 1 && k >= 8192 && k.is_multiple_of(128) {
             4
         } else {
@@ -147,8 +142,7 @@ impl Backend {
             ("N", n as f64),
             ("K", k as f64),
             ("M", rows as f64),
-            ("WDTYPE", dtype_flag(dtype)),
-            ("GROUP", group_const(w)),
+            ("QTYPE", qtype as f64),
             ("ACC", gemm_acc as f64),
             ("Y_STRIDE", n as f64),
             ("Y_OFF", 0.0),
@@ -160,8 +154,8 @@ impl Backend {
         } else {
             y
         };
-        let unit_scale = self.unit_scale();
-        let bufs = [x, wb, Self::scale_binding(unit_scale, w), yb];
+        let lut = Binding::Full(self.quant_lut());
+        let bufs = [x, wb, lut, yb];
         Self::set(
             &self.kernels,
             commands,
@@ -213,7 +207,7 @@ impl Backend {
         y: Binding<'_>,
         acc: bool,
     ) -> Result<()> {
-        let (n, k, wb, dtype) = Self::weight_io(w);
+        let (n, k, wb, qtype) = Self::weight_io(w);
         assert!(k.is_multiple_of(32), "gemv K {k} is not a multiple of 32");
         let base = n.div_ceil(64);
         let segs: u32 = if base >= 96 {
@@ -227,13 +221,10 @@ impl Backend {
         if segs > 1 {
             self.ensure_gemv_partial(n * segs);
         }
-        let unit_scale = self.unit_scale();
-        let scale = Self::scale_binding(unit_scale, w);
         let consts = [
             ("N", n as f64),
             ("K", k as f64),
-            ("WDTYPE", dtype_flag(dtype)),
-            ("GROUP", group_const(w)),
+            ("QTYPE", qtype as f64),
             ("SEGS", segs as f64),
             ("ACC", acc as u32 as f64),
         ];
@@ -242,7 +233,8 @@ impl Backend {
         } else {
             Binding::Slice(&self.gemv_partial, 0, n as u64 * 4 * segs as u64)
         };
-        let bufs = [x, wb, scale, out];
+        let lut = Binding::Full(self.quant_lut());
+        let bufs = [x, wb, lut, out];
         Self::set(
             &self.kernels,
             commands,
@@ -270,22 +262,5 @@ impl Backend {
             )?;
         }
         Ok(())
-    }
-}
-
-fn dtype_flag(dtype: DType) -> f64 {
-    match dtype {
-        DType::Bf16 => 0.0,
-        DType::I8 => 1.0,
-        DType::F32 | DType::U32 | DType::F16 => {
-            unreachable!("gemm weights are bf16-packed or i8")
-        }
-    }
-}
-
-fn group_const(w: &Weight) -> f64 {
-    match w.group() {
-        Some(group) => group as f64,
-        None => 0.0,
     }
 }

@@ -1,51 +1,37 @@
-use crate::{DType, Tensor};
+use crate::{DType, Quant, Tensor};
 
 pub enum Weight {
     Plain(Tensor),
-
-    Quantized {
-        tensor: Tensor,
-        scale: Tensor,
-        group: u32,
-    },
+    Quantized(Tensor),
 }
 
 impl Weight {
     pub fn plain(t: Tensor) -> Self {
         assert!(
-            t.dtype == DType::F32 || t.dtype == DType::Bf16,
-            "plain weight must be f32 or bf16"
+            matches!(t.dtype, DType::F32 | DType::Bf16 | DType::F16),
+            "plain weight must be f32, bf16 or f16"
         );
         Self::Plain(t)
     }
 
-    pub fn quant(t: Tensor, scale: Tensor, group: u32) -> Self {
-        assert!(t.dtype == DType::I8, "scaled weight must be i8");
-        Self::Quantized {
-            tensor: t,
-            scale,
-            group,
-        }
+    pub fn quantized(t: Tensor) -> Self {
+        assert!(
+            matches!(t.dtype, DType::Quant(_)),
+            "quantized weight must carry a block format"
+        );
+        Self::Quantized(t)
     }
 
     pub fn tensor(&self) -> &Tensor {
         match self {
-            Self::Plain(t) => t,
-            Self::Quantized { tensor, .. } => tensor,
+            Self::Plain(t) | Self::Quantized(t) => t,
         }
     }
 
-    pub fn scale(&self) -> Option<&Tensor> {
-        match self {
-            Self::Plain(_) => None,
-            Self::Quantized { scale, .. } => Some(scale),
-        }
-    }
-
-    pub fn group(&self) -> Option<u32> {
-        match self {
-            Self::Plain(_) => None,
-            Self::Quantized { group, .. } => Some(*group),
+    pub fn quant(&self) -> Option<Quant> {
+        match self.tensor().dtype {
+            DType::Quant(q) => Some(q),
+            _ => None,
         }
     }
 }

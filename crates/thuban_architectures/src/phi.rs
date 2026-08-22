@@ -79,18 +79,10 @@ fn parse_transformer(v: &Value) -> Result<Config> {
     Ok(cfg)
 }
 
-fn phi_role(key: &str) -> Role {
-    if key == "embed_tokens.weight" {
-        Role::I8
-    } else {
-        dense_role(key)
-    }
-}
-
 fn plan() -> Plan {
     Plan {
         key: gguf_key,
-        role: phi_role,
+        role: dense_role,
     }
 }
 
@@ -102,7 +94,7 @@ pub fn load(
     backend: &Backend,
 ) -> Result<Model> {
     let cfg = parse_transformer(v)?;
-    let extra = split_fused(backend, source, &cfg, phi_role)?;
+    let extra = split_fused(backend, source, &cfg, dense_role)?;
     Model::load_extra(
         source,
         cfg,
@@ -191,22 +183,44 @@ fn split_rows(
     parts: &[(&str, u32, u32)],
 ) -> Result<()> {
     let k = raw.shape[1];
-    let data = raw.data.into_f32()?;
-    for &(part, lo, hi) in parts {
-        let key = key_for(part);
-        let slice: Vec<f32> = data[(lo as usize * k as usize)..(hi as usize * k as usize)].to_vec();
-        out.push((
-            key.clone(),
-            upload(
-                backend,
-                &key,
-                thuban_checkpoint::RawTensor {
-                    shape: vec![hi - lo, k],
-                    data: thuban_checkpoint::TensorData::F32(slice),
-                },
-                role(&key),
-            )?,
-        ));
+    match raw.data {
+        thuban_checkpoint::TensorData::Quant { quant, bytes, .. } => {
+            let bl = quant.block_len() as u32;
+            for &(part, lo, hi) in parts {
+                if !lo.is_multiple_of(bl) || !hi.is_multiple_of(bl) {
+                    return Err(Error::Model(format!(
+                        "{part}: fused row range [{lo}, {hi}) is not a multiple of the {quant:?} block length"
+                    )));
+                }
+                let row_bytes = (k as usize / quant.block_len()) * quant.block_bytes();
+                let slice = &bytes[lo as usize * row_bytes..hi as usize * row_bytes];
+                let padded = quant.pad_blocks(slice, (hi - lo) as usize * k as usize)?;
+                out.push((
+                    key_for(part),
+                    Weight::quantized(backend.tensor_quant(&padded, vec![hi - lo, k], quant)),
+                ));
+            }
+        }
+        other => {
+            let data = other.into_f32()?;
+            for &(part, lo, hi) in parts {
+                let key = key_for(part);
+                let slice: Vec<f32> =
+                    data[(lo as usize * k as usize)..(hi as usize * k as usize)].to_vec();
+                out.push((
+                    key.clone(),
+                    upload(
+                        backend,
+                        &key,
+                        thuban_checkpoint::RawTensor {
+                            shape: vec![hi - lo, k],
+                            data: thuban_checkpoint::TensorData::F32(slice),
+                        },
+                        role(&key),
+                    )?,
+                ));
+            }
+        }
     }
     Ok(())
 }

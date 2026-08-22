@@ -1,42 +1,54 @@
-# Thuban
+<!-- ![LOGO](assets/logo.svg) -->
 
-GPU-accelerated LLM inference engine built on portable compute shaders.
+<p align="center">
+  <strong>Fast, cross-platform LLM inference engine.</strong>
+</p>
 
-## Usage
+<p align="center">
+  <a href="https://github.com/formetaohy/Thuban/actions/workflows/ci.yml"><img src="https://github.com/formetaohy/Thuban/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://crates.io/crates/thuban"><img src="https://img.shields.io/crates/v/thuban?style=flat-square" alt="crates.io" /></a>
+  <a href="https://github.com/formetaohy/Thuban/stargazers"><img src="https://img.shields.io/github/stars/formetaohy/Thuban?style=flat-square&color=yellow" alt="Stars" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/language-Rust-dea584?style=flat-square&logo=rust" alt="Rust" /></a>
+  <a href="https://github.com/formetaohy/Thuban/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License" /></a>
+</p>
 
-```toml
-[dependencies]
-thuban = "0.1.0"
-```
+<p align="center">
+  <a href="README_CN.md">中文</a>
+</p>
 
-Every sub-crate is re-exported as a module and gated behind a feature of the
-same name, all enabled by default except `thuban_server`:
+## What is Thuban?
 
-```rust
-use thuban::gpu;
-use thuban::architectures;
-```
+Thuban is a LLM inference engine written in pure Rust on [WGPU](https://github.com/gfx-rs/wgpu). It runs on the GPU via portable compute shaders, supporting **Windows**, **Linux/Android**, **macOS/iOS**, and the **Web (WASM)**.
 
-For a lean build, disable the default features and pick only what you need:
+## Features
 
-```toml
-[dependencies]
-thuban = { version = "0.1.0", default-features = false, features = ["thuban_architectures"] }
-```
+- **Cross-platform** — Write once, run everywhere.
+- **Fast** — Highly optimized inference core.
+- **Native GGUF support** — all GGUF quantization formats run natively on the GPU.
+- **API server** — Serve models behind OpenAI (chat completions / responses), Anthropic messages, and Gemini APIs
 
-| Feature | Module |
-| --- | --- |
-| `thuban_architectures` | `architectures` |
-| `thuban_backend` | `backend` |
-| `thuban_checkpoint` | `checkpoint` |
-| `thuban_error` | `error` |
-| `thuban_fetch` | `fetch` |
-| `thuban_generate` | `generate` |
-| `thuban_gpu` | `gpu` |
-| `thuban_kernel` | `kernel` |
-| `thuban_model` | `model` |
-| `thuban_num` | `num` |
-| `thuban_profiler` | `profiler` |
-| `thuban_server` | `server` | opt-in: `features = ["thuban_server"]` |
-| `thuban_tensor` | `tensor` |
-| `thuban_tokenizer` | `tokenizer` |
+## Supported Architectures
+
+| Family | Models
+| --- | ---
+| Qwen | Qwen3.5 / Qwen3 / Qwen2 / Qwen1.5
+| LLaMA | LLaMA 2/3.x, Mistral, Phi-3/3.5
+| Gemma | Gemma 2 / 3
+| Phi | Phi-4-mini / Phi-3.x
+| Phi-MoE | Phi-tiny/mini-MoE
+| Gemma 4 | Gemma 4 E2B/E4B
+
+We're actively adding support for more models. If there's a model you'd like supported, feel free to open an issue or PR.
+
+
+## Quick Start
+
+[Examples](examples/README.md): Thuban's dedicated, runnable examples — a great way to get hands-on with the engine.
+
+## Contact
+
+Email: **formetaohy@gmail.com**
+
+## License
+
+[MIT](LICENSE)

@@ -1,144 +1,7 @@
-mod tables;
-
 use thuban_error::{Error, Result};
 use thuban_num::{bf16_to_f32, f16_to_f32};
-
-use tables::*;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GgmlType {
-    F32 = 0,
-    F16 = 1,
-    Q4_0 = 2,
-    Q4_1 = 3,
-    Q5_0 = 6,
-    Q5_1 = 7,
-    Q8_0 = 8,
-    Q2K = 10,
-    Q3K = 11,
-    Q4K = 12,
-    Q5K = 13,
-    Q6K = 14,
-    Q8K = 15,
-    Iq2Xxs = 16,
-    Iq2Xs = 17,
-    Iq3Xxs = 18,
-    Iq1S = 19,
-    Iq4Nl = 20,
-    Iq3S = 21,
-    Iq2S = 22,
-    Iq4Xs = 23,
-    Iq1M = 29,
-    Bf16 = 30,
-    Tq1_0 = 34,
-    Tq2_0 = 35,
-    Mxfp4 = 39,
-    Nvfp4 = 40,
-    Q1_0 = 41,
-    Q2_0 = 42,
-}
-
-impl GgmlType {
-    pub fn from_u32(v: u32) -> Result<Self> {
-        Ok(match v {
-            0 => GgmlType::F32,
-            1 => GgmlType::F16,
-            2 => GgmlType::Q4_0,
-            3 => GgmlType::Q4_1,
-            6 => GgmlType::Q5_0,
-            7 => GgmlType::Q5_1,
-            8 => GgmlType::Q8_0,
-            10 => GgmlType::Q2K,
-            11 => GgmlType::Q3K,
-            12 => GgmlType::Q4K,
-            13 => GgmlType::Q5K,
-            14 => GgmlType::Q6K,
-            15 => GgmlType::Q8K,
-            16 => GgmlType::Iq2Xxs,
-            17 => GgmlType::Iq2Xs,
-            18 => GgmlType::Iq3Xxs,
-            19 => GgmlType::Iq1S,
-            20 => GgmlType::Iq4Nl,
-            21 => GgmlType::Iq3S,
-            22 => GgmlType::Iq2S,
-            23 => GgmlType::Iq4Xs,
-            29 => GgmlType::Iq1M,
-            30 => GgmlType::Bf16,
-            34 => GgmlType::Tq1_0,
-            35 => GgmlType::Tq2_0,
-            39 => GgmlType::Mxfp4,
-            40 => GgmlType::Nvfp4,
-            41 => GgmlType::Q1_0,
-            42 => GgmlType::Q2_0,
-            other => {
-                return Err(Error::Model(format!(
-                    "unsupported ggml tensor type {other}"
-                )));
-            }
-        })
-    }
-
-    pub fn block_len(self) -> usize {
-        match self {
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => 1,
-            GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 => {
-                32
-            }
-            GgmlType::Q1_0 | GgmlType::Iq4Nl | GgmlType::Mxfp4 => 32,
-            GgmlType::Nvfp4 => 64,
-            GgmlType::Q2_0 => 64,
-            GgmlType::Q2K
-            | GgmlType::Q3K
-            | GgmlType::Q4K
-            | GgmlType::Q5K
-            | GgmlType::Q6K
-            | GgmlType::Q8K
-            | GgmlType::Iq2Xxs
-            | GgmlType::Iq2Xs
-            | GgmlType::Iq3Xxs
-            | GgmlType::Iq1S
-            | GgmlType::Iq3S
-            | GgmlType::Iq2S
-            | GgmlType::Iq4Xs
-            | GgmlType::Iq1M
-            | GgmlType::Tq1_0
-            | GgmlType::Tq2_0 => 256,
-        }
-    }
-
-    pub fn block_bytes(self) -> usize {
-        match self {
-            GgmlType::F32 => 4,
-            GgmlType::F16 | GgmlType::Bf16 => 2,
-            GgmlType::Q4_0 => 18,
-            GgmlType::Q4_1 => 20,
-            GgmlType::Q5_0 => 22,
-            GgmlType::Q5_1 => 24,
-            GgmlType::Q8_0 => 34,
-            GgmlType::Q2K => 84,
-            GgmlType::Q3K => 110,
-            GgmlType::Q4K => 144,
-            GgmlType::Q5K => 176,
-            GgmlType::Q6K => 210,
-            GgmlType::Q8K => 292,
-            GgmlType::Iq2Xxs => 66,
-            GgmlType::Iq2Xs => 74,
-            GgmlType::Iq3Xxs => 98,
-            GgmlType::Iq1S => 50,
-            GgmlType::Iq4Nl => 18,
-            GgmlType::Iq3S => 110,
-            GgmlType::Iq2S => 82,
-            GgmlType::Iq4Xs => 136,
-            GgmlType::Iq1M => 56,
-            GgmlType::Tq1_0 => 54,
-            GgmlType::Tq2_0 => 66,
-            GgmlType::Mxfp4 => 17,
-            GgmlType::Nvfp4 => 36,
-            GgmlType::Q1_0 => 6,
-            GgmlType::Q2_0 => 18,
-        }
-    }
-}
+pub use thuban_tensor::Quant;
+use thuban_tensor::quant::tables::*;
 
 fn half(bytes: &[u8], off: usize) -> f32 {
     f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]))
@@ -156,7 +19,7 @@ fn u32_le(bytes: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
 }
 
-pub fn to_f32(ty: GgmlType, bytes: &[u8], numel: usize) -> Result<Vec<f32>> {
+pub fn to_f32(ty: Quant, bytes: &[u8], numel: usize) -> Result<Vec<f32>> {
     let bl = ty.block_len();
     let bb = ty.block_bytes();
     let blocks = numel.div_ceil(bl);
@@ -177,49 +40,49 @@ pub fn to_f32(ty: GgmlType, bytes: &[u8], numel: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-fn decode_block(ty: GgmlType, blk: &[u8], y: &mut [f32]) {
+fn decode_block(ty: Quant, blk: &[u8], y: &mut [f32]) {
     match ty {
-        GgmlType::F32 => {
+        Quant::F32 => {
             for (i, c) in blk.chunks_exact(4).enumerate().take(y.len()) {
                 y[i] = f32_le(c, 0);
             }
         }
-        GgmlType::F16 => {
+        Quant::F16 => {
             for (i, c) in blk.chunks_exact(2).enumerate().take(y.len()) {
                 y[i] = f16_to_f32(u16_le(c, 0));
             }
         }
-        GgmlType::Bf16 => {
+        Quant::Bf16 => {
             for (i, c) in blk.chunks_exact(2).enumerate().take(y.len()) {
                 y[i] = bf16_to_f32(u16_le(c, 0));
             }
         }
-        GgmlType::Q8_0 => q8_0(blk, y),
-        GgmlType::Q4_0 => q4_0(blk, y),
-        GgmlType::Q4_1 => q4_1(blk, y),
-        GgmlType::Q5_0 => q5_0(blk, y),
-        GgmlType::Q5_1 => q5_1(blk, y),
-        GgmlType::Q2K => q2k(blk, y),
-        GgmlType::Q3K => q3k(blk, y),
-        GgmlType::Q4K => q4k(blk, y),
-        GgmlType::Q5K => q5k(blk, y),
-        GgmlType::Q6K => q6k(blk, y),
-        GgmlType::Q8K => q8k(blk, y),
-        GgmlType::Iq2Xxs => iq2_xxs(blk, y),
-        GgmlType::Iq2Xs => iq2_xs(blk, y),
-        GgmlType::Iq3Xxs => iq3_xxs(blk, y),
-        GgmlType::Iq1S => iq1_s(blk, y),
-        GgmlType::Iq4Nl => iq4_nl(blk, y),
-        GgmlType::Iq3S => iq3_s(blk, y),
-        GgmlType::Iq2S => iq2_s(blk, y),
-        GgmlType::Iq4Xs => iq4_xs(blk, y),
-        GgmlType::Iq1M => iq1_m(blk, y),
-        GgmlType::Tq1_0 => tq1_0(blk, y),
-        GgmlType::Tq2_0 => tq2_0(blk, y),
-        GgmlType::Mxfp4 => mxfp4(blk, y),
-        GgmlType::Nvfp4 => nvfp4(blk, y),
-        GgmlType::Q1_0 => q1_0(blk, y),
-        GgmlType::Q2_0 => q2_0(blk, y),
+        Quant::Q8_0 => q8_0(blk, y),
+        Quant::Q4_0 => q4_0(blk, y),
+        Quant::Q4_1 => q4_1(blk, y),
+        Quant::Q5_0 => q5_0(blk, y),
+        Quant::Q5_1 => q5_1(blk, y),
+        Quant::Q2K => q2k(blk, y),
+        Quant::Q3K => q3k(blk, y),
+        Quant::Q4K => q4k(blk, y),
+        Quant::Q5K => q5k(blk, y),
+        Quant::Q6K => q6k(blk, y),
+        Quant::Q8K => q8k(blk, y),
+        Quant::Iq2Xxs => iq2_xxs(blk, y),
+        Quant::Iq2Xs => iq2_xs(blk, y),
+        Quant::Iq3Xxs => iq3_xxs(blk, y),
+        Quant::Iq1S => iq1_s(blk, y),
+        Quant::Iq4Nl => iq4_nl(blk, y),
+        Quant::Iq3S => iq3_s(blk, y),
+        Quant::Iq2S => iq2_s(blk, y),
+        Quant::Iq4Xs => iq4_xs(blk, y),
+        Quant::Iq1M => iq1_m(blk, y),
+        Quant::Tq1_0 => tq1_0(blk, y),
+        Quant::Tq2_0 => tq2_0(blk, y),
+        Quant::Mxfp4 => mxfp4(blk, y),
+        Quant::Nvfp4 => nvfp4(blk, y),
+        Quant::Q1_0 => q1_0(blk, y),
+        Quant::Q2_0 => q2_0(blk, y),
     }
 }
 
@@ -275,8 +138,8 @@ fn q5_1(b: &[u8], y: &mut [f32]) {
 }
 
 fn q2k(b: &[u8], y: &mut [f32]) {
-    let d = half(b, 68);
-    let min = half(b, 70);
+    let d = half(b, 80);
+    let min = half(b, 82);
     let scales = &b[0..16];
     let q = &b[16..80];
     let mut o = 0usize;
@@ -463,7 +326,7 @@ fn q8k(b: &[u8], y: &mut [f32]) {
 
 fn q1_0(b: &[u8], y: &mut [f32]) {
     let d = half(b, 0);
-    for j in 0..32 {
+    for j in 0..128 {
         y[j] = if b[2 + j / 8] >> (j % 8) & 1 != 0 { d } else { -d };
     }
 }
@@ -713,31 +576,25 @@ fn iq4_xs(b: &[u8], y: &mut [f32]) {
 }
 
 fn tq1_0(b: &[u8], y: &mut [f32]) {
-    let d = half(b, 2 + 48);
+    let d = half(b, 52);
     const POW3: [u16; 6] = [1, 3, 9, 27, 81, 243];
-    let mut o = 0usize;
-    for j in 0..32 {
-        for n in 0..5 {
-            let q = (b[j] as u16 * POW3[n]) & 0xff;
-            let xi = ((q * 3) >> 8) as i16;
-            y[o] = (xi - 1) as f32 * d;
-            o += 1;
+    let dec = |q: u8, n: usize| {
+        let v = (q as u16 * POW3[n]) & 0xff;
+        (((v * 3) >> 8) as i32 - 1) as f32 * d
+    };
+    for n in 0..5 {
+        for m in 0..32 {
+            y[n * 32 + m] = dec(b[m], n);
         }
     }
-    for j in 32..48 {
-        for n in 0..5 {
-            let q = (b[j] as u16 * POW3[n]) & 0xff;
-            let xi = ((q * 3) >> 8) as i16;
-            y[o] = (xi - 1) as f32 * d;
-            o += 1;
+    for n in 0..5 {
+        for m in 0..16 {
+            y[160 + n * 16 + m] = dec(b[32 + m], n);
         }
     }
-    for j in 48..52 {
-        for n in 0..4 {
-            let q = (b[j] as u16 * POW3[n]) & 0xff;
-            let xi = ((q * 3) >> 8) as i16;
-            y[o] = (xi - 1) as f32 * d;
-            o += 1;
+    for n in 0..4 {
+        for m in 0..4 {
+            y[240 + n * 4 + m] = dec(b[48 + m], n);
         }
     }
 }

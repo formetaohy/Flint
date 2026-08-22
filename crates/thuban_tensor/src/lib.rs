@@ -1,5 +1,7 @@
+pub mod quant;
 mod weight;
 
+pub use quant::Quant;
 pub use weight::Weight;
 
 use thuban_gpu::Buffer;
@@ -10,7 +12,7 @@ pub enum DType {
     U32,
     Bf16,
     F16,
-    I8,
+    Quant(Quant),
 }
 
 pub struct Tensor {
@@ -32,7 +34,9 @@ impl Tensor {
         match self.dtype {
             DType::F32 | DType::U32 => self.numel() * 4,
             DType::Bf16 | DType::F16 => self.numel() * 2,
-            DType::I8 => self.numel(),
+            DType::Quant(q) => {
+                (self.numel() as usize).div_ceil(q.block_len()) as u64 * q.padded_bytes() as u64
+            }
         }
     }
 }

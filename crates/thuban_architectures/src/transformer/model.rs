@@ -218,7 +218,7 @@ impl Model {
         );
         let pd = per_layer.dim * self.cfg.layers;
         let embed_scale = (per_layer.dim as f32).sqrt();
-        ops::embed_split(
+        ops::embed(
             backend,
             commands,
             &s.ids,
@@ -228,7 +228,6 @@ impl Model {
                 rows: m,
                 dim: pd,
                 scale: embed_scale,
-                split: pe.tensor().shape[0] / 2,
             },
         )?;
         ops::gemm(

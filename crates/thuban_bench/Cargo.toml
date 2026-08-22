@@ -14,6 +14,7 @@ thuban_error.workspace = true
 thuban_gpu.workspace = true
 thuban_kernel.workspace = true
 thuban_model.workspace = true
+thuban_num.workspace = true
 thuban_profiler.workspace = true
 thuban_tensor.workspace = true
 clap.workspace = true

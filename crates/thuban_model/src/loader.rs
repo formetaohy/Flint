@@ -3,15 +3,11 @@ use std::collections::HashMap;
 use thuban_backend::Backend;
 use thuban_checkpoint::{Checkpoint, RawTensor, TensorData};
 use thuban_error::{Error, Result};
-use thuban_num::f32_to_bf16;
 use thuban_tensor::{Tensor, Weight};
-
-use crate::quant::{choose_group, quantize, repack_q8};
 
 pub enum Role {
     F32,
-    Bf16,
-    I8,
+    Quant,
 }
 
 pub struct Plan {
@@ -33,7 +29,7 @@ impl WeightSet {
     pub fn take_tensor(&mut self, key: &str) -> Result<Tensor> {
         match self.take(key)? {
             Weight::Plain(t) => Ok(t),
-            Weight::Quantized { .. } => Err(Error::Model(format!(
+            Weight::Quantized(_) => Err(Error::Model(format!(
                 "{key:?} is quantized; expected a plain tensor"
             ))),
         }
@@ -78,54 +74,40 @@ pub fn upload(backend: &Backend, key: &str, raw: RawTensor, role: Role) -> Resul
             let data = raw.data.into_f32()?;
             Ok(Weight::plain(backend.tensor_f32(&data, shape)))
         }
-        Role::Bf16 => {
-            let bytes = match raw.data {
-                TensorData::Bf16Bytes(b) => b,
-                TensorData::F32(f) => f
-                    .iter()
-                    .flat_map(|v| f32_to_bf16(*v).to_le_bytes())
-                    .collect(),
-                TensorData::Q8_0 { .. } => raw
-                    .data
-                    .into_f32()?
-                    .iter()
-                    .flat_map(|v| f32_to_bf16(*v).to_le_bytes())
-                    .collect(),
-            };
-            Ok(Weight::plain(backend.tensor_bf16(&bytes, shape)?))
-        }
-        Role::I8 => {
+        Role::Quant => {
             if shape.len() != 2 {
                 return Err(Error::Model(format!(
                     "{key}: quantized weight must be a [N, K] matrix, got {shape:?}"
                 )));
             }
             let (n, k) = (shape[0], shape[1]);
+            let numel = (n as usize) * (k as usize);
             match raw.data {
-                TensorData::Q8_0 { bytes, numel } => {
-                    if numel != (n * k) as usize {
+                TensorData::Quant { quant, bytes, numel } => {
+                    if numel != (n as usize) * (k as usize) {
                         return Err(Error::Model(format!(
-                            "{key}: Q8_0 numel {numel} does not match shape {shape:?}"
+                            "{key}: quantized numel {numel} does not match shape {shape:?}"
                         )));
                     }
-                    let (bytes, scales) = repack_q8(&bytes, n as usize, k as usize)?;
-                    Ok(Weight::quant(
-                        backend.tensor_i8(&bytes, shape),
-                        backend.tensor_f32(&scales, vec![k / 32, n]),
-                        32,
-                    ))
+                    if !k.is_multiple_of(quant.block_len() as u32) {
+                        return Err(Error::Model(format!(
+                            "{key}: K={k} is not a multiple of the {quant:?} block length {}",
+                            quant.block_len()
+                        )));
+                    }
+                    let padded = quant.pad_blocks(&bytes, numel)?;
+                    Ok(Weight::quantized(backend.tensor_quant(&padded, shape, quant)))
                 }
-                other => {
-                    let group = choose_group(k)?;
-                    let data = other.into_f32()?;
-                    let (bytes, scales) = quantize(&data, n as usize, k as usize, group as usize);
-                    let (n, groups) = (n, k / group);
-                    Ok(Weight::quant(
-                        backend.tensor_i8(&bytes, shape),
-                        backend.tensor_f32(&scales, vec![groups, n]),
-                        group,
-                    ))
+                TensorData::F32(f) => Ok(Weight::plain(backend.tensor_f32(&f, shape))),
+                TensorData::F16Bytes(b) => {
+                    if numel * 2 != b.len() {
+                        return Err(Error::Model(format!(
+                            "{key}: f16 numel mismatch for shape {shape:?}"
+                        )));
+                    }
+                    Ok(Weight::plain(backend.tensor_f16(&b, shape)?))
                 }
+                TensorData::Bf16Bytes(b) => Ok(Weight::plain(backend.tensor_bf16(&b, shape)?)),
             }
         }
     }

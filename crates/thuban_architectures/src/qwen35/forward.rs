@@ -53,7 +53,6 @@ impl LanguageModel for Qwen35 {
                     rows: m,
                     dim: cfg.hidden,
                     scale: 1.0,
-                    split: 0,
                 },
             )?;
 

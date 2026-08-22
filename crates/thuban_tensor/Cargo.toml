@@ -7,4 +7,5 @@ repository.workspace = true
 description = "Tensor and weight primitives for Thuban"
 
 [dependencies]
+thuban_error.workspace = true
 thuban_gpu.workspace = true

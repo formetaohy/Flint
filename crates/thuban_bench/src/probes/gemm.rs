@@ -1,10 +1,10 @@
 use thuban_backend::Backend;
 use thuban_error::Result;
-use thuban_tensor::DType;
+use thuban_tensor::{DType, Quant};
 
 pub(super) fn gemm_probe() -> Result<()> {
     use thuban_backend::{Binding, Commands};
-    use thuban_model::quant::{choose_group, quantize};
+    use crate::synth_blocks::synth_blocks;
 
     let mut backend = Backend::new()?;
     eprintln!("[probe] adapter: {}", backend.adapter_name());
@@ -17,31 +17,38 @@ pub(super) fn gemm_probe() -> Result<()> {
     let m = env("PROBE_M", 128);
     let n = env("PROBE_N", 14336);
     let k = env("PROBE_K", 4096);
+    let quant: Quant = std::env::var("PROBE_QTYPE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Quant::from_ggml)
+        .transpose()?
+        .unwrap_or(Quant::Q8_0);
     let x: Vec<f32> = (0..m * k)
         .map(|i| ((i as f32) * 0.001 - 2.0) * 0.5)
         .collect();
+    let xb = backend.tensor_f32(&x, vec![m, k]);
     let w: Vec<f32> = (0..n * k)
         .map(|i| ((i % 97) as f32) * 0.001 - 0.5)
         .collect();
-    let group = choose_group(k)?;
-    let (bytes, scales) = quantize(&w, n as usize, k as usize, group as usize);
-    let xb = backend.tensor_f32(&x, vec![m, k]);
-    let wdtype: f64 = std::env::var("PROBE_WDTYPE")
-        .map(|v| v.parse().unwrap())
-        .unwrap_or(1.0);
-    let (wb, sb) = if wdtype == 0.0 {
-        let wbytes: Vec<u8> = w
-            .iter()
-            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
-            .collect();
-        let bf = backend.tensor_bf16(&wbytes, vec![n, k]).unwrap();
-        let s = backend.tensor_f32(&[1.0], vec![1]);
-        (bf, s)
-    } else {
-        let wi = backend.tensor_i8(&bytes, vec![n, k]);
-        let si = backend.tensor_f32(&scales, vec![n, k / group]);
-        (wi, si)
+    let wb = match quant {
+        Quant::Bf16 => {
+            let wbytes: Vec<u8> = w
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            backend.tensor_bf16(&wbytes, vec![n, k]).unwrap()
+        }
+        Quant::F16 => {
+            let wbytes: Vec<u8> = w
+                .iter()
+                .flat_map(|v| thuban_num::f32_to_f16(*v).to_le_bytes())
+                .collect();
+            backend.tensor_f16(&wbytes, vec![n, k]).unwrap()
+        }
+        Quant::F32 => backend.tensor_f32(&w, vec![n, k]),
+        _ => backend.tensor_quant(&synth_blocks(quant, n, k), vec![n, k], quant),
     };
+    let qtype = quant.as_u32();
     let kernel_name: &'static str = Box::leak(
         std::env::var("PROBE_KERNEL")
             .unwrap_or("gemm".into())
@@ -76,44 +83,44 @@ pub(super) fn gemm_probe() -> Result<()> {
             ("K", k as f64),
             ("M", m as f64),
             ("SEGS", 1.0),
-            ("WDTYPE", wdtype),
-            ("GROUP", group as f64),
+            ("QTYPE", qtype as f64),
             ("ACC", 0.0),
             ("Y_STRIDE", n as f64),
             ("Y_OFF", 0.0),
         ],
     )?;
-    let binds = [
-        thuban_gpu::BindingRef {
-            index: 0,
-            buffer: &xf16.as_ref().unwrap_or(&xb).buf,
-            offset: 0,
-            size: 0,
-        },
-        thuban_gpu::BindingRef {
-            index: 1,
-            buffer: &wb.buf,
-            offset: 0,
-            size: 0,
-        },
-        thuban_gpu::BindingRef {
-            index: 2,
-            buffer: &sb.buf,
-            offset: 0,
-            size: 0,
-        },
-        thuban_gpu::BindingRef {
-            index: 3,
-            buffer: &y.buf,
-            offset: 0,
-            size: 0,
-        },
-    ];
     let single = std::env::var("PROBE_SINGLE").is_ok();
     if single {
         for _ in 0..40 {
             let mut enc = backend.encoder().unwrap();
             {
+                let lut = thuban_gpu::BindingRef {
+                    index: 2,
+                    buffer: &backend.quant_lut().buf,
+                    offset: 0,
+                    size: 0,
+                };
+                let binds = [
+                    thuban_gpu::BindingRef {
+                        index: 0,
+                        buffer: &xf16.as_ref().unwrap_or(&xb).buf,
+                        offset: 0,
+                        size: 0,
+                    },
+                    thuban_gpu::BindingRef {
+                        index: 1,
+                        buffer: &wb.buf,
+                        offset: 0,
+                        size: 0,
+                    },
+                    lut,
+                    thuban_gpu::BindingRef {
+                        index: 3,
+                        buffer: &y.buf,
+                        offset: 0,
+                        size: 0,
+                    },
+                ];
                 let mut commands = Commands::begin(&mut enc);
                 let k = backend.kernel(kernel_name)?;
                 commands.raw().bind(k, &binds)?;
@@ -128,6 +135,33 @@ pub(super) fn gemm_probe() -> Result<()> {
         let iters = 60;
         let mut enc = backend.encoder().unwrap();
         {
+            let lut = thuban_gpu::BindingRef {
+                index: 2,
+                buffer: &backend.quant_lut().buf,
+                offset: 0,
+                size: 0,
+            };
+            let binds = [
+                thuban_gpu::BindingRef {
+                    index: 0,
+                    buffer: &xf16.as_ref().unwrap_or(&xb).buf,
+                    offset: 0,
+                    size: 0,
+                },
+                thuban_gpu::BindingRef {
+                    index: 1,
+                    buffer: &wb.buf,
+                    offset: 0,
+                    size: 0,
+                },
+                lut,
+                thuban_gpu::BindingRef {
+                    index: 3,
+                    buffer: &y.buf,
+                    offset: 0,
+                    size: 0,
+                },
+            ];
             let mut commands = Commands::begin(&mut enc);
             let k = backend.kernel(kernel_name)?;
             commands.raw().bind(k, &binds)?;
@@ -143,7 +177,7 @@ pub(super) fn gemm_probe() -> Result<()> {
         let secs = t0.elapsed().as_secs_f64();
         let flops = 2.0 * m as f64 * n as f64 * k as f64 * iters as f64;
         eprintln!(
-            "[probe] gemm {kernel_name} single-enc wdtype={wdtype}: {:.2} TFLOPS ({:.1} us/call)",
+            "[probe] gemm {kernel_name} single-enc qtype={qtype}: {:.2} TFLOPS ({:.1} us/call)",
             flops / secs / 1e12,
             secs / iters as f64 * 1e6
         );
@@ -170,8 +204,7 @@ pub(super) fn gemm_probe() -> Result<()> {
                     ("K", k as f64),
                     ("M", m as f64),
                     ("SEGS", 1.0),
-                    ("WDTYPE", wdtype),
-                    ("GROUP", group as f64),
+                    ("QTYPE", qtype as f64),
                     ("ACC", 0.0),
                     ("Y_STRIDE", n as f64),
                     ("Y_OFF", 0.0),
@@ -179,7 +212,7 @@ pub(super) fn gemm_probe() -> Result<()> {
                 &[
                     Binding::Full(xf16.as_ref().unwrap_or(&xb)),
                     Binding::Full(&wb),
-                    Binding::Full(&sb),
+                    Binding::Full(backend.quant_lut()),
                     Binding::Full(&y),
                 ],
                 [n.div_ceil(tn), m.div_ceil(tm), 1],
@@ -200,7 +233,7 @@ pub(super) fn gemm_probe() -> Result<()> {
     let secs = t0.elapsed().as_secs_f64();
     let flops = 2.0 * m as f64 * n as f64 * k as f64 * iters as f64;
     eprintln!(
-        "[probe] gemm {kernel_name} wdtype={wdtype}: {:.2} TFLOPS ({:.1} us/call)",
+        "[probe] gemm {kernel_name} qtype={qtype}: {:.2} TFLOPS ({:.1} us/call)",
         flops / secs / 1e12,
         secs / iters as f64 * 1e6
     );

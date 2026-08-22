@@ -24,6 +24,7 @@ Thuban is a LLM inference engine written in pure Rust on [WGPU](https://github.c
 
 - **Cross-platform** — Write once, run everywhere.
 - **Fast** — Highly optimized inference core.
+- **Native GGUF support** — all GGUF quantization formats run natively on the GPU.
 - **API server** — Serve models behind OpenAI (chat completions / responses), Anthropic messages, and Gemini APIs
 
 ## Supported Architectures

@@ -77,7 +77,7 @@ pub(super) fn paged_probe() -> Result<()> {
             *off += 16;
         }
     }
-    let _ = backend.read_f32(&backend.unit_scale().buf, 0, 1)?;
+    let _ = backend.read_f32(&backend.quant_lut().buf, 0, 1)?;
     eprintln!(
         "[probe] prefill: {SEQS} x {PREFILL} tokens, {}/{} pages used",
         model.used_pages(),
@@ -106,7 +106,7 @@ pub(super) fn paged_probe() -> Result<()> {
     for _ in 0..DECODE {
         run(&mut model, &mut backend, &mut t)?;
     }
-    let _ = backend.read_f32(&backend.unit_scale().buf, 0, 1)?;
+    let _ = backend.read_f32(&backend.quant_lut().buf, 0, 1)?;
     let secs = t0.elapsed().as_secs_f64();
     let tokens = DECODE * SEQS;
     eprintln!(

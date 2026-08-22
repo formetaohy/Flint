@@ -3,26 +3,26 @@ members = ["crates/*", "examples"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/formetaohy/Thuban"
 
 [workspace.dependencies]
-thuban_architectures = { path = "crates/thuban_architectures", version = "0.1.0" }
-thuban_backend = { path = "crates/thuban_backend", version = "0.1.0" }
-thuban_checkpoint = { path = "crates/thuban_checkpoint", version = "0.1.0" }
-thuban_error = { path = "crates/thuban_error", version = "0.1.0" }
-thuban_fetch = { path = "crates/thuban_fetch", version = "0.1.0" }
-thuban_generate = { path = "crates/thuban_generate", version = "0.1.0" }
-thuban_gpu = { path = "crates/thuban_gpu", version = "0.1.0" }
-thuban_kernel = { path = "crates/thuban_kernel", version = "0.1.0" }
-thuban_model = { path = "crates/thuban_model", version = "0.1.0" }
-thuban_num = { path = "crates/thuban_num", version = "0.1.0" }
-thuban_profiler = { path = "crates/thuban_profiler", version = "0.1.0" }
-thuban_server = { path = "crates/thuban_server", version = "0.1.0" }
-thuban_tensor = { path = "crates/thuban_tensor", version = "0.1.0" }
-thuban_tokenizer = { path = "crates/thuban_tokenizer", version = "0.1.0" }
+thuban_architectures = { path = "crates/thuban_architectures", version = "0.2.0" }
+thuban_backend = { path = "crates/thuban_backend", version = "0.2.0" }
+thuban_checkpoint = { path = "crates/thuban_checkpoint", version = "0.2.0" }
+thuban_error = { path = "crates/thuban_error", version = "0.2.0" }
+thuban_fetch = { path = "crates/thuban_fetch", version = "0.2.0" }
+thuban_generate = { path = "crates/thuban_generate", version = "0.2.0" }
+thuban_gpu = { path = "crates/thuban_gpu", version = "0.2.0" }
+thuban_kernel = { path = "crates/thuban_kernel", version = "0.2.0" }
+thuban_model = { path = "crates/thuban_model", version = "0.2.0" }
+thuban_num = { path = "crates/thuban_num", version = "0.2.0" }
+thuban_profiler = { path = "crates/thuban_profiler", version = "0.2.0" }
+thuban_server = { path = "crates/thuban_server", version = "0.2.0" }
+thuban_tensor = { path = "crates/thuban_tensor", version = "0.2.0" }
+thuban_tokenizer = { path = "crates/thuban_tokenizer", version = "0.2.0" }
 
 ahash = "0.8.12"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

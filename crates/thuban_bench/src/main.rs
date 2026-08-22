@@ -153,7 +153,7 @@ fn main() -> Result<()> {
             hidden_rows: &[],
         }],
     )?;
-    let _ = backend.read_f32(&backend.unit_scale().buf, 0, 1)?;
+    let _ = backend.read_f32(&backend.quant_lut().buf, 0, 1)?;
     let prefill_span = match &profiler {
         Some(p) => Some(p.lock().unwrap().begin_span()?),
         None => None,
@@ -190,7 +190,7 @@ fn main() -> Result<()> {
         p.lock().unwrap().end_span("prefill", span)?;
     }
 
-    let _ = backend.read_f32(&backend.unit_scale().buf, 0, 1)?;
+    let _ = backend.read_f32(&backend.quant_lut().buf, 0, 1)?;
     let prefill_secs = t0.elapsed().as_secs_f64();
     eprintln!(
         "[bench] prefill: {} tok in {:.2}s ({:.1} tok/s)",

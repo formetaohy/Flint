@@ -1,23 +1,19 @@
 use thuban_backend::Backend;
 use thuban_error::Result;
-use thuban_tensor::DType;
+use thuban_tensor::{DType, Quant};
 
 pub(super) fn cpu_probe() -> Result<()> {
     use thuban_backend::{Binding, Commands};
-    use thuban_model::quant::{choose_group, quantize};
+    use crate::synth_blocks::synth_blocks;
 
-    let mut backend = Backend::new()?;
+    let backend = Backend::new()?;
     let n = 14336u32;
     let k = 4096u32;
+    let quant = Quant::Q8_0;
     let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.001 - 2.0).collect();
-    let w: Vec<f32> = (0..n * k)
-        .map(|i| ((i % 97) as f32) * 0.001 - 0.5)
-        .collect();
-    let group = choose_group(k)?;
-    let (bytes, scales) = quantize(&w, n as usize, k as usize, group as usize);
+    let blocks = synth_blocks(quant, n, k);
     let xb = backend.tensor_f32(&x, vec![k]);
-    let wb = backend.tensor_i8(&bytes, vec![n, k]);
-    let sb = backend.tensor_f32(&scales, vec![k / group, n]);
+    let wb = backend.tensor_quant(&blocks, vec![n, k], quant);
     let y = backend.zero_tensor(&[n], DType::F32);
     let partial = backend.zero_tensor(&[2 * n], DType::F32);
 
@@ -31,15 +27,14 @@ pub(super) fn cpu_probe() -> Result<()> {
                 &[
                     ("N", n as f64),
                     ("K", k as f64),
-                    ("WDTYPE", 1.0),
-                    ("GROUP", group as f64),
+                    ("QTYPE", quant.as_u32() as f64),
                     ("SEGS", 2.0),
                     ("ACC", 0.0),
                 ],
                 &[
                     Binding::Full(&xb),
                     Binding::Full(&wb),
-                    Binding::Full(&sb),
+                    Binding::Full(backend.quant_lut()),
                     Binding::Full(&partial),
                 ],
                 [n.div_ceil(64), 2, 1],
@@ -55,8 +50,7 @@ pub(super) fn cpu_probe() -> Result<()> {
         let consts = [
             ("N", n as f64),
             ("K", k as f64),
-            ("WDTYPE", 1.0),
-            ("GROUP", group as f64),
+            ("QTYPE", quant.as_u32() as f64),
             ("SEGS", 2.0),
             ("ACC", 0.0),
         ];
@@ -76,7 +70,7 @@ pub(super) fn cpu_probe() -> Result<()> {
             },
             thuban_gpu::BindingRef {
                 index: 2,
-                buffer: &sb.buf,
+                buffer: &backend.quant_lut().buf,
                 offset: 0,
                 size: 0,
             },

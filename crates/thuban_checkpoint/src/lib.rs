@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use thuban_error::{Error, Result};
+use thuban_tensor::Quant;
 
 pub use gguf::{Gguf, GgufWriter};
 
@@ -110,23 +111,28 @@ impl Metadata {
 
 pub enum TensorData {
     F32(Vec<f32>),
-
+    F16Bytes(Vec<u8>),
     Bf16Bytes(Vec<u8>),
-
-    Q8_0 { bytes: Vec<u8>, numel: usize },
+    Quant {
+        quant: Quant,
+        bytes: Vec<u8>,
+        numel: usize,
+    },
 }
 
 impl TensorData {
     pub fn into_f32(self) -> Result<Vec<f32>> {
         match self {
             TensorData::F32(v) => Ok(v),
+            TensorData::F16Bytes(b) => Ok(b
+                .chunks_exact(2)
+                .map(|c| thuban_num::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect()),
             TensorData::Bf16Bytes(b) => Ok(b
                 .chunks_exact(2)
                 .map(|c| thuban_num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect()),
-            TensorData::Q8_0 { bytes, numel } => {
-                dequant::to_f32(dequant::GgmlType::Q8_0, &bytes, numel)
-            }
+            TensorData::Quant { quant, bytes, numel } => dequant::to_f32(quant, &bytes, numel),
         }
     }
 }

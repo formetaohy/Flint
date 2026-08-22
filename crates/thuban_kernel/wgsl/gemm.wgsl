@@ -3,17 +3,16 @@ struct Pc {
     K: u32,
     M: u32,
     SEGS: u32,
-    WDTYPE: u32,
-    GROUP: u32,
+    QTYPE: u32,
     ACC: u32,
     Y_STRIDE: u32,
     Y_OFF: u32,
 }
 var<immediate> pc: Pc;
 
-@group(0) @binding(0) var<storage, read_write> x: array<f32>;
-@group(0) @binding(1) var<storage, read_write> w: array<u32>;
-@group(0) @binding(2) var<storage, read_write> scales: array<f32>;
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<u32>;
+@group(0) @binding(2) var<storage, read> lut: array<u32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 
 const TM: u32 = 64;
@@ -24,22 +23,6 @@ const PAD: u32 = 36;
 var<workgroup> xs: array<vec4<f32>, TM * PAD / 4>;
 var<workgroup> ws: array<vec4<f32>, TN * PAD / 4>;
 
-fn deq4(word: u32) -> vec4<f32> {
-    return vec4<f32>(
-        f32(i32((word & 255u) << 24u) >> 24),
-        f32(i32((word & 65280u) << 16u) >> 24),
-        f32(i32((word & 16711680u) << 8u) >> 24),
-        f32(i32((word >> 24u) << 24u) >> 24),
-    );
-}
-
-fn deq2(word: u32) -> vec2<f32> {
-    return vec2<f32>(
-        bitcast<f32>((word & 65535u) << 16),
-        bitcast<f32>((word >> 16) << 16),
-    );
-}
-
 @compute @workgroup_size(256, 1, 1)
 fn gemm(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -49,8 +32,7 @@ fn gemm(
     let K = pc.K;
     let M = pc.M;
     let SEGS = pc.SEGS;
-    let WDTYPE = pc.WDTYPE;
-    let GROUP = pc.GROUP;
+    let ty = pc.QTYPE;
     let ACC = pc.ACC;
     let Y_STRIDE = pc.Y_STRIDE;
     let Y_OFF = pc.Y_OFF;
@@ -80,25 +62,16 @@ fn gemm(
         }
         xs[(row * PAD + k4) / 4u] = v;
     }
-    for (var i = 0u; i < 4u; i++) {
-        let idx = lid.x + i * 256u;
-        let col = idx / 8u;
-        let k4 = (idx % 8u) * 4u;
-        var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-        if n0 + col < N && k1 + k4 < K {
-            if WDTYPE == 1u {
-                let k = k1 + k4;
-                let word = w[((k / 16u) * N + n0 + col) * 4u + (k % 16u) / 4u];
-                let sc = scales[(k / GROUP) * N + n0 + col];
-                v = deq4(word) * sc;
-            } else {
-                let k = k1 + k4;
-                let w0 = w[(n0 + col) * (K / 2u) + k / 2u];
-                let w1 = w[(n0 + col) * (K / 2u) + k / 2u + 1u];
-                v = vec4<f32>(deq2(w0), deq2(w1));
+    {
+        let col = lid.x / 2u;
+        let h = (lid.x % 2u) * 16u;
+        var wv: array<vec4<f32>, 8>;
+        tile32(ty, n0 + col, k1, K, &wv);
+        if n0 + col < N {
+            for (var q = 0u; q < 4u; q++) {
+                ws[(col * PAD + h + 4u * q) / 4u] = wv[h / 16u * 4u + q];
             }
         }
-        ws[(col * PAD + k4) / 4u] = v;
     }
     workgroupBarrier();
 
@@ -155,25 +128,16 @@ fn gemm(
                 }
                 xs[(row * PAD + k4) / 4u] = v;
             }
-            for (var i = 0u; i < 4u; i++) {
-                let idx = lid.x + i * 256u;
-                let col = idx / 8u;
-                let k4 = (idx % 8u) * 4u;
-                var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-                if n0 + col < N && k1 + k4 < K {
-                    if WDTYPE == 1u {
-                        let k = k1 + k4;
-                        let word = w[((k / 16u) * N + n0 + col) * 4u + (k % 16u) / 4u];
-                        let sc = scales[(k / GROUP) * N + n0 + col];
-                        v = deq4(word) * sc;
-                    } else {
-                        let k = k1 + k4;
-                        let w0 = w[(n0 + col) * (K / 2u) + k / 2u];
-                        let w1 = w[(n0 + col) * (K / 2u) + k / 2u + 1u];
-                        v = vec4<f32>(deq2(w0), deq2(w1));
+            {
+                let col = lid.x / 2u;
+                let h = (lid.x % 2u) * 16u;
+                var wv: array<vec4<f32>, 8>;
+                tile32(ty, n0 + col, k1, K, &wv);
+                if n0 + col < N {
+                    for (var q = 0u; q < 4u; q++) {
+                        ws[(col * PAD + h + 4u * q) / 4u] = wv[h / 16u * 4u + q];
                     }
                 }
-                ws[(col * PAD + k4) / 4u] = v;
             }
         }
         workgroupBarrier();
@@ -212,4 +176,3 @@ fn gemm(
         }
     }
 }
-

@@ -1847,7 +1847,7 @@ dependencies = [
 
 [[package]]
 name = "thuban"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thuban_architectures",
  "thuban_backend",
@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "thuban_architectures"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "thuban_backend",
@@ -1880,9 +1880,10 @@ dependencies = [
 
 [[package]]
 name = "thuban_backend"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
+ "thuban_checkpoint",
  "thuban_error",
  "thuban_gpu",
  "thuban_kernel",
@@ -1893,7 +1894,7 @@ dependencies = [
 
 [[package]]
 name = "thuban_bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "serde_json",
@@ -1904,31 +1905,34 @@ dependencies = [
  "thuban_gpu",
  "thuban_kernel",
  "thuban_model",
+ "thuban_num",
  "thuban_profiler",
  "thuban_tensor",
 ]
 
 [[package]]
 name = "thuban_checkpoint"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "bytemuck",
  "memmap2",
  "serde",
  "serde_json",
  "thuban_error",
  "thuban_num",
+ "thuban_tensor",
 ]
 
 [[package]]
 name = "thuban_error"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "thuban_examples"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "env_logger",
@@ -1945,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "thuban_fetch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "thuban_error",
@@ -1954,7 +1958,7 @@ dependencies = [
 
 [[package]]
 name = "thuban_generate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "thuban_backend",
@@ -1965,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "thuban_gpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pollster",
  "thuban_error",
@@ -1974,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "thuban_kernel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "naga",
  "thuban_error",
@@ -1983,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "thuban_model"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "thuban_backend",
@@ -1996,11 +2000,11 @@ dependencies = [
 
 [[package]]
 name = "thuban_num"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "thuban_profiler"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thuban_error",
  "thuban_gpu",
@@ -2008,7 +2012,7 @@ dependencies = [
 
 [[package]]
 name = "thuban_server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -2029,14 +2033,15 @@ dependencies = [
 
 [[package]]
 name = "thuban_tensor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "thuban_error",
  "thuban_gpu",
 ]
 
 [[package]]
 name = "thuban_tokenizer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "serde_json",

@@ -2,7 +2,6 @@ pub mod config;
 pub mod loader;
 pub mod ops;
 pub mod pool;
-pub mod quant;
 pub mod rows;
 pub mod traits;
 pub mod weights;

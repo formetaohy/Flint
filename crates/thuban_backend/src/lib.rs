@@ -5,7 +5,8 @@ use std::sync::Arc;
 use thuban_error::{Error, Result};
 use thuban_gpu::{BindingRef, Buffer, Device, Encoder, HostAccess, Kernel, Submission};
 use thuban_kernel::Kernels;
-use thuban_tensor::{DType, Tensor};
+use thuban_tensor::{DType, Quant, Tensor};
+use thuban_tensor::quant::lut_bytes;
 
 #[derive(Clone, Copy)]
 pub enum Binding<'a> {
@@ -54,15 +55,15 @@ impl<'a> Commands<'a> {
 pub struct Backend {
     device: Arc<Device>,
     kernels: Kernels,
-    unit_scale: Tensor,
+    quant_lut: Tensor,
     gemv_partial: Tensor,
     gemm_partial: Tensor,
     gemm_xf16: Tensor,
     read_staging: std::cell::RefCell<(Buffer, u64)>,
     profiler: Option<Arc<std::sync::Mutex<thuban_profiler::GpuProfiler>>>,
 
-    pending: Vec<Submission>,
-    retired: Vec<(Tensor, u32)>,
+    pending: std::cell::RefCell<Vec<Submission>>,
+    retired: std::cell::RefCell<Vec<(Tensor, u32)>>,
 }
 
 impl Backend {
@@ -71,7 +72,7 @@ impl Backend {
             Arc::new(Device::open().map_err(|e| Error::Gpu(format!("no suitable backend: {e}")))?);
         let kernels = Kernels::new(device.as_ref())?;
         Self::warmup(device.as_ref(), &kernels)?;
-        let unit_scale = Tensor::new(Self::zeroed_buf(device.as_ref(), 4), vec![1], DType::F32);
+        let quant_lut = Self::lut_tensor(device.as_ref());
         let gemv_partial = Self::partial_buf(device.as_ref(), 8 * 65536)?;
         let gemm_partial = Self::partial_buf(device.as_ref(), 4 * 128 * 16384)?;
         let gemm_xf16 = Self::partial_f16_buf(device.as_ref(), 128 * 8192)?;
@@ -81,14 +82,14 @@ impl Backend {
         Ok(Self {
             device,
             kernels,
-            unit_scale,
+            quant_lut,
             gemv_partial,
             gemm_partial,
             gemm_xf16,
             read_staging: std::cell::RefCell::new((read_staging, 1 << 20)),
             profiler: None,
-            pending: Vec::new(),
-            retired: Vec::new(),
+            pending: std::cell::RefCell::new(Vec::new()),
+            retired: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -118,6 +119,18 @@ impl Backend {
         buf
     }
 
+    fn lut_tensor(device: &Device) -> Tensor {
+        Tensor::new(
+            Self::upload_buf(device, &lut_bytes()),
+            vec![thuban_tensor::quant::LUT_LEN / 4],
+            DType::U32,
+        )
+    }
+
+    pub fn quant_lut(&self) -> &Tensor {
+        &self.quant_lut
+    }
+
     fn partial_buf(device: &Device, words: usize) -> Result<Tensor> {
         Ok(Tensor::new(
             device
@@ -139,16 +152,17 @@ impl Backend {
     }
 
     fn retire(&mut self, tensor: Tensor) {
-        let refs = self.pending.len() as u32 + 1;
-        self.retired.push((tensor, refs));
+        let refs = self.pending.borrow().len() as u32 + 1;
+        self.retired.borrow_mut().push((tensor, refs));
     }
 
-    fn settle_retired(&mut self) {
+    fn settle_retired(&self) {
+        let mut retired = self.retired.borrow_mut();
         let mut i = 0;
-        while i < self.retired.len() {
-            self.retired[i].1 -= 1;
-            if self.retired[i].1 == 0 {
-                self.retired.swap_remove(i);
+        while i < retired.len() {
+            retired[i].1 -= 1;
+            if retired[i].1 == 0 {
+                retired.swap_remove(i);
             } else {
                 i += 1;
             }
@@ -166,7 +180,9 @@ impl Backend {
         let bytes = match dtype {
             DType::F32 | DType::U32 => numel * 4,
             DType::Bf16 | DType::F16 => numel * 2,
-            DType::I8 => numel,
+            DType::Quant(q) => {
+                (numel as usize).div_ceil(q.block_len()) as u64 * q.padded_bytes() as u64
+            }
         };
         Tensor::new(
             Self::zeroed_buf(self.device.as_ref(), bytes),
@@ -195,8 +211,16 @@ impl Backend {
     }
 
     pub fn tensor_bf16(&self, bytes: &[u8], shape: Vec<u32>) -> Result<Tensor> {
+        self.tensor_f16_bytes(bytes, shape, DType::Bf16)
+    }
+
+    pub fn tensor_f16(&self, bytes: &[u8], shape: Vec<u32>) -> Result<Tensor> {
+        self.tensor_f16_bytes(bytes, shape, DType::F16)
+    }
+
+    fn tensor_f16_bytes(&self, bytes: &[u8], shape: Vec<u32>, dtype: DType) -> Result<Tensor> {
         if !bytes.len().is_multiple_of(2) {
-            return Err(Error::Model("odd bf16 byte count".to_string()));
+            return Err(Error::Model("odd 16-bit byte count".to_string()));
         }
         let packed: Vec<u32> = bytes
             .chunks_exact(4)
@@ -212,16 +236,19 @@ impl Backend {
             packed
         };
         let buf = self.upload(bytemuck::cast_slice(&padded));
-        Ok(Tensor::new(buf, shape, DType::Bf16))
+        Ok(Tensor::new(buf, shape, dtype))
     }
 
-    pub fn tensor_i8(&self, bytes: &[u8], shape: Vec<u32>) -> Tensor {
-        assert!(
-            bytes.len().is_multiple_of(4),
-            "i8 count not a multiple of 4"
+    pub fn tensor_quant(&self, padded: &[u8], shape: Vec<u32>, quant: Quant) -> Tensor {
+        let numel: usize = shape.iter().map(|d| *d as usize).product();
+        let expect = numel.div_ceil(quant.block_len()) * quant.padded_bytes();
+        assert_eq!(
+            padded.len(),
+            expect,
+            "padded quant buffer size mismatch"
         );
-        let buf = self.upload(bytes);
-        Tensor::new(buf, shape, DType::I8)
+        let buf = self.upload(padded);
+        Tensor::new(buf, shape, DType::Quant(quant))
     }
 
     fn upload(&self, bytes: &[u8]) -> Buffer {
@@ -258,7 +285,7 @@ impl Backend {
     }
 
     pub fn dispatch(
-        &mut self,
+        &self,
         commands: &mut Commands<'_>,
         name: &'static str,
         consts: &[(&'static str, f64)],
@@ -301,17 +328,18 @@ impl Backend {
         Ok(())
     }
 
-    pub fn unit_scale(&self) -> &Tensor {
-        &self.unit_scale
-    }
-
-    pub fn submit(&mut self, encoder: &mut Encoder) -> Result<()> {
-        if self.pending.len() >= 2 {
-            let done = self.pending.remove(0);
-            done.wait()?;
-            self.settle_retired();
+    pub fn submit(&self, encoder: &mut Encoder) -> Result<()> {
+        {
+            let mut pending = self.pending.borrow_mut();
+            if pending.len() >= 2 {
+                let done = pending.remove(0);
+                drop(pending);
+                done.wait()?;
+                self.settle_retired();
+                pending = self.pending.borrow_mut();
+            }
+            pending.push(encoder.submit_and_reset());
         }
-        self.pending.push(encoder.submit_and_reset());
         Ok(())
     }
 

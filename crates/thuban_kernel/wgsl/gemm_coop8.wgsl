@@ -5,8 +5,7 @@ fn gemm_coop8(
 ) {
     let N = pc.N;
     let K = pc.K;
-    let WDTYPE = pc.WDTYPE;
-    let GROUP = pc.GROUP;
+    let ty = pc.QTYPE;
     let ACC = pc.ACC;
     let Y_STRIDE = pc.Y_STRIDE;
     let Y_OFF = pc.Y_OFF;
@@ -19,7 +18,7 @@ fn gemm_coop8(
     let r0 = m0 + sr * 32u;
     let c0 = n0 + sc * 64u;
 
-    stage_b(0u, 0u, n0, lid.x, N, K, WDTYPE, GROUP);
+    stage_b(0u, 0u, n0, lid.x, N, K, ty);
     workgroupBarrier();
 
     let yb = r0 * Y_STRIDE + Y_OFF + c0;
@@ -161,7 +160,7 @@ fn gemm_coop8(
         let p1 = 1u - p;
         workgroupBarrier();
         if it + 1u < steps {
-            stage_b(p1, (it + 1u) * BK, n0, lid.x, N, K, WDTYPE, GROUP);
+            stage_b(p1, (it + 1u) * BK, n0, lid.x, N, K, ty);
         }
         let kb = it * BK;
         let ab = r0 * K + kb;

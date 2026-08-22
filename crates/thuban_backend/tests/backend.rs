@@ -1,6 +1,6 @@
 use thuban_backend::{Backend, Binding, Commands};
 use thuban_profiler::GpuProfiler;
-use thuban_tensor::{DType, Weight};
+use thuban_tensor::{DType, Quant, Weight};
 
 #[test]
 fn f32_roundtrip() {
@@ -55,8 +55,8 @@ fn tensor_geometry_per_dtype() {
     assert_eq!(b.dtype, DType::Bf16);
     assert_eq!(b.byte_len(), 12);
 
-    let i = backend.tensor_i8(&[0u8; 8], vec![2, 4]);
-    assert_eq!(i.byte_len(), 8);
+    let q = backend.tensor_quant(&[0u8; 8 * 20], vec![2, 4 * 32], Quant::Q4_0);
+    assert_eq!(q.byte_len(), 8 * 20);
 }
 
 #[test]
@@ -66,19 +66,19 @@ fn bf16_odd_byte_count_fails_fast() {
         .tensor_bf16(&[0u8; 3], vec![1])
         .err()
         .expect("odd byte count must fail");
-    assert!(err.to_string().contains("odd bf16"), "{err}");
+    assert!(err.to_string().contains("odd 16-bit"), "{err}");
 }
 
 #[test]
-#[should_panic(expected = "multiple of 4")]
-fn i8_count_must_align_to_u32_words() {
+#[should_panic(expected = "padded quant buffer size mismatch")]
+fn quant_buffer_size_must_match_padded_blocks() {
     let backend = Backend::new().unwrap();
-    backend.tensor_i8(&[0u8; 3], vec![3]);
+    backend.tensor_quant(&[0u8; 3], vec![32], Quant::Q4_0);
 }
 
 #[test]
 fn unknown_shader_is_an_error_not_a_panic() {
-    let mut backend = Backend::new().unwrap();
+    let backend = Backend::new().unwrap();
     let t = backend.zero_tensor(&[1], DType::F32);
     let mut enc = backend.encoder().unwrap();
     let mut commands = Commands::begin(&mut enc);
@@ -93,43 +93,34 @@ fn weight_invariants() {
     let backend = Backend::new().unwrap();
     let f = backend.tensor_f32(&[0.0; 4], vec![2, 2]);
     let b = backend.tensor_bf16(&[0u8; 8], vec![2, 2]).unwrap();
-    let i = backend.tensor_i8(&[0u8; 4], vec![2, 2]);
-    let s = backend.tensor_f32(&[1.0; 2], vec![2, 1]);
+    let q = backend.tensor_quant(&[0u8; 40], vec![2, 32], Quant::Q4_0);
 
     assert!(matches!(Weight::plain(f), Weight::Plain(_)));
     assert!(matches!(Weight::plain(b), Weight::Plain(_)));
-    assert!(matches!(
-        Weight::quant(i, s, 128),
-        Weight::Quantized { group: 128, .. }
-    ));
+    assert_eq!(Weight::quantized(q).quant(), Some(Quant::Q4_0));
 
     let f = backend.tensor_f32(&[0.0; 4], vec![2, 2]);
     let w = Weight::plain(f);
-    assert!(w.scale().is_none());
-    assert_eq!(w.group(), None);
+    assert!(w.quant().is_none());
     assert_eq!(w.tensor().shape, vec![2, 2]);
-    let i = backend.tensor_i8(&[0u8; 4], vec![2, 2]);
-    let s = backend.tensor_f32(&[1.0; 1], vec![1, 1]);
-    let q = Weight::quant(i, s, 32);
-    assert_eq!(q.group(), Some(32));
-    assert!(q.scale().is_some());
+    let q = backend.tensor_quant(&[0u8; 36], vec![1, 32], Quant::Q8_0);
+    assert_eq!(Weight::quantized(q).quant(), Some(Quant::Q8_0));
 }
 
 #[test]
-#[should_panic(expected = "must be f32 or bf16")]
-fn plain_weight_rejects_i8() {
+#[should_panic(expected = "must be f32, bf16 or f16")]
+fn plain_weight_rejects_quant() {
     let backend = Backend::new().unwrap();
-    let i = backend.tensor_i8(&[0u8; 4], vec![2, 2]);
-    Weight::plain(i);
+    let q = backend.tensor_quant(&[0u8; 40], vec![2, 32], Quant::Q4_0);
+    Weight::plain(q);
 }
 
 #[test]
-#[should_panic(expected = "must be i8")]
+#[should_panic(expected = "must carry a block format")]
 fn quant_weight_rejects_floats() {
     let backend = Backend::new().unwrap();
     let f = backend.tensor_f32(&[0.0; 4], vec![2, 2]);
-    let s = backend.tensor_f32(&[1.0], vec![1]);
-    Weight::quant(f, s, 128);
+    Weight::quantized(f);
 }
 
 #[test]
@@ -139,16 +130,16 @@ fn adapter_name_is_reported() {
 }
 
 #[test]
-fn unit_scale_is_a_single_element_tensor() {
+fn quant_lut_is_uploaded() {
     let backend = Backend::new().unwrap();
-    let d = backend.unit_scale();
-    assert_eq!(d.numel(), 1);
-    assert_eq!(d.dtype, DType::F32);
+    let d = backend.quant_lut();
+    assert_eq!(d.numel(), thuban_tensor::quant::LUT_LEN as u64 / 4);
+    assert_eq!(d.dtype, DType::U32);
 }
 
 #[test]
 fn external_profiler_records_spans() {
-    let mut backend = Backend::new().unwrap();
+    let backend = Backend::new().unwrap();
     let mut prof = GpuProfiler::new(backend.device()).unwrap();
     let span = prof.begin_span().unwrap();
     let t = backend.zero_tensor(&[1], DType::F32);

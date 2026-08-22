@@ -24,15 +24,19 @@ use crate::shader;
 pub const SHADERS: &[ShaderSpec] = &[
     shader!(
         shader::GEMM,
-        ["gemm.wgsl"],
-        &[BindingMode::ReadWrite; 4],
+        ["quant.wgsl", "gemm.wgsl"],
+        &[
+            BindingMode::ReadOnly,
+            BindingMode::ReadOnly,
+            BindingMode::ReadOnly,
+            BindingMode::ReadWrite
+        ],
         &[
             ("N", Scalar::U32),
             ("K", Scalar::U32),
             ("M", Scalar::U32),
             ("SEGS", Scalar::U32),
-            ("WDTYPE", Scalar::U32),
-            ("GROUP", Scalar::U32),
+            ("QTYPE", Scalar::U32),
             ("ACC", Scalar::U32),
             ("Y_STRIDE", Scalar::U32),
             ("Y_OFF", Scalar::U32),
@@ -40,7 +44,7 @@ pub const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         shader::GEMM_COOP,
-        ["gemm_coop_common.wgsl", "gemm_coop.wgsl"],
+        ["gemm_coop_common.wgsl", "quant.wgsl", "gemm_coop.wgsl"],
         &[
             BindingMode::ReadOnly,
             BindingMode::ReadOnly,
@@ -52,8 +56,7 @@ pub const SHADERS: &[ShaderSpec] = &[
             ("K", Scalar::U32),
             ("M", Scalar::U32),
             ("SEGS", Scalar::U32),
-            ("WDTYPE", Scalar::U32),
-            ("GROUP", Scalar::U32),
+            ("QTYPE", Scalar::U32),
             ("ACC", Scalar::U32),
             ("Y_STRIDE", Scalar::U32),
             ("Y_OFF", Scalar::U32),
@@ -61,7 +64,7 @@ pub const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         shader::GEMM_COOP8,
-        ["gemm_coop_common.wgsl", "gemm_coop8.wgsl"],
+        ["gemm_coop_common.wgsl", "quant.wgsl", "gemm_coop8.wgsl"],
         &[
             BindingMode::ReadOnly,
             BindingMode::ReadOnly,
@@ -73,8 +76,7 @@ pub const SHADERS: &[ShaderSpec] = &[
             ("K", Scalar::U32),
             ("M", Scalar::U32),
             ("SEGS", Scalar::U32),
-            ("WDTYPE", Scalar::U32),
-            ("GROUP", Scalar::U32),
+            ("QTYPE", Scalar::U32),
             ("ACC", Scalar::U32),
             ("Y_STRIDE", Scalar::U32),
             ("Y_OFF", Scalar::U32),
@@ -101,13 +103,17 @@ pub const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         shader::GEMV,
-        ["gemv.wgsl"],
-        &[BindingMode::ReadWrite; 4],
+        ["quant.wgsl", "gemv.wgsl"],
+        &[
+            BindingMode::ReadOnly,
+            BindingMode::ReadOnly,
+            BindingMode::ReadOnly,
+            BindingMode::ReadWrite
+        ],
         &[
             ("N", Scalar::U32),
             ("K", Scalar::U32),
-            ("WDTYPE", Scalar::U32),
-            ("GROUP", Scalar::U32),
+            ("QTYPE", Scalar::U32),
             ("SEGS", Scalar::U32),
             ("ACC", Scalar::U32),
         ]
@@ -124,16 +130,18 @@ pub const SHADERS: &[ShaderSpec] = &[
     ),
     shader!(
         shader::EMBED,
-        ["embed.wgsl"],
-        &[BindingMode::ReadWrite; 5],
+        ["quant.wgsl", "embed.wgsl"],
+        &[
+            BindingMode::ReadOnly,
+            BindingMode::ReadOnly,
+            BindingMode::ReadOnly,
+            BindingMode::ReadWrite
+        ],
         &[
             ("M", Scalar::U32),
             ("DIM", Scalar::U32),
             ("SCALE", Scalar::F32),
-            ("WDTYPE", Scalar::U32),
-            ("GROUP", Scalar::U32),
-            ("SPLIT", Scalar::U32),
-            ("ROWS", Scalar::U32),
+            ("QTYPE", Scalar::U32),
         ]
     ),
     shader!(

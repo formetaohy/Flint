@@ -9,6 +9,8 @@ description = "GGUF checkpoint reader with dequantization for the Thuban engine"
 [dependencies]
 thuban_error.workspace = true
 thuban_num.workspace = true
+thuban_tensor.workspace = true
+bytemuck.workspace = true
 memmap2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

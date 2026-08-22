@@ -6,16 +6,15 @@ use memmap2::Mmap;
 
 use thuban_error::{Error, Result};
 use thuban_num::{f32_to_bf16, f32_to_f16};
+use thuban_tensor::Quant;
 
-use super::dequant::{self, GgmlType};
 use super::{Checkpoint, MetaVal, Metadata, RawTensor, TensorData};
 
 const MAGIC: u32 = 0x4655_4747;
 
 struct TensorInfo {
-    ty: GgmlType,
+    quant: Quant,
     shape: Vec<u32>,
-
     offset: usize,
     numel: usize,
 }
@@ -70,22 +69,21 @@ impl Gguf {
                 numel *= d;
                 dims.push(d as u32);
             }
-            let ty = GgmlType::from_u32(r.u32()?)?;
+            let quant = Quant::from_ggml(r.u32()?)?;
             let rel = r.u64()? as usize;
-            infos.push((name, ty, dims, numel, rel));
+            infos.push((name, quant, dims, numel, rel));
         }
 
         let data_start = align_up(r.1, alignment);
 
         let mut tensors = HashMap::with_capacity(tensor_count);
-        for (name, ty, dims, numel, rel) in infos {
-            let offset = data_start + rel;
+        for (name, quant, dims, numel, rel) in infos {
             tensors.insert(
                 name,
                 TensorInfo {
-                    ty,
+                    quant,
                     shape: dims,
-                    offset,
+                    offset: data_start + rel,
                     numel,
                 },
             );
@@ -93,7 +91,7 @@ impl Gguf {
         if let Some(info) = tensors
             .get("rope_freqs.weight")
             .or_else(|| tensors.get("rope_freqs"))
-            && info.ty == GgmlType::F32
+            && info.quant == Quant::F32
         {
             let need = info.numel * 4;
             let start = info.offset;
@@ -123,57 +121,31 @@ impl Gguf {
     fn qk_interleaved(&self) -> bool {
         self.meta.str("general.architecture") == Some("llama")
     }
-}
 
-fn deinterleave_rows_f32(v: &mut [f32], rows: u32, cols: u32, hd: u32) {
-    let (cols, hd) = (cols as usize, hd as usize);
-    let half = hd / 2;
-    let mut buf = vec![0f32; rows as usize * cols];
-    buf.copy_from_slice(v);
-    for h in 0..rows as usize / hd {
-        for i in 0..half {
-            let (dst, src) = (h * hd + i, h * hd + 2 * i);
-            v[dst * cols..(dst + 1) * cols].copy_from_slice(&buf[src * cols..(src + 1) * cols]);
-            let (dst, src) = (h * hd + half + i, h * hd + 2 * i + 1);
-            v[dst * cols..(dst + 1) * cols].copy_from_slice(&buf[src * cols..(src + 1) * cols]);
-        }
+    fn interleaved_rows(&self, name: &str, shape: &[u32], rows: u32) -> Option<u32> {
+        let hd = self.head_dim().unwrap_or(0);
+        (self.qk_interleaved() && hd > 0 && hd.is_multiple_of(2) && {
+            let is_qk = name.ends_with("attn_q.weight")
+                || name.ends_with("attn_k.weight")
+                || name.ends_with("attn_q.bias")
+                || name.ends_with("attn_k.bias");
+            is_qk && shape.first().copied().unwrap_or(0).is_multiple_of(hd) && rows > hd
+        })
+        .then_some(hd)
     }
 }
 
-fn deinterleave_rows_bf16(v: &mut [u8], rows: u32, cols: u32, hd: u32) {
-    let words = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u16, v.len() / 2) };
-    let (cols, hd) = (cols as usize, hd as usize);
+fn deinterleave_rows(bytes: &mut [u8], row_bytes: usize, rows: u32, hd: u32) {
+    let (rows, hd) = (rows as usize, hd as usize);
     let half = hd / 2;
-    let mut buf = vec![0u16; rows as usize * cols];
-    buf.copy_from_slice(words);
-    for h in 0..rows as usize / hd {
+    let buf = bytes.to_vec();
+    for h in 0..rows / hd {
         for i in 0..half {
             let (dst, src) = (h * hd + i, h * hd + 2 * i);
-            words[dst * cols..(dst + 1) * cols].copy_from_slice(&buf[src * cols..(src + 1) * cols]);
-            let (dst, src) = (h * hd + half + i, h * hd + 2 * i + 1);
-            words[dst * cols..(dst + 1) * cols].copy_from_slice(&buf[src * cols..(src + 1) * cols]);
-        }
-    }
-}
-
-fn deinterleave_rows_q8(v: &mut [u8], rows: u32, cols: u32, hd: u32) {
-    const BLOCK: usize = 32;
-    let (cols, hd) = (cols as usize, hd as usize);
-    assert!(
-        cols.is_multiple_of(BLOCK),
-        "Q8_0 deinterleave requires cols to be a multiple of 32, got {cols}"
-    );
-    let half = hd / 2;
-    let row_bytes = (cols / BLOCK) * 34;
-    let mut buf = vec![0u8; rows as usize * row_bytes];
-    buf.copy_from_slice(v);
-    for h in 0..rows as usize / hd {
-        for i in 0..half {
-            let (dst, src) = (h * hd + i, h * hd + 2 * i);
-            v[dst * row_bytes..(dst + 1) * row_bytes]
+            bytes[dst * row_bytes..(dst + 1) * row_bytes]
                 .copy_from_slice(&buf[src * row_bytes..(src + 1) * row_bytes]);
             let (dst, src) = (h * hd + half + i, h * hd + 2 * i + 1);
-            v[dst * row_bytes..(dst + 1) * row_bytes]
+            bytes[dst * row_bytes..(dst + 1) * row_bytes]
                 .copy_from_slice(&buf[src * row_bytes..(src + 1) * row_bytes]);
         }
     }
@@ -189,7 +161,7 @@ impl Checkpoint for Gguf {
             .tensors
             .get(name)
             .ok_or_else(|| Error::Checkpoint(format!("gguf tensor {name:?} not found")))?;
-        let need = info.numel.div_ceil(info.ty.block_len()) * info.ty.block_bytes();
+        let need = info.numel.div_ceil(info.quant.block_len()) * info.quant.block_bytes();
         let end = info.offset + need;
         if end > self.mmap.len() {
             return Err(Error::Checkpoint(format!(
@@ -202,44 +174,46 @@ impl Checkpoint for Gguf {
         let bytes = &self.mmap[info.offset..end];
 
         let shape: Vec<u32> = info.shape.iter().rev().cloned().collect();
-
-        let hd = self.head_dim().unwrap_or(0);
-        let interleaved = self.qk_interleaved() && hd > 0 && hd.is_multiple_of(2) && {
-            let is_qk = name.ends_with("attn_q.weight")
-                || name.ends_with("attn_k.weight")
-                || name.ends_with("attn_q.bias")
-                || name.ends_with("attn_k.bias");
-            is_qk && shape[0].is_multiple_of(hd)
-        };
-        let (rows, cols) = match shape.len() {
-            2 => (shape[0], shape[1]),
-            _ => (shape[0], 1),
-        };
-
-        let data = match info.ty {
-            GgmlType::Bf16 => {
-                let mut d = bytes.to_vec();
-                if interleaved {
-                    deinterleave_rows_bf16(&mut d, rows, cols, hd);
+        let rows = shape[0];
+        let cols = if shape.len() >= 2 { shape[1] } else { 1 };
+        let data = match info.quant {
+            Quant::F32 => {
+                let mut v: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                if let Some(hd) = self.interleaved_rows(name, &shape, rows) {
+                    deinterleave_rows(
+                        bytemuck::cast_slice_mut(&mut v),
+                        cols as usize * 4,
+                        rows,
+                        hd,
+                    );
                 }
-                TensorData::Bf16Bytes(d)
+                TensorData::F32(v)
             }
-            GgmlType::Q8_0 => {
+            Quant::F16 | Quant::Bf16 => {
                 let mut d = bytes.to_vec();
-                if interleaved {
-                    deinterleave_rows_q8(&mut d, rows, cols, hd);
+                if let Some(hd) = self.interleaved_rows(name, &shape, rows) {
+                    deinterleave_rows(&mut d, cols as usize * 2, rows, hd);
                 }
-                TensorData::Q8_0 {
+                if info.quant == Quant::F16 {
+                    TensorData::F16Bytes(d)
+                } else {
+                    TensorData::Bf16Bytes(d)
+                }
+            }
+            quant => {
+                let mut d = bytes.to_vec();
+                if let Some(hd) = self.interleaved_rows(name, &shape, rows) {
+                    let row_bytes = quant.row_bytes(cols);
+                    deinterleave_rows(&mut d, row_bytes, rows, hd);
+                }
+                TensorData::Quant {
+                    quant,
                     bytes: d,
                     numel: info.numel,
                 }
-            }
-            _ => {
-                let mut v = dequant::to_f32(info.ty, bytes, info.numel)?;
-                if interleaved {
-                    deinterleave_rows_f32(&mut v, rows, cols, hd);
-                }
-                TensorData::F32(v)
             }
         };
         Ok(RawTensor { shape, data })
@@ -343,8 +317,7 @@ pub struct GgufWriter {
 
 struct GgufTensor {
     name: String,
-    ty: GgmlType,
-
+    quant: Quant,
     shape: Vec<u32>,
     data: Vec<u8>,
 }
@@ -410,7 +383,7 @@ impl GgufWriter {
         }
         self.tensors.push(GgufTensor {
             name: name.to_string(),
-            ty: GgmlType::F32,
+            quant: Quant::F32,
             shape: shape.to_vec(),
             data: bytes,
         });
@@ -423,32 +396,31 @@ impl GgufWriter {
         }
         self.tensors.push(GgufTensor {
             name: name.to_string(),
-            ty: GgmlType::Bf16,
+            quant: Quant::Bf16,
             shape: shape.to_vec(),
             data: bytes,
         });
     }
 
-    pub fn tensor_q8_0(&mut self, name: &str, shape: &[u32], data: &[f32]) {
-        assert!(
-            data.len().is_multiple_of(32),
-            "Q8_0 requires a multiple of 32 elements, got {}",
-            data.len()
-        );
-        let mut bytes = Vec::with_capacity(data.len() / 32 * 34);
-        for block in data.chunks_exact(32) {
-            let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
-            let d = if amax == 0.0 { 0.0 } else { amax / 127.0 };
-            bytes.extend_from_slice(&f32_to_f16(d).to_le_bytes());
-            for v in block {
-                bytes.push(((v / d).round().clamp(-127.0, 127.0) as i8) as u8);
-            }
+    pub fn tensor_f16(&mut self, name: &str, shape: &[u32], data: &[f32]) {
+        let mut bytes = Vec::with_capacity(data.len() * 2);
+        for v in data {
+            bytes.extend_from_slice(&f32_to_f16(*v).to_le_bytes());
         }
         self.tensors.push(GgufTensor {
             name: name.to_string(),
-            ty: GgmlType::Q8_0,
+            quant: Quant::F16,
             shape: shape.to_vec(),
             data: bytes,
+        });
+    }
+
+    pub fn tensor_raw(&mut self, name: &str, shape: &[u32], quant: Quant, data: &[u8]) {
+        self.tensors.push(GgufTensor {
+            name: name.to_string(),
+            quant,
+            shape: shape.to_vec(),
+            data: data.to_vec(),
         });
     }
 
@@ -473,7 +445,7 @@ impl GgufWriter {
             for d in t.shape.iter().rev() {
                 out.extend_from_slice(&(*d as u64).to_le_bytes());
             }
-            out.extend_from_slice(&(t.ty as u32).to_le_bytes());
+            out.extend_from_slice(&(t.quant.as_u32()).to_le_bytes());
             out.extend_from_slice(&0u64.to_le_bytes());
         }
 

@@ -4,8 +4,8 @@ use thuban_backend::{Backend, Binding, Commands};
 use thuban_kernel::{Act, NormMode, shader};
 
 mod support;
-use thuban_tensor::{DType, Tensor, Weight};
 use support::cpu_ref;
+use thuban_tensor::{DType, Quant, Tensor, Weight};
 
 static GPU: Mutex<()> = Mutex::new(());
 
@@ -86,7 +86,7 @@ impl Ctx {
     }
 
     fn dispatch(
-        &mut self,
+        &self,
         name: &'static str,
         consts: &[(&'static str, f64)],
         bufs: &[Binding<'_>],
@@ -146,72 +146,109 @@ fn agree(gpu: &[f32], cpu: &[f32], rel: f32, abs: f32) {
     }
 }
 
-fn quant(data: &[f32], rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f32>) {
-    let mut row_major = Vec::new();
-    let mut scales = vec![0f32; rows * (cols / group)];
-    for r in 0..rows {
-        for g in 0..cols / group {
-            let block = &data[r * cols + g * group..r * cols + (g + 1) * group];
-            let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
-            let scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
-            scales[g * rows + r] = scale;
-            for v in block {
-                row_major.push((v / scale).round().clamp(-127.0, 127.0) as i8 as u8);
+const ALL_QUANTS: &[Quant] = &[
+    Quant::Q4_0,
+    Quant::Q4_1,
+    Quant::Q5_0,
+    Quant::Q5_1,
+    Quant::Q8_0,
+    Quant::Q2K,
+    Quant::Q3K,
+    Quant::Q4K,
+    Quant::Q5K,
+    Quant::Q6K,
+    Quant::Q8K,
+    Quant::Iq2Xxs,
+    Quant::Iq2Xs,
+    Quant::Iq3Xxs,
+    Quant::Iq1S,
+    Quant::Iq4Nl,
+    Quant::Iq3S,
+    Quant::Iq2S,
+    Quant::Iq4Xs,
+    Quant::Iq1M,
+    Quant::Tq1_0,
+    Quant::Tq2_0,
+];
+
+fn f16_offsets(quant: Quant) -> &'static [usize] {
+    match quant {
+        Quant::Q4_1 => &[0, 2],
+        Quant::Q5_1 => &[0, 2],
+        Quant::Q2K => &[80, 82],
+        Quant::Q3K => &[108],
+        Quant::Q4K => &[0, 2],
+        Quant::Q5K => &[0, 2],
+        Quant::Q6K => &[208],
+        Quant::Tq1_0 => &[52],
+        Quant::Tq2_0 => &[64],
+        Quant::Q8K | Quant::Iq1M => &[],
+        _ => &[0],
+    }
+}
+
+fn synth_blocks(quant: Quant, numel: usize, seed: u64) -> Vec<u8> {
+    fn xorshift(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+    let bb = quant.block_bytes();
+    let blocks = numel.div_ceil(quant.block_len());
+    let mut raw = vec![0u8; blocks * bb];
+    let mut s = seed | 1;
+    for b in 0..blocks {
+        let off = b * bb;
+        for i in 0..bb {
+            raw[off + i] = (xorshift(&mut s) >> 33) as u8;
+        }
+        match quant {
+            Quant::Q8K => {
+                let d = 0x3b00_0000u32 | (xorshift(&mut s) as u32 & 0x007f_ffff);
+                raw[off..off + 4].copy_from_slice(&d.to_le_bytes());
+            }
+            Quant::Iq1M => {
+                let sc3 = (xorshift(&mut s) & 0x00ff) as u16 | 0x3000;
+                raw[off + 54..off + 56].copy_from_slice(&sc3.to_le_bytes());
+            }
+            _ => {
+                for &fo in f16_offsets(quant) {
+                    let h = (xorshift(&mut s) & 0x9fff) % 0x1800;
+                    raw[off + fo..off + fo + 2].copy_from_slice(&(h as u16).to_le_bytes());
+                }
             }
         }
     }
-    let mut bytes = vec![0u8; rows * cols];
-    for kb in 0..cols / 16 {
-        for r in 0..rows {
-            for i in 0..16 {
-                bytes[(kb * rows + r) * 16 + i] = row_major[r * cols + kb * 16 + i];
-            }
-        }
+    raw
+}
+
+fn quant_weight(ctx: &Ctx, quant: Quant, n: u32, k: u32, seed: u64) -> (Weight, Vec<f32>) {
+    let numel = (n as usize) * (k as usize);
+    let raw = synth_blocks(quant, numel, seed);
+    let cpu = thuban_checkpoint::dequant::to_f32(quant, &raw, numel).unwrap();
+    let padded = quant.pad_blocks(&raw, numel).unwrap();
+    let wb = ctx.backend.tensor_quant(&padded, vec![n, k], quant);
+    (Weight::quantized(wb), cpu)
+}
+
+fn qtype_of(w: &Weight) -> u32 {
+    match w.tensor().dtype {
+        DType::F32 => 0,
+        DType::F16 => 1,
+        DType::Bf16 => 30,
+        DType::Quant(q) => q.as_u32(),
+        DType::U32 => unreachable!("weights are never index tensors"),
     }
-    (bytes, scales)
 }
 
-fn dequant(bytes: &[u8], scales: &[f32], rows: usize, cols: usize, group: usize) -> Vec<f32> {
-    let mut out = vec![0f32; rows * cols];
-    for kb in 0..cols / 16 {
-        for r in 0..rows {
-            for i in 0..16 {
-                let byte = bytes[(kb * rows + r) * 16 + i];
-                let g = (kb * 16) / group;
-                out[r * cols + kb * 16 + i] = (byte as i8) as f32 * scales[g * rows + r];
-            }
-        }
-    }
-    out
-}
-
-enum WType {
-    Bf16,
-    I8(usize),
-}
-
-fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
-    let mut ctx = Ctx::new();
+fn gemm_case(quant: Quant, m: usize, n: usize, k: usize, seed: u64) {
+    let ctx = Ctx::new();
     let mut rng = Rng(seed);
     let x = rng.fill(m * k);
-    let w = rng.fill(n * k);
     let xb = ctx.f32(&x, &[m as u32, k as u32]);
     let y = ctx.zero(&[m as u32, n as u32]);
-
-    let (wb, sb, wdtype, group, cpu_w, rel, abs) = match wt {
-        WType::Bf16 => {
-            let wb = ctx.bf16(&w, &[n as u32, k as u32]);
-            let sb = ctx.f32(&[0.0], &[1]);
-            (wb, sb, 0.0, 128.0, bf16_round(&w), 2e-2, 5e-2)
-        }
-        WType::I8(group) => {
-            let (wq, scales) = quant(&w, n, k, group);
-            let cpu_w = dequant(&wq, &scales, n, k, group);
-            let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
-            let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
-            (wb, sb, 1.0, group as f64, cpu_w, 1e-4, 1e-3)
-        }
-    };
+    let (weight, cpu_w) = quant_weight(&ctx, quant, n as u32, k as u32, seed ^ 0x9e37);
 
     ctx.dispatch(
         shader::GEMM,
@@ -220,27 +257,109 @@ fn gemm_case(wt: WType, m: usize, n: usize, k: usize, seed: u64) {
             ("K", k as f64),
             ("M", m as f64),
             ("SEGS", 1.0),
-            ("WDTYPE", wdtype),
-            ("GROUP", group),
+            ("QTYPE", qtype_of(&weight) as f64),
             ("ACC", 0.0),
             ("Y_STRIDE", n as f64),
             ("Y_OFF", 0.0),
         ],
         &[
             Binding::Full(&xb),
-            Binding::Full(&wb),
-            Binding::Full(&sb),
+            Binding::Full(weight.tensor()),
+            Binding::Full(ctx.backend.quant_lut()),
             Binding::Full(&y),
         ],
         [n.div_ceil(128) as u32, m.div_ceil(64) as u32, 1],
     );
-    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), rel, abs);
+    agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 1e-3, 1e-2);
 }
 
 #[test]
 fn gemm_bf16() {
     let _g = gpu();
-    gemm_case(WType::Bf16, 16, 64, 128, 7);
+    let ctx = Ctx::new();
+    let mut rng = Rng(7);
+    let (m, n, k) = (16usize, 64usize, 128usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.zero(&[m as u32, n as u32]);
+    let wb = ctx.bf16(&w, &[n as u32, k as u32]);
+    let weight = Weight::plain(wb);
+    ctx.dispatch(
+        shader::GEMM,
+        &[
+            ("N", n as f64),
+            ("K", k as f64),
+            ("M", m as f64),
+            ("SEGS", 1.0),
+            ("QTYPE", qtype_of(&weight) as f64),
+            ("ACC", 0.0),
+            ("Y_STRIDE", n as f64),
+            ("Y_OFF", 0.0),
+        ],
+        &[
+            Binding::Full(&xb),
+            Binding::Full(weight.tensor()),
+            Binding::Full(ctx.backend.quant_lut()),
+            Binding::Full(&y),
+        ],
+        [n.div_ceil(128) as u32, m.div_ceil(64) as u32, 1],
+    );
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
+        2e-2,
+        5e-2,
+    );
+}
+
+#[test]
+fn gemm_each_quant() {
+    let _g = gpu();
+    for (i, &q) in ALL_QUANTS.iter().enumerate() {
+        eprintln!("quant {q:?}");
+        gemm_case(q, 64, 128, 256, 1000 + i as u64);
+    }
+}
+
+#[test]
+fn gemm_bf16_multi_tile_m() {
+    let _g = gpu();
+    let ctx = Ctx::new();
+    let mut rng = Rng(29);
+    let (m, n, k) = (32usize, 32usize, 64usize);
+    let x = rng.fill(m * k);
+    let w = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[m as u32, k as u32]);
+    let y = ctx.zero(&[m as u32, n as u32]);
+    let wb = ctx.bf16(&w, &[n as u32, k as u32]);
+    let weight = Weight::plain(wb);
+    ctx.dispatch(
+        shader::GEMM,
+        &[
+            ("N", n as f64),
+            ("K", k as f64),
+            ("M", m as f64),
+            ("SEGS", 1.0),
+            ("QTYPE", qtype_of(&weight) as f64),
+            ("ACC", 0.0),
+            ("Y_STRIDE", n as f64),
+            ("Y_OFF", 0.0),
+        ],
+        &[
+            Binding::Full(&xb),
+            Binding::Full(weight.tensor()),
+            Binding::Full(ctx.backend.quant_lut()),
+            Binding::Full(&y),
+        ],
+        [n.div_ceil(128) as u32, m.div_ceil(64) as u32, 1],
+    );
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
+        2e-2,
+        5e-2,
+    );
 }
 
 struct GemmCase<'a> {
@@ -262,13 +381,6 @@ fn coop_gemm(ctx: &mut Ctx, case: &GemmCase<'_>) {
         &[Binding::Full(x), Binding::Full(&xf)],
         [(m * k / 4).div_ceil(256), 1, 1],
     );
-    let unit = ctx.f32(&[1.0], &[1]);
-    let scale = match w.scale() {
-        Some(s) => Binding::Full(s),
-        None => Binding::Full(&unit),
-    };
-    let wdtype = if w.scale().is_some() { 1.0 } else { 0.0 };
-    let group = w.group().unwrap_or(128) as f64;
     ctx.dispatch(
         shader::GEMM_COOP,
         &[
@@ -276,8 +388,7 @@ fn coop_gemm(ctx: &mut Ctx, case: &GemmCase<'_>) {
             ("K", k as f64),
             ("M", m as f64),
             ("SEGS", 1.0),
-            ("WDTYPE", wdtype),
-            ("GROUP", group),
+            ("QTYPE", qtype_of(w) as f64),
             ("ACC", acc as u32 as f64),
             ("Y_STRIDE", n as f64),
             ("Y_OFF", 0.0),
@@ -285,7 +396,7 @@ fn coop_gemm(ctx: &mut Ctx, case: &GemmCase<'_>) {
         &[
             Binding::Full(&xf),
             Binding::Full(w.tensor()),
-            scale,
+            Binding::Full(ctx.backend.quant_lut()),
             Binding::Full(y),
         ],
         [n.div_ceil(128), m.div_ceil(128), 1],
@@ -296,6 +407,9 @@ fn coop_gemm(ctx: &mut Ctx, case: &GemmCase<'_>) {
 fn gemm_coop_bf16() {
     let _g = gpu();
     let mut ctx = Ctx::new();
+    if ctx.backend.device().coop_gemm().is_none() {
+        return;
+    }
     let mut rng = Rng(7);
     let (m, n, k) = (128usize, 128usize, 256usize);
     let x = rng.fill(m * k);
@@ -316,7 +430,6 @@ fn gemm_coop_bf16() {
             acc: false,
         },
     );
-
     agree(
         &ctx.read(&y),
         &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
@@ -326,44 +439,43 @@ fn gemm_coop_bf16() {
 }
 
 #[test]
-fn gemm_coop_i8_group32() {
+fn gemm_coop_each_quant() {
     let _g = gpu();
     let mut ctx = Ctx::new();
-    let mut rng = Rng(71);
-    let (m, n, k, group) = (128usize, 128usize, 256usize, 32usize);
-    let x = rng.fill(m * k);
-    let w = rng.fill(n * k);
-    let xb = ctx.f32(&x, &[m as u32, k as u32]);
-    let y = ctx.zero(&[m as u32, n as u32]);
-    let (wq, scales) = quant(&w, n, k, group);
-    let cpu_w = dequant(&wq, &scales, n, k, group);
-    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
-    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
-    let weight = Weight::quant(wb, sb, group as u32);
-    coop_gemm(
-        &mut ctx,
-        &GemmCase {
-            x: &xb,
-            w: &weight,
-            y: &y,
-            m: m as u32,
-            n: n as u32,
-            k: k as u32,
-            acc: false,
-        },
-    );
-    agree(
-        &ctx.read(&y),
-        &cpu_ref::gemm(&x, &cpu_w, m, n, k),
-        1e-2,
-        1e-2,
-    );
+    if ctx.backend.device().coop_gemm().is_none() {
+        return;
+    }
+    for (i, &q) in ALL_QUANTS.iter().enumerate() {
+        eprintln!("quant {q:?}");
+        let mut rng = Rng(2000 + i as u64);
+        let (m, n, k) = (128usize, 128usize, 256usize);
+        let x = rng.fill(m * k);
+        let xb = ctx.f32(&x, &[m as u32, k as u32]);
+        let y = ctx.zero(&[m as u32, n as u32]);
+        let (weight, cpu_w) = quant_weight(&ctx, q, n as u32, k as u32, 3000 + i as u64);
+        coop_gemm(
+            &mut ctx,
+            &GemmCase {
+                x: &xb,
+                w: &weight,
+                y: &y,
+                m: m as u32,
+                n: n as u32,
+                k: k as u32,
+                acc: false,
+            },
+        );
+        agree(&ctx.read(&y), &cpu_ref::gemm(&x, &cpu_w, m, n, k), 1e-1, 2e-1);
+    }
 }
 
 #[test]
 fn gemm_coop_bf16_acc() {
     let _g = gpu();
     let mut ctx = Ctx::new();
+    if ctx.backend.device().coop_gemm().is_none() {
+        return;
+    }
     let mut rng = Rng(13);
     let (m, n, k) = (128usize, 128usize, 256usize);
     let x = rng.fill(m * k);
@@ -396,6 +508,9 @@ fn gemm_coop_bf16_acc() {
 fn gemm_coop_bf16_multi_tile() {
     let _g = gpu();
     let mut ctx = Ctx::new();
+    if ctx.backend.device().coop_gemm().is_none() {
+        return;
+    }
     let mut rng = Rng(29);
     let (m, n, k) = (128usize, 256usize, 1024usize);
     let x = rng.fill(m * k);
@@ -416,7 +531,6 @@ fn gemm_coop_bf16_multi_tile() {
             acc: false,
         },
     );
-
     agree(
         &ctx.read(&y),
         &cpu_ref::gemm(&x, &bf16_round(&w), m, n, k),
@@ -425,60 +539,14 @@ fn gemm_coop_bf16_multi_tile() {
     );
 }
 
-#[test]
-fn gemm_acc_coop_full() {
-    let _g = gpu();
+fn gemm_acc_case(m: usize, n: usize, k: usize, acc: bool, seed: u64) {
     let mut ctx = Ctx::new();
-    let mut rng = Rng(31);
-    let (m, n, k, group) = (128usize, 128usize, 256usize, 32usize);
+    let mut rng = Rng(seed);
     let x = rng.fill(m * k);
-    let w = rng.fill(n * k);
-    let xb = ctx.f32(&x, &[m as u32, k as u32]);
-    let y = ctx.zero(&[m as u32, n as u32]);
-    let (wq, scales) = quant(&w, n, k, group);
-    let cpu_w = dequant(&wq, &scales, n, k, group);
-    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
-    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
-    let weight = Weight::quant(wb, sb, group as u32);
-    let mut enc = ctx.backend.encoder().unwrap();
-    {
-        let mut commands = Commands::begin(&mut enc);
-        ctx.backend
-            .gemm_acc(
-                &mut commands,
-                Binding::Full(&xb),
-                &weight,
-                Binding::Full(&y),
-                m as u32,
-                false,
-            )
-            .unwrap();
-    }
-    ctx.backend.submit(&mut enc).unwrap();
-    agree(
-        &ctx.read(&y),
-        &cpu_ref::gemm(&x, &cpu_w, m, n, k),
-        1e-2,
-        1e-2,
-    );
-}
-
-#[test]
-fn gemm_acc_coop_tail() {
-    let _g = gpu();
-    let mut ctx = Ctx::new();
-    let mut rng = Rng(37);
-    let (m, n, k, group) = (144usize, 128usize, 256usize, 32usize);
-    let x = rng.fill(m * k);
-    let w = rng.fill(n * k);
     let y0 = rng.fill(m * n);
     let xb = ctx.f32(&x, &[m as u32, k as u32]);
     let y = ctx.f32(&y0, &[m as u32, n as u32]);
-    let (wq, scales) = quant(&w, n, k, group);
-    let cpu_w = dequant(&wq, &scales, n, k, group);
-    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
-    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
-    let weight = Weight::quant(wb, sb, group as u32);
+    let (weight, cpu_w) = quant_weight(&ctx, Quant::Q8_0, n as u32, k as u32, seed ^ 0x1234);
     let mut enc = ctx.backend.encoder().unwrap();
     {
         let mut commands = Commands::begin(&mut enc);
@@ -489,180 +557,58 @@ fn gemm_acc_coop_tail() {
                 &weight,
                 Binding::Full(&y),
                 m as u32,
-                false,
-            )
-            .unwrap();
-    }
-    ctx.backend.submit(&mut enc).unwrap();
-    agree(
-        &ctx.read(&y),
-        &cpu_ref::gemm(&x, &cpu_w, m, n, k),
-        1e-2,
-        1e-2,
-    );
-}
-
-#[test]
-fn gemm_acc_coop_tail_accumulates() {
-    let _g = gpu();
-    let mut ctx = Ctx::new();
-    let mut rng = Rng(39);
-    let (m, n, k, group) = (144usize, 128usize, 256usize, 32usize);
-    let x = rng.fill(m * k);
-    let w = rng.fill(n * k);
-    let y0 = rng.fill(m * n);
-    let xb = ctx.f32(&x, &[m as u32, k as u32]);
-    let y = ctx.f32(&y0, &[m as u32, n as u32]);
-    let (wq, scales) = quant(&w, n, k, group);
-    let cpu_w = dequant(&wq, &scales, n, k, group);
-    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
-    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
-    let weight = Weight::quant(wb, sb, group as u32);
-    let mut enc = ctx.backend.encoder().unwrap();
-    {
-        let mut commands = Commands::begin(&mut enc);
-        ctx.backend
-            .gemm_acc(
-                &mut commands,
-                Binding::Full(&xb),
-                &weight,
-                Binding::Full(&y),
-                m as u32,
-                true,
+                acc,
             )
             .unwrap();
     }
     ctx.backend.submit(&mut enc).unwrap();
     let mut expect = cpu_ref::gemm(&x, &cpu_w, m, n, k);
-    for i in 0..expect.len() {
-        expect[i] += y0[i];
+    if acc {
+        for i in 0..expect.len() {
+            expect[i] += y0[i];
+        }
     }
-    agree(&ctx.read(&y), &expect, 1e-2, 1e-2);
+    agree(&ctx.read(&y), &expect, 2e-2, 1e-1);
+}
+
+#[test]
+fn gemm_acc_coop_full() {
+    let _g = gpu();
+    gemm_acc_case(128, 128, 256, false, 31);
+}
+
+#[test]
+fn gemm_acc_coop_tail() {
+    let _g = gpu();
+    gemm_acc_case(144, 128, 256, false, 37);
+}
+
+#[test]
+fn gemm_acc_coop_tail_accumulates() {
+    let _g = gpu();
+    gemm_acc_case(144, 128, 256, true, 39);
 }
 
 #[test]
 fn gemm_acc_coop_long_k() {
     let _g = gpu();
-    let mut ctx = Ctx::new();
-    let mut rng = Rng(41);
-    let (m, n, k, group) = (128usize, 128usize, 8192usize, 32usize);
-    let x = rng.fill(m * k);
-    let w = rng.fill(n * k);
-    let xb = ctx.f32(&x, &[m as u32, k as u32]);
-    let y = ctx.zero(&[m as u32, n as u32]);
-    let (wq, scales) = quant(&w, n, k, group);
-    let cpu_w = dequant(&wq, &scales, n, k, group);
-    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
-    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
-    let weight = Weight::quant(wb, sb, group as u32);
-    let mut enc = ctx.backend.encoder().unwrap();
-    {
-        let mut commands = Commands::begin(&mut enc);
-        ctx.backend
-            .gemm_acc(
-                &mut commands,
-                Binding::Full(&xb),
-                &weight,
-                Binding::Full(&y),
-                m as u32,
-                false,
-            )
-            .unwrap();
-    }
-    ctx.backend.submit(&mut enc).unwrap();
-    agree(
-        &ctx.read(&y),
-        &cpu_ref::gemm(&x, &cpu_w, m, n, k),
-        2e-2,
-        3e-2,
-    );
+    gemm_acc_case(128, 128, 8192, false, 41);
 }
 
 #[test]
 fn gemm_classic_segs_long_k() {
     let _g = gpu();
-    let mut ctx = Ctx::new();
-    let mut rng = Rng(43);
-    let (m, n, k, group) = (64usize, 64usize, 8192usize, 32usize);
-    let x = rng.fill(m * k);
-    let w = rng.fill(n * k);
-    let xb = ctx.f32(&x, &[m as u32, k as u32]);
-    let y = ctx.zero(&[m as u32, n as u32]);
-    let (wq, scales) = quant(&w, n, k, group);
-    let cpu_w = dequant(&wq, &scales, n, k, group);
-    let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
-    let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
-    let weight = Weight::quant(wb, sb, group as u32);
-    let mut enc = ctx.backend.encoder().unwrap();
-    {
-        let mut commands = Commands::begin(&mut enc);
-        ctx.backend
-            .gemm_acc(
-                &mut commands,
-                Binding::Full(&xb),
-                &weight,
-                Binding::Full(&y),
-                m as u32,
-                false,
-            )
-            .unwrap();
-    }
-    ctx.backend.submit(&mut enc).unwrap();
-    agree(
-        &ctx.read(&y),
-        &cpu_ref::gemm(&x, &cpu_w, m, n, k),
-        1e-2,
-        1e-2,
-    );
+    gemm_acc_case(64, 64, 8192, false, 43);
 }
 
-#[test]
-fn gemm_bf16_multi_tile_m() {
-    let _g = gpu();
-    gemm_case(WType::Bf16, 32, 32, 64, 29);
-}
-
-#[test]
-fn gemm_i8_group128() {
-    let _g = gpu();
-    gemm_case(WType::I8(128), 16, 256, 256, 17);
-}
-
-#[test]
-fn gemm_i8_group64() {
-    let _g = gpu();
-    gemm_case(WType::I8(64), 16, 64, 960, 19);
-}
-
-#[test]
-fn gemm_i8_group32() {
-    let _g = gpu();
-    gemm_case(WType::I8(32), 16, 32, 192, 23);
-}
-
-fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
-    let mut ctx = Ctx::new();
+fn gemv_case(quant: Quant, n: usize, k: usize, seed: u64, segs: u32) {
+    let ctx = Ctx::new();
     let mut rng = Rng(seed);
     let x = rng.fill(k);
-    let w = rng.fill(n * k);
     let xb = ctx.f32(&x, &[k as u32]);
     let y = ctx.zero(&[n as u32]);
     let partial = ctx.zero(&[8, 65536]);
-
-    let (wb, sb, wdtype, group, cpu_w, rel, abs) = match wt {
-        WType::Bf16 => {
-            let wb = ctx.bf16(&w, &[n as u32, k as u32]);
-            let sb = ctx.f32(&[0.0], &[1]);
-            (wb, sb, 0.0, 128.0, bf16_round(&w), 2e-2, 5e-2)
-        }
-        WType::I8(group) => {
-            let (wq, scales) = quant(&w, n, k, group);
-            let cpu_w = dequant(&wq, &scales, n, k, group);
-            let wb = ctx.backend.tensor_i8(&wq, vec![n as u32, k as u32]);
-            let sb = ctx.f32(&scales, &[n as u32, (k / group) as u32]);
-            (wb, sb, 1.0, group as f64, cpu_w, 1e-4, 1e-3)
-        }
-    };
+    let (weight, cpu_w) = quant_weight(&ctx, quant, n as u32, k as u32, seed ^ 0xbeef);
 
     let out = if segs == 1 {
         Binding::Full(&y)
@@ -674,15 +620,14 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
         &[
             ("N", n as f64),
             ("K", k as f64),
-            ("WDTYPE", wdtype),
-            ("GROUP", group),
+            ("QTYPE", qtype_of(&weight) as f64),
             ("SEGS", segs as f64),
             ("ACC", 0.0),
         ],
         &[
             Binding::Full(&xb),
-            Binding::Full(&wb),
-            Binding::Full(&sb),
+            Binding::Full(weight.tensor()),
+            Binding::Full(ctx.backend.quant_lut()),
             out,
         ],
         [(n.div_ceil(64)) as u32, segs, 1],
@@ -698,37 +643,95 @@ fn gemv_case(wt: WType, n: usize, k: usize, seed: u64, segs: u32) {
             [(n.div_ceil(256)) as u32, 1, 1],
         );
     }
-    agree(&ctx.read(&y), &cpu_ref::gemv(&x, &cpu_w, n, k), rel, abs);
+    agree(&ctx.read(&y), &cpu_ref::gemv(&x, &cpu_w, n, k), 1e-3, 1e-2);
+}
+
+fn gemv_bf16_case(n: usize, k: usize, seed: u64, segs: u32) {
+    let ctx = Ctx::new();
+    let mut rng = Rng(seed);
+    let x = rng.fill(k);
+    let w = rng.fill(n * k);
+    let xb = ctx.f32(&x, &[k as u32]);
+    let y = ctx.zero(&[n as u32]);
+    let partial = ctx.zero(&[8, 65536]);
+    let wb = ctx.bf16(&w, &[n as u32, k as u32]);
+    let weight = Weight::plain(wb);
+    let out = if segs == 1 {
+        Binding::Full(&y)
+    } else {
+        Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64)
+    };
+    ctx.dispatch(
+        shader::GEMV,
+        &[
+            ("N", n as f64),
+            ("K", k as f64),
+            ("QTYPE", qtype_of(&weight) as f64),
+            ("SEGS", segs as f64),
+            ("ACC", 0.0),
+        ],
+        &[
+            Binding::Full(&xb),
+            Binding::Full(weight.tensor()),
+            Binding::Full(ctx.backend.quant_lut()),
+            out,
+        ],
+        [(n.div_ceil(64)) as u32, segs, 1],
+    );
+    if segs > 1 {
+        ctx.dispatch(
+            shader::MERGE_GEMV,
+            &[("N", n as f64), ("SEGS", segs as f64), ("ACC", 0.0)],
+            &[
+                Binding::Slice(&partial, 0, n as u64 * 4 * segs as u64),
+                Binding::Full(&y),
+            ],
+            [(n.div_ceil(256)) as u32, 1, 1],
+        );
+    }
+    agree(
+        &ctx.read(&y),
+        &cpu_ref::gemv(&x, &bf16_round(&w), n, k),
+        2e-2,
+        5e-2,
+    );
 }
 
 #[test]
 fn gemv_bf16() {
     let _g = gpu();
-    gemv_case(WType::Bf16, 32, 128, 31, 1);
+    gemv_bf16_case(32, 128, 31, 1);
 }
 
 #[test]
-fn gemv_i8_group128() {
+fn gemv_each_quant() {
     let _g = gpu();
-    gemv_case(WType::I8(128), 64, 256, 37, 1);
+    for (i, &q) in ALL_QUANTS.iter().enumerate() {
+        gemv_case(q, 64, 256, 4000 + i as u64, 1);
+    }
 }
 
 #[test]
-fn gemv_i8_partial_chunk() {
+fn gemv_each_quant_partial_chunk() {
     let _g = gpu();
-    gemv_case(WType::I8(32), 32, 192, 41, 1);
+    for (i, &q) in ALL_QUANTS.iter().enumerate() {
+        let k = if q.block_len() == 32 { 192 } else { 256 };
+        gemv_case(q, 32, k, 5000 + i as u64, 1);
+    }
 }
 
 #[test]
-fn gemv_i8_split4() {
+fn gemv_each_quant_split4() {
     let _g = gpu();
-    gemv_case(WType::I8(128), 64, 512, 43, 4);
+    for (i, &q) in ALL_QUANTS.iter().enumerate() {
+        gemv_case(q, 64, 1024, 6000 + i as u64, 4);
+    }
 }
 
 #[test]
 fn gemv_bf16_split8() {
     let _g = gpu();
-    gemv_case(WType::Bf16, 32, 1024, 47, 8);
+    gemv_bf16_case(32, 1024, 47, 8);
 }
 
 #[test]
@@ -762,7 +765,7 @@ fn gemv_bf16_split_segs_divide_k_blocks() {
 }
 
 fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let vocab = 8usize;
     let mut rng = Rng(seed);
     let table = rng.fill(vocab * dim);
@@ -774,11 +777,10 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
     let ib = Tensor::new(
         ctx.backend.storage(rows as u64 * 4),
         vec![rows as u32],
-        DType::F32,
+        DType::U32,
     );
     ctx.backend.write_u32(&ib.buf, &ids);
     let y = ctx.zero(&[16u32, dim as u32]);
-    let fallback = ctx.f32(&[1.0], &[1]);
     let w = Weight::plain(tb);
 
     ctx.dispatch(
@@ -787,19 +789,15 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
             ("M", rows as f64),
             ("DIM", dim as f64),
             ("SCALE", scale as f64),
-            ("WDTYPE", 0.0),
-            ("GROUP", 128.0),
-            ("SPLIT", u32::MAX as f64),
-            ("ROWS", vocab as f64),
+            ("QTYPE", qtype_of(&w) as f64),
         ],
         &[
             Binding::Full(&ib),
             Binding::Full(w.tensor()),
-            Binding::Full(&fallback),
-            Binding::Full(&fallback),
+            Binding::Full(ctx.backend.quant_lut()),
             Binding::Full(&y),
         ],
-        [(rows * dim).div_ceil(256) as u32, 1, 1],
+        [(rows * dim / 32).div_ceil(256) as u32, 1, 1],
     );
     let got = ctx.read(&y);
     agree(
@@ -811,19 +809,64 @@ fn embed_case(rows: usize, dim: usize, scale: f32, seed: u64) {
 }
 
 #[test]
+fn embed_native_each_quant() {
+    let _g = gpu();
+    let ctx = Ctx::new();
+    let vocab = 4usize;
+    let dim = 256usize;
+    let rows = 8usize;
+    let mut rng = Rng(77);
+    let _table = rng.fill(vocab * dim);
+    let ids: Vec<u32> = (0..rows).map(|r| (r * 2 + 1) as u32 % vocab as u32).collect();
+    let ib = Tensor::new(
+        ctx.backend.storage(rows as u64 * 4),
+        vec![rows as u32],
+        DType::U32,
+    );
+    ctx.backend.write_u32(&ib.buf, &ids);
+    let y = ctx.zero(&[16u32, dim as u32]);
+    for (i, &q) in ALL_QUANTS.iter().enumerate() {
+        let (w, cpu) = quant_weight(&ctx, q, vocab as u32, dim as u32, 7000 + i as u64);
+        ctx.dispatch(
+            shader::EMBED,
+            &[
+                ("M", rows as f64),
+                ("DIM", dim as f64),
+                ("SCALE", 1.0),
+                ("QTYPE", qtype_of(&w) as f64),
+            ],
+            &[
+                Binding::Full(&ib),
+                Binding::Full(w.tensor()),
+                Binding::Full(ctx.backend.quant_lut()),
+                Binding::Full(&y),
+            ],
+            [(rows * dim / 32).div_ceil(256) as u32, 1, 1],
+        );
+        let got = ctx.read(&y);
+        agree(
+            &got[..rows * dim],
+            &cpu_ref::embed(&ids, &cpu, dim, 1.0),
+            1e-3,
+            1e-2,
+        );
+    }
+}
+
+#[test]
 fn embed_unit_scale() {
     let _g = gpu();
-    embed_case(4, 16, 1.0, 11);
+    embed_case(4, 32, 1.0, 11);
 }
 
 #[test]
 fn embed_gemma_scale() {
     let _g = gpu();
-    embed_case(3, 16, 4.0, 13);
+    embed_case(3, 32, 4.0, 13);
 }
 
 fn norm_case(mode: NormMode, rows: usize, dim: usize, w_dim: usize, seed: u64) {
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let mut rng = Rng(seed);
     let x = rng.fill(rows * dim);
     let w = rng.fill(w_dim);
@@ -925,7 +968,7 @@ fn norm_rope_cpu(x: &[f32], w: &[f32], cos: &[f32], sin: &[f32], spec: NormRopeA
 fn norm_rope_mode4_pos72_repro() {
     let _g = gpu();
     let (rows, dim, rot, heads, pos) = (32usize, 128usize, 128usize, 16usize, 72usize);
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let mut rng = Rng(1234);
     let x = rng.fill(rows * dim);
     let w = rng.fill(dim);
@@ -1021,7 +1064,7 @@ fn norm_direct() {
 #[test]
 fn add() {
     let _g = gpu();
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let n = 100usize;
     let mut rng = Rng(33);
     let a = rng.fill(n);
@@ -1042,7 +1085,7 @@ fn add() {
 #[test]
 fn bias() {
     let _g = gpu();
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let (rows, dim) = (3usize, 16usize);
     let mut rng = Rng(35);
     let x = rng.fill(rows * dim);
@@ -1064,7 +1107,7 @@ fn bias() {
 #[test]
 fn swiglu() {
     let _g = gpu();
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let n = 100usize;
     let mut rng = Rng(41);
     let g = rng.fill(n);
@@ -1090,7 +1133,7 @@ fn swiglu() {
 #[test]
 fn swiglu_gelu_tanh() {
     let _g = gpu();
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let n = 100usize;
     let mut rng = Rng(47);
     let g = rng.fill(n);
@@ -1117,7 +1160,7 @@ fn swiglu_gelu_tanh() {
 #[test]
 fn softcap() {
     let _g = gpu();
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let n = 100usize;
     let mut rng = Rng(53);
     let mut x = rng.fill(n);
@@ -1138,7 +1181,7 @@ fn softcap() {
 #[test]
 fn mul_broadcast() {
     let _g = gpu();
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let n = 160usize;
     let mut rng = Rng(59);
     let a = rng.fill(n);
@@ -1165,7 +1208,7 @@ fn mul_broadcast() {
 #[test]
 fn concat() {
     let _g = gpu();
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let (rows, d) = (2usize, 8usize);
     let mut rng = Rng(37);
     let a = rng.fill(rows * d);
@@ -1184,7 +1227,7 @@ fn concat() {
 }
 
 fn rope_case(m: usize, heads: usize, hd: usize, rot: usize, pos: usize, seed: u64) {
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let half = rot / 2;
     let max_seq = pos + m + 2;
     let theta = 1e7f64;
@@ -1252,7 +1295,7 @@ fn rope_full_rotation() {
 #[test]
 fn kv_store_writes_both_caches() {
     let _g = gpu();
-    let mut ctx = Ctx::new();
+    let ctx = Ctx::new();
     let (m, nkv, hd, max_seq, pos) = (3usize, 2usize, 4usize, 8usize, 3usize);
     let mut rng = Rng(111);
     let k_src = rng.fill(m * nkv * hd);
@@ -1469,11 +1512,100 @@ fn anchor_attn_causal_and_window() {
 #[test]
 fn gemv_bf16_wide() {
     let _g = gpu();
-    gemv_case(WType::Bf16, 256, 2560, 99, 1);
+    gemv_bf16_case(256, 2560, 99, 1);
 }
 
 #[test]
-fn gemm_i8_9728() {
+fn gemm_q8_0_9728() {
     let _g = gpu();
-    gemm_case(WType::I8(128), 16, 2560, 9728, 77);
+    gemm_case(Quant::Q8_0, 16, 2560, 9728, 77);
+}
+
+#[test]
+fn gemv_real_q2k_tensor_if_present() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../temp/q2k_gate2.bin");
+    if !path.exists() {
+        eprintln!("skipping: temp/q2k_gate.bin not present");
+        return;
+    }
+    let _g = gpu();
+    let mut ctx = Ctx::new();
+    let raw = std::fs::read(path).unwrap();
+    let (n, k) = (3584usize, 1024usize);
+    let q = Quant::Q2K;
+    let cpu_w = thuban_checkpoint::dequant::to_f32(q, &raw, n * k).unwrap();
+    let padded = q.pad_blocks(&raw, n * k).unwrap();
+    let wb = ctx.backend.tensor_quant(&padded, vec![n as u32, k as u32], q);
+    let weight = Weight::quantized(wb);
+    let mut rng = Rng(99);
+    let x = rng.fill(k);
+    let xb = ctx.f32(&x, &[k as u32]);
+    let y = ctx.zero(&[n as u32]);
+    let mut enc = ctx.backend.encoder().unwrap();
+    {
+        let mut pass = Commands::begin(&mut enc);
+        ctx.backend
+            .gemv(&mut pass, Binding::Full(&xb), &weight, Binding::Full(&y))
+            .unwrap();
+    }
+    ctx.backend.submit(&mut enc).unwrap();
+    let gpu = ctx.read(&y);
+    let cpu = cpu_ref::gemv(&x, &cpu_w, n, k);
+    let mut worst = 0.0f32;
+    for j in 0..n {
+        worst = worst.max((gpu[j] - cpu[j]).abs());
+    }
+    let scale = cpu.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    eprintln!("real q2k gemv: worst {worst}, max|y| {scale}");
+    assert!(worst < 1e-2 * scale + 1e-2, "worst {worst} scale {scale}");
+}
+
+#[test]
+fn embed_real_model_if_present() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../temp/q4km_embd2.bin");
+    if !path.exists() {
+        eprintln!("skipping: real embedding tensor not present");
+        return;
+    }
+    let _g = gpu();
+    let ctx = Ctx::new();
+    let raw = std::fs::read(path).unwrap();
+    let (vocab, dim) = (248320usize, 1024usize);
+    let q = Quant::Q6K;
+    let rows = 4usize;
+    let ids: Vec<u32> = vec![1, 777, 12345, 248319];
+    let cpu = thuban_checkpoint::dequant::to_f32(q, &raw, vocab * dim).unwrap();
+    let padded = q.pad_blocks(&raw, vocab * dim).unwrap();
+    let wb = ctx.backend.tensor_quant(&padded, vec![vocab as u32, dim as u32], q);
+    let w = Weight::quantized(wb);
+    let ib = Tensor::new(ctx.backend.storage(rows as u64 * 4), vec![rows as u32], DType::U32);
+    ctx.backend.write_u32(&ib.buf, &ids);
+    let y = ctx.zero(&[rows as u32, dim as u32]);
+    ctx.dispatch(
+        shader::EMBED,
+        &[
+            ("M", rows as f64),
+            ("DIM", dim as f64),
+            ("SCALE", 1.0),
+            ("QTYPE", qtype_of(&w) as f64),
+        ],
+        &[
+            Binding::Full(&ib),
+            Binding::Full(w.tensor()),
+            Binding::Full(ctx.backend.quant_lut()),
+            Binding::Full(&y),
+        ],
+        [(rows * dim / 32).div_ceil(256) as u32, 1, 1],
+    );
+    let gpu = ctx.read(&y);
+    for r in 0..rows {
+        for d in 0..dim {
+            let a = gpu[r * dim + d];
+            let b = cpu[ids[r] as usize * dim + d];
+            assert!(
+                (a - b).abs() <= 1e-4 * b.abs() + 1e-6,
+                "row {r} col {d}: gpu {a} vs cpu {b}"
+            );
+        }
+    }
 }

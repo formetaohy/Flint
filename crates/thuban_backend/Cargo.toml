@@ -15,4 +15,5 @@ thuban_profiler.workspace = true
 thuban_tensor.workspace = true
 
 [dev-dependencies]
+thuban_checkpoint.workspace = true
 thuban_num.workspace = true

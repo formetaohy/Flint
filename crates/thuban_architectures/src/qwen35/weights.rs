@@ -60,10 +60,8 @@ pub fn role(key: &str) -> Role {
         || key.contains("conv1d")
     {
         Role::F32
-    } else if key == "embed_tokens.weight" {
-        Role::Bf16
     } else {
-        Role::I8
+        Role::Quant
     }
 }
 

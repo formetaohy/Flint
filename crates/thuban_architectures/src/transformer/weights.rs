@@ -13,13 +13,8 @@ use crate::transformer::config::Config;
 pub fn role(key: &str) -> Role {
     if key.contains("norm") || key.ends_with(".bias") || key.ends_with("layer_scalar") {
         Role::F32
-    } else if key == "embed_tokens.weight"
-        || key == "embed_tokens_per_layer.weight"
-        || key.contains("router")
-    {
-        Role::Bf16
     } else {
-        Role::I8
+        Role::Quant
     }
 }
 

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use thuban_checkpoint::{Checkpoint, Gguf, MetaVal};
+use thuban_tensor::Quant;
 
 fn w_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -305,9 +306,18 @@ fn writer_roundtrips_through_reader() {
     let f32_data: Vec<f32> = (0..32).map(|i| i as f32 - 16.0).collect();
     let bf16_data: Vec<f32> = (0..64).map(|i| i as f32 * 0.5).collect();
     let q8_data: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 3.0).collect();
+    let mut q8_blocks = Vec::new();
+    for blk in q8_data.chunks_exact(32) {
+        let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+        q8_blocks.extend_from_slice(&thuban_num::f32_to_f16(d).to_le_bytes());
+        for v in blk {
+            q8_blocks.push((v / d).round().clamp(-127.0, 127.0) as i8 as u8);
+        }
+    }
     w.tensor_f32("t_f32", &[2, 16], &f32_data);
     w.tensor_bf16("t_bf16", &[2, 32], &bf16_data);
-    w.tensor_q8_0("t_q8", &[2, 32], &q8_data);
+    w.tensor_raw("t_q8", &[2, 32], Quant::Q8_0, &q8_blocks);
     std::fs::write(dir.join("m.gguf"), w.finish()).unwrap();
 
     let g = Gguf::open(&dir.join("m.gguf")).unwrap();
@@ -466,3 +476,5 @@ fn leaves_non_llama_qk_rows_untouched() {
         );
     }
 }
+
+

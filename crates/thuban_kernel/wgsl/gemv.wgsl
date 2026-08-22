@@ -1,35 +1,18 @@
 struct Pc {
     N: u32,
     K: u32,
-    WDTYPE: u32,
-    GROUP: u32,
+    QTYPE: u32,
     SEGS: u32,
     ACC: u32,
 }
 var<immediate> pc: Pc;
 
-@group(0) @binding(0) var<storage, read_write> x: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read_write> w: array<vec4<u32>>;
-@group(0) @binding(2) var<storage, read_write> scales: array<f32>;
+@group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> w: array<u32>;
+@group(0) @binding(2) var<storage, read> lut: array<u32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 
 var<workgroup> ps: array<f32, 256>;
-
-fn deq4(word: u32) -> vec4<f32> {
-    return vec4<f32>(
-        f32(i32((word & 255u) << 24) >> 24),
-        f32(i32((word & 65280u) << 16) >> 24),
-        f32(i32((word & 16711680u) << 8) >> 24),
-        f32(i32((word >> 24) << 24) >> 24),
-    );
-}
-
-fn deq2(word: u32) -> vec2<f32> {
-    return vec2<f32>(
-        bitcast<f32>((word & 65535u) << 16),
-        bitcast<f32>((word >> 16) << 16),
-    );
-}
 
 @compute @workgroup_size(256, 1, 1)
 fn gemv(
@@ -38,8 +21,7 @@ fn gemv(
 ) {
     let N = pc.N;
     let K = pc.K;
-    let WDTYPE = pc.WDTYPE;
-    let GROUP = pc.GROUP;
+    let ty = pc.QTYPE;
     let SEGS = pc.SEGS;
     let ACC = pc.ACC;
     let t = lid.x;
@@ -64,28 +46,17 @@ fn gemv(
             let xv5 = x[xb + 5u];
             let xv6 = x[xb + 6u];
             let xv7 = x[xb + 7u];
-            if WDTYPE == 1u {
-                let wb4 = (kb / 16u) * N + c0;
-                let qv0 = w[wb4];
-                let qv1 = w[wb4 + N];
-                let sc = scales[(kb / GROUP) * N + c0];
-                var dotp0 = dot(xv0, deq4(qv0.x)) + dot(xv1, deq4(qv0.y));
-                dotp0 = dotp0 + dot(xv2, deq4(qv0.z)) + dot(xv3, deq4(qv0.w));
-                var dotp1 = dot(xv4, deq4(qv1.x)) + dot(xv5, deq4(qv1.y));
-                dotp1 = dotp1 + dot(xv6, deq4(qv1.z)) + dot(xv7, deq4(qv1.w));
-                acc = acc + (dotp0 + dotp1) * sc;
-            } else {
-                let wb2 = c0 * (K / 8u) + kb / 8u;
-                let av0 = w[wb2];
-                let av1 = w[wb2 + 1u];
-                let av2 = w[wb2 + 2u];
-                let av3 = w[wb2 + 3u];
-                var dotp0 = dot(xv0, vec4<f32>(deq2(av0.x), deq2(av0.y))) + dot(xv1, vec4<f32>(deq2(av0.z), deq2(av0.w)));
-                dotp0 = dotp0 + dot(xv2, vec4<f32>(deq2(av1.x), deq2(av1.y))) + dot(xv3, vec4<f32>(deq2(av1.z), deq2(av1.w)));
-                var dotp1 = dot(xv4, vec4<f32>(deq2(av2.x), deq2(av2.y))) + dot(xv5, vec4<f32>(deq2(av2.z), deq2(av2.w)));
-                dotp1 = dotp1 + dot(xv6, vec4<f32>(deq2(av3.x), deq2(av3.y))) + dot(xv7, vec4<f32>(deq2(av3.z), deq2(av3.w)));
-                acc = acc + dotp0 + dotp1;
-            }
+            var wv: array<vec4<f32>, 8>;
+            tile32(ty, c0, kb, K, &wv);
+            var dotp = dot(xv0, wv[0]);
+            dotp = dotp + dot(xv1, wv[1]);
+            dotp = dotp + dot(xv2, wv[2]);
+            dotp = dotp + dot(xv3, wv[3]);
+            dotp = dotp + dot(xv4, wv[4]);
+            dotp = dotp + dot(xv5, wv[5]);
+            dotp = dotp + dot(xv6, wv[6]);
+            dotp = dotp + dot(xv7, wv[7]);
+            acc = acc + dotp;
         }
     }
     ps[t] = acc;

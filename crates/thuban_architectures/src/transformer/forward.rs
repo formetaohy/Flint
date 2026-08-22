@@ -95,7 +95,6 @@ impl LanguageModel for Model {
                     rows: m,
                     dim: cfg.hidden,
                     scale: cfg.embed_scale,
-                    split: 0,
                 },
             )?;
             self.per_layer_embed(backend, &mut commands, s, m)?;

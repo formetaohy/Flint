@@ -1,7 +1,7 @@
 mod iq_refs;
 
 use thuban_checkpoint::TensorData;
-use thuban_checkpoint::dequant::{GgmlType, to_f32};
+use thuban_checkpoint::dequant::{Quant, to_f32};
 use thuban_num::f16_to_f32;
 
 #[test]
@@ -34,45 +34,45 @@ fn f16_covers_the_ieee754_cases() {
 
 #[test]
 fn type_table_matches_ggml() {
-    let valid: &[(u32, GgmlType, usize, usize)] = &[
-        (0, GgmlType::F32, 1, 4),
-        (1, GgmlType::F16, 1, 2),
-        (2, GgmlType::Q4_0, 32, 18),
-        (3, GgmlType::Q4_1, 32, 20),
-        (6, GgmlType::Q5_0, 32, 22),
-        (7, GgmlType::Q5_1, 32, 24),
-        (8, GgmlType::Q8_0, 32, 34),
-        (10, GgmlType::Q2K, 256, 84),
-        (11, GgmlType::Q3K, 256, 110),
-        (12, GgmlType::Q4K, 256, 144),
-        (13, GgmlType::Q5K, 256, 176),
-        (14, GgmlType::Q6K, 256, 210),
-        (15, GgmlType::Q8K, 256, 292),
-        (16, GgmlType::Iq2Xxs, 256, 66),
-        (17, GgmlType::Iq2Xs, 256, 74),
-        (18, GgmlType::Iq3Xxs, 256, 98),
-        (19, GgmlType::Iq1S, 256, 50),
-        (20, GgmlType::Iq4Nl, 32, 18),
-        (21, GgmlType::Iq3S, 256, 110),
-        (22, GgmlType::Iq2S, 256, 82),
-        (23, GgmlType::Iq4Xs, 256, 136),
-        (29, GgmlType::Iq1M, 256, 56),
-        (30, GgmlType::Bf16, 1, 2),
-        (34, GgmlType::Tq1_0, 256, 54),
-        (35, GgmlType::Tq2_0, 256, 66),
-        (39, GgmlType::Mxfp4, 32, 17),
-        (40, GgmlType::Nvfp4, 64, 36),
-        (41, GgmlType::Q1_0, 32, 6),
-        (42, GgmlType::Q2_0, 64, 18),
+    let valid: &[(u32, Quant, usize, usize)] = &[
+        (0, Quant::F32, 1, 4),
+        (1, Quant::F16, 1, 2),
+        (2, Quant::Q4_0, 32, 18),
+        (3, Quant::Q4_1, 32, 20),
+        (6, Quant::Q5_0, 32, 22),
+        (7, Quant::Q5_1, 32, 24),
+        (8, Quant::Q8_0, 32, 34),
+        (10, Quant::Q2K, 256, 84),
+        (11, Quant::Q3K, 256, 110),
+        (12, Quant::Q4K, 256, 144),
+        (13, Quant::Q5K, 256, 176),
+        (14, Quant::Q6K, 256, 210),
+        (15, Quant::Q8K, 256, 292),
+        (16, Quant::Iq2Xxs, 256, 66),
+        (17, Quant::Iq2Xs, 256, 74),
+        (18, Quant::Iq3Xxs, 256, 98),
+        (19, Quant::Iq1S, 256, 50),
+        (20, Quant::Iq4Nl, 32, 18),
+        (21, Quant::Iq3S, 256, 110),
+        (22, Quant::Iq2S, 256, 82),
+        (23, Quant::Iq4Xs, 256, 136),
+        (29, Quant::Iq1M, 256, 56),
+        (30, Quant::Bf16, 1, 2),
+        (34, Quant::Tq1_0, 256, 54),
+        (35, Quant::Tq2_0, 256, 66),
+        (39, Quant::Mxfp4, 32, 17),
+        (40, Quant::Nvfp4, 64, 36),
+        (41, Quant::Q1_0, 128, 18),
+        (42, Quant::Q2_0, 64, 18),
     ];
     for &(tag, ty, bl, bb) in valid {
-        assert_eq!(GgmlType::from_u32(tag).unwrap(), ty);
+        assert_eq!(Quant::from_ggml(tag).unwrap(), ty);
         assert_eq!(ty.block_len(), bl);
         assert_eq!(ty.block_bytes(), bb);
     }
     for tag in [4u32, 5, 9, 24, 31] {
         assert!(
-            GgmlType::from_u32(tag).is_err(),
+            Quant::from_ggml(tag).is_err(),
             "tag {tag} must be rejected"
         );
     }
@@ -105,15 +105,15 @@ fn q8k_and_bitnet_decode() {
     for i in 0..256u32 {
         raw[4 + i as usize] = (i as i8) as u8;
     }
-    let got = to_f32(GgmlType::Q8K, &raw, 256).unwrap();
+    let got = to_f32(Quant::Q8K, &raw, 256).unwrap();
     for i in 0..256usize {
         assert_eq!(got[i], 1.5 * (i as i8) as f32, "Q8_K element {i}");
     }
 
-    let mut raw = vec![0u8; 6];
+    let mut raw = vec![0u8; 18];
     raw[0..2].copy_from_slice(&f32_to_half(2.0).to_le_bytes());
     raw[2] = 0b1010_1010;
-    let got = to_f32(GgmlType::Q1_0, &raw, 32).unwrap();
+    let got = to_f32(Quant::Q1_0, &raw, 128).unwrap();
     assert_eq!(got[0], -2.0);
     assert_eq!(got[1], 2.0);
     assert_eq!(got[7], 2.0);
@@ -122,7 +122,7 @@ fn q8k_and_bitnet_decode() {
     let mut raw = vec![0u8; 18];
     raw[0..2].copy_from_slice(&f32_to_half(0.5).to_le_bytes());
     raw[2] = 0b01_00_11_10;
-    let got = to_f32(GgmlType::Q2_0, &raw, 64).unwrap();
+    let got = to_f32(Quant::Q2_0, &raw, 64).unwrap();
     assert_eq!(got[0], 0.5);
     assert_eq!(got[1], 1.0);
     assert_eq!(got[2], -0.5);
@@ -132,16 +132,20 @@ fn q8k_and_bitnet_decode() {
 #[test]
 fn tq1_0_decodes_balanced_ternary() {
     let mut raw = vec![0u8; 54];
-    raw[50..52].copy_from_slice(&f32_to_half(1.0).to_le_bytes());
+    raw[52..54].copy_from_slice(&f32_to_half(1.0).to_le_bytes());
     raw[0] = 194;
-    let got = to_f32(GgmlType::Tq1_0, &raw, 256).unwrap();
-    assert_eq!(&got[0..5], &[1.0, -1.0, 1.0, 0.0, 0.0]);
+    let got = to_f32(Quant::Tq1_0, &raw, 256).unwrap();
+    for n in 0..5 {
+        assert_eq!(got[n * 32], [1.0, -1.0, 1.0, 0.0, 0.0][n]);
+    }
 
     let mut raw = vec![0u8; 54];
-    raw[50..52].copy_from_slice(&f32_to_half(1.0).to_le_bytes());
-    raw[52] = 0;
-    let got = to_f32(GgmlType::Tq1_0, &raw, 256).unwrap();
-    assert_eq!(&got[240..244], &[-1.0, -1.0, -1.0, -1.0]);
+    raw[52..54].copy_from_slice(&f32_to_half(1.0).to_le_bytes());
+    raw[48] = 0;
+    let got = to_f32(Quant::Tq1_0, &raw, 256).unwrap();
+    for n in 0..4 {
+        assert_eq!(got[240 + n * 4], -1.0);
+    }
 }
 
 fn f32_to_half(v: f32) -> u16 {
@@ -196,17 +200,17 @@ type RefDecoder = fn(&[u8], &mut [f32]);
 
 #[test]
 fn block_decoders_match_reference() {
-    let quants: &[(GgmlType, RefDecoder)] = &[
-        (GgmlType::Q8_0, ref_q8_0),
-        (GgmlType::Q4_0, ref_q4_0),
-        (GgmlType::Q4_1, ref_q4_1),
-        (GgmlType::Q5_0, ref_q5_0),
-        (GgmlType::Q5_1, ref_q5_1),
-        (GgmlType::Q2K, ref_q2k),
-        (GgmlType::Q3K, ref_q3k),
-        (GgmlType::Q4K, ref_q4k),
-        (GgmlType::Q5K, ref_q5k),
-        (GgmlType::Q6K, ref_q6k),
+    let quants: &[(Quant, RefDecoder)] = &[
+        (Quant::Q8_0, ref_q8_0),
+        (Quant::Q4_0, ref_q4_0),
+        (Quant::Q4_1, ref_q4_1),
+        (Quant::Q5_0, ref_q5_0),
+        (Quant::Q5_1, ref_q5_1),
+        (Quant::Q2K, ref_q2k),
+        (Quant::Q3K, ref_q3k),
+        (Quant::Q4K, ref_q4k),
+        (Quant::Q5K, ref_q5k),
+        (Quant::Q6K, ref_q6k),
     ];
     let mut rng = Bytes(7);
     for &(ty, reference) in quants {
@@ -236,14 +240,14 @@ fn block_decoders_match_reference() {
 fn float_types_decode_directly() {
     let vals = [1.5f32, -2.25, 0.0, 100.0];
     let f32_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-    assert_eq!(to_f32(GgmlType::F32, &f32_bytes, 4).unwrap(), vals);
+    assert_eq!(to_f32(Quant::F32, &f32_bytes, 4).unwrap(), vals);
 
     let bf: Vec<u8> = vals
         .iter()
         .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
         .collect();
     assert_eq!(
-        to_f32(GgmlType::Bf16, &bf, 4).unwrap(),
+        to_f32(Quant::Bf16, &bf, 4).unwrap(),
         vals,
         "these values are bf16-exact"
     );
@@ -253,14 +257,14 @@ fn float_types_decode_directly() {
         .flat_map(|v| half_bits(*v))
         .collect();
     assert_eq!(
-        to_f32(GgmlType::F16, &f16_bytes, 4).unwrap(),
+        to_f32(Quant::F16, &f16_bytes, 4).unwrap(),
         vec![1.0, -2.0, 0.0, 2.5]
     );
 }
 
 #[test]
 fn truncated_input_fails_fast() {
-    let err = to_f32(GgmlType::Q8_0, &[0u8; 10], 32).unwrap_err();
+    let err = to_f32(Quant::Q8_0, &[0u8; 10], 32).unwrap_err();
     assert!(err.to_string().contains("truncated"), "{err}");
 }
 
@@ -337,7 +341,7 @@ fn ref_q5_1(b: &[u8], y: &mut [f32]) {
 }
 
 fn ref_q2k(b: &[u8], y: &mut [f32]) {
-    let (d, dmin) = (half(b, 68), half(b, 70));
+    let (d, dmin) = (half(b, 80), half(b, 82));
     let (scales, qs) = (&b[0..16], &b[16..80]);
     for (v, out) in y.iter_mut().enumerate() {
         let (n, r) = ((v / 128) * 32, v % 128);

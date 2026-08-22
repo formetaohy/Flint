@@ -29,3 +29,7 @@ path = "schema/main.rs"
 [[example]]
 name = "server"
 path = "server/main.rs"
+
+[[example]]
+name = "verify"
+path = "verify/main.rs"
